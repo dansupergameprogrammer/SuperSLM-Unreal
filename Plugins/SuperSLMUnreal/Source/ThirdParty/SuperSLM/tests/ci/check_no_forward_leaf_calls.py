@@ -1,0 +1,768 @@
+"""CI source check: no translation unit in the forward composition may name a
+checked-chain-funnel leaf directly, outside the funnel's own file and the leaf
+certification TUs (SuperSLM_S3a_WalkingSkeleton_Plan.md Sec7.3; T-200,
+Sec17.3 cell 5; S3.1).
+
+This is the structural half of the funnel (Sec7.3): a lint rule and a wrapper
+type were both considered and rejected there in favour of a single-entry-point
+funnel PLUS this check, which is what stops a future call site from reaching a
+caller-ensures leaf directly instead of routing through the checked entry
+points (`RequantChainChecked` / `NarrowRowChecked`).
+
+Modelled on the precedent already in the tree, tests/check_no_pow_operator.py,
+with the one property that precedent does NOT need and this check does: an
+INPUT SET derived from a directory glob rather than a hardcoded file tuple
+(Sec7.3 names check_no_pow_operator.py's hardcoded two-element tuple as "the
+precedent's own weakness, not inherited"). One property does NOT fully
+transfer: check_no_pow_operator.py gets its precision from `ast.parse` over
+Python; a ban on C++ identifiers in forward TUs has no AST behind it here and
+is a text scan (Sec7.3, verbatim) -- but not a raw one.
+
+CORRECTED (T-2125): the scan is comment-aware. `find_banned_leaf_uses` blanks
+`//` line comments and `/* */` block comments before running the leaf-name
+regex (`_strip_comments_preserving_line_numbers`, below -- newlines are kept
+exactly where they were, so a hit reported after a multi-line block comment
+still carries its real line number), rather than scanning the raw byte
+stream. Prose that NAMES a leaf while documenting why a nearby function calls
+it -- e.g. a comment explaining that `BiasReconcileWide` "uses the same
+portable 128-bit facility RequantTokenCode/IExpEvaluate already use
+internally" (`src/forward/forward_sites.cpp`) -- is not a call site and must
+not fail this check; a raw substring scan cannot tell the two apart, which is
+exactly the gap this correction closes (found live: that exact comment
+reddened the real-tree end-to-end cell with zero code change, a checker
+defect, not a code regression). A leaf name inside a STRING or char literal
+is still an accepted over-approximation -- this module tracks literal state
+only to keep a `//`/`/*` inside one from being misread as a comment opener
+(CORRECTED further, T-2125 fix round, Poirot 242dc12-t2125-ci-drift-
+review.md Significant 1: the first version of the comment stripper had no
+notion of "inside a literal" at all, which traded that false positive for a
+false NEGATIVE -- a `//` inside an ordinary string blanked the rest of its
+line, and a bare `"/*"` string opened a block comment that swallowed every
+real call up to the next genuine `*/`; both executed and reproduced live at
+review time, see `_strip_comments_preserving_line_numbers`'s own docstring
+below for the fix), it does not classify what the literal's own content
+means, and the rule remains a ban rather than a full classifier for that one
+remaining shape.
+
+WHERE THIS STANDS AS OF THE S3.1 HEADER-CONTRACT BUILD (2026-07-28, commit
+32aca0c, T-200): `src/forward/checked_chain_funnel.cpp` now exists and
+_DEFAULT_FORWARD_GLOBS resolves to exactly that one real file against the
+tree. main()'s end-to-end run against it is no longer vacuous --
+test_check_no_forward_leaf_calls.py's own
+`test_main_end_to_end_against_the_real_default_glob_is_no_longer_vacuous`
+asserts the real, exact population and that the real tree passes -- though
+that cell proves the WIRING (the real glob and allowlist agree on the real
+file), not the MECHANISM (a real banned-leaf call being caught): the funnel's
+own file is allowlisted, and `scan_files` skips reading an allowlisted path's
+content at all, so every mechanism cell still drives this module against
+constructed fixture files standing in for "a forward TU," per
+StandardsDocument Sec4's population-validation requirement.
+
+UPDATED AT THE S3.2 HEADER-CONTRACT BUILD (2026-07-28, commit a594dd2): the
+build staged S3.2's site compositions at `src/forward_sites.cpp` rather than
+under `src/forward/`, specifically so this module's own exact-population
+assertion (then hardcoded to one file) would not need editing as part of that
+pass -- see that build log (Claude/Brunel/superslm-s3.2-weightless-and-
+projection-sites-contract-build-2026-07-28.md) and the file's own placement
+comment. That left `src/forward_sites.cpp` -- a real forward-composition
+source, in the plan's own sense -- entirely outside _DEFAULT_FORWARD_GLOBS'
+scan root, so a banned leaf called directly from it would pass this check
+with nothing to catch it: the structural guarantee Sec7.3 exists to hold had
+a hole exactly where the newest site compositions live.
+
+Closed here by widening _DEFAULT_FORWARD_GLOBS to also name
+`src/forward_sites.cpp` explicitly (it is NOT added to _DEFAULT_ALLOWLIST --
+it is scanned, not exempted) and by moving the "expected real population"
+this module's own end-to-end test asserts from a hardcoded count of one to a
+named, sized set (_EXPECTED_REAL_FORWARD_FILES, below) that already lists
+both real files. Physically relocating `src/forward_sites.cpp` under
+`src/forward/` (the placement the S3.2 build log itself named as the
+eventual, cleaner fix) is a production-source change outside this module's
+own writable surface (`tests/`) and is routed rather than done here; this
+widening closes the coverage gap immediately, independent of whether or when
+that move happens, and keeps working unchanged after it does (the sibling
+glob entry becomes redundant with the directory glob at that point, not
+wrong).
+"""
+from __future__ import annotations
+
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
+_INCLUDE_DIR = os.path.join(_REPO_ROOT, "include")
+
+# The eight funnel leaves named at Sec7.3, verbatim: the forward-leaf caller-ensures
+# set the funnel exists to keep off every call site but its own.
+BANNED_LEAVES = (
+    "MaxAbsReduce",
+    "MaxAbsReduceWide",
+    "RowBoundsWide",
+    "NormalizeScale",
+    "DynamicScaleReciprocal",
+    "RequantTokenCode",
+    "RequantTokenCodeWide",
+    "NarrowAccumulatorToI32",
+)
+
+# The forward-composition source root (Sec11): src/forward/checked_chain_funnel.cpp
+# is the one real file under the directory glob as of the S3.1 header-contract
+# build (2026-07-28, commit 32aca0c). `src/forward_sites.cpp` (S3.2, commit
+# a594dd2) is a second real forward-composition source that was deliberately
+# placed OUTSIDE src/forward/ (see module docstring) -- named here explicitly so
+# it is scanned starting now, rather than left dark until a future move brings it
+# under the directory glob on its own.
+_DEFAULT_FORWARD_GLOBS = (
+    "src/forward/**/*.cpp",
+    "src/forward/**/*.h",
+    "src/forward_sites.cpp",
+)
+
+# The real forward-composition population this module's own end-to-end test
+# (test_check_no_forward_leaf_calls.py::
+# test_main_end_to_end_against_the_real_default_glob_is_no_longer_vacuous)
+# asserts _DEFAULT_FORWARD_GLOBS resolves to EXACTLY -- a named, sized set
+# rather than a hardcoded count of one, so a third real file lands "correctly"
+# failing that assertion (per its own docstring) whatever N happens to be
+# today, without the assertion itself needing to change shape again.
+_EXPECTED_REAL_FORWARD_FILES = (
+    "src/forward/checked_chain_funnel.cpp",
+    "src/forward/forward_sites.cpp",
+)
+
+# Relative-to-repo-root paths permitted to name a banned leaf directly. Only a
+# path _DEFAULT_FORWARD_GLOBS can match is meaningful here: scan_files's
+# allowlist is consulted solely against the files main() globs in, so an entry
+# outside src/forward/** is never reached by the default scan and would read
+# as protection while providing none (Poirot ac34677 review finding N4). The
+# leaf certification TUs and tests/test_main.cpp's own direct calls into the
+# funnel's leaves live outside that glob root; a caller that needs them
+# allowlisted supplies them explicitly to scan_files (see
+# test_check_no_forward_leaf_calls.py's allowlist-control cells), rather than
+# carrying them here where they can never be consulted.
+_DEFAULT_ALLOWLIST = (
+    "src/forward/checked_chain_funnel.cpp",
+)
+
+# The funnel's own two documented entry points (Sec7.2): these are EXPECTED to
+# call banned leaves internally -- that is what a checked entry point is for --
+# so they are excluded from find_leaf_forwarding_doors' count rather than
+# reported as forwarding doors themselves.
+_FUNNEL_ENTRY_POINTS = (
+    "RequantChainChecked",
+    "NarrowRowChecked",
+)
+
+# The named, sized set of functions inside the funnel's own file that are
+# PERMITTED to forward a banned leaf to an outside caller. T-2739 re-derived
+# this list against T2704 design §2.2: the legacy C19 reciprocal door,
+# the residual site's fused NormalizeScale+DynamicScaleReciprocal door, and
+# the pre-write C26 funnel are the complete designed surface. In particular,
+# the C26 door is named PreflightRequantChain rather than an internal Build*
+# helper, so the census follows the design's public seam rather than a
+# refactorable implementation detail. Sized to N, the same
+# _EXPECTED_REAL_FORWARD_FILES idiom above -- a second door landing without a
+# matching update here is caught by the equality assertion in
+# find_leaf_forwarding_doors' caller, not silently accepted.
+_EXPECTED_DOOR_FUNCTIONS = (
+    "CarriedScaleReciprocal",
+    "CarriedScaleNormalizedReciprocal",
+    "PreflightRequantChain",
+)
+
+# --- T-1381: a Clang-AST derivation of the door count, replacing the text
+# scanner (D-SLM464; SuperSLM_S3a_WalkingSkeleton_Plan.md Sec7.3a). ---
+#
+# T-1378 hardened the prior column-0-anchored, no-nested-parens regex scanner
+# with comment/string stripping, a balanced-parenthesis parameter list, and
+# brace-context tracking -- and an independent sweep against the HARDENED
+# scanner (Poirot 5af6ab5-t1377-t1378-review-2026-07-31.md, Significant 2)
+# still found three more missed shapes, one of them newly introduced by the
+# hardening itself: a trailing return type (`auto Foo(...) -> int64_t {`,
+# already a live style at src/bad_alloc_wrap.h:49) silently passed because
+# `_SIGNATURE_TAIL_RE` admitted only optional `noexcept` between `)` and `{`;
+# a door inside an `extern "C" { ... }` linkage block silently passed because
+# the brace-context tracker only ever tagged a brace "namespace" or "other",
+# never "extern C"; and a C++14 digit separator (`1'000`) appearing an ODD
+# number of times in the file blanked EVERYTHING from it to end of file,
+# because the comment/string stripper treated every `'` as a char-literal
+# opener with no way to tell a digit separator from a real char literal by
+# text alone -- silently erasing every door after it.
+#
+# Per `StandardsDocument.md` Sec4, a defect class that survives a second,
+# carefully-executed repair is repaired by removing the class, not by
+# patching a third special case onto the same recognizer: comments, string
+# and char literals, digit separators, namespace/extern-"C" nesting at any
+# depth, and trailing return types are not six special cases to enumerate by
+# hand, they are ordinary nodes a real C++ grammar already resolves. This
+# section replaces the hand-rolled text scanner (the comment/string stripper
+# and the brace-tracking function-body finder, both removed) with a Clang AST
+# walk over the funnel's own one file, mirroring the pattern already
+# CI-wired in this repo at `tests/ci/derive_bad_alloc_membership.py`/
+# `tools/ci/check_bad_alloc_contract.py` (same pinned `clang++-18`, same
+# `ubuntu-latest` runner image; `.github/workflows/tests.yml`'s
+# `bad-alloc-membership-check` job proves the exact binary is present
+# there). The whole-tree leaf ban (`scan_files`/`find_banned_leaf_uses`,
+# below) is UNCHANGED -- it is a deliberately over-approximate text scan by
+# design (a ban, not a classifier; Sec7.3's own module docstring) and
+# carries no soundness gap this replaces.
+#
+# `-fsyntax-only -Xclang -ast-dump=json` still emits a full AST for a scratch
+# file with no `#include`s at all (every banned-leaf name and every type
+# unresolved): Clang's error-recovery machinery represents an unresolved call
+# as an `UnresolvedLookupExpr` carrying the callee's name directly, and an
+# unresolved type does not prevent the enclosing `FunctionDecl`, its name, or
+# its `CompoundStmt` body from appearing in the dump. This is what lets the
+# same population of constructed, include-free scratch fixtures this suite
+# already uses drive the AST-based mechanism exactly as they drove the text
+# scanner, with no synthetic header prelude required (confirmed by execution:
+# `clang++ -Xclang -ast-dump=json -fsyntax-only` on a bare
+# `int64_t CarriedScaleReciprocal(int64_t m) { return
+# DynamicScaleReciprocal(m); }` -- no includes, no declarations -- exits 0
+# and dumps a `FunctionDecl` named `CarriedScaleReciprocal` whose body
+# contains an `UnresolvedLookupExpr` named `DynamicScaleReciprocal`).
+#
+# Validated against the same population `test_check_no_forward_leaf_calls.py`
+# already carries (five constructed doors plus the false-positive control)
+# PLUS the three shapes this review found still missed (trailing return type,
+# `extern "C" { }`, the odd-count digit separator) -- nine cases in total,
+# each executed against BOTH the text-scan mechanism being replaced
+# (reproduced verbatim in the test file, since this module no longer carries
+# it) and this AST-based one, so the improvement is measured rather than
+# asserted (StandardsDocument Sec4).
+#
+# CORRECTED 2026-07-31 (Poirot 5eff945-t1380-t1381-t1382-review-2026-07-31.md,
+# Significant 1; T-1383): the paragraph just above this one shipped true; the
+# ORIGINAL `_TOP_LEVEL_FUNCTION_KINDS` docstring (the comment directly below,
+# now corrected in place) shipped a parity claim that was false the moment it
+# was written -- admitting `FunctionDecl` only was argued to exclude a member
+# function "exactly as the prior text scanner's brace-context tag 'other'
+# did," which holds for an IN-CLASS member definition but not for an
+# OUT-OF-LINE one (`Ret S::Door(...) { ... }`), which is not nested inside a
+# struct body at all and which BOTH retired scanners caught. `find_leaf_
+# forwarding_doors` now admits member-function kinds alongside `FunctionDecl`
+# (both in-class and out-of-line member definitions surface as the identical
+# `CXXMethodDecl` kind, confirmed by execution -- indistinguishable by kind
+# alone), guarded so a lambda's own closure-type call operator -- itself a
+# `CXXMethodDecl`, lexically nested inside a `LambdaExpr` -- is never counted
+# as a separate top-level door: that guard is what keeps this widening from
+# regressing `test_t1381_ast_mechanism_finds_a_door_hidden_inside_a_lambda_
+# in_real_declared_code` into reporting two doors for one. Population widened
+# by: the nine T-1381 required (unchanged and re-verified against the fixed
+# mechanism); the two further shapes T-1381's own independent sweep already
+# found (a leaf call hidden inside a lambda defined in a door's own body,
+# against real declared code; and a local variable shadowing a leaf's name),
+# both unchanged and re-verified here too; the out-of-line member door this
+# correction targets; and two further shapes an independent sweep found this
+# round -- an in-class member door, now also caught as a consequence of the
+# same fix, and a namespace-scope function pointer initialised to a leaf's
+# address, which remains missed by this mechanism and by both retired
+# scanners alike: a `VarDecl` carries no `FunctionDecl`/`CXXMethodDecl` node
+# for either generation to find, so this is documented parity, not a
+# regression, and is not fixed here. See `test_check_no_forward_leaf_calls.py`'s
+# own T-1383 section for all three new cases this correction adds, each
+# executed against a verbatim reproduction of the mechanism this correction
+# replaces, exactly as the nine cases above are measured against the
+# mechanism T-1381 replaced. T-1465: this module states no running total --
+# the count is pinned once, under an assertion, by
+# `test_population_count_is_stated` in that file, which is this population's
+# single source of truth.
+
+sys.path.insert(0, _THIS_DIR)
+from _clang_discovery import discover_clangxx  # noqa: E402  (path set above)
+
+# D-SLM528 (T-1494): discovered rather than only read from an already-set
+# environment variable, the same fix as derive_bad_alloc_membership.py's --
+# see _clang_discovery's module docstring for the defect this closes.
+_DEFAULT_CLANGXX = discover_clangxx()
+
+# The AST node kinds `find_leaf_forwarding_doors` treats as door candidates:
+# free/namespace-scope functions AND member functions, in-class or defined
+# out-of-line -- both shapes surface as the SAME kind string in Clang's own
+# dump (confirmed by execution: an out-of-line `Ret S::Door(...) { ... }`
+# and an in-class `struct S { Ret Door(...) { ... } };` both produce a
+# `CXXMethodDecl` node carrying a `CompoundStmt` body, indistinguishable by
+# kind alone). (Corrected 2026-07-31, Poirot Significant 1 /T-1383: this set
+# previously admitted `FunctionDecl` only, on a comment claiming parity with
+# the prior text scanner's brace-context tag "other" -- false for an
+# out-of-line member definition, which is not nested inside a struct body at
+# all and was caught by both retired scanners. `find_leaf_forwarding_doors`'
+# own lambda guard below is what keeps this widening from also reporting a
+# lambda's closure-type call operator as a spurious extra door.)
+_TOP_LEVEL_FUNCTION_KINDS = (
+    "FunctionDecl",
+    "CXXMethodDecl",
+    "CXXConstructorDecl",
+    "CXXDestructorDecl",
+    "CXXConversionDecl",
+)
+
+
+class ClangUnavailable(RuntimeError):
+    """Raised when clang++ itself cannot be found -- the environment
+    problem, distinct from a genuine population mismatch and distinct from a
+    found clang++ that failed to complete (T-1508: a toolchain that hangs
+    instead of exiting is not absent, and is raised as RuntimeError, not
+    this). Mirrors tests/ci/derive_bad_alloc_membership.py's own exception of
+    the same name."""
+
+# Wall-clock budget for a single clang++ -ast-dump=json invocation. T-1508:
+# named as a constant rather than a repeated literal so _run_clang_ast_dump's
+# timeout message always states the value it was actually run with.
+_AST_DUMP_TIMEOUT_SECONDS = 180
+
+
+def _run_clang_ast_dump(source_path: str, clangxx: str = _DEFAULT_CLANGXX,
+                         include_dir: str | None = None) -> dict:
+    """Runs `clangxx -Xclang -ast-dump=json -fsyntax-only` against
+    `source_path` and returns the parsed JSON root. A missing clang++ raises
+    `ClangUnavailable`. A found clang++ that times out without completing
+    (T-1508 -- e.g. a major-version mismatch hanging inside a
+    standard-library header) raises `RuntimeError`, not `ClangUnavailable`:
+    it was found, so its failure is not an absent toolchain. A RECOVERABLE
+    semantic error -- an unresolved identifier or an unknown type name, the
+    ordinary case for a scratch fixture with no `#include`s -- does NOT
+    raise, even though Clang's own exit code is nonzero in that case
+    (confirmed by execution: `clang++ -fsyntax-only` on
+    `int64_t Foo(int64_t m) { return Bar(m); }` with no declarations at all
+    exits 1, reporting "unknown type name 'int64_t'" twice, yet still emits
+    a complete, valid AST dump on stdout carrying `Foo`'s `FunctionDecl`, its
+    `CompoundStmt` body, and an `UnresolvedLookupExpr` named `Bar` -- the
+    exit code reflects the semantic errors, not whether the AST dump itself
+    succeeded). What DOES distinguish a genuine parse failure (an
+    unterminated brace, for instance) is that clang emits NO stdout at all
+    in that case -- so the discriminator this function uses is "did valid
+    JSON come back on stdout," not the process's exit code."""
+    cmd = [clangxx, "-std=c++20", "-Xclang", "-ast-dump=json", "-fsyntax-only", "-x", "c++"]
+    if include_dir is not None:
+        cmd += ["-I", include_dir]
+    cmd.append(source_path)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=_AST_DUMP_TIMEOUT_SECONDS)
+    except FileNotFoundError as e:
+        raise ClangUnavailable(f"{clangxx} not found on PATH: {e}") from e
+    except subprocess.TimeoutExpired as e:
+        # A found clang++ that hangs rather than exiting is not an absent
+        # toolchain (T-1508): see derive_bad_alloc_membership.py's
+        # run_clang_ast_dump for the defect this closes.
+        raise RuntimeError(
+            f"{clangxx} timed out after {_AST_DUMP_TIMEOUT_SECONDS}s dumping "
+            f"{source_path} -- a toolchain that was found but did not "
+            "complete, not a missing one"
+        ) from e
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"clang++ produced no usable AST dump for {source_path} (exit {proc.returncode}):\n"
+            f"{proc.stderr.decode('utf-8', errors='replace')}"
+        ) from e
+
+
+def _node_leaf_name(node: dict, leaves: tuple[str, ...]) -> str | None:
+    """If `node` is a reference to one of `leaves` -- resolved (`DeclRefExpr`/
+    `MemberExpr` whose `referencedDecl.name` is a leaf, the shape a call
+    takes when the callee IS declared, e.g. the real production file with its
+    real `#include`s) or unresolved (`UnresolvedLookupExpr` whose own `name`
+    is a leaf directly, the shape an include-free scratch fixture takes) --
+    returns the matched leaf name, else None."""
+    referenced = node.get("referencedDecl")
+    if isinstance(referenced, dict) and referenced.get("name") in leaves:
+        return referenced["name"]
+    if node.get("kind") == "UnresolvedLookupExpr" and node.get("name") in leaves:
+        return node["name"]
+    return None
+
+
+def _body_calls_leaf(body: dict, leaves: tuple[str, ...]) -> bool:
+    """Whether ANY node in `body`'s subtree (a `CompoundStmt`) references a
+    banned leaf -- walked with no regard to further nesting (an `if`, a
+    lambda, another block), matching the text scanner's own "anywhere in the
+    body text" convention exactly, just precise about what counts as a
+    reference instead of a raw substring match."""
+    stack = [body]
+    while stack:
+        n = stack.pop()
+        if not isinstance(n, dict):
+            continue
+        if _node_leaf_name(n, leaves) is not None:
+            return True
+        stack.extend(n.get("inner") or [])
+    return False
+
+
+def find_leaf_forwarding_doors(
+    path: str,
+    leaves: tuple[str, ...] = BANNED_LEAVES,
+    exclude: tuple[str, ...] = _FUNNEL_ENTRY_POINTS,
+    clangxx: str = _DEFAULT_CLANGXX,
+    include_dir: str | None = _INCLUDE_DIR,
+) -> list[str]:
+    """Every top-level function DEFINED in `path` whose body names a banned
+    leaf, excluding `exclude` (the funnel's own checked entry points, which
+    are SUPPOSED to). T-1381 (D-SLM464): derived from a real Clang AST dump
+    of `path` rather than a hand-rolled text scan -- see the module comment
+    above for what this replaced and why. A "top-level function DEFINED" is
+    an AST node whose kind is one of `_TOP_LEVEL_FUNCTION_KINDS` (a free or
+    namespace-scope function, or a member function -- in-class or defined
+    out-of-line, indistinguishable by kind alone; corrected 2026-07-31,
+    Poirot Significant 1 / T-1383) located in `path` itself (tracked via the
+    dump's own file-attribution, the same delta-encoded `loc.file`/
+    `includedFrom` walk `derive_bad_alloc_membership.py` already uses) that
+    carries a `CompoundStmt` body -- a declaration with no body (e.g. the
+    header's own prototype, or an out-of-line member's own in-class
+    declaration) is not a door. A candidate the AST dump nests AS A
+    DESCENDANT of another candidate node -- not only a `LambdaExpr`'s own
+    closure-type call operator, but any function-like body the dump places
+    under another, such as a local class's member function declared inside
+    a function body -- is never itself reported as a separate door, whether
+    or not the enclosing candidate itself turns out to be a door (corrected
+    2026-07-31, Poirot Significant 1 / T-1386: the walk previously
+    suppressed only the `LambdaExpr` shape by name, which left a local class
+    nested inside a function body double-counted -- the identical shape
+    under a different keyword). **This is a claim about the AST dump's own
+    descendant structure, not about source-lexical nesting**: a
+    namespace-scope lambda's closure type is emitted by Clang as a
+    descendant of its `LambdaExpr` (suppressed here) AND, separately, as a
+    second, sibling `CXXRecordDecl` directly under the enclosing
+    `NamespaceDecl` -- nested in nothing this walk visits -- so that second
+    emission still reports as its own door (`operator()`; Poirot
+    9b0f938-t1411-t1415-t1416-t1386-t1388-confirmation-2026-07-31.md Minor 1).
+    No namespace-scope lambda exists in the funnel file this module guards,
+    so the gap is unexercised, not closed. T-1383's widening from
+    `FunctionDecl` alone would otherwise flag a genuinely AST-nested
+    candidate as its own door, double-counting a leaf call the enclosing
+    door (the function whose body declares it) already accounts for, exactly
+    as
+    `test_t1381_ast_mechanism_finds_a_door_hidden_inside_a_lambda_in_real_
+    declared_code` and `test_t1386_local_class_member_inside_function_body_
+    is_not_double_counted` require. Returns names in file order, so the
+    caller gets a stable diff against `_EXPECTED_DOOR_FUNCTIONS` when one
+    changes."""
+    root = _run_clang_ast_dump(path, clangxx, include_dir)
+    target = os.path.normpath(os.path.abspath(path)).replace("\\", "/")
+    state = {"file": None}
+    doors: list[str] = []
+
+    def walk(n: object, nested_in_candidate: bool) -> None:
+        if not isinstance(n, dict):
+            return
+        kind = n.get("kind")
+        loc = n.get("loc") or {}
+        if "file" in loc:
+            state["file"] = loc["file"]
+        cur_file = str(state["file"] or "").replace("\\", "/")
+        is_candidate = (
+            kind in _TOP_LEVEL_FUNCTION_KINDS
+            and cur_file
+            and os.path.normpath(os.path.abspath(cur_file)).replace("\\", "/") == target
+        )
+        if not nested_in_candidate and is_candidate:
+            name = n.get("name")
+            body = next(
+                (c for c in (n.get("inner") or []) if isinstance(c, dict) and c.get("kind") == "CompoundStmt"),
+                None,
+            )
+            if body is not None and name not in exclude and name not in doors and _body_calls_leaf(body, leaves):
+                doors.append(name)
+        # Anything this walk reaches as an AST DESCENDANT of any candidate is
+        # nested, regardless of the construct that carries it down and
+        # regardless of whether the enclosing candidate itself turns out to
+        # be a door (T-1386): a lambda's own closure-type call operator
+        # (`CXXMethodDecl` inside a `LambdaExpr`) and a local class's member
+        # function (`CXXMethodDecl` inside a `CXXRecordDecl`) are the same
+        # shape under different keywords, and both are already accounted for
+        # by the enclosing candidate's own `_body_calls_leaf` walk, which has
+        # no regard to further nesting. `is_candidate` alone (not just
+        # `LambdaExpr`) is what widens the walk into a local class's members
+        # without a second spurious top-level report. This is descendant
+        # structure in the AST dump, not source-lexical nesting: a
+        # namespace-scope lambda's closure type is ALSO emitted as a sibling
+        # `CXXRecordDecl` under the enclosing `NamespaceDecl`, which this walk
+        # never marks nested, so that emission still reports (Poirot
+        # 9b0f938-…-confirmation-2026-07-31.md Minor 1; unexercised here, no
+        # namespace-scope lambda exists in the file this module guards).
+        child_nested_in_candidate = nested_in_candidate or is_candidate
+        for c in n.get("inner") or []:
+            walk(c, child_nested_in_candidate)
+
+    walk(root, False)
+    return doors
+
+
+_LEAF_PATTERN_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _leaf_pattern(leaf: str) -> re.Pattern[str]:
+    """A whole-identifier match for `leaf`: not preceded or followed by a character
+    that could extend it into a different identifier. This is what keeps a call to
+    `MaxAbsReduceWide` from also being reported as a hit on `MaxAbsReduce` (a strict
+    prefix of it, and separately banned) -- the lookaround anchors both ends."""
+    cached = _LEAF_PATTERN_CACHE.get(leaf)
+    if cached is None:
+        cached = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(leaf) + r"(?![A-Za-z0-9_])")
+        _LEAF_PATTERN_CACHE[leaf] = cached
+    return cached
+
+
+def _strip_comments_preserving_line_numbers(text: str) -> str:
+    """`text` with every `//` line comment and `/* */` block comment blanked to
+    spaces -- every newline byte kept exactly where it was, so line numbers
+    computed against the RETURNED text still match the original file
+    line-for-line. Mirrors the `strip_comments` convention already used by
+    tests/ci/check_gpu_guard_status_parity.py and tests/ci/
+    check_gemm_site_thread_width_parity.py, adapted to BLANK rather than
+    DELETE so the (line, leaf) hits this module reports stay accurate against
+    the original file.
+
+    CORRECTED (T-2125 fix round, Poirot 242dc12-t2125-ci-drift-review.md,
+    Significant 1): the first version of this function scanned for `//` and
+    `/*` with no notion of "inside a string or char literal," which traded
+    the false positive it was written to close for a false NEGATIVE -- the
+    harmful direction for a ban. A `//` inside an ordinary string (e.g.
+    `"scheme://host"`) blanked the rest of its line, silently hiding a real
+    call later on that same line; a bare `"/*"` string opened a block comment
+    that ran to the next real `*/`, however far away, swallowing every real
+    call in between. Both executed and reproduced live at review time.
+
+    String literals (`"..."`), char literals (`'...'`), and raw string
+    literals (`R"delim(...)delim"`, with the u8/u/U/L encoding-prefix
+    variants) are now tracked as a literal state, entered and exited by this
+    same single pass, and their bytes are copied through verbatim rather than
+    scanned for `//`/`/*` -- a comment marker inside one is literal content,
+    never a comment opener. Backslash escapes inside a string or char literal
+    (`\\"`, `\\'`, `\\\\`) are honored so an escaped quote does not end the
+    literal early. Leaf names inside a (non-raw-string-delimiter) literal
+    are therefore still reported by `find_banned_leaf_uses`, because the
+    literal's own text is preserved, not blanked -- the module docstring's
+    named, deliberate over-approximation for that one remaining shape is
+    unchanged by this correction.
+
+    A C++14 digit separator (`1'000`) is distinguished from a char-literal
+    opener the same way this repo's own T-1381/T-1383 sweep already had to
+    for the sibling AST-based door scanner this module replaced (see this
+    module's history above): a `'` immediately preceded by an alphanumeric
+    character is treated as a separator, not an opener, because no valid
+    char literal can be immediately preceded by an identifier or digit
+    character with no operator between them -- the exact defect class that
+    sweep found silently erasing everything after an odd-count digit
+    separator in a hand-rolled stripper, closed here before it could recur
+    in this one."""
+    out = []
+    i = 0
+    n = len(text)
+    _RAW_STRING_PREFIXES = ("u8R", "uR", "UR", "LR", "R")
+    while i < n:
+        c = text[i]
+        two = text[i:i + 2]
+
+        if two == "//":
+            j = text.find("\n", i)
+            end = n if j == -1 else j
+            out.append(" " * (end - i))
+            i = end
+            continue
+
+        if two == "/*":
+            j = text.find("*/", i + 2)
+            end = n if j == -1 else j + 2
+            out.append("".join("\n" if ch == "\n" else " " for ch in text[i:end]))
+            i = end
+            continue
+
+        if c == '"':
+            raw_prefix_len = 0
+            for prefix in _RAW_STRING_PREFIXES:
+                start = i - len(prefix)
+                if start >= 0 and text[start:i] == prefix and (
+                    start == 0 or not (text[start - 1].isalnum() or text[start - 1] == "_")
+                ):
+                    raw_prefix_len = len(prefix)
+                    break
+            if raw_prefix_len:
+                paren = text.find("(", i + 1)
+                if paren == -1:
+                    out.append(text[i:])
+                    i = n
+                    continue
+                delim = text[i + 1:paren]
+                closer = ")" + delim + '"'
+                end_paren = text.find(closer, paren + 1)
+                end = n if end_paren == -1 else end_paren + len(closer)
+                out.append(text[i:end])
+                i = end
+                continue
+            j = i + 1
+            while j < n:
+                if text[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    j += 1
+                    break
+                j += 1
+            out.append(text[i:j])
+            i = j
+            continue
+
+        if c == "'":
+            prev = text[i - 1] if i > 0 else ""
+            if prev.isalnum():
+                out.append(c)
+                i += 1
+                continue
+            j = i + 1
+            while j < n:
+                if text[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if text[j] == "'":
+                    j += 1
+                    break
+                j += 1
+            out.append(text[i:j])
+            i = j
+            continue
+
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def find_banned_leaf_uses(path: str, leaves: tuple[str, ...] = BANNED_LEAVES) -> list[tuple[int, str]]:
+    """Every (1-based line number, leaf name) hit in `path`, in file order. A text
+    scan, not an AST walk (Sec7.3) -- comments are stripped first (T-2125,
+    `_strip_comments_preserving_line_numbers` above), so a leaf name mentioned
+    only in prose is not a hit; a leaf name inside a string or char literal is
+    still reported (comments and literal-vs-code confusion are the ambiguities
+    this module closes, not the identity of what is inside a literal -- see the
+    module docstring), a deliberate, narrower over-approximation of a ban, not
+    an attempt to fully classify intent.
+
+    CORRECTED (T-2125 fix round, Poirot 242dc12-t2125-ci-drift-review.md,
+    Significant 2): split on `stripped.splitlines()`, which also breaks on
+    `\\v`, `\\f`, `\\x1c`-`\\x1e`, `\\x85`, `\\u2028`, and `\\u2029` -- none of
+    which starts a new line in the ORIGINAL file's own numbering, so any of
+    those bytes anywhere before a hit shifted every line number reported after
+    it, in the one function whose stated purpose is line-number fidelity.
+    `str.split("\\n")` splits on exactly the byte that starts a new line in a
+    file opened in text mode, no more and no less."""
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    stripped = _strip_comments_preserving_line_numbers(text)
+    hits: list[tuple[int, str]] = []
+    for lineno, line in enumerate(stripped.split("\n"), start=1):
+        for leaf in leaves:
+            if _leaf_pattern(leaf).search(line):
+                hits.append((lineno, leaf))
+    return hits
+
+
+def _glob_files(globs: tuple[str, ...], repo_root: str) -> list[str]:
+    out: list[str] = []
+    for g in globs:
+        out.extend(glob.glob(os.path.join(repo_root, g), recursive=True))
+    return sorted(out)
+
+
+def scan_files(
+    file_paths: list[str],
+    allowlist: tuple[str, ...] = _DEFAULT_ALLOWLIST,
+    repo_root: str = _REPO_ROOT,
+    leaves: tuple[str, ...] = BANNED_LEAVES,
+) -> list[str]:
+    """Scans every file in `file_paths` (absolute or repo-root-relative), skipping
+    anything whose repo-root-relative path (normalized, so `/` and `\\` both match)
+    is in `allowlist`. Returns one formatted failure string per hit, empty if clean."""
+    allow_norm = {os.path.normpath(p) for p in allowlist}
+    failures: list[str] = []
+    for p in file_paths:
+        abs_p = p if os.path.isabs(p) else os.path.join(repo_root, p)
+        rel = os.path.relpath(abs_p, repo_root)
+        rel_norm = os.path.normpath(rel)
+        if rel_norm in allow_norm:
+            continue
+        if not os.path.isfile(abs_p):
+            failures.append(f"{rel}: file not found at {abs_p}")
+            continue
+        for lineno, leaf in find_banned_leaf_uses(abs_p, leaves):
+            failures.append(f"{rel}:{lineno}: names banned leaf '{leaf}' outside the funnel's own file")
+    return failures
+
+
+def check_door_count(
+    funnel_path: str = os.path.join(_REPO_ROOT, "src/forward/checked_chain_funnel.cpp"),
+    expected: tuple[str, ...] = _EXPECTED_DOOR_FUNCTIONS,
+) -> list[str]:
+    """Significant 9 (Poirot e4b398c review, T-1357/D-SLM433): `scan_files` above
+    holds every OTHER forward TU off the eight banned leaves; nothing holds the
+    DOOR COUNT itself inside the funnel's own file. Asserts the exact,
+    named set of functions in `funnel_path` that forward a banned leaf to an
+    outside caller equals `expected` -- a second door opened alongside
+    one of the designed doors (or a rename of one) is caught here, the same
+    named-set idiom `_EXPECTED_REAL_FORWARD_FILES` already uses one level up."""
+    if not os.path.isfile(funnel_path):
+        # Not a failure: this check is auxiliary to scan_files' own glob-driven
+        # scan, applied only when the real funnel file is actually present at
+        # the given repo_root. A scratch-directory caller exercising
+        # scan_files/main against a constructed tree with no funnel file at
+        # all is exercising the leaf-ban mechanism, not this door-count guard.
+        return []
+    doors = sorted(set(find_leaf_forwarding_doors(funnel_path)))
+    if doors != sorted(expected):
+        return [
+            f"{funnel_path}: forwarding doors == {doors}, want exactly {sorted(expected)} "
+            f"-- a door was added, removed, or renamed without updating "
+            f"_EXPECTED_DOOR_FUNCTIONS"
+        ]
+    return []
+
+
+def main(
+    globs: tuple[str, ...] = _DEFAULT_FORWARD_GLOBS,
+    allowlist: tuple[str, ...] = _DEFAULT_ALLOWLIST,
+    repo_root: str = _REPO_ROOT,
+) -> int:
+    files = _glob_files(globs, repo_root)
+    failures = scan_files(files, allowlist, repo_root)
+    # The door-count guard applies only against the REAL production tree, not
+    # an arbitrary scratch `repo_root` a mechanism test constructs to exercise
+    # the leaf-ban scan in isolation (this module's existing convention,
+    # test_check_no_forward_leaf_calls.py's docstring): those scratch trees
+    # often write a minimal stand-in `checked_chain_funnel.cpp` with no doors
+    # at all, which is not the fault this guard exists to catch. The real
+    # tree's own door count is asserted separately and unconditionally by
+    # test_main_end_to_end_against_the_real_default_glob_is_no_longer_vacuous.
+    if os.path.normpath(repo_root) == os.path.normpath(_REPO_ROOT):
+        try:
+            failures += check_door_count(
+                os.path.join(repo_root, "src/forward/checked_chain_funnel.cpp")
+            )
+        except ClangUnavailable as e:
+            # T-1381 (D-SLM464): the door-count guard is now Clang-AST-derived
+            # and needs a real clang++ on PATH (or SUPERSLM_CLANGXX). Reported
+            # as a clean gate failure, mirroring tools/ci/check_bad_alloc_
+            # contract.py's own handling of the same exception -- an
+            # environment gap, not a Python traceback.
+            print(f"check_no_forward_leaf_calls.py: clang++ unavailable -- {e}", file=sys.stderr)
+            return 1
+    if failures:
+        print("check_no_forward_leaf_calls.py: FAILED", file=sys.stderr)
+        for f in failures:
+            print(f"  - {f}", file=sys.stderr)
+        return 1
+    print(
+        f"check_no_forward_leaf_calls.py: OK -- {len(files)} forward-composition file(s) "
+        f"scanned, zero banned-leaf calls outside the allowlist, and the door count "
+        f"holds at {len(_EXPECTED_DOOR_FUNCTIONS)}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,857 @@
+"""Curie's red suite for check_present_tense_defect_comments.py
+(SuperSLM_S3a_WalkingSkeletonPlan.md Sec11 intro, Sec14.12; D-SLM411, D-SLM414,
+D-SLM418; board T-1337).
+
+Mirrors tests/ci/test_check_no_forward_leaf_calls.py's own convention: mechanism
+cells (rule coverage, marker recognition, block boundaries, input coverage) drive
+the module against constructed scratch files, never the real production tree,
+per StandardsDocument Sec4's population-validation requirement -- a check shown
+only to pass on unchanged input is not shown to catch anything. The historical-
+population cells at the bottom of this file are the OTHER half of Sec4: they
+replay the seven real sites T-1331/T-1334 found, recovered from git history,
+rather than a fault the module's own author injected.
+"""
+
+import os
+import tempfile
+
+import check_present_tense_defect_comments as cptdc
+
+_FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "present_tense_defect_historical_fixtures")
+
+
+def _write(tmpdir: str, rel_path: str, content: str) -> str:
+    abs_path = os.path.join(tmpdir, rel_path)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    with open(abs_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return abs_path
+
+
+def _read_lines(rel_fixture_name: str) -> list[str]:
+    path = os.path.join(_FIXTURES_DIR, rel_fixture_name)
+    with open(path, "r", encoding="utf-8") as f:
+        return f.readlines()
+
+
+# --- Rule coverage: each severity-label family is individually detected. ---
+
+
+def test_each_severity_label_family_with_no_marker_is_flagged():
+    for label in ("Critical 1", "Significant 5", "Weak 2", "Structural 3"):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(
+                tmp,
+                "tests/site.cpp",
+                f"// {label} (Poirot deadbeef-some-review.md): the guard does not exist.\n",
+            )
+            hits = cptdc.find_uncited_defect_citations(path)
+            assert len(hits) == 1, f"expected exactly one hit for {label!r}, got {hits}"
+            assert hits[0][2] == [label], f"expected label {label!r} reported, got {hits[0][2]}"
+
+
+def test_a_label_without_a_digit_is_not_matched():
+    """"Significant B" is this codebase's OWN, separate convention for a coverage-
+    dimension tag (plan Sec13's own "Significant B" callouts), not a severity
+    finding -- it must not be mistaken for one."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(tmp, "tests/site.cpp", "// Significant B: the exact status, not merely not-Ok.\n")
+        assert cptdc.find_uncited_defect_citations(path) == []
+
+
+# --- Resolution markers: either suppresses a flag. ---
+
+
+def test_the_word_closed_case_insensitive_suppresses_the_flag():
+    for spelling in ("closed", "CLOSED", "Closed"):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(tmp, "tests/site.cpp", f"// Critical 1 ({spelling}; Poirot deadbeef.md): now guards it.\n")
+            assert cptdc.find_uncited_defect_citations(path) == [], f"{spelling!r} must suppress the flag"
+
+
+def test_a_cited_ticket_id_suppresses_the_flag():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(tmp, "tests/site.cpp", "// Critical 2 (T-1322): the guard now exists.\n")
+        assert cptdc.find_uncited_defect_citations(path) == []
+
+
+def test_a_marker_in_a_different_block_does_not_suppress_an_unrelated_citation():
+    """Negative control for block boundaries: a blank line (code or whitespace)
+    between two comment runs must stop a resolution marker in the SECOND block
+    from silently satisfying a citation in the FIRST -- otherwise any 'closed'
+    anywhere later in the file would clear every uncited citation before it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/site.cpp",
+            # One single physical Python line, not one quoted literal per
+            # target line: a quoted literal that opens a physical line with
+            # nothing else on it is itself indistinguishable from a genuine
+            # generated `//`-comment line (see check_present_tense_defect_
+            # comments.py's own _PY_QUOTED_CPP_COMMENT_PATTERN) -- so split
+            # across separate physical lines, THIS fixture's own first
+            # citation reads, to this module scanning its own source under
+            # its default globs, as an uncited "Critical 1" with the "closed"
+            # marker on an unrelated later line (T-1485's real-tree run
+            # caught this). Folding both citations onto one physical source
+            # line keeps them one block for this module's self-scan while the
+            # OUTPUT file `_write` produces is byte-for-byte identical -- two
+            # `//` lines separated by a blank line -- so the test still
+            # exercises exactly the two-block shape it asserts.
+            "// Critical 1 (Poirot deadbeef.md): the guard does not exist.\n\n"
+            "// Critical 2 (closed; Poirot deadbeef.md): this one is fixed.\n",
+        )
+        hits = cptdc.find_uncited_defect_citations(path)
+        assert len(hits) == 1
+        assert hits[0][2] == ["Critical 1"]
+
+
+def test_a_citation_split_across_a_line_break_is_still_matched_against_the_merged_block():
+    """This codebase's own fixed text splits a label across a line break
+    ("...(Significant " / "5, closed by...)") -- the merged-block join must still
+    find both the label and the marker."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/site.cpp",
+            "// ParseConfigImpl now enforces the check (Significant\n// 5, closed by the review).\n",
+        )
+        assert cptdc.find_uncited_defect_citations(path) == []
+
+
+def test_a_check_msg_style_multiline_string_literal_is_scanned_as_one_block():
+    """The one historical site (D-SLM411) that sat inside a live CHECK_MSG
+    failure-message string, rather than a `//` comment -- this codebase writes a
+    multi-line string as one quoted literal per physical line."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/site.cpp",
+            'CHECK_MSG(status == kOk,\n'
+            '          "the parity check == %s, want Ok -- ParseConfigImpl performs no "\n'
+            '          "parity check today (Significant 5)",\n'
+            "          StatusName(status));\n",
+        )
+        hits = cptdc.find_uncited_defect_citations(path)
+        assert len(hits) == 1
+        assert hits[0][2] == ["Significant 5"]
+
+
+def test_a_clean_check_msg_string_with_the_marker_inline_is_not_flagged():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/site.cpp",
+            'CHECK_MSG(status == kOk,\n'
+            '          "the parity check == %s, want Ok (Significant 5, closed by the review)",\n'
+            "          StatusName(status));\n",
+        )
+        assert cptdc.find_uncited_defect_citations(path) == []
+
+
+def test_a_file_with_no_severity_citation_at_all_is_never_flagged():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(tmp, "tests/site.cpp", "// A perfectly ordinary comment about a passing test.\n")
+        assert cptdc.find_uncited_defect_citations(path) == []
+
+
+# --- Python triple-quoted docstrings: joined as one block, not fragmented at
+# the opening line (T-1485). ---
+
+
+def test_a_multiline_python_docstring_is_joined_into_one_block():
+    """T-1485's real-tree run: a Python docstring's OPENING line happens to
+    start with `"` and so passes the plain-STRING check, but every line after
+    it does not start with a quote character at all -- without explicit
+    triple-quote tracking, only the opening line is scanned, silently hiding
+    a resolution marker that in fact appears later in the same docstring."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/site_test.py",
+            'def test_something():\n'
+            '    """Pins a mutation (Poirot deadbeef review, Critical 1,\n'
+            '    Execution evidence): the property T-9001 restored, and the\n'
+            '    guard now holds for every case in the pin."""\n'
+            "    assert True\n",
+        )
+        assert cptdc.find_uncited_defect_citations(path) == [], (
+            "the resolution marker T-9001 appears two physical lines below the citation, "
+            "inside the same docstring -- the merged block must still find it"
+        )
+
+
+def test_a_multiline_python_docstring_with_no_marker_anywhere_is_still_flagged():
+    # The target docstring's `"""` delimiters are built from `_TQ` rather than
+    # written as a literal three-quote run: a literal run here would itself be
+    # an (uncited, marker-free) instance of this exact block shape in THIS
+    # module's own source, which this module's own default globs scan (a
+    # self-application collision T-1485's real-tree run hit once already; see
+    # test_a_marker_in_a_different_block_does_not_suppress_an_unrelated_
+    # citation's comment above).
+    _tq = '"' * 3
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/site_test.py",
+            'def test_something():\n'
+            f"    {_tq}The mutation this guard exists to catch (Critical 1's own\n"
+            '    text): a regression must fail loudly rather than pass\n'
+            f"    silently.{_tq}\n"
+            "    assert True\n",
+        )
+        hits = cptdc.find_uncited_defect_citations(path)
+        assert len(hits) == 1
+        assert hits[0][2] == ["Critical 1"]
+
+
+def test_a_single_line_python_docstring_is_unaffected():
+    """A one-line docstring (opens and closes its triple-quote on the same
+    physical line) is not swept into an erroneous multi-line continuation --
+    the very next, unrelated line must not be pulled into its block."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/site_test.py",
+            'def test_something():\n'
+            '    """Critical 1 (closed): a one-line docstring."""\n'
+            "    assert True\n",
+        )
+        assert cptdc.find_uncited_defect_citations(path) == []
+
+
+# --- Tokenize-derived Python string spans replace triple-quote parity
+# tracking (T-1538): the parity tracker desynchronised on any ordinary line
+# outside a string carrying an odd triple-quote count, inverting docstring/
+# code polarity for the rest of the file, and had no closing marker at all
+# in `.cpp`/`.h`, where it ran to end of file. ---
+
+
+def test_a_preceding_comment_naming_the_triple_quote_delimiter_does_not_hide_a_later_citation():
+    """T-1538 Significant 1 (Poirot 884ee74-t1485-present-tense-gate-blocking-
+    review-2026-07-31.md): the per-line triple-quote-parity tracker read this
+    file's own leading `#` comment -- which names the delimiter and so carries
+    an odd triple-quote count -- as OPENING a phantom string, inverting every
+    later docstring boundary's polarity for the rest of the file and hiding
+    the uncited citation below entirely. Tokenize-derived spans are immune:
+    a `#` comment is never part of any STRING token."""
+    # Interpolated, not written literally: a bare "Critical 1" on a line
+    # starting with a quote character would itself be an uncited instance of
+    # this exact defect class in THIS module's own source, which this
+    # module's own default globs scan (the Minor 4 self-scan collision
+    # T-1485's real-tree run hit once already; see
+    # test_a_marker_in_a_different_block_does_not_suppress_an_unrelated_
+    # citation's comment above).
+    _label = "Critical" + " 1"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/site_test.py",
+            '# The fixture generators write """-delimited blocks.\n'
+            "\n"
+            "def test_something():\n"
+            '    """Pins the mutation this guard exists to catch.\n'
+            "\n"
+            f"    {_label} (Poirot deadbeef.md): the guard does not exist and the\n"
+            '    kernel reads unmapped heap memory on every call."""\n'
+            "    assert True\n",
+        )
+        hits = cptdc.find_uncited_defect_citations(path)
+        assert len(hits) == 1, (
+            f"the preceding comment must not suppress the uncited {_label} citation, got {hits}"
+        )
+        assert hits[0][2] == [_label]
+
+
+def test_a_stray_triple_quote_length_run_in_a_cpp_comment_does_not_collapse_the_file():
+    """T-1538 Significant 2 (same casebook): no `.cpp`/`.h` line ever closes a
+    phantom Python string, so the parity tracker's collapse ran to end of
+    file -- an uncited citation followed, anywhere later in the file, by an
+    unrelated block that happens to contain the word "closed" was silenced,
+    because the whole remainder of the file became one block. `.cpp`/`.h`
+    inputs now get no triple-quote handling at all, so the stray `'''` below
+    (an apostrophe-heavy aside, not a string delimiter in C++) must not merge
+    anything across the blank/code lines that separate real comment blocks."""
+    # Interpolated for the same self-scan-collision reason as the test above.
+    _label = "Critical" + " 1"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/site.cpp",
+            "// possessives run together: foos''' bar\n"
+            "int x = 0;\n"
+            "int y = 0;\n"
+            "int z = 0;\n"
+            f"// {_label}: the guard does not exist.\n"
+            "int w = 0;\n"
+            "int v = 0;\n"
+            "// unrelated, closed elsewhere\n",
+        )
+        hits = cptdc.find_uncited_defect_citations(path)
+        assert hits == [(5, 5, [_label])], (
+            f"the later, unrelated 'closed' comment must not silence the uncited {_label} "
+            f"citation by way of a file-wide collapse, got {hits}"
+        )
+
+
+def test_a_multiline_fstring_citation_is_caught_not_silently_admitted():
+    """T-1545 (Poirot 28aa351-t1544-present-tense-confirmation-2026-07-31.md
+    Significant 1): on Python 3.12+ a multi-line f-string is not a
+    tokenize.STRING token at all -- it is FSTRING_START/MIDDLE/END -- so the
+    prior filter (STRING only) found no span for it, every physical line fell
+    through to `_line_kind`, the opening line starts with `f` rather than a
+    quote character so it (and every following line) classified OTHER, and no
+    block formed: an uncited citation inside a multi-line f-string was
+    silently admitted. Matched against a plain triple-quoted control that
+    differs by exactly the leading `f`, which was already caught before this
+    fix and must remain caught after it."""
+    _label = "Critical" + " 1"
+    with tempfile.TemporaryDirectory() as tmp:
+        fstring_path = _write(
+            tmp,
+            "tests/fstring_site_test.py",
+            "def test_something():\n"
+            f'    x = f"""line1\n'
+            f"    {_label} unresolved\n"
+            '    line3"""\n'
+            "    assert x\n",
+        )
+        hits = cptdc.find_uncited_defect_citations(fstring_path)
+        assert len(hits) == 1, (
+            f"a citation inside a multi-line f-string must be caught, got {hits}"
+        )
+        assert hits[0][2] == [_label]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        control_path = _write(
+            tmp,
+            "tests/plain_site_test.py",
+            "def test_something():\n"
+            '    x = """line1\n'
+            f"    {_label} unresolved\n"
+            '    line3"""\n'
+            "    assert x\n",
+        )
+        hits = cptdc.find_uncited_defect_citations(control_path)
+        assert len(hits) == 1, (
+            f"the plain triple-quoted control (no leading f) must still be caught, got {hits}"
+        )
+        assert hits[0][2] == [_label]
+
+
+def test_a_resolution_marker_in_one_paragraph_of_a_multiline_string_does_not_clear_an_unrelated_paragraph():
+    """T-1545 (Poirot 28aa351-t1544-present-tense-confirmation-2026-07-31.md
+    Significant 2, the prior review's Significant 3 reopened): every physical
+    line a `.py` file's tokenizer places inside one multi-line STRING span
+    was forced to kind STRING regardless of blank lines within it, so the
+    WHOLE span merged into one block -- a resolution marker anywhere inside
+    it silently satisfied a citation anywhere else inside it, however many
+    blank lines separated them, which is exactly what `_line_kind`'s own
+    docstring says must not happen ("a resolution marker written for one
+    comment can never silently satisfy a citation in an unrelated, later
+    block"). A blank line inside the string span now breaks the block the
+    same way a blank line already breaks a `//` comment run, so a genuine
+    uncited citation thirty lines below an unrelated resolved paragraph, in
+    the same docstring, is still flagged."""
+    _label = "Critical" + " 1"
+    filler = "\n".join(f"    filler line {n} of the docstring." for n in range(30))
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/site_test.py",
+            'def test_something():\n'
+            '    """Module docstring.\n'
+            "\n"
+            "    Significant 5 (closed; fixed 2026-07-01).\n"
+            f"{filler}\n"
+            "\n"
+            f"    {_label}: the guard does not exist and the kernel reads\n"
+            '    unmapped heap memory on every call.\n'
+            '    """\n'
+            "    assert True\n",
+        )
+        hits = cptdc.find_uncited_defect_citations(path)
+        assert hits, (
+            "an unrelated 'closed' resolution thirty lines above, in the same "
+            f"docstring, must not silently clear the genuine uncited {_label} "
+            f"citation below the blank-line paragraph break, got {hits}"
+        )
+        labels = {label for _, _, block_labels in hits for label in block_labels}
+        assert _label in labels, f"expected {_label} among the flagged labels, got {labels}"
+        significant5_hit = any("Significant 5" in block_labels for _, _, block_labels in hits)
+        assert not significant5_hit, (
+            f"'Significant 5 (closed; ...)' carries its own resolution marker in its own "
+            f"paragraph and must not be flagged, got {hits}"
+        )
+
+
+def test_two_adjacent_string_literals_with_no_blank_line_between_them_do_not_merge():
+    """T-1553 (Poirot d2a7eed-t1547-present-tense-confirmation-2026-07-31.md
+    Significant 1): `_python_multiline_string_lines` used to flatten every
+    literal's own line range into one undifferentiated `frozenset[int]`, so
+    `_iter_blocks` had no way to tell where one literal ended and the next
+    began -- two DISTINCT multi-line string literals with no blank line
+    between them read as a single block, and a resolution marker inside the
+    first silently satisfied an uncited citation inside the second. T-1545's
+    own f-string fix newly exposed this: an f-string's lines were not in the
+    pool at all before that fix, so an f-string immediately followed by a
+    plain multi-line string never had the chance to merge with it.
+
+    Primary construction, matching the review's own repro exactly: an
+    f-string carrying a closed "Significant 5" citation, immediately followed
+    (no blank line) by a plain multi-line string carrying an uncited
+    citation."""
+    _label = "Critical" + " 1"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/adjacent_fstring_then_plain_test.py",
+            'HEADER = f"""Significant 5 (closed; fixed 2026-07-01).\n'
+            "index of the remediation suite.\n"
+            '"""\n'
+            f'BODY = """{_label}: the guard does not exist and the kernel\n'
+            "reads unmapped heap memory on every call.\n"
+            '"""\n',
+        )
+        hits = cptdc.find_uncited_defect_citations(path)
+        assert hits, (
+            f"an f-string's own closed 'Significant 5' citation must not silently satisfy "
+            f"the uncited {_label} citation in the immediately adjacent, distinct multi-line "
+            f"string, got {hits}"
+        )
+        labels = {label for _, _, block_labels in hits for label in block_labels}
+        assert _label in labels, f"expected {_label} among the flagged labels, got {labels}"
+        significant5_hit = any("Significant 5" in block_labels for _, _, block_labels in hits)
+        assert not significant5_hit, (
+            f"the f-string's own 'Significant 5 (closed; ...)' carries its own resolution "
+            f"marker in its own literal and must not be flagged, got {hits}"
+        )
+
+    # Control 1: the same adjacency shape with BOTH literals plain (no
+    # leading `f`) -- latent on this checker since before T-1545 too (the
+    # review confirmed it: neither 28aa351 nor d2a7eed caught it), because
+    # the flattening defect this fix removes applies to any two adjacent
+    # literals, not only ones involving an f-string. The general remedy
+    # (literal-identity-aware block boundaries) must close this too.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/adjacent_plain_then_plain_test.py",
+            'HEADER = """Significant 5 (closed; fixed 2026-07-01).\n'
+            "index of the remediation suite.\n"
+            '"""\n'
+            f'BODY = """{_label}: the guard does not exist and the kernel\n'
+            "reads unmapped heap memory on every call.\n"
+            '"""\n',
+        )
+        hits = cptdc.find_uncited_defect_citations(path)
+        assert hits, (
+            f"two adjacent PLAIN multi-line strings with no blank line between them must not "
+            f"let the first's closed citation silently satisfy the second's uncited {_label}, "
+            f"got {hits}"
+        )
+        labels = {label for _, _, block_labels in hits for label in block_labels}
+        assert _label in labels, f"expected {_label} among the flagged labels, got {labels}"
+
+    # Control 2: the same two literals with a blank line between them --
+    # already caught before this fix (the blank line alone already breaks
+    # the block) and must remain caught after it.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/blank_separated_literals_test.py",
+            'HEADER = """Significant 5 (closed; fixed 2026-07-01).\n'
+            "index of the remediation suite.\n"
+            '"""\n'
+            "\n"
+            f'BODY = """{_label}: the guard does not exist and the kernel\n'
+            "reads unmapped heap memory on every call.\n"
+            '"""\n',
+        )
+        hits = cptdc.find_uncited_defect_citations(path)
+        assert hits, f"the blank-line-separated pair must remain caught, got {hits}"
+        labels = {label for _, _, block_labels in hits for label in block_labels}
+        assert _label in labels, f"expected {_label} among the flagged labels, got {labels}"
+
+
+def test_a_multiline_literal_does_not_merge_with_a_following_single_line_literal():
+    """T-1557 (Poirot b2b00b4-t1556-adjacency-fold-confirmation-2026-07-31.md
+    Significant 1): T-1553's literal-start break was DIRECTIONAL. It closed a
+    block when a tokenizer span BEGAN, and a single-line literal produces no
+    span and therefore no start line -- while still classifying STRING through
+    `_line_kind`. So a multi-line literal carrying a resolution marker,
+    immediately followed by a single-line string literal carrying an uncited
+    citation, still read as ONE block and the citation was silently cleared.
+
+    The reverse ordering was already caught at b2b00b4 (the multi-line
+    literal's own start line broke the block), which is what exposed the
+    asymmetry: the same two literals, same adjacency, opposite order, opposite
+    outcome. This is the primary construction only -- its controls are
+    separate cells below, so a regression here cannot mask them."""
+    _label = "Critical" + " 1"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/span_exit_multiline_then_single_test.py",
+            'A = """Significant 5 (closed; fixed 2026-07-01).\n'
+            "index of the remediation suite.\n"
+            '"""\n'
+            f'"{_label}: the guard does not exist"\n',
+        )
+        hits = cptdc.find_uncited_defect_citations(path)
+        assert hits, (
+            f"a multi-line literal's own closed 'Significant 5' must not silently satisfy the "
+            f"uncited {_label} in the distinct single-line literal on the very next line -- the "
+            f"block boundary has to hold leaving a span, not only entering one, got {hits}"
+        )
+        labels = {label for _, _, block_labels in hits for label in block_labels}
+        assert _label in labels, f"expected {_label} among the flagged labels, got {labels}"
+        significant5_hit = any("Significant 5" in block_labels for _, _, block_labels in hits)
+        assert not significant5_hit, (
+            f"the multi-line literal carries its own resolution marker in its own literal and "
+            f"must not be flagged, got {hits}"
+        )
+
+
+def test_the_span_exit_pair_separated_by_a_blank_line_remains_caught():
+    """T-1557 blank-line control for the cell above. A blank line already broke
+    this block before the span-membership break existed, so this shape was
+    caught at 28aa351, d2a7eed and b2b00b4 alike, and it must stay caught.
+
+    **This cell does NOT pin the blank-line rule, and an earlier version of
+    this docstring claimed it did** (T-1564, Poirot 83260be-t1560-span-
+    membership-boundary-confirmation-2026-07-31.md Minor 3). Measured over
+    seven single mutations of the checker: this cell stayed green under every
+    mutation that destroys the blank-line rule, including removing it
+    altogether. It cannot be otherwise -- the blank line here sits at line 4,
+    OUTSIDE the span at lines 1-3, so no blank-line-inside-a-span rule is
+    exercised, and the generic break is redundant with the span-membership
+    break sitting beside it.
+
+    What actually pins the blank-line rule is
+    `test_a_resolution_marker_in_one_paragraph_of_a_multiline_string_does_not
+    _clear_an_unrelated_paragraph`, which reddens under each of those
+    mutations. This cell is kept as a regression guard on the primary's own
+    shape, which is worth having and is all it is."""
+    _label = "Critical" + " 1"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/span_exit_blank_separated_test.py",
+            'A = """Significant 5 (closed; fixed 2026-07-01).\n'
+            "index of the remediation suite.\n"
+            '"""\n'
+            "\n"
+            f'"{_label}: the guard does not exist"\n',
+        )
+        hits = cptdc.find_uncited_defect_citations(path)
+        assert hits, f"the blank-line-separated span-exit pair must remain caught, got {hits}"
+        labels = {label for _, _, block_labels in hits for label in block_labels}
+        assert _label in labels, f"expected {_label} among the flagged labels, got {labels}"
+
+
+def test_two_single_line_string_literals_still_merge_by_design():
+    """T-1557 design control (same casebook, Observation 5). The span-exit
+    break keys on span MEMBERSHIP, not on giving every literal its own start
+    line, and that distinction is load-bearing rather than incidental. Two
+    single-line string literals both sit wholly outside every tokenizer span,
+    so they compare equal and still merge -- which is the bare C string-literal
+    continuation rule this codebase's multi-line CHECK_MSG messages depend on.
+
+    The naive extension of T-1553 -- a start line per literal -- would split
+    this and fire false positives across the fixture generators. This cell goes
+    red if anyone tries it, which is the only reason that reasoning survives in
+    executable form rather than only in a docstring."""
+    _label = "Critical" + " 1"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/single_line_run_merges_test.py",
+            f'    "{_label}: the guard does not exist "\n'
+            '    "and the kernel reads unmapped heap memory "\n'
+            '    "(closed; fixed 2026-07-01)."\n',
+        )
+        hits = cptdc.find_uncited_defect_citations(path)
+        assert not hits, (
+            f"a run of single-line string literals is ONE authored block (the bare C "
+            f"string-literal continuation rule), so the resolution marker on its last line "
+            f"clears the {_label} citation on its first -- splitting them would fire false "
+            f"positives across every fixture generator, got {hits}"
+        )
+
+
+def test_shared_physical_line_multiline_then_multiline_splits_loudly():
+    """T-1562 (Poirot 83260be-t1560-span-membership-boundary-confirmation-
+    2026-07-31.md Significant 1). Where one literal's last physical line is
+    also the next literal's first, this scanner is line-granular and there is
+    no line boundary between them to break at. When the SECOND literal is
+    multi-line it contributes its own start line, which falls on the shared
+    line, so the break fires INSIDE the first literal and separates its own
+    citation from its own resolution marker -- a loud false positive.
+
+    This is the ONLY one of the four shared-line orderings that errs loud. The
+    other three merge silently and are pinned by the cell below. An earlier
+    version of this module's docstring claimed all four split; that claim was
+    false in the reassuring direction, and it is what the finding named."""
+    _label = "Critical" + " 1"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/shared_line_multi_then_multi_test.py",
+            f'X = ("""{_label} was found here\n'
+            'closed""" """second literal body\n'
+            '""")\n',
+        )
+        hits = cptdc.find_uncited_defect_citations(path)
+        assert hits, (
+            f"a multi-line literal sharing its last physical line with a following MULTI-line "
+            f"literal is expected to SPLIT, flagging {_label} apart from its own 'closed' "
+            f"marker -- erring loud on correct code. If this merged, the one shared-line "
+            f"ordering that announces itself has gone silent, got {hits}"
+        )
+
+
+def test_the_other_three_shared_physical_line_orderings_merge_silently():
+    """T-1562, the same finding's other half, pinned as a KNOWN BLIND SPOT
+    rather than as a design choice -- because it is not one.
+
+    When the second literal of a shared-line pair is single-line it produces no
+    tokenize span and therefore no start line, so nothing keys a break and the
+    two authored literals become one block. A resolution marker in either then
+    satisfies an uncited citation in the other: this module's own defect class,
+    silent. Shared-line pairs are common in the scanned tree, but **0 of them
+    have a multi-line first literal** -- independently measured twice, agreeing
+    on that zero and disagreeing on the total, so only the zero is stated. Every
+    live instance therefore takes one of these three paths, and none currently
+    manifests a hit.
+
+    Closing them requires decomposing a physical line into its constituent
+    literals, which is a sub-line rewrite of `_iter_blocks`'s contract and a
+    design call rather than a text fix. This cell exists so the blind spot is
+    executable and counted rather than described. **If one of these goes red
+    that is good news** -- something started catching a shape this module
+    currently misses -- and the four-way table in `_iter_blocks`'s docstring
+    needs updating with it.
+
+    Every construction is evaluated before any assertion, so no ordering's
+    result can mask another's."""
+    _label = "Critical" + " 1"
+    constructions = {
+        "multi-line -> single-line": f'X = ("""{_label} was found here\nclosed""" "tail literal")\n',
+        "single-line -> multi-line": f'X = ("lead {_label}" """body\nclosed""")\n',
+        "single-line -> single-line": f'X = ("lead {_label}" "tail closed")\n',
+    }
+    observed = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, (name, src) in enumerate(constructions.items()):
+            path = _write(tmp, f"tests/shared_line_blind_{i}_test.py", src)
+            observed[name] = cptdc.find_uncited_defect_citations(path)
+
+    still_blind = [k for k, v in observed.items() if not v]
+    assert len(still_blind) == 3, (
+        f"all three of these shared-physical-line orderings are known to merge silently, "
+        f"missing the {_label} citation entirely. Any that now reports a hit has started "
+        f"catching a shape this module documents as a blind spot -- update the four-way "
+        f"table in `_iter_blocks`'s docstring to match. Observed: {observed}"
+    )
+
+
+def test_an_implicitly_concatenated_multiline_and_single_line_literal_is_a_known_false_positive():
+    """T-1563 (same casebook, Minor 2). The span-exit break T-1557 added fires
+    between a multi-line literal and a single-line literal on the FOLLOWING
+    line. That is the defect shape when they are two authored messages -- and
+    it is also, unchanged, the shape of ONE authored message written as
+    implicit concatenation, where the citation and its resolution marker are
+    parts of a single string value.
+
+    The `+` spelling was already flagged before T-1557 (a line beginning `+ "`
+    classifies OTHER and broke the block anyway), so only the implicit spelling
+    is new. Reach is zero across the scanned tree and a false positive on a
+    blocking gate is self-announcing, so it is accepted and named rather than
+    suppressed. If it fires on real code the fix is a line break in that
+    source, not a change here.
+
+    Pinned so the behaviour change is recorded somewhere that can fail --
+    the finding was that no record named it at all."""
+    _label = "Critical" + " 1"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/implicit_concat_false_positive_test.py",
+            f'MSG = ("""{_label} was found\n'
+            "here\n"
+            '"""\n'
+            '"closed by T-1234")\n',
+        )
+        hits = cptdc.find_uncited_defect_citations(path)
+        assert hits, (
+            f"one authored message written as implicit concatenation across a multi-line and a "
+            f"single-line literal is expected to be FLAGGED -- a known, accepted false positive "
+            f"of the span-exit break. If this stopped firing, the span-exit boundary weakened "
+            f"and the {_label} defect shape it exists to catch may have gone with it, got {hits}"
+        )
+
+
+def test_a_py_file_tokenize_cannot_parse_is_reported_as_a_failure_not_treated_as_clean():
+    """T-1538: a `.py` file this check cannot tokenize must not be silently
+    scanned as clean (StandardsDocument Sec4) -- scan_files reports it as its
+    own failure line, the same posture as a missing file."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _write(tmp, "tests/broken.py", 'x = """unterminated triple-quoted string\n')
+        failures = cptdc.scan_files(["tests/broken.py"], repo_root=tmp)
+        assert len(failures) == 1
+        assert "tokeniz" in failures[0].lower(), f"expected a tokenize-failure message, got {failures}"
+
+
+# --- Python-quoted `//` comment lines: a fixture generator that builds
+# multi-line C++ output as one Python string literal per physical line
+# (T-1485). ---
+
+
+def test_a_run_of_python_quoted_cpp_comment_lines_forms_one_block():
+    """tests/gen_*.py's own convention: a Python list of string literals, one
+    per generated-file physical line, where several consecutive elements are
+    themselves quoted `//` comment lines destined for the generated .h/.cpp
+    file. These must merge into one block the same way the equivalent real
+    `//` lines would if read directly from the generated output."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/gen_site_fixtures.py",
+            "lines = [\n"
+            '    "// Witness 1 (Poirot deadbeef review, Critical 1): the same",\n'
+            '    "// off-ratio mechanism as witness 0.",\n'
+            "]\n",
+        )
+        hits = cptdc.find_uncited_defect_citations(path)
+        assert len(hits) == 1
+        assert hits[0][2] == ["Critical 1"]
+
+
+def test_a_python_quoted_cpp_comment_run_does_not_swallow_neighboring_code_lines():
+    """T-1485's real-tree run: gen_c32_softmax_row_width_gate_fixtures.py's
+    five-line `//` comment was merged, under the plain bare-quote STRING rule,
+    into an eighteen-line block that also swallowed a struct definition and
+    blank-line placeholders -- because every one of those lines is ALSO,
+    coincidentally, its own complete Python string literal starting with `"`.
+    A quoted `//` line must merge only with adjacent quoted `//` lines, never
+    with a neighboring quoted line that is not itself a `//` line."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(
+            tmp,
+            "tests/gen_site_fixtures.py",
+            "lines = [\n"
+            '    "};",\n'
+            '    "",\n'
+            '    "// Witness 4 (Poirot deadbeef review, Critical 1): the same",\n'
+            '    "// off-ratio mechanism as witness 1.",\n'
+            '    "",\n'
+            '    "struct Witness4 { int64_t x; };",\n'
+            '    "// Critical 1 (closed): restated for a later, unrelated witness.",\n'
+            "]\n",
+        )
+        hits = cptdc.find_uncited_defect_citations(path)
+        assert len(hits) == 1, f"expected exactly the uncited Witness 4 block, got {hits}"
+        assert hits[0][0] == 4 and hits[0][1] == 5, (
+            f"expected the flagged block to span exactly lines 4-5 (the two `// Witness 4` "
+            f"lines), not the surrounding struct/blank-line/later-citation lines: got {hits[0]}"
+        )
+
+
+# --- main()/scan_files() end-to-end and input coverage. ---
+
+
+def test_main_fails_when_a_scanned_file_has_an_uncited_citation():
+    with tempfile.TemporaryDirectory() as tmp:
+        _write(tmp, "tests/site.cpp", "// Critical 1: the guard does not exist.\n")
+        code = cptdc.main(globs=("tests/*.cpp",), repo_root=tmp)
+        assert code == 1
+
+
+def test_main_passes_when_every_citation_carries_a_marker():
+    with tempfile.TemporaryDirectory() as tmp:
+        _write(tmp, "tests/site.cpp", "// Critical 1 (closed): the guard now exists.\n")
+        code = cptdc.main(globs=("tests/*.cpp",), repo_root=tmp)
+        assert code == 0
+
+
+def test_input_coverage_a_file_in_a_freshly_added_nested_directory_is_still_scanned():
+    """Input coverage: the file set is glob-derived (`tests/**/*.cpp`), not
+    enumerated by hand, so a file under a subdirectory that did not exist when
+    this check was authored is still reached."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _write(tmp, "tests/newly/added/subdir/site.cpp", "// Critical 1: the guard does not exist.\n")
+        code = cptdc.main(globs=cptdc._DEFAULT_TEST_GLOBS, repo_root=tmp)
+        assert code == 1, "a citation under a freshly added tests/ subdirectory must still be caught"
+
+
+def test_input_coverage_a_python_test_file_is_scanned_too():
+    with tempfile.TemporaryDirectory() as tmp:
+        _write(tmp, "tests/tool_test.py", "# Critical 1: the guard does not exist.\n")
+        # Python's own line-comment token is '#', not '//' -- confirm this
+        # module's rule (keyed to '//') does NOT falsely match a '#' comment,
+        # which is a real, honest input-coverage gap for .py files rather than a
+        # bug: no historical site lives in a Python comment, and none of the
+        # seven recovered sites are Python, so this gap does not touch the
+        # validated population. Documented here so it is a known limitation,
+        # not a silent one.
+        code = cptdc.main(globs=cptdc._DEFAULT_TEST_GLOBS, repo_root=tmp)
+        assert code == 0, (
+            "a '#'-style Python comment citing a severity label is NOT matched by this "
+            "module's '//'-keyed comment-block rule -- known gap, see comment above"
+        )
+
+
+def test_missing_scanned_file_is_reported_distinctly_from_a_dirty_one():
+    failures = cptdc.scan_files(["/does/not/exist/site.cpp"], repo_root="/does/not/exist")
+    assert len(failures) == 1
+    assert "not found" in failures[0]
+
+
+# --- Historical population validation (StandardsDocument Sec4). ---
+#
+# tests/ci/present_tense_defect_historical_fixtures/site{1..7}_{pre,post}.txt hold
+# the exact recovered text of all seven sites T-1331/T-1334 found (D-SLM411,
+# D-SLM414): site1-6 from `D:\SuperSLM`@fa5113d^ (before the six-site rewrite) and
+# @fa5113d (after); site7 from @ee76dbd^ and @ee76dbd (the seventh, found by the
+# scrub for the sixth). Fixing nothing here -- these are read-only replays of
+# text that was already fixed at those two real commits, satisfying Sec4's "found
+# independently of the check, verified, and reproduced before anything is fixed."
+
+_SITE_NAMES = ("site1", "site2", "site3", "site4", "site5", "site6", "site7")
+
+
+def test_fires_on_every_historical_pre_fix_site():
+    misses = []
+    for name in _SITE_NAMES:
+        lines = _read_lines(f"{name}_pre.txt")
+        hits = cptdc.scan_text(lines)
+        if not hits:
+            misses.append(name)
+    assert not misses, (
+        f"rule coverage gap: the following historical PRE-fix sites were NOT flagged: {misses} "
+        f"-- this check does not reproduce the full T-1331/T-1334 population"
+    )
+
+
+def test_does_not_fire_on_any_historical_post_fix_site():
+    false_positives = []
+    for name in _SITE_NAMES:
+        lines = _read_lines(f"{name}_post.txt")
+        hits = cptdc.scan_text(lines)
+        if hits:
+            false_positives.append((name, hits))
+    assert not false_positives, (
+        f"the check fires on the CURRENT, already-fixed text of these sites: {false_positives} "
+        f"-- it would never stop reporting the correct, current comment"
+    )
+
+
+def test_historical_population_is_the_full_named_set_not_a_subset():
+    """Guards the fixture set itself: seven pre and seven post files, one pair
+    per site named in D-SLM411/D-SLM414, so a fixture accidentally left out does
+    not silently shrink the population this suite claims to validate against."""
+    for name in _SITE_NAMES:
+        for suffix in ("pre", "post"):
+            path = os.path.join(_FIXTURES_DIR, f"{name}_{suffix}.txt")
+            assert os.path.isfile(path), f"missing historical fixture: {path}"

@@ -1,0 +1,286 @@
+// SuperSLM artifact format (`.sslm`). Current format version is
+// kArtifactFormatVersion below, the single source of truth -- not restated
+// as a number here, so this comment cannot go stale the next time the
+// format bumps.
+//
+// The runtime C++ loader for a converted, quantized model. This header is the
+// machine-readable contract for the format specified in docs/sslm_format.md; the
+// two must agree byte-for-byte. Standard library only — Layer 1 is independently
+// embeddable, with no third-party runtime dependency.
+//
+// The loader is a trust boundary: every field of the file is treated as hostile
+// input and validated against declared bounds before any section byte is read.
+// Deviation is rejection with a versioned diagnostic, never a silent partial load.
+#ifndef SUPERSLM_ARTIFACT_H
+#define SUPERSLM_ARTIFACT_H
+#include "superslm/api.h"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace superslm {
+
+// Bumped on any field-layout change, new required section, or integrity-hash change.
+// v2 (S2.4): adds the required SigmoidLut (SIL1) section — the forward has no i-exp-sigmoid
+// fallback once C10 is the LUT, so a v1 artifact lacks a required section and a v2
+// loader rejects it (UnsupportedVersion), never a silent degrade (docs/sslm_format.md Versioning).
+inline constexpr uint32_t kArtifactFormatVersion = 2;
+
+// Header/table geometry (v1). See docs/sslm_format.md "Byte layout".
+inline constexpr uint32_t kHeaderBytes = 64;
+inline constexpr uint32_t kSectionDescBytes = 40;
+inline constexpr uint32_t kMaxSections = 4096;
+inline constexpr uint32_t kIntegrityHashOffset = 32; // where integrity_sha256 begins
+inline constexpr uint32_t kIntegrityHashBytes = 32;
+inline constexpr uint8_t kMagic[4] = {'S', 'S', 'L', 'M'};
+
+enum class SslmSectionType : uint32_t {
+	Config = 0,
+	Provenance = 1,
+	Weights = 2,
+	Biases = 3,
+	RopeTables = 4,
+	Scales = 5,
+	WeightScales = 6,
+	CompositionConstants = 7,
+	KvLandingScales = 8,
+	KvLandingReciprocals = 9,
+	Calibration = 10,
+	GoldenHashes = 11,
+	SigmoidLut = 12,    // S2: fixed-point SiLU sigmoid LUT (SIL1); required from v2 (C10)
+	Tokenizer = 20,     // S1: byte-BPE vocab + merges + special tokens
+	ChatTemplate = 21,  // S1: chat template + special-token metadata (JSON)
+	UnicodeTables = 22, // S1: pinned NFC + \p{L}/\p{N}/\s tables
+	// Reserved — introduced at a later slot.
+	SchemaMasks = 30,   // S5
+	// S3.7 (§8.3): the token-length calibration band -- a KVC1 keyed blob,
+	// like CompositionConstants/KvLandingScales/KvLandingReciprocals above,
+	// carrying one entry's (min, max) token-count pair. OPTIONAL at the
+	// current container version, not a CFG1 extension and not a version
+	// bump -- absence loads exactly as before this type existed.
+	CalibrationBand = 31,
+	// The two new runtime-additive-
+	// LoRA adapter arrays (design Sec4) get their OWN, distinct section types --
+	// never WeightScales'/WSC1's own type or magic -- so a genuine WSC1 section and a genuine
+	// DeltaFoldScales/UFoldScales section are structurally different from the moment the
+	// artifact's top-level section table is walked, before any triple's values are ever read
+	// (closing the loader-confusion hazard: both array kinds share
+	// WSC1's own [count,3] int32 storage shape, but are domain-incompatible -- WSC1's triple is
+	// unsigned [0,31], these two are signed [-31,31] and consumed by a different runtime
+	// primitive, ApplyAmplifyingWeightScaleFold, design Sec4). Values chosen to sit past the
+	// existing reserved range (S5's SchemaMasks=30, S3.7's CalibrationBand=31) rather than
+	// inside it.
+	DeltaFoldScales = 40,
+	UFoldScales = 41,
+	// T-2199 Phase D1 (plan Sec8 D1, Decision A mechanism, D-SLM3794): the damped-greedy
+	// decoder's own artifact-carried LM-head logit scale, DGC1 -- a fixed 12-byte binary
+	// struct (int64 scale_mantissa_m, int32 scale_exponent_e), Raw dtype like every other
+	// binary-struct/keyed/opaque-byte section. OPTIONAL, gated behind
+	// kDampedGreedyArtifactConstantsFlag (below): absence (flag unset) loads exactly as before
+	// this type existed, matching CalibrationBand's own precedent.
+	DampedGreedyConstants = 42,
+	// D-SLM7036: dense, flag-gated QK-norm channel landing source/derived table.
+	QkChannelTable = 43,
+};
+
+enum class SslmDtype : uint32_t {
+	Raw = 0,     // byte stream (JSON sections use this)
+	Int8 = 1,
+	Int32 = 2,
+	Int64 = 3,
+	Uint8 = 4,
+	Float32 = 5,
+	Float64 = 6,
+};
+
+// Byte width of a dtype element; 0 for an unknown dtype value.
+uint32_t DtypeSize(uint32_t dtype) noexcept;
+
+// True if the value names a section type the v1 loader recognizes.
+bool IsKnownSectionType(uint32_t type) noexcept;
+
+// The dtype every section of a given known type must carry (docs/sslm_format.md
+// section-types table — normative). Only meaningful once IsKnownSectionType(type)
+// holds; returns SslmDtype::Raw for anything else.
+SslmDtype ExpectedDtype(uint32_t type) noexcept;
+
+// Every way a `.sslm` can be rejected. `Ok` is the only non-error value.
+enum class SslmStatus {
+	Ok = 0,
+	NullData,            // OpenFromMemory: data == nullptr
+	NullPath,            // OpenFromFile: path == nullptr
+	Truncated,           // file smaller than the header/table it declares
+	BadMagic,            // first four bytes are not "SSLM"
+	UnsupportedVersion,  // format_version != kArtifactFormatVersion
+	BadHeader,           // header_bytes wrong, or a reserved field nonzero
+	TooManySections,     // section_count > kMaxSections
+	FileSizeMismatch,    // header file_bytes != actual size
+	BadAlignment,        // a section alignment is not a power of two in [8,4096]
+	Misaligned,          // a section offset is not a multiple of its alignment
+	SectionOutOfBounds,  // a section range exceeds the file (or overflows)
+	SectionOverlap,      // a section overlaps the header/table or another section
+	BadDtype,            // a section dtype is unknown
+	SectionDtypeMismatch, // a known dtype, but not the one this section type requires
+	SizeMismatch,        // byte_size != elem_count * dtype_size
+	UnknownSection,      // a section type outside the v1 set
+	DuplicateSection,    // the same section type appears twice
+	MissingSection,      // a required section for this format_version is absent
+	IntegrityMismatch,   // recomputed SHA-256 != stored integrity hash
+	IoError,             // the file could not be read (OpenFromFile only)
+};
+
+// Human-readable name for a status, for diagnostics and test messages.
+SUPERSLM_API const char* SslmStatusName(SslmStatus s) noexcept;
+
+// The production Option-G selection mechanism is a header `flags` bit, not an
+// environment variable and not a format_version bump. Declared here (the
+// design's own exact value, not implementation logic) so the red suite can
+// reference the flag symbolically; `SslmArtifact::flags_`/
+// `OptionGFusedKLandingEnabled()` below are declared, not defined -- the
+// build loosens artifact.cpp's `flags != 0` check to
+// `flags & ~kKnownArtifactFlagsMask` and wires `flags_`/the accessor for
+// real. `kKnownArtifactFlagsMask` is every bit a legal artifact may set
+// (currently the three flags below); an unknown bit stays a BadHeader rejection
+// under the loosened check (design's own "reject-over-degrade preserved").
+inline constexpr uint32_t kOptionGFusedKLandingFlag = 0x1u;
+// T-2199 Phase D1 (plan Sec8 D1, D-SLM3794): the damped-greedy decoder's own artifact-carried
+// scale constants flag -- widens kKnownArtifactFlagsMask the same way kOptionGFusedKLandingFlag
+// did, following this header's own established convention for adding a bit (this comment,
+// above). A pre-Phase-D1 loader (kKnownArtifactFlagsMask == kOptionGFusedKLandingFlag only)
+// rejects any artifact setting this bit with BadHeader, per D-SLM3794's own ruling and
+// docs/sslm_format.md's Versioning section.
+inline constexpr uint32_t kDampedGreedyArtifactConstantsFlag = 0x2u;
+inline constexpr uint32_t kQkNormFusedKChannelTableFlag = 0x4u;
+inline constexpr uint32_t kKnownArtifactFlagsMask =
+    kOptionGFusedKLandingFlag | kDampedGreedyArtifactConstantsFlag |
+    kQkNormFusedKChannelTableFlag;
+
+inline constexpr uint32_t kNoSection = 0xFFFFFFFFu;
+
+// A rejection: the code, which section tripped it (or kNoSection), and a message
+// carrying the offending values.
+struct SslmError {
+	SslmStatus code = SslmStatus::Ok;
+	uint32_t section_index = kNoSection;
+	std::string message;
+};
+
+// A validated, in-place view of one section's bytes. `data` points into the
+// artifact's owned buffer and is valid for the artifact's lifetime.
+struct SslmSectionView {
+	SslmSectionType type{};
+	SslmDtype dtype{};
+	const uint8_t* data = nullptr;
+	uint64_t byte_size = 0;
+	uint64_t elem_count = 0;
+	uint32_t alignment = 0;
+};
+
+// A loaded, fully validated `.sslm`. Constructed only through Open*; a default
+// instance is empty and Ok()==false.
+class SslmArtifact {
+public:
+	SslmArtifact() = default;
+
+	// Owns a copy of the artifact bytes; section views point into that buffer. A
+	// copy would deep-copy the bytes to a new address while the views still pointed
+	// at the source, so copy is deleted. Move transfers the vector's buffer (its
+	// address is preserved), so the views stay valid across a move.
+	SslmArtifact(const SslmArtifact&) = delete;
+	SslmArtifact& operator=(const SslmArtifact&) = delete;
+	SslmArtifact(SslmArtifact&&) = default;
+	SslmArtifact& operator=(SslmArtifact&&) = default;
+
+	// Validate `size` bytes at `data` as a v1 `.sslm`. On Ok, `out` owns a copy of
+	// the bytes and exposes the header + sections. On any error, `out` is left empty
+	// and `err` (if non-null) carries the diagnostic. Throws only std::bad_alloc
+	// (S-HARDEN-7, F5); never reads a section byte before the file passes every
+	// structural check. `data == nullptr` is rejected explicitly (NullData) before
+	// any other check, regardless of `size` — the caller's null pointer is never
+	// dereferenced (F14).
+	static SUPERSLM_API SslmStatus OpenFromMemory(const uint8_t* data, size_t size,
+	                                 SslmArtifact& out, SslmError* err);
+
+	// Read the file at `path`, then OpenFromMemory. `path == nullptr` is rejected
+	// explicitly (NullPath) before any file-system call. IoError if the file is
+	// unreadable. Throws only std::bad_alloc (S-HARDEN-7, F5).
+	static SslmStatus OpenFromFile(const char* path, SslmArtifact& out, SslmError* err);
+
+	bool Ok() const noexcept { return ok_; }
+	uint32_t FormatVersion() const noexcept { return format_version_; }
+	uint64_t FileBytes() const noexcept { return file_bytes_; }
+
+	// (design Sec9's "base-hash" validation): the raw 32-byte
+	// integrity hash `FingerprintHex()` already hex-encodes, exposed as bytes so a
+	// DeltaFoldScales/UFoldScales section's own declared base-artifact hash (design Sec9 item
+	// (d)) can be compared against the ACTUALLY-mapped base's own hash without a hex
+	// round-trip. Same value FingerprintHex() derives from; this is not a second hash.
+	std::array<uint8_t, kIntegrityHashBytes> RawIntegrityHash() const noexcept {
+		std::array<uint8_t, kIntegrityHashBytes> out{};
+		for (uint32_t i = 0; i < kIntegrityHashBytes; ++i) out[i] = integrity_[i];
+		return out;
+	}
+
+	// Lowercase hex of the stored integrity hash (the artifact's fingerprint).
+	// Throws only std::bad_alloc (S-HARDEN-7, F5).
+	std::string FingerprintHex() const;
+
+	const std::vector<SslmSectionView>& Sections() const noexcept { return sections_; }
+
+	// The section of the given type, or nullptr if absent.
+	SUPERSLM_API const SslmSectionView* Section(SslmSectionType type) const noexcept;
+
+	// (design Sec31.2.1/Sec31.2.5): true iff this artifact's header `flags` field sets
+	// `kOptionGFusedKLandingFlag` -- the ONE dispatch point
+	// `RunLayerLoop`'s two fused K-landing call sites read (replacing an earlier
+	// spike-only env-var gate). Declared, not defined: `flags_` (below) is
+	// never written by this header's own unmodified `artifact.cpp` (a test-design
+	// seat's write scope is declaration, not the loader body), so calling this
+	// accessor link-fails until the build wires both. Convention: this
+	// suite's own established declare-and-stub practice (RopeApplySite's own
+	// history, this file's sibling forward_sites.h).
+	bool OptionGFusedKLandingEnabled() const noexcept;
+
+	// T-2199 Phase D1: true iff this artifact's header `flags` field sets
+	// `kDampedGreedyArtifactConstantsFlag` -- mirrors `OptionGFusedKLandingEnabled()` above exactly,
+	// same precedent, new bit.
+	bool DampedGreedyConstantsFlagSet() const noexcept;
+	bool QkNormFusedKChannelTableFlagSet() const noexcept;
+
+private:
+	// S-HARDEN-7: grants src/artifact.cpp's SslmArtifactAccess (defined only
+	// there, never declared here) access to the private members below, so
+	// this class's *Impl bodies can live entirely in the .cpp rather than as
+	// private member declarations in this header. A private member
+	// declaration here would itself be a public-C++-surface function the
+	// membership-check AST walk (S-HARDEN-7, design Sec3.1) would derive as
+	// a member of its own population — access specifiers are invisible to
+	// that walk, which is why the *Impl bodies must not be declared here at
+	// all, not merely marked private. A friend `struct` declaration is a
+	// FriendDecl in the AST, not a FunctionDecl/CXXMethodDecl, so it can
+	// never be picked up by that walk regardless of the rule's conditions.
+	friend struct SslmArtifactAccess;
+
+	bool ok_ = false;
+	uint32_t format_version_ = 0;
+	uint64_t file_bytes_ = 0;
+	// (design Sec31.2.1): the raw header `flags` field. Default-
+	// initialized to 0 so every EXISTING construction path (this class's
+	// default constructor; every artifact this campaign has ever loaded,
+	// which per the current strict `flags != 0` check can only ever be 0)
+	// is unaffected by this field's addition. Never written by this
+	// unmodified header's own artifact.cpp -- Brunel's build wires the real
+	// Load()-path assignment.
+	uint32_t flags_ = 0;
+	uint8_t integrity_[kIntegrityHashBytes] = {};
+	std::vector<uint8_t> bytes_;              // owned copy of the whole file
+	std::vector<SslmSectionView> sections_;   // views into bytes_
+};
+
+} // namespace superslm
+
+#endif // SUPERSLM_ARTIFACT_H

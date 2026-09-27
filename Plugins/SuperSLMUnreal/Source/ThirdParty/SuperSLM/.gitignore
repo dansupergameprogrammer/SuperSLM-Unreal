@@ -1,0 +1,19 @@
+build/
+out/
+out-clang/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+.vs/
+.idea/
+__pycache__/
+
+# generated verification corpora
+tools/_*corpus*.txt
+tools/_out/
+
+# git worktrees checked out inside the repo (never committable -- an embedded
+# git repository, which git itself warns about on `add`)
+.worktrees/

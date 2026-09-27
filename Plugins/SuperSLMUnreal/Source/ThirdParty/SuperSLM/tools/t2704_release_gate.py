@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+"""Fail-closed T-2704 release gate for the pinned real-model cell."""
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import math
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+MODEL_FIDELITY_FLOORS = {
+    "Qwen3": {"value": .800623, "strictly_greater": True},
+    "Qwen2.5": {"value": .938495, "strictly_greater": False},
+}
+QWEN3_FIDELITY_TARGET = .906603
+RETRIEVAL_TOTAL = 239
+FLOAT_RETRIEVAL_ANCHOR = {146, 147}
+REQUIRED_MODELS = {"Qwen2.5", "Qwen3"}
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_GLOBAL_PROVENANCE_INPUTS = {"build.bat", "CMakeLists.txt", "tools/build_layer_trace.bat"}
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def tree_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    for member in sorted(path.rglob("*"), key=lambda item: item.as_posix()):
+        if member.is_file():
+            digest.update(member.relative_to(path).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(bytes.fromhex(sha256(member)))
+    return digest.hexdigest()
+
+
+def residual_trace_population_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    for member in sorted(path.glob("*.residual.jsonl"), key=lambda item: item.name):
+        digest.update(member.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(bytes.fromhex(sha256(member)))
+    return digest.hexdigest()
+
+
+def reject(message: str) -> None:
+    raise ValueError(message)
+
+
+def captured_text(payload: bytes | None) -> str:
+    """A decisive, locale-independent rendering of captured child output."""
+    if payload is None:
+        return "<not captured>"
+    return payload.decode("utf-8", errors="backslashreplace")
+
+
+def passes_fidelity_floor(model: str, fidelity: float) -> bool:
+    rule = MODEL_FIDELITY_FLOORS[model]
+    return fidelity > rule["value"] if rule["strictly_greater"] else fidelity >= rule["value"]
+
+
+def fidelity_from_loss(loss: float) -> float:
+    return round(1.0 - loss, 6)
+
+
+def reject_fidelity_floor(model: str, fidelity: float) -> None:
+    rule = MODEL_FIDELITY_FLOORS[model]
+    comparator = "<=" if rule["strictly_greater"] else "<"
+    reject(f"{model} fidelity {fidelity:.6f} {comparator} {rule['value']:.6f}")
+
+
+def qwen3_target_report(fidelity: float) -> dict[str, float]:
+    distance = round(abs(QWEN3_FIDELITY_TARGET - fidelity), 6)
+    return {
+        "final_norm_fidelity": fidelity,
+        "target": QWEN3_FIDELITY_TARGET,
+        "distance": distance,
+        "shortfall": round(max(0.0, QWEN3_FIDELITY_TARGET - fidelity), 6),
+    }
+
+
+def grade_fidelity(rows: list[dict[str, Any]]) -> dict[str, float]:
+    """Grade the parsed final-norm fidelity rows produced by the diagnostic."""
+    if not isinstance(rows, list):
+        reject("fidelity report has no model rows")
+    found: dict[str, float] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            reject("fidelity report has malformed or duplicate row")
+        name, fidelity = row.get("model"), row.get("final_norm_fidelity")
+        if (
+            name not in REQUIRED_MODELS
+            or name in found
+            or not isinstance(fidelity, (int, float))
+            or isinstance(fidelity, bool)
+        ):
+            reject("fidelity report has malformed or duplicate row")
+        fidelity = float(fidelity)
+        if not 0.0 <= fidelity <= 1.0:
+            reject(f"{name} fidelity {fidelity:.6f} is outside [0, 1]")
+        found[name] = fidelity
+    if set(found) != REQUIRED_MODELS:
+        reject("fidelity report omits a model or fails the threshold")
+    for model, fidelity in found.items():
+        if not passes_fidelity_floor(model, fidelity):
+            reject_fidelity_floor(model, fidelity)
+    return found
+
+
+def one_sided_mcnemar_worse_p(b: int, c: int) -> tuple[int, int]:
+    """Return exact P(X >= b | X ~ Binomial(b + c, 1/2))."""
+    discordant_total = b + c
+    if discordant_total == 0:
+        return 1, 1
+    return sum(math.comb(discordant_total, count) for count in range(b, discordant_total + 1)), 1 << discordant_total
+
+
+def grade_retrieval(result: dict[str, Any]) -> dict[str, Any]:
+    """Grade paired candidate/float retrieval correctness on corpus-239."""
+    if not isinstance(result, dict):
+        reject("retrieval report has malformed candidate/float counts")
+    correct, total = result.get("retrieval_correct"), result.get("retrieval_total")
+    float_correct, float_total = result.get("float_correct"), result.get("float_total")
+    b, c = result.get("engine_wrong_float_correct"), result.get("engine_correct_float_wrong")
+    if (
+        not isinstance(correct, int)
+        or isinstance(correct, bool)
+        or not isinstance(total, int)
+        or isinstance(total, bool)
+        or not isinstance(float_correct, int)
+        or isinstance(float_correct, bool)
+        or not isinstance(float_total, int)
+        or isinstance(float_total, bool)
+        or not isinstance(b, int)
+        or isinstance(b, bool)
+        or not isinstance(c, int)
+        or isinstance(c, bool)
+    ):
+        reject("retrieval report has malformed candidate/float or paired count")
+    if total != RETRIEVAL_TOTAL or float_total != RETRIEVAL_TOTAL:
+        reject(f"retrieval report totals must both equal {RETRIEVAL_TOTAL}: candidate={total}, float={float_total}")
+    if not 0 <= correct <= total or not 0 <= float_correct <= float_total:
+        reject(f"retrieval report has out-of-range correctness count: candidate={correct}/{total}, float={float_correct}/{float_total}")
+    if float_correct not in FLOAT_RETRIEVAL_ANCHOR:
+        reject(f"retrieval float anchor {float_correct}/{float_total} is outside 146-147/{RETRIEVAL_TOTAL}")
+    if b < 0 or c < 0 or b + c > total or correct - float_correct != c - b:
+        reject(f"retrieval report has malformed paired counts: b={b}, c={c}, candidate={correct}, float={float_correct}")
+    numerator, denominator = one_sided_mcnemar_worse_p(b, c)
+    significance = {
+        "b": b,
+        "c": c,
+        "discordant_total": b + c,
+        "one_sided_exact_p": numerator / denominator,
+        "one_sided_exact_p_fraction": f"{numerator}/{denominator}",
+    }
+    if numerator * 20 < denominator:
+        reject("retrieval candidate significantly worse than float: "
+               f"b={b}, c={c}, p={significance['one_sided_exact_p_fraction']} ({significance['one_sided_exact_p']:.12g})")
+    return significance
+
+
+def grade_replay(report: dict[str, Any], model_sha256: dict[str, str]) -> None:
+    """Grade the parsed two-model real-trace replay report."""
+    if not isinstance(report, dict):
+        reject("replay report omits Qwen3 or Qwen2.5")
+    rows = report.get("models")
+    if not isinstance(rows, dict) or set(rows) != {"qwen3", "qwen2p5"}:
+        reject("replay report omits Qwen3 or Qwen2.5")
+    margins = report.get("margins")
+    if margins is not None and (
+        not isinstance(margins, list)
+        or not margins
+        or any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in margins)
+    ):
+        reject("replay report has nonpositive or malformed margin")
+    for key, name in (("qwen3", "Qwen3"), ("qwen2p5", "Qwen2.5")):
+        row = rows[key]
+        if not isinstance(row, dict) or row.get("status") != "MEASURED":
+            reject(f"{name} replay is not measured against its pinned artifact")
+        artifact = row.get("artifact")
+        if not isinstance(artifact, dict) or artifact.get("whole_file_sha256") != model_sha256[name]:
+            reject(f"{name} replay is not measured against its pinned artifact")
+        counts = row.get("refusals")
+        if not isinstance(counts, dict) or any(value != 0 for value in counts.values()):
+            reject(f"{name} replay has unexpected construction errors: {counts}")
+
+
+def load(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def resolve(value: str, manifest: Path) -> Path:
+    candidate = Path(value)
+    return candidate if candidate.is_absolute() else manifest.parent.parent.parent / candidate
+
+
+def validate_models(manifest: dict[str, Any], path: Path) -> dict[str, dict[str, Any]]:
+    rows = manifest.get("models")
+    if not isinstance(rows, list):
+        reject("manifest has no model rows")
+    found: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("name"), str) or row["name"] in found:
+            reject("model row is malformed or duplicate")
+        artifact = row.get("artifact")
+        if not isinstance(artifact, dict) or not isinstance(artifact.get("path"), str) or not isinstance(artifact.get("sha256"), str):
+            reject(f"{row['name']} model row has no artifact path and SHA-256")
+        file = resolve(artifact["path"], path)
+        if not file.is_file():
+            reject(f"missing pinned artifact: {row['name']}: {file}")
+        digest = sha256(file)
+        if digest != artifact["sha256"]:
+            reject(f"changed pinned artifact: {row['name']}: expected {artifact['sha256']}, got {digest}")
+        found[row["name"]] = {"row": row, "path": file, "sha256": digest}
+    if set(found) != REQUIRED_MODELS:
+        reject("manifest must have exactly Qwen2.5 and Qwen3 rows")
+    return found
+
+
+def validate_identities(manifest: dict[str, Any], path: Path) -> dict[str, str]:
+    rows = manifest.get("identities")
+    if not isinstance(rows, list) or not rows:
+        reject("manifest has no pinned diagnostic identities")
+    found = {}
+    for row in rows:
+        if not isinstance(row, dict) or not all(isinstance(row.get(key), str) and row[key] for key in ("name", "path", "sha256")):
+            reject("diagnostic identity requires name, path, and SHA-256")
+        file, kind = resolve(row["path"], path), row.get("kind", "file")
+        if kind == "file" and file.is_file():
+            digest = sha256(file)
+        elif kind == "tree" and file.is_dir():
+            digest = tree_sha256(file)
+        elif kind == "residual-trace-population" and file.is_dir():
+            digest = residual_trace_population_sha256(file)
+        else:
+            reject(f"missing pinned {kind} identity: {row['name']}: {file}")
+        if digest != row["sha256"]:
+            reject(f"changed pinned identity: {row['name']}: expected {row['sha256']}, got {digest}")
+        found[row["name"]] = digest
+    return found
+
+
+def _provenance_inputs_changed(changed_paths: list[str], source_inputs: tuple[str, ...]) -> list[str]:
+    relevant = []
+    for changed in changed_paths:
+        normalized = changed.replace("\\", "/")
+        if (
+            normalized.startswith(("src/", "include/"))
+            or normalized in _GLOBAL_PROVENANCE_INPUTS
+            or normalized in source_inputs
+            or normalized.endswith((".hlsl", ".hlsli"))
+        ):
+            relevant.append(normalized)
+    return relevant
+
+
+def _git_output(arguments: list[str], repository: Path) -> str:
+    try:
+        completed = subprocess.run(["git", "-C", str(repository), *arguments], text=False,
+                                   capture_output=True, check=False)
+    except OSError as error:
+        reject(f"cannot query diagnostic provenance: {error}")
+    if completed.returncode:
+        reject(f"cannot query diagnostic provenance: {captured_text(completed.stderr).strip()}")
+    return captured_text(completed.stdout).strip()
+
+
+def _git_is_ancestor(source_commit: str, head: str, repository: Path) -> bool:
+    try:
+        completed = subprocess.run(["git", "-C", str(repository), "merge-base", "--is-ancestor",
+                                   source_commit, head], text=False, capture_output=True, check=False)
+    except OSError as error:
+        reject(f"cannot query diagnostic provenance: {error}")
+    if completed.returncode in (0, 1):
+        return completed.returncode == 0
+    reject(f"cannot query diagnostic provenance: {captured_text(completed.stderr).strip()}")
+
+
+def _validate_compiled_diagnostic_records(
+    records: list[dict[str, Any]], head: str, is_ancestor: Any, changed_paths: list[str]
+) -> dict[str, dict[str, Any]]:
+    if not records:
+        reject("manifest has no compiled diagnostic provenance")
+    found: dict[str, dict[str, Any]] = {}
+    for record in records:
+        required = ("name", "path", "source_commit", "build_command", "sha256", "source_inputs")
+        if (
+            not isinstance(record, dict)
+            or not all(isinstance(record.get(key), str) and record[key] for key in ("name", "source_commit", "sha256"))
+            or not isinstance(record.get("path"), Path)
+            or not isinstance(record.get("build_command"), list)
+            or not record["build_command"]
+            or not all(isinstance(item, str) and item for item in record["build_command"])
+            or not isinstance(record.get("source_inputs"), tuple)
+            or not record["source_inputs"]
+            or not all(isinstance(item, str) and item for item in record["source_inputs"])
+            or record["name"] in found
+        ):
+            reject("compiled diagnostic provenance requires name, path, source commit, build command, SHA-256, and source inputs")
+        executable = record["path"]
+        if not executable.is_file():
+            reject(f"missing compiled diagnostic: {record['name']}: {executable}")
+        actual = sha256(executable)
+        if actual != record["sha256"]:
+            reject(f"changed compiled diagnostic: {record['name']}: expected {record['sha256']}, got {actual}")
+        if not is_ancestor(record["source_commit"], head):
+            reject(f"compiled diagnostic source is not an ancestor of gate HEAD: {record['name']}: {record['source_commit']}")
+        changed = _provenance_inputs_changed(changed_paths, record["source_inputs"])
+        if changed:
+            reject(f"compiled diagnostic source predates changed build input: {record['name']}: {changed[0]}")
+        found[record["name"]] = {
+            "path": str(executable), "source_commit": record["source_commit"],
+            "build_command": record["build_command"], "sha256": actual,
+        }
+    return found
+
+
+def validate_compiled_diagnostic_provenance(manifest: dict[str, Any], manifest_path: Path) -> dict[str, dict[str, Any]]:
+    rows = manifest.get("compiled_diagnostics")
+    if not isinstance(rows, list):
+        reject("manifest has no compiled diagnostic provenance")
+    parsed = []
+    for row in rows:
+        if not isinstance(row, dict):
+            reject("compiled diagnostic provenance is malformed")
+        copied = dict(row)
+        if isinstance(copied.get("path"), str):
+            copied["path"] = resolve(copied["path"], manifest_path)
+        if isinstance(copied.get("source_inputs"), list):
+            copied["source_inputs"] = tuple(copied["source_inputs"])
+        parsed.append(copied)
+    head = _git_output(["rev-parse", "HEAD"], _REPO_ROOT)
+    def is_ancestor(source_commit: str, candidate_head: str) -> bool:
+        return _git_is_ancestor(source_commit, candidate_head, _REPO_ROOT)
+    for record in parsed:
+        source = record.get("source_commit")
+        if isinstance(source, str):
+            record["_changed_paths"] = [
+                path for path in _git_output(["diff", "--name-only", "-z", f"{source}..{head}"], _REPO_ROOT).split("\0") if path
+            ]
+    # `_validate_compiled_diagnostic_records` accepts one range population. Validate records one
+    # at a time so each compares its own source commit to this gate's actual HEAD.
+    results = {}
+    for record in parsed:
+        record_changed = record.pop("_changed_paths", [])
+        results.update(_validate_compiled_diagnostic_records([record], head, is_ancestor, record_changed))
+    return results
+
+
+def run(command: list[str], label: str) -> None:
+    completed = subprocess.run(command, text=False, capture_output=True, check=False)
+    if completed.returncode:
+        reject(f"{label} diagnostic exited {completed.returncode}; stdout: "
+               f"{captured_text(completed.stdout).strip()}; stderr: {captured_text(completed.stderr).strip()}")
+
+
+def run_fidelity(config: dict[str, Any], models: dict[str, dict[str, Any]], work: Path) -> list[dict[str, Any]]:
+    runs = config.get("runs")
+    if not isinstance(runs, list):
+        reject("manifest has no fidelity runs")
+    results, seen = [], set()
+    for spec in runs:
+        needed = ("model", "artifact_cache", "hf_model", "layer_trace")
+        if not isinstance(spec, dict) or not all(isinstance(spec.get(key), str) for key in needed):
+            reject("fidelity run is incomplete")
+        model = spec["model"]
+        if model not in models or model in seen:
+            reject("fidelity runs must cover each model exactly once")
+        output = work / ("fidelity-" + model.lower().replace(".", ""))
+        command = ["python", "tools/t2703_fidelity_localization.py", "--artifact", str(models[model]["path"]),
+                   "--artifact-cache", spec["artifact_cache"], "--hf-model", spec["hf_model"],
+                   "--layer-trace", spec["layer_trace"], "--output", str(output)]
+        if spec.get("control"):
+            command.append("--control")
+        run(command, f"{model} fidelity")
+        summary_path = output / "summary.json"
+        if not summary_path.is_file():
+            reject(f"{model} fidelity did not write summary.json")
+        summary = load(summary_path)
+        curves = summary.get("curves")
+        if summary.get("artifact_sha256") != models[model]["sha256"] or not isinstance(curves, list) or not curves or curves[-1].get("pairing") != "final_norm":
+            reject(f"{model} fidelity summary is not bound to its pinned artifact/final norm")
+        loss = curves[-1].get("engine_vs_float", {}).get("median")
+        if not isinstance(loss, (int, float)) or not 0 <= loss <= 1:
+            reject(f"{model} final-norm loss is malformed")
+        fidelity = fidelity_from_loss(float(loss))
+        results.append({"model": model, "artifact_sha256": models[model]["sha256"], "final_norm_loss": loss,
+                        "final_norm_fidelity": fidelity, "command": command, "summary": summary})
+        seen.add(model)
+    if seen != REQUIRED_MODELS:
+        reject("fidelity runs omit Qwen2.5 or Qwen3")
+    return results
+
+
+def run_retrieval(config: dict[str, Any], models: dict[str, dict[str, Any]], work: Path) -> dict[str, Any]:
+    needed = ("model", "corpus", "query_source", "hf_model", "probe", "provisional", "provisional_sha256", "phases")
+    if not all(isinstance(config.get(key), str) for key in needed[:-1]) or not isinstance(config.get("phases"), list):
+        reject("retrieval configuration is incomplete")
+    output = work / "retrieval"
+    arguments = ["--corpus", config["corpus"], "--query-source", config["query_source"], "--hf-model", config["hf_model"],
+                 "--probe", config["probe"], "--candidate", str(models["Qwen3"]["path"]), "--candidate-sha256", models["Qwen3"]["sha256"],
+                 "--provisional", config["provisional"], "--provisional-sha256", config["provisional_sha256"], "--output", str(output)]
+    phases = config["phases"]
+    expected_phases = ["float", "candidate", "provisional", "equivalence", "analyze"]
+    if phases != expected_phases:
+        reject(f"retrieval phases must be exactly {expected_phases}")
+    commands = [["python", "tools/t2703_retrieval_measure.py", phase, *arguments] for phase in phases]
+    for command in commands:
+        run(command, f"retrieval {command[2]}")
+    summary = load(output / "retrieval-summary.json")
+    if not isinstance(summary, dict):
+        reject("retrieval summary is malformed")
+    arms, comparisons, provenance = summary.get("arms"), summary.get("paired_comparisons"), summary.get("provenance")
+    if not isinstance(arms, dict) or not isinstance(comparisons, dict) or not isinstance(provenance, dict):
+        reject("retrieval summary has malformed arms, paired comparisons, or provenance")
+    candidate_arm, float_arm = arms.get("candidate"), arms.get("float")
+    paired = comparisons.get("candidate_vs_float")
+    if not isinstance(candidate_arm, dict) or not isinstance(float_arm, dict) or not isinstance(paired, dict):
+        reject("retrieval summary has missing or malformed candidate/float paired results")
+    candidate_row, float_row = candidate_arm.get("class_match_at_1"), float_arm.get("class_match_at_1")
+    if not isinstance(candidate_row, dict) or not isinstance(float_row, dict):
+        reject("retrieval summary has missing or malformed class-match counts")
+    correct, total = candidate_row.get("count"), candidate_row.get("total")
+    if provenance.get("candidate_artifact_sha256") != models["Qwen3"]["sha256"]:
+        reject("retrieval candidate result is not bound to the pinned Qwen3 artifact")
+    return {
+        "model": config["model"], "retrieval_correct": correct, "retrieval_total": total,
+        "float_correct": float_row.get("count"), "float_total": float_row.get("total"),
+        "engine_wrong_float_correct": paired.get("engine_wrong_float_correct"),
+        "engine_correct_float_wrong": paired.get("engine_correct_float_wrong"),
+        "commands": commands, "summary": summary,
+    }
+
+
+def run_replay(config: dict[str, Any], models: dict[str, dict[str, Any]], work: Path) -> dict[str, Any]:
+    needed = ("qwen3_traces", "qwen2p5_traces", "qwen3_trace_population_sha256", "qwen2p5_trace_population_sha256")
+    if not all(isinstance(config.get(key), str) for key in needed):
+        reject("replay configuration is incomplete")
+    output = work / "replay.json"
+    command = ["python", "tools/t2723_t2704_production_refusal_replay.py", "--model", "both", "--qwen3-traces", config["qwen3_traces"],
+               "--qwen3-artifact", str(models["Qwen3"]["path"]), "--qwen3-artifact-sha256", models["Qwen3"]["sha256"],
+               "--qwen3-trace-population-sha256", config["qwen3_trace_population_sha256"],
+               "--qwen2p5-traces", config["qwen2p5_traces"], "--qwen2p5-artifact", str(models["Qwen2.5"]["path"]),
+               "--qwen2p5-artifact-sha256", models["Qwen2.5"]["sha256"],
+               "--qwen2p5-trace-population-sha256", config["qwen2p5_trace_population_sha256"], "--output", str(output)]
+    run(command, "real-trace replay")
+    report = load(output)
+    return {"command": command, "report": report}
+
+
+def gate(manifest_path: Path, report_path: Path) -> dict[str, Any]:
+    manifest, models = load(manifest_path), None
+    models = validate_models(manifest, manifest_path)
+    compiled_diagnostics = validate_compiled_diagnostic_provenance(manifest, manifest_path)
+    identities = validate_identities(manifest, manifest_path)
+    diagnostics = manifest.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        reject("manifest has no diagnostics")
+    work = report_path.parent / f".t2704-release-gate-work-{report_path.stem}"
+    if work.exists():
+        shutil.rmtree(work)
+    work.mkdir(parents=True)
+    fidelity_rows = run_fidelity(diagnostics.get("fidelity", {}), models, work)
+    fidelity = grade_fidelity(fidelity_rows)
+    retrieval = run_retrieval(diagnostics.get("retrieval", {}), models, work)
+    retrieval["candidate_vs_float"] = grade_retrieval(retrieval)
+    replay = run_replay(diagnostics.get("replay", {}), models, work)
+    grade_replay(replay["report"], {name: value["sha256"] for name, value in models.items()})
+    result: dict[str, Any] = {"manifest_sha256": sha256(manifest_path), "identities": identities,
+                              "compiled_diagnostics": compiled_diagnostics,
+                              "models": {name: {"path": str(value["path"]), "sha256": value["sha256"]} for name, value in models.items()},
+                              "fidelity": fidelity_rows, "qwen3_target": qwen3_target_report(fidelity["Qwen3"]),
+                              "retrieval": retrieval, "replay": replay}
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return result
+
+
+def commission(receipt: Path) -> int:
+    with tempfile.TemporaryDirectory(prefix="t2704-") as temporary:
+        root = Path(temporary)
+        models = []
+        for name in sorted(REQUIRED_MODELS):
+            artifact = root / f"{name}.sslm"; artifact.write_bytes(name.encode())
+            models.append({"name": name, "artifact": {"path": artifact.name, "sha256": sha256(artifact)}})
+        corpus = root / "corpus.jsonl"; corpus.write_text("corpus\n", encoding="utf-8")
+        manifest = root / "tests/data/manifest.json"; manifest.parent.mkdir(parents=True)
+        manifest.write_text(json.dumps({"models": models, "identities": [{"name": "corpus", "path": corpus.name, "sha256": sha256(corpus)}], "diagnostics": {}}), encoding="utf-8")
+        model_sha256 = {name: value["sha256"] for name, value in validate_models(load(manifest), manifest).items()}
+        validate_identities(load(manifest), manifest)
+        healthy_fidelity = [{"model": "Qwen3", "final_norm_fidelity": .85},
+                            {"model": "Qwen2.5", "final_norm_fidelity": .94}]
+        healthy_retrieval = {
+            "retrieval_correct": 139, "retrieval_total": 239,
+            "float_correct": 147, "float_total": 239,
+            "engine_wrong_float_correct": 19, "engine_correct_float_wrong": 11,
+        }
+        healthy_replay = {"models": {
+            "qwen3": {"status": "MEASURED", "artifact": {"whole_file_sha256": model_sha256["Qwen3"]}, "refusals": {}},
+            "qwen2p5": {"status": "MEASURED", "artifact": {"whole_file_sha256": model_sha256["Qwen2.5"]}, "refusals": {}},
+        }, "margins": [1, 9]}
+
+        diagnostic = root / "diagnostic.exe"; diagnostic.write_bytes(b"T-2704 commissioned diagnostic")
+        provenance_record = {
+            "name": "commissioned diagnostic", "path": diagnostic, "source_commit": "a" * 40,
+            "build_command": ["cmake", "--build", "build", "--target", "diagnostic"],
+            "sha256": sha256(diagnostic), "source_inputs": ("tools/diagnostic.cpp",),
+        }
+
+        def provenance_case(record: dict[str, Any], ancestor: bool = True, changes: list[str] | None = None) -> int:
+            try:
+                _validate_compiled_diagnostic_records([record], "b" * 40,
+                                                     lambda _source, _head: ancestor, changes or [])
+                return 0
+            except ValueError:
+                return 1
+
+        def grade_all(fidelity: list[dict[str, Any]], retrieval: dict[str, Any], replay: dict[str, Any]) -> dict[str, float]:
+            graded_fidelity = grade_fidelity(fidelity)
+            grade_retrieval(retrieval)
+            grade_replay(replay, model_sha256)
+            return graded_fidelity
+
+        if fidelity_from_loss(.199377) != .800623:
+            return 2
+        results, healthy_qwen3_target = {}, None
+        def retrieval_with(**updates: Any) -> dict[str, Any]:
+            result = dict(healthy_retrieval)
+            result.update(updates)
+            return result
+
+        def retrieval_without(key: str) -> dict[str, Any]:
+            result = dict(healthy_retrieval)
+            result.pop(key)
+            return result
+
+        cases = {
+            "healthy_qwen3_shortfall": lambda: grade_all(healthy_fidelity, healthy_retrieval, healthy_replay),
+            "qwen3_not_improved": lambda: grade_all([{"model": "Qwen3", "final_norm_fidelity": .800623}, {"model": "Qwen2.5", "final_norm_fidelity": .94}], healthy_retrieval, healthy_replay),
+            "qwen25_regression": lambda: grade_all([{"model": "Qwen3", "final_norm_fidelity": .85}, {"model": "Qwen2.5", "final_norm_fidelity": .938494}], healthy_retrieval, healthy_replay),
+            "retrieval_observed_19_11": lambda: grade_all(healthy_fidelity, healthy_retrieval, healthy_replay),
+            "retrieval_worse_25_5": lambda: grade_all(healthy_fidelity, retrieval_with(retrieval_correct=127, engine_wrong_float_correct=25, engine_correct_float_wrong=5), healthy_replay),
+            "retrieval_boundary_reject_20_10": lambda: grade_all(healthy_fidelity, retrieval_with(retrieval_correct=137, engine_wrong_float_correct=20, engine_correct_float_wrong=10), healthy_replay),
+            "retrieval_boundary_accept_19_11": lambda: grade_all(healthy_fidelity, healthy_retrieval, healthy_replay),
+            "retrieval_zero_discordant": lambda: grade_all(healthy_fidelity, retrieval_with(retrieval_correct=147, engine_wrong_float_correct=0, engine_correct_float_wrong=0), healthy_replay),
+            "retrieval_missing_b": lambda: grade_all(healthy_fidelity, retrieval_without("engine_wrong_float_correct"), healthy_replay),
+            "retrieval_missing_c": lambda: grade_all(healthy_fidelity, retrieval_without("engine_correct_float_wrong"), healthy_replay),
+            "retrieval_malformed_paired_count": lambda: grade_all(healthy_fidelity, retrieval_with(engine_wrong_float_correct=True), healthy_replay),
+            "retrieval_float_anchor_outside": lambda: grade_all(healthy_fidelity, retrieval_with(float_correct=145, retrieval_correct=137, engine_wrong_float_correct=18, engine_correct_float_wrong=8), healthy_replay),
+            "nonpositive_margin": lambda: grade_all(healthy_fidelity, healthy_retrieval, {**copy.deepcopy(healthy_replay), "margins": [1, 0]}),
+            "omitted_qwen25": lambda: grade_all([{"model": "Qwen3", "final_norm_fidelity": .85}], healthy_retrieval, healthy_replay),
+            "omitted_qwen3": lambda: grade_all([{"model": "Qwen2.5", "final_norm_fidelity": .94}], healthy_retrieval, healthy_replay),
+            "fidelity_outside_unit_interval": lambda: grade_all([{"model": "Qwen3", "final_norm_fidelity": 2.0}, {"model": "Qwen2.5", "final_norm_fidelity": .94}], healthy_retrieval, healthy_replay),
+            "retrieval_correct_above_total": lambda: grade_all(healthy_fidelity, retrieval_with(retrieval_correct=240), healthy_replay),
+            "retrieval_total_not_239": lambda: grade_all(healthy_fidelity, retrieval_with(retrieval_total=238), healthy_replay),
+            "replay_missing_qwen3": lambda: grade_all(healthy_fidelity, healthy_retrieval, {"models": {"qwen2p5": healthy_replay["models"]["qwen2p5"]}, "margins": [1, 9]}),
+            "replay_missing_qwen2p5": lambda: grade_all(healthy_fidelity, healthy_retrieval, {"models": {"qwen3": healthy_replay["models"]["qwen3"]}, "margins": [1, 9]}),
+        }
+        for name, check in cases.items():
+            try:
+                fidelity = check()
+                if name == "healthy_qwen3_shortfall":
+                    healthy_qwen3_target = qwen3_target_report(fidelity["Qwen3"])
+                    if healthy_qwen3_target != {"final_norm_fidelity": .85, "target": .906603, "distance": .056603, "shortfall": .056603}:
+                        return 2
+                code = 0
+            except ValueError: code = 1
+            results[name] = code
+            if code != (0 if name in {"healthy_qwen3_shortfall", "retrieval_observed_19_11", "retrieval_boundary_accept_19_11", "retrieval_zero_discordant"} else 1): return 2
+        observed_retrieval = grade_retrieval(healthy_retrieval)
+        if observed_retrieval != {
+            "b": 19, "c": 11, "discordant_total": 30,
+            "one_sided_exact_p": 107636402 / 1073741824,
+            "one_sided_exact_p_fraction": "107636402/1073741824",
+        }:
+            return 2
+        corpus.write_text("changed\n", encoding="utf-8")
+        try: validate_identities(load(manifest), manifest); results["changed_identity"] = 0
+        except ValueError: results["changed_identity"] = 1
+        if results["changed_identity"] != 1: return 2
+        results["provenance_healthy"] = provenance_case(provenance_record)
+        stale_commit = dict(provenance_record); results["provenance_nonancestor"] = provenance_case(stale_commit, ancestor=False)
+        changed_source = dict(provenance_record); results["provenance_changed_source"] = provenance_case(changed_source, changes=["src/forward/forward_sites.cpp"])
+        changed_hash = dict(provenance_record); changed_hash["sha256"] = "0" * 64
+        results["provenance_changed_executable"] = provenance_case(changed_hash)
+        if results["provenance_healthy"] != 0 or any(
+            results[name] != 1 for name in ("provenance_nonancestor", "provenance_changed_source", "provenance_changed_executable")
+        ):
+            return 2
+        undecodable_report = root / "undecodable-child-rejection.json"
+        code, _unused, error = execute_with_rejection_report(
+            None, undecodable_report,
+            lambda: run([sys.executable, "-c", "import sys; sys.stderr.buffer.write(b'\\x8f'); sys.exit(1)"], "undecodable child"),
+        )
+        if error is not None:
+            report = load(undecodable_report)
+            results["undecodable_child_rejection"] = int(
+                code == 1 and report.get("verdict") == "REJECTED" and "\\x8f" in report.get("decisive_witness", "")
+            )
+        else:
+            results["undecodable_child_rejection"] = 0
+        if results["undecodable_child_rejection"] != 1:
+            return 2
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps({"id": "T-2734-release-gate", "instrument_sha256": sha256(Path(__file__)), "results": results,
+                                      "healthy_qwen3_target": healthy_qwen3_target,
+                                      "observed_retrieval_significance": observed_retrieval,
+                                      "status": "grading commissioned in-process; production route commissioned on real data"}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return 0
+
+
+def write_rejection_report(manifest_path: Path | None, report_path: Path | None, error: Exception) -> None:
+    if report_path is None:
+        return
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    result: dict[str, Any] = {"verdict": "REJECTED", "decisive_witness": str(error)}
+    if manifest_path is not None and manifest_path.is_file():
+        result["manifest_sha256"] = sha256(manifest_path)
+    report_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def execute_with_rejection_report(manifest_path: Path | None, report_path: Path | None, operation: Any) -> tuple[int, Any, Exception | None]:
+    try:
+        return 0, operation(), None
+    except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as error:
+        write_rejection_report(manifest_path, report_path, error)
+        return 1, None, error
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--manifest", type=Path); parser.add_argument("--report", type=Path)
+    parser.add_argument("--commission", type=Path)
+    args = parser.parse_args()
+    if args.commission: return commission(args.commission)
+    if not args.manifest or not args.report: parser.error("--manifest and --report are required outside --commission")
+    code, result, error = execute_with_rejection_report(args.manifest, args.report,
+                                                        lambda: gate(args.manifest, args.report))
+    if error is not None:
+        print(f"T2704_RELEASE_GATE_REJECTED: {error}", file=sys.stderr)
+        return code
+    print(json.dumps(result, sort_keys=True))
+    return code
+
+
+if __name__ == "__main__": raise SystemExit(main())

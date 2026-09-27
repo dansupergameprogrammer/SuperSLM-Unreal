@@ -1,0 +1,49 @@
+SuperSLM -- vendored source dependency
+
+Tag:    v1.9.0
+Commit: d870d27863c73afb0d558b376f5e8ad84f83951c
+Source repository: the upstream SuperSLM repository (not this repository)
+
+Vendored 2026-08-22 (at v1.2.0, corrected the same day), re-pinned to v1.5.0 2026-09-18,
+to v1.7.0 2026-09-23 (1.6.0 was skipped), to v1.7.1 2026-09-24, and to v1.9.0 2026-09-25 (one
+pin from v1.7.1; 1.8.0 and 1.8.1 were skipped; the tag, never main), in a clone of the upstream
+repository, via:
+  git ls-tree -r v1.9.0
+  git cat-file blob <blob id>   -- per file, the raw blob written to this tree
+
+This tree is the tag's full source distribution (CMakeLists.txt, cmake/, include/, src/,
+tests/, tools/, docs/, build.bat, build_cert.bat, license and policy files), byte-identical to
+`git show v1.9.0:<path>` for every file, except `.github/` (CI workflow definitions for the
+upstream repository, not consumed by this plugin's own build). 892 files, each re-checked at
+re-vendoring time against its tag blob id: 852 at v1.7.1 plus 40 files added by v1.9.0, with
+none removed (up from 845 at v1.7.0, 684 at v1.5.0 and 526 at v1.2.0). The 40 added files are
+three release notes, one CI checker under tools/ci/, four under tests/ci/, and test suites
+under tests/; none is a library source, so the wrapper set is unchanged. The product change
+across v1.7.1..v1.9.0 is: 1.8.0's GPU allocation-failure status contract (src/gpu/,
+include/superslm/gpu_1p0.h, gpu_port.h, checked_chain_funnel.h, src/sslm_abi.cpp); 1.8.1's
+per-site saturation counts through CPU prefill and prefix adoption (src/sslm_abi.cpp); and
+1.9.0's CPU save format SSB5 (src/sslm_abi.cpp; SSB4, SSB3 and SSB2 still restore) and the
+map-time damped-greedy i-exp peak check (src/damped_greedy_phaseD.cpp,
+include/superslm/sslm_phaseD.h). The shader set is unchanged at 35.
+
+**The first vendoring pass at v1.2.0 (2026-08-22) was corrected the same day**: `git archive`
+on Windows applies `.gitattributes`' `text`/`eol=crlf`
+line-ending rules exactly as a normal checkout would, so every `*.cpp`/`*.h`/`*.md`/etc. file
+(marked `text`, tool-native on checkout) came out CRLF-converted -- 357 of 526 files differed
+from the tag by line endings only, content unaffected. `git show <tag>:<path>` does not apply
+this conversion -- it returns the raw blob -- so every re-vendoring since, including this one,
+reads every file that way instead of via `git archive`.
+
+This plugin never consumes a prebuilt SuperSLM binary. It builds this tree from source with the
+engine's own toolchain, which is why
+the full CMake project -- including its test and tool executables' source, not only include/
+and the library sources -- is vendored: CMakeLists.txt declares those targets unconditionally
+at configure time, and configure fails if their sources are absent.
+
+Do not hand-edit any file under this directory. A correction to SuperSLM is made upstream and
+this tree is re-vendored at the new pin. `VENDORED_MANIFEST.sha256` records this tree's own
+per-file hashes at vendoring time, checked by `ci/tests/test_vendored_tree_checks_run_in_ci.py`
+against the COMMITTED tree at every `ci/tests` run -- a hand-edit that alters any file's content
+fails that check. (`ci/check_vendored_tree_matches_manifest.py` and
+`ci/check_vendored_wrappers_complete.py` are the checkers; `ci/tests` runs them, and the
+repository's coherence-checks workflow runs them too.)

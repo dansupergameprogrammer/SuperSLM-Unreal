@@ -1,0 +1,28 @@
+// X-macro field list for superslm::SequenceLayerState (forward_sites.h:441-464).
+// A hand-listed field enumeration in prose does not automatically extend to a field
+// a future engine change adds -- C++ has no reflection over this struct. This file is
+// the single, compile-checked place "which fields the census covers" is written:
+// expanded by both the CPU-side test oracle (tests/test_main.cpp, search "T-2019")
+// and any future GPU-side struct-layout/serialization code that needs the identical
+// field list.
+//
+// Adding or removing a field: add/remove one SSLM_SEQ_LAYER_STATE_FIELD line below
+// AND bump kExpectedSequenceLayerStateFieldCount at every point that constant is
+// defined (tests/test_main.cpp's T-2019 section) -- the static_assert there is what
+// converts a missed field from an invisible gap into a build failure.
+//
+// Field order matches forward_sites.h's own struct declaration order; this file
+// does not itself assert that order, only that this list's cardinality matches the
+// struct's own field count as of the last time a maintainer counted by hand.
+
+#ifndef SSLM_SEQ_LAYER_STATE_FIELD
+#error "define SSLM_SEQ_LAYER_STATE_FIELD(name) before including this file"
+#endif
+
+SSLM_SEQ_LAYER_STATE_FIELD(hidden_codes)
+SSLM_SEQ_LAYER_STATE_FIELD(hidden_scale)
+SSLM_SEQ_LAYER_STATE_FIELD(layer_index)
+SSLM_SEQ_LAYER_STATE_FIELD(kv_saturation_count)
+SSLM_SEQ_LAYER_STATE_FIELD(context_length)
+
+#undef SSLM_SEQ_LAYER_STATE_FIELD

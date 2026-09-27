@@ -1,0 +1,173 @@
+// damped_greedy_phaseD.cpp -- T-2199 Phase D1 (artifact-carried scale constants) and the
+// D2/D3-shared params validation + D2's thin ABI wrapper. Design of record:
+// Claude/Plans/superslm-1p2-fsd-plan-2026-08-19.md Sec8 Phase D, Sec9 dim2/dim9. Every certified
+// primitive this file calls (SslmArtifact, IExpScaleConstants) is reused, never reimplemented.
+#include "superslm/sslm_phaseD.h"
+
+#include <cstring>
+
+#include "superslm/intmath.h"
+#include "superslm/sslm_damped_greedy.h"  // N2 fix: the shared AlphaQ15InDomain validator
+
+// T-2199 Phase D review fix S5: relocated into namespace superslm (see sslm_phaseD.h's own top
+// comment for the full reasoning and the suite-link argument).
+namespace superslm {
+
+namespace {
+
+// DGC1's own fixed 12-byte layout: int64 scale_mantissa_m (little-endian), int32
+// scale_exponent_e (little-endian) -- matching this codebase's own "a converter never emits
+// host-endian bytes" convention (sslm_fixtures.h). Kept file-local: no other translation unit
+// needs the raw byte shape, only the parsed struct.
+constexpr size_t kSectionBytes = 12;
+
+void PutI64LE(std::vector<uint8_t>& b, size_t off, int64_t v) {
+	const uint64_t u = static_cast<uint64_t>(v);
+	for (int i = 0; i < 8; ++i) b[off + static_cast<size_t>(i)] = static_cast<uint8_t>((u >> (8 * i)) & 0xFF);
+}
+void PutI32LE(std::vector<uint8_t>& b, size_t off, int32_t v) {
+	const uint32_t u = static_cast<uint32_t>(v);
+	for (int i = 0; i < 4; ++i) b[off + static_cast<size_t>(i)] = static_cast<uint8_t>((u >> (8 * i)) & 0xFF);
+}
+int64_t GetI64LE(const uint8_t* p) {
+	uint64_t u = 0;
+	for (int i = 0; i < 8; ++i) u |= static_cast<uint64_t>(p[i]) << (8 * i);
+	return static_cast<int64_t>(u);
+}
+int32_t GetI32LE(const uint8_t* p) {
+	uint32_t u = 0;
+	for (int i = 0; i < 4; ++i) u |= static_cast<uint32_t>(p[i]) << (8 * i);
+	return static_cast<int32_t>(u);
+}
+
+// Plan Sec2.3's own real constraint, applied here: a derived (q_b, q_c) is only usable if
+// M = q_b^2 + q_c stays within [0, kSoftmaxRowMaxSafeExponent] AND width <= INT64_MAX / M
+// (when M != 0) at kRealVocabSizeForDomainCheck. Reuses the certified IExpScaleConstants to
+// derive (q_ln2, q_b, q_c) from (m, e) exactly the way Phase B3's runtime derivation would --
+// never a second, hand-rolled derivation.
+bool ScaleConstantsInDomain(int64_t m, int32_t e) {
+	int64_t q_ln2 = 0, q_b = 0, q_c = 0;
+	const auto domain = superslm::IExpScaleConstants(m, e, superslm::kIExpLn2Q, 30,
+	                                                  superslm::kIExpBQ, 30, superslm::kIExpCaQ, 30,
+	                                                  &q_ln2, &q_b, &q_c);
+	if (domain != superslm::IExpScaleDomain::kOk) return false;
+	const auto width_status = superslm::CheckSoftmaxRowWidthDomain(
+	    q_b, q_c, static_cast<size_t>(kRealVocabSizeForDomainCheck));
+	if (width_status != superslm::SslmForwardStatus::Ok) return false;
+	// The peak construction decode applies to these same constants (DampedGreedyPeakInDomain).
+	// Without it a scale such as (m=0, e=0) derives q = (0, 0, 0), passes the two checks above,
+	// maps with damped greedy available, and then every damped-greedy decode is refused.
+	return DampedGreedyPeakInDomain(q_ln2, q_b, q_c);
+}
+
+}  // namespace
+
+bool DampedGreedyPeakInDomain(int64_t q_ln2, int64_t q_b, int64_t q_c) noexcept {
+	superslm::IExpConstruction peak_construction;
+	const superslm::IExpDomain peak_domain =
+	    superslm::IExpConstruct(0, q_ln2, q_b, q_c, &peak_construction);
+	if (peak_domain == superslm::IExpDomain::kBadQ || peak_domain == superslm::IExpDomain::kBadQLn2 ||
+	    peak_domain == superslm::IExpDomain::kBadQB) {
+		return false;
+	}
+	const int64_t peak = superslm::IExpEvaluate(peak_construction);
+	return peak >= 1 && peak <= superslm::kSoftmaxRowMaxSafeExponent;
+}
+
+RawSection MakeDampedGreedyConstantsSection(const DampedGreedyScaleConstants& constants) {
+	RawSection s;
+	s.type = static_cast<uint32_t>(superslm::SslmSectionType::DampedGreedyConstants);
+	s.dtype = static_cast<uint32_t>(superslm::SslmDtype::Raw);
+	s.alignment = 8;
+	s.data.assign(kSectionBytes, 0);
+	PutI64LE(s.data, 0, constants.scale_mantissa_m);
+	PutI32LE(s.data, 8, constants.scale_exponent_e);
+	return s;
+}
+
+bool ArtifactHasDampedGreedyConstants(const superslm::SslmArtifact& art) noexcept {
+	if (!art.DampedGreedyConstantsFlagSet()) return false;
+	const superslm::SslmSectionView* sec =
+	    art.Section(superslm::SslmSectionType::DampedGreedyConstants);
+	if (!sec) return false;
+	if (sec->dtype != superslm::SslmDtype::Raw) return false;
+	if (sec->byte_size != kSectionBytes) return false;
+	return true;
+}
+
+bool ReadDampedGreedyScaleConstants(const superslm::SslmArtifact& art,
+                                     DampedGreedyScaleConstants* out) noexcept {
+	if (!ArtifactHasDampedGreedyConstants(art)) return false;
+	const superslm::SslmSectionView* sec =
+	    art.Section(superslm::SslmSectionType::DampedGreedyConstants);
+	const int64_t m = GetI64LE(sec->data);
+	const int32_t e = GetI32LE(sec->data + 8);
+	// Sec9 dim2's own hostile-input discipline, applied to this new field: a malformed or
+	// out-of-domain (m, e) is a defined rejection, never a silent hand-back of a pair Phase B3's
+	// own IExpScaleConstants derivation would misbehave on downstream.
+	if (!ScaleConstantsInDomain(m, e)) return false;
+	out->scale_mantissa_m = m;
+	out->scale_exponent_e = e;
+	return true;
+}
+
+bool ReadDampedGreedyScaleConstants(const superslm::SslmModelView& model,
+                                     DampedGreedyScaleConstants* out) noexcept {
+	if (!model.DampedGreedyConstantsFlagSet()) return false;
+	const superslm::SslmSectionView* s =
+	    model.Section(superslm::SslmSectionType::DampedGreedyConstants);
+	if (!s || !out || s->dtype != superslm::SslmDtype::Raw || s->byte_size != kSectionBytes ||
+	    s->elem_count != kSectionBytes) {
+		return false;
+	}
+	const int64_t m = GetI64LE(s->data);
+	const int32_t e = GetI32LE(s->data + 8);
+	if (!ScaleConstantsInDomain(m, e)) return false;
+	out->scale_mantissa_m = m;
+	out->scale_exponent_e = e;
+	return true;
+}
+
+// --- D2/D3 shared params validation (plan Sec9 dim2) -------------------------------------------
+// T-2199 Phase D review fix, S2 (Claude/Poirot/7a3b10a-t2199-phaseD-review.md): `mode` is now
+// checked against the closed set of defined values -- plan Sec8 D1 states the mode selector
+// "follows the same reject-unknown convention Sec2.6 documents for the artifact format's own
+// flags bit," and the prior build inverted that: any mode that was not literally kDampedGreedy
+// silently ran greedy, including garbage/uninitialized mode words. An unknown mode now rejects.
+bool ValidateDampedGreedyParams(const DampedGreedyValidationParams& p,
+                                 int32_t vocab_size) noexcept {
+	if (p.mode != DampedGreedyMode::kGreedy && p.mode != DampedGreedyMode::kDampedGreedy) {
+		return false;
+	}
+	if (p.mode != DampedGreedyMode::kDampedGreedy) return true;  // greedy: nothing further to validate
+	// T-2199 Phase D review fix, C2, and closing-round residue N2
+	// (Claude/Poirot/a12bbdd-t2199-phaseD-closing.md): the plan's own two-sided sanity ceiling
+	// (Sec9 dim2: "alpha_q15 is rejected outside [0, 2^20)") -- a defense-in-depth bound on top of
+	// the field's own int32_t width (sslm_abi.h's own C2 comment), not a substitute for it. N2
+	// fix: routed through the SAME shared superslm::AlphaQ15InDomain (sslm_damped_greedy.h) the
+	// two public score-and-argmax entry points now enforce themselves, rather than re-deriving the
+	// identical bound a second time in this translation unit.
+	if (!superslm::AlphaQ15InDomain(p.alpha_q15)) return false;
+	if (p.anti_lm_max_order < 1) return false;
+	// T-2238/F4 (SuperSLM 1.2.1, D-SLM3953): the ceiling is DERIVED BY EXECUTION, not invented
+	// (D-SLM3912): under the shipped recurrence (`Q15Pow(kBetaQ15 = 29491)`, starting at 1<<15,
+	// `result = (result * 29491) >> 15`), exponent 82 is the last carrying nonzero weight --
+	// Q15Pow(29491, 82) truncates to exactly zero -- so with max_order M >= 83 order 1 carries
+	// exponent M-1 >= 82 and its contribution is identically zero: the parameter stops denoting
+	// what it names while AntiLmCreate still pays up to M unordered_map constructions. Rejected
+	// outright, never clamped -- the ABI's own existing discipline for an out-of-domain field
+	// (`top_k > vocab_size` rejects). A contract narrowing on a shipped public ABI: a value
+	// 1.2.0 accepts becomes SSLM_INVALID_ARGUMENT here; disclosed in CHANGELOG.md under Changed.
+	if (p.anti_lm_max_order > 82) return false;
+	if (p.top_k < 1 || p.top_k > vocab_size) return false;
+	return true;
+}
+
+// T-2199 Phase D closing round, item 2 (conductor's commission, 2026-08-20): the thin
+// sslm_decode_step_damped_greedy/sslm_decode_params_damped_greedy shim that used to live here
+// is DELETED -- see sslm_phaseD.h's own top comment. The real, additive-field
+// sslm_decode_step/sslm_decode_params (sslm_abi.h) IS the production entry point; callers pass
+// mode=SSLM_DECODE_MODE_DAMPED_GREEDY directly (tools/sslm_generate.cpp's own S4 CLI wiring is
+// the reference caller).
+
+}  // namespace superslm

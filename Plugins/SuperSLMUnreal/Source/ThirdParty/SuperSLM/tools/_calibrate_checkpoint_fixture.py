@@ -1,0 +1,324 @@
+"""A tiny, real, on-disk checkpoint directory for exercising `calibrate_checkpoint.py`'s CLI
+(B1, T-2123/T-2137 design §6). No existing construction in either repository builds this:
+`sslm_pinned_calibration_fixture.py` and `pipeline.fixture_model` both build a synthetic,
+in-memory model fed directly to `build_sections`/`_calibrate` and never touch a checkpoint
+directory on disk (checked at source, design §6 B1's own coverage note) -- neither ever calls
+`pipeline.load_model`, which is the function `calibrate_checkpoint.py`'s CLI actually calls
+and which requires a real `checkpoint / "config.json"` plus safetensors tensors on disk, and
+a real tokenizer directory with a chat template (`_checkpoint_tokenize_prompt`).
+
+Sized only to exercise `load_model`'s own rejection paths and a minimal successful load --
+not a stand-in for the real Qwen2.5-1.5B-Instruct checkpoint §5's release gate uses.
+"""
+
+import json
+from pathlib import Path
+
+import numpy as np
+
+# A tiny fixed vocabulary covering the words this repo's own calibration-prompt text and the
+# corpus's turns are built from, plus [UNK]/[PAD]/[BOS]/[EOS]/two chat-role tokens. Every word
+# not in this list maps to [UNK] -- the tokenizer never produces an id outside [0, VOCAB_SIZE).
+_SPECIAL = ["[PAD]", "[UNK]", "[BOS]", "[EOS]"]
+_WORDS = [
+    "the", "a", "an", "you", "are", "is", "for", "and", "or", "not", "this", "that",
+    "system", "user", "assistant", "customer", "book", "cancel", "price", "intent",
+    "slot", "day", "time", "size", "style", "budget", "deposit", "artist", "tattoo",
+    "shop", "front", "desk", "json", "object", "key", "value", "true", "false", "none",
+    "unspecified", "monday", "tuesday", "wednesday", "arm", "leg", "back",
+]
+VOCAB = _SPECIAL + _WORDS
+VOCAB_SIZE = len(VOCAB)  # 48
+
+HIDDEN_SIZE = 8
+NUM_HIDDEN_LAYERS = 1
+NUM_ATTENTION_HEADS = 2
+NUM_KEY_VALUE_HEADS = 1
+HEAD_DIM = 4
+INTERMEDIATE_SIZE = 16
+MAX_POSITION_EMBEDDINGS = 256
+
+_CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "{{ message['role'] }}: {{ message['content'] }}\n"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}assistant:\n{% endif %}"
+)
+
+
+def _write_tokenizer(checkpoint_dir: Path) -> None:
+    from tokenizers import Tokenizer, decoders, pre_tokenizers
+    from tokenizers.models import WordLevel
+
+    vocab = {tok: i for i, tok in enumerate(VOCAB)}
+    tok = Tokenizer(WordLevel(vocab=vocab, unk_token="[UNK]"))
+    tok.pre_tokenizer = pre_tokenizers.Sequence(
+        [pre_tokenizers.Whitespace()]
+    )
+    tok.decoder = decoders.WordPiece()
+    tok.save(str(checkpoint_dir / "tokenizer.json"))
+
+    tokenizer_config = {
+        "tokenizer_class": "PreTrainedTokenizerFast",
+        "chat_template": _CHAT_TEMPLATE,
+        "unk_token": "[UNK]",
+        "pad_token": "[PAD]",
+        "bos_token": "[BOS]",
+        "eos_token": "[EOS]",
+        "model_max_length": MAX_POSITION_EMBEDDINGS,
+    }
+    (checkpoint_dir / "tokenizer_config.json").write_text(
+        json.dumps(tokenizer_config), encoding="utf-8"
+    )
+    (checkpoint_dir / "special_tokens_map.json").write_text(
+        json.dumps({"unk_token": "[UNK]", "pad_token": "[PAD]",
+                    "bos_token": "[BOS]", "eos_token": "[EOS]"}),
+        encoding="utf-8",
+    )
+
+
+def _write_config(checkpoint_dir: Path) -> None:
+    config = {
+        "hidden_size": HIDDEN_SIZE,
+        "num_hidden_layers": NUM_HIDDEN_LAYERS,
+        "num_attention_heads": NUM_ATTENTION_HEADS,
+        "num_key_value_heads": NUM_KEY_VALUE_HEADS,
+        "head_dim": HEAD_DIM,
+        "intermediate_size": INTERMEDIATE_SIZE,
+        "vocab_size": VOCAB_SIZE,
+        "rope_theta": 10000.0,
+        "rms_norm_eps": 1e-6,
+        "tie_word_embeddings": True,
+        "max_position_embeddings": MAX_POSITION_EMBEDDINGS,
+        "model_type": "qwen2",
+    }
+    (checkpoint_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+
+def _write_safetensors(checkpoint_dir: Path, *, seed: int = 0) -> None:
+    """The legacy fixture's own fixed tensor set, written via `_write_safetensors_shard`
+    (T-2549 N-2 correction: T-2543 introduced that function as a verbatim, un-called copy
+    of this one's own serializer, against its own docstring's "generalized rather than
+    imported" claim -- Poirot e0fdd60-t2544-ask5-trackc-confirmation.md N-2. This function
+    now builds the dict and delegates the actual serialization, which is the reuse that
+    was claimed)."""
+    rng = np.random.default_rng(seed)
+    q_width = NUM_ATTENTION_HEADS * HEAD_DIM
+    kv_width = NUM_KEY_VALUE_HEADS * HEAD_DIM
+
+    def small(*shape):
+        return rng.normal(scale=0.02, size=shape).astype(np.float32)
+
+    tensors = {
+        "model.embed_tokens.weight": small(VOCAB_SIZE, HIDDEN_SIZE),
+        "model.norm.weight": np.ones(HIDDEN_SIZE, dtype=np.float32),
+    }
+    for layer in range(NUM_HIDDEN_LAYERS):
+        p = f"model.layers.{layer}"
+        tensors[f"{p}.input_layernorm.weight"] = np.ones(HIDDEN_SIZE, dtype=np.float32)
+        tensors[f"{p}.post_attention_layernorm.weight"] = np.ones(HIDDEN_SIZE, dtype=np.float32)
+        tensors[f"{p}.self_attn.q_proj.weight"] = small(q_width, HIDDEN_SIZE)
+        tensors[f"{p}.self_attn.k_proj.weight"] = small(kv_width, HIDDEN_SIZE)
+        tensors[f"{p}.self_attn.v_proj.weight"] = small(kv_width, HIDDEN_SIZE)
+        tensors[f"{p}.self_attn.o_proj.weight"] = small(HIDDEN_SIZE, q_width)
+        tensors[f"{p}.self_attn.q_proj.bias"] = small(q_width)
+        tensors[f"{p}.self_attn.k_proj.bias"] = small(kv_width)
+        tensors[f"{p}.self_attn.v_proj.bias"] = small(kv_width)
+        tensors[f"{p}.mlp.gate_proj.weight"] = small(INTERMEDIATE_SIZE, HIDDEN_SIZE)
+        tensors[f"{p}.mlp.up_proj.weight"] = small(INTERMEDIATE_SIZE, HIDDEN_SIZE)
+        tensors[f"{p}.mlp.down_proj.weight"] = small(HIDDEN_SIZE, INTERMEDIATE_SIZE)
+
+    _write_safetensors_shard(checkpoint_dir, tensors)
+
+
+def build_fixture_checkpoint(checkpoint_dir: Path, *, seed: int = 0) -> Path:
+    """Build a complete, real, on-disk checkpoint directory at `checkpoint_dir`:
+    `config.json`, `model.safetensors`, and a working fast tokenizer with a chat template.
+    Every field `pipeline.load_config`/`pipeline.load_model` requires is present; every
+    tensor `pipeline._upstream_names` demands is on disk. Idempotent -- safe to call once
+    per test session and reuse.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    _write_config(checkpoint_dir)
+    _write_safetensors(checkpoint_dir, seed=seed)
+    _write_tokenizer(checkpoint_dir)
+    return checkpoint_dir
+
+
+def _write_safetensors_shard(checkpoint_dir: Path, tensors: dict) -> None:
+    """One safetensors file at `checkpoint_dir / "model.safetensors"`, from
+    `{tensor_name: array}` -- the minimal on-disk safetensors shape (8-byte little-endian
+    header length, JSON header, raw bytes back to back), generic over an arbitrary tensor
+    dict rather than one hardcoded fixture's own fixed set. `_write_safetensors` (above)
+    builds its own fixed dict and calls this function to serialize it.
+
+    **T-2543 M-4 correction, T-2549 N-2 correction.** The first version of this function
+    imported `tools/reference_pipeline/tests/conftest.py`'s own `write_safetensors_shard`
+    across the `tools/`/`tests/` boundary via a `sys.path` insertion -- the sibling
+    fixture file in this same directory records the tree's own convention against exactly
+    that shape (`_t2194_bf16_lora_fixture.py`: reuse `_calibrate_checkpoint_fixture.py`'s
+    own `_write_safetensors` "rather than a cross-suite import"), fixed (M-4) by copying
+    that local writer's own serializer body here instead. The copy left `_write_safetensors`
+    with its own, second, un-called copy of the identical eighteen lines -- a duplicate
+    the M-4 fix's own docstring described as "generalized rather than imported" without
+    actually being called by anything (Poirot
+    e0fdd60-t2544-ask5-trackc-confirmation.md N-2). `_write_safetensors` now calls this
+    function instead of carrying its own copy, which is the reuse both docstrings always
+    claimed.
+    """
+    header = {}
+    payload = bytearray()
+    offset = 0
+    for name, arr in tensors.items():
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        data = arr.tobytes()
+        header[name] = {"dtype": "F32", "shape": list(arr.shape),
+                        "data_offsets": [offset, offset + len(data)]}
+        payload += data
+        offset += len(data)
+    header["__metadata__"] = {}
+    header_bytes = json.dumps(header).encode("utf-8")
+
+    path = checkpoint_dir / "model.safetensors"
+    with open(path, "wb") as handle:
+        handle.write(len(header_bytes).to_bytes(8, "little"))
+        handle.write(header_bytes)
+        handle.write(bytes(payload))
+
+
+def _parameterized_tensors(*, prefix, biased, lm_head_present, qk_norm, seed):
+    """`{tensor_name: array}` for one parameterized fixture -- every one of Track C's own
+    checkpoint fixtures is one call to this function under a different `prefix`.
+
+    `prefix="both"`/`prefix=None` emit only the anchor tensor(s) their own rejection cell
+    needs: `_upstream_names`'s namespace-detection rejects before any other tensor is
+    ever read, so the rest of a legitimate checkpoint's payload is not needed to exercise
+    either rejection.
+    """
+    rng = np.random.default_rng(seed)
+    q_width = NUM_ATTENTION_HEADS * HEAD_DIM
+    kv_width = NUM_KEY_VALUE_HEADS * HEAD_DIM
+
+    def small(*shape):
+        return rng.normal(scale=0.02, size=shape).astype(np.float32)
+
+    if prefix == "both":
+        return {
+            "model.embed_tokens.weight": small(VOCAB_SIZE, HIDDEN_SIZE),
+            "embed_tokens.weight": small(VOCAB_SIZE, HIDDEN_SIZE),
+        }
+    if prefix is None:
+        # A root matching NEITHER known anchor.
+        return {"backbone.embed_tokens.weight": small(VOCAB_SIZE, HIDDEN_SIZE)}
+
+    ns = prefix   # "" (bare) or "model." (legacy)
+    tensors = {
+        f"{ns}embed_tokens.weight": small(VOCAB_SIZE, HIDDEN_SIZE),
+        f"{ns}norm.weight": np.ones(HIDDEN_SIZE, dtype=np.float32),
+    }
+    for layer in range(NUM_HIDDEN_LAYERS):
+        p = f"{ns}layers.{layer}"
+        tensors[f"{p}.input_layernorm.weight"] = np.ones(HIDDEN_SIZE, dtype=np.float32)
+        tensors[f"{p}.post_attention_layernorm.weight"] = np.ones(HIDDEN_SIZE, dtype=np.float32)
+        tensors[f"{p}.self_attn.q_proj.weight"] = small(q_width, HIDDEN_SIZE)
+        tensors[f"{p}.self_attn.k_proj.weight"] = small(kv_width, HIDDEN_SIZE)
+        tensors[f"{p}.self_attn.v_proj.weight"] = small(kv_width, HIDDEN_SIZE)
+        tensors[f"{p}.self_attn.o_proj.weight"] = small(HIDDEN_SIZE, q_width)
+        if biased:
+            tensors[f"{p}.self_attn.q_proj.bias"] = small(q_width)
+            tensors[f"{p}.self_attn.k_proj.bias"] = small(kv_width)
+            tensors[f"{p}.self_attn.v_proj.bias"] = small(kv_width)
+        if qk_norm not in (True, False, "q_only", "k_only"):
+            # T-2549 N-4: an unrecognized qk_norm value used to fall through the `if
+            # qk_norm:`/`!= "k_only"`/`!= "q_only"` gates below and silently build the
+            # SYMMETRIC pair -- the exact silent-default shape this tree's own N3
+            # discipline (an unrecognized constant is a hard rejection, never a silent
+            # drop, cited two paragraphs below for the production code this fixture
+            # exercises) forbids, and specifically the shape that would make an
+            # asymmetric-presence rejection cell pass vacuously if a caller mistyped the
+            # sentinel (Poirot e0fdd60-t2544-ask5-trackc-confirmation.md N-4).
+            raise ValueError(
+                f"qk_norm={qk_norm!r} is not one of True, False, 'q_only', 'k_only'"
+            )
+        if qk_norm:
+            # `qk_norm` also accepts the string sentinels "q_only"/"k_only" (truthy, so
+            # this outer gate still fires) -- builds ONE of the pair only, for the
+            # asymmetric-presence rejection cell (design Sec4). Both sentinels still
+            # write the SAME non-uniform values as the symmetric case, below.
+            # T-2543 S-2: a uniform (all-ones) gain is invariant under ANY permutation of
+            # its own elements, so it cannot discriminate _permuted_if_rope's own
+            # q_norm.gain/k_norm.gain branch -- deleting that branch left the whole suite
+            # green (Poirot 2a46a85-t2540-ask5-trackc-review.md S-2). Two distinct,
+            # strictly non-uniform vectors close that gap: reordering EITHER one under the
+            # RoPE-pair permutation (order = [0, 2, 1, ...] for HEAD_DIM=4) changes which
+            # int8 code lands at which position, so a reverted permutation now changes the
+            # emitted WGT1 bytes.
+            if qk_norm != "k_only":
+                tensors[f"{p}.self_attn.q_norm.weight"] = np.array(
+                    [0.1 * (i + 1) for i in range(HEAD_DIM)], dtype=np.float32)
+            if qk_norm != "q_only":
+                tensors[f"{p}.self_attn.k_norm.weight"] = np.array(
+                    [0.1 * (HEAD_DIM - i) for i in range(HEAD_DIM)], dtype=np.float32)
+        tensors[f"{p}.mlp.gate_proj.weight"] = small(INTERMEDIATE_SIZE, HIDDEN_SIZE)
+        tensors[f"{p}.mlp.up_proj.weight"] = small(INTERMEDIATE_SIZE, HIDDEN_SIZE)
+        tensors[f"{p}.mlp.down_proj.weight"] = small(HIDDEN_SIZE, INTERMEDIATE_SIZE)
+    if lm_head_present:
+        # lm_head sits outside the `model.` submodule under BOTH conventions -- never
+        # namespaced to `ns`, matching pipeline._upstream_names's own CKN-04 fix.
+        tensors["lm_head.weight"] = small(VOCAB_SIZE, HIDDEN_SIZE)
+    return tensors
+
+
+def build_parameterized_fixture_checkpoint(
+    checkpoint_dir: Path, *, prefix, biased: bool, tie_word_embeddings: bool,
+    lm_head_present: bool = None, qk_norm: bool = True, seed: int = 0,
+) -> Path:
+    """A real, on-disk checkpoint directory whose namespace convention, bias presence,
+    tied-embeddings state, lm_head presence, and QK-norm presence are each stated by the
+    caller -- the one construction every one of Track C's own checkpoint fixtures is built
+    from (design §6 Track C step 8), never a separate hand-built mechanism per cell.
+
+    `prefix`: `"model."` (the legacy, `model.`-prefixed convention every existing
+    incumbent carries), `""` (this ask's own bare-backbone convention), `None` (a
+    sentinel -- emits a root matching NEITHER known anchor, for the "matches neither
+    convention" rejection cell), or `"both"` (a sentinel -- emits BOTH anchor tensors,
+    for the "matches both conventions" rejection cell).
+
+    `lm_head_present` defaults to mirroring `tie_word_embeddings` (the shape every
+    existing incumbent carries: tied embeddings never carry a separate `lm_head.weight`,
+    untied ones always do) and is set independently only to exercise CKN-04's own
+    presence gate directly, both directions.
+
+    `qk_norm` defaults to True -- this ask's own candidate, and the whole reason this
+    track exists, carries these tensors. The backward-compatibility fixture states it
+    False explicitly: "matching every existing incumbent exactly" means a checkpoint
+    that does NOT carry this ask's own new tensors. `qk_norm` also accepts the string
+    sentinels "q_only"/"k_only" (T-2543 C-1) -- builds ONE of the pair, for the
+    asymmetric-presence rejection cell design Sec4 requires.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if lm_head_present is None:
+        lm_head_present = not tie_word_embeddings
+    config = {
+        "hidden_size": HIDDEN_SIZE,
+        "num_hidden_layers": NUM_HIDDEN_LAYERS,
+        "num_attention_heads": NUM_ATTENTION_HEADS,
+        "num_key_value_heads": NUM_KEY_VALUE_HEADS,
+        "head_dim": HEAD_DIM,
+        "intermediate_size": INTERMEDIATE_SIZE,
+        "vocab_size": VOCAB_SIZE,
+        "rope_theta": 10000.0,
+        "rms_norm_eps": 1e-6,
+        "tie_word_embeddings": tie_word_embeddings,
+        "max_position_embeddings": MAX_POSITION_EMBEDDINGS,
+        "model_type": "qwen2",
+    }
+    (checkpoint_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    tensors = _parameterized_tensors(
+        prefix=prefix, biased=biased, lm_head_present=lm_head_present,
+        qk_norm=qk_norm, seed=seed)
+    _write_safetensors_shard(checkpoint_dir, tensors)
+    _write_tokenizer(checkpoint_dir)
+    return checkpoint_dir

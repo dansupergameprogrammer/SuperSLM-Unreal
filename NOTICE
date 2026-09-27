@@ -1,0 +1,12 @@
+SuperSLM-Unreal
+Copyright 2026 Dan Super (RageQuitDan)
+
+This product includes SuperSLM (https://github.com/dansupergameprogrammer/SuperSLM),
+Copyright 2026 Dan Super, licensed under the Apache License, Version 2.0. Its
+source is vendored, unmodified, under Plugins/SuperSLMUnreal/Source/ThirdParty/SuperSLM/,
+together with its own LICENSE and NOTICE files.
+
+The example model artifact attached to this project's releases is not part of this source
+tree: Qwen2.5-0.5B-Instruct by the Qwen team (Alibaba Cloud), Apache-2.0; converted and
+quantized (modified) by this project. It is distributed under its source checkpoint's license,
+whose notice it retains: Copyright 2024 Alibaba Cloud.

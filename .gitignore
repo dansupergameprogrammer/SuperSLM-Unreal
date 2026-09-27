@@ -1,0 +1,21 @@
+# Unreal generated
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+.vs/
+.idea/
+*.sln
+*.code-workspace
+
+# Python bytecode and test caches from the ci/ checks
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Converted model artifacts are large and belong to their checkpoint's license; they ship as
+# release assets, never in the tree. The small .sslm test fixtures under Source/ are exempt.
+ExampleProject/**/*.sslm
+# The example model asset is imported locally from that release asset (docs/GETTING_STARTED.md,
+# "The example project") and is never committed either.
+ExampleProject/Content/SuperSLMExample/

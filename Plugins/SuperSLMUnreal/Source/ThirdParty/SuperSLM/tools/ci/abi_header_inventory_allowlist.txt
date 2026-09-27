@@ -1,0 +1,65 @@
+# T-2139 sixth confirmation review item 5 (Claude/Poirot/5fbd04d-t2139-sixth-confirmation-review.md,
+# ruled in Claude/Vitruvius/t2133-layer1-c-abi-design-2026-08-16.md Sec8's "structural half"
+# paragraph) -- tools/ci/check_abi_header_inventory.py's own allowlist. Format:
+# `<IDENTIFIER>  # <reason>`. An allowlisted identifier is still PRINTED every run, never
+# silently dropped -- same convention as tools/ci/tools_build_recipe_allowlist.txt.
+#
+# Validated (StandardsDocument Sec4) against the real tip BEFORE this file existed: the checker
+# extracted 6 identifiers from include/superslm/sslm_abi.h (SUPERSLM_INCLUDE_SSLM_ABI_H,
+# SSLM_STATUS_ENUM_LIST, SSLM_STATUS_ENUM_VALUE_, SSLM_ABI_ALIGNMENT_BYTES,
+# SUPERSLM_ABI_ENUM_ONLY, SUPERSLM_ABI_FUNCTIONS_INCLUDED_). Four already have a Sec8 inventory
+# line in prose (SUPERSLM_INCLUDE_SSLM_ABI_H's own top-level guard is narrated by name three times
+# outside any code block; the other three carry the ruling's own dedicated inventory paragraphs).
+# Two did not, and this file is that finding's honest disposition -- NOT both "fine to skip" for
+# the same reason; see each entry below.
+SSLM_STATUS_ENUM_VALUE_  # a scratch, function-like X-macro-expansion helper #define'd and
+# #undef'd within the same six lines of sslm_status's own enum-body definition (sslm_abi.h:151-153)
+# -- never visible past its own #undef, never consumer-facing surface, the same kind of pure
+# implementation-internal identifier the design's own ruling names the top-level include guard as
+# an example of (Sec8, "an explicit allowlist for identifiers this section deliberately does not
+# narrate"). Ruled deliberately out of scope for a Sec8 inventory line, not a gap.
+# SSLM_ABI_ALIGNMENT_BYTES's entry was removed 2026-08-17 per its own removal instruction: the
+# design ruled it public consumer-facing surface and Sec8 gained its inventory line (D-SLM3472,
+# design fold commit 579845b4b4), so the check now guards it for real instead of treating it as
+# a disclosed exception.
+SSLM_SCHEMA_NONE  # T-2132 (G5-2), added 2026-08-17. This checker's own inventory source is
+# t2133-layer1-c-abi-design-2026-08-16.md Sec8 -- the pre-G5 C1-C7 ABI's own design of record.
+# SSLM_SCHEMA_NONE is NOT a t2133/Sec8 identifier at all: it is transcribed verbatim from
+# tests/t2130-g5-red-suite/sslm_g5.h, which itself transcribes it from
+# t2119-g5-constrained-decoding-design-2026-08-16.md Sec5 ("SSLM_SCHEMA_NONE -- the
+# unconstrained sentinel schema handle, design Sec5") -- a different design document this
+# checker's own inventory source does not, and structurally cannot, cover. Ruled public
+# consumer-facing surface by THAT design (the unconstrained sentinel every
+# sslm_seq_set_schema/sslm_prefix_set_schema caller passes), matching sslm_g5.h's own
+# unconditional #define -- allowlisted here rather than mis-filed against t2133's own Sec8
+# text, which would be citing the wrong design for what it does not, and should not, name.
+SSLM_DECODE_MODE_GREEDY  # T-2199 Phase D1, added 2026-08-20 (Claude/Plans/
+# superslm-1p2-fsd-plan-2026-08-19.md Sec8 Phase D1, Wizard repo -- a different design document
+# this checker's own inventory source, t2133 Sec8, does not and structurally cannot cover, same
+# shape as SSLM_SCHEMA_NONE above). Public, consumer-facing surface: the value a caller sets
+# sslm_decode_params::mode to for the pre-existing greedy-argmax selection (0, and the default
+# under zero-init, so every existing caller is unaffected). Ruled public by T-2199's own Sec8
+# D1 ("an ADDITIVE FIELD... `mode` selects the decode-step's own selection mechanism"; sslm_abi.h
+# carries the constant's own inventory comment directly, but Sec8's own inventory line lives in
+# the OTHER design document, hence this allowlist entry rather than a t2133 mis-file).
+SSLM_DECODE_MODE_DAMPED_GREEDY  # T-2199 Phase D1, added 2026-08-20 -- pairs with
+# SSLM_DECODE_MODE_GREEDY immediately above; same design document, same reasoning, the other of
+# the two legal values `sslm_decode_params::mode` accepts (1).
+SSLM_DAMPED_GREEDY_DEFAULT_ALPHA_Q15  # T-2199/FSD release candidate, added 2026-08-21 (commit
+# e1e7e37, "prepare SuperSLM 1.2 damped greedy release candidate") -- the value
+# sslm_decode_params_init writes into sslm_decode_params::alpha_q15, exported so a caller can
+# read the shipped default instead of transcribing it. Ruled by the FSD design
+# (Claude/Plans/superslm-1p2-fsd-plan-2026-08-19.md, Wizard repo) -- a different design document
+# this checker's own inventory source, t2133 Sec8, does not and structurally cannot cover; same
+# shape as SSLM_DECODE_MODE_GREEDY above. FLAGGED PRE-EXISTING at the v1.2.0 tag by T-2243's
+# 1.2.1 build gate (the checker fails on f409bda itself when the records repo is reachable):
+# these three entries are the disclosed-exception disposition, entered 2026-08-23; a dedicated
+# inventory ruling in the FSD design's own Sec8 remains owed and removes them when it lands
+# (the SSLM_ABI_ALIGNMENT_BYTES precedent). Tracked as T-2264, minted 2026-08-23 (T-2243 review
+# finding 9, D-SLM4113) -- the owed follow-up carried no ticket id or date before this.
+SSLM_DAMPED_GREEDY_DEFAULT_ANTI_LM_ORDER  # pairs with SSLM_DAMPED_GREEDY_DEFAULT_ALPHA_Q15
+# immediately above; same commit, same design document, same flagged-pre-existing disposition --
+# the sslm_decode_params_init default for anti_lm_max_order.
+SSLM_DAMPED_GREEDY_DEFAULT_TOP_K  # pairs with the two entries above; same commit, same design
+# document, same flagged-pre-existing disposition -- the sslm_decode_params_init default for
+# top_k.

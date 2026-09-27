@@ -1,0 +1,104 @@
+@echo off
+rem T-2112 (Curie): builds every RED-BY-LINK cell file in this directory against the REAL engine
+rem (the identical source list build.bat, this repo's own root, uses) and captures the LINK
+rem transcript. Per StandardsDocument.md Sec5.4/Curie's own red-first discipline, this is run and
+rem the transcript kept as evidence a cell is red for the RIGHT reason (LNK2019 unresolved
+rem external on the 1.0 API symbols this suite calls, never a compile error and never a silent
+rem pass) -- not merely asserted in prose. Each translation unit is compiled to a .obj (proving
+rem compile succeeds against the declared surface, dim-7's own claim) and then link is attempted
+rem into a throwaway .exe (proving no implementation exists yet). Exit code is 1 (red) until the
+rem build seat (T-2113) lands the 1.0 API's own .cpp; this script's own exit code inverts to 0
+rem ONLY once linking succeeds, at which point this suite has gone from red to buildable and the
+rem individual CHECK/FAIL output governs pass/fail from then on.
+setlocal enabledelayedexpansion
+set "T2948_ONLY=%~1"
+set HEREDIR=%~dp0
+set ENG=%HEREDIR%..\..
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat" -arch=x64 -no_logo
+cd /d "%HEREDIR%"
+if not exist obj mkdir obj
+rem T-2124 confirmation N1 (Claude/Poirot/435f730-t2124-adapter-uaf-review.md): ShaderPath()
+rem resolves <exe_dir>\shaders\*.cso, so binaries built into obj\ MUST have the compiled
+rem shaders beside them or every shader load surfaces as SSLM_DEVICE_LOST (the false
+rem D-SLM3388 signature). Copy the engine build's shaders next to the suite binaries.
+if exist ..\..\out\shaders xcopy /Y /I /Q ..\..\out\shaders obj\shaders >nul
+
+rem T-2948 targeted build: place this executable away from obj\shaders so its default
+rem lookup is deliberately poisoned by run_green.bat. Build only the added cell.
+if "%T2948_ONLY%"=="shaderdir" (
+    if not exist obj\t2808 mkdir obj\t2808
+    cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_O11_ALLOC_INJECTION /I%ENG%\include /I%ENG%\tests /I. ^
+        %ENG%\src\artifact.cpp %ENG%\src\sha256.cpp %ENG%\src\tokenizer.cpp %ENG%\src\model.cpp ^
+        %ENG%\src\intmath.cpp %ENG%\src\silu_lut.cpp %ENG%\src\matmul.cpp %ENG%\src\proof_manifest.cpp ^
+        %ENG%\src\trace_hook.cpp %ENG%\src\forward\checked_chain_funnel.cpp ^
+        %ENG%\src\forward\forward_sites.cpp %ENG%\src\decode_digest.cpp %ENG%\src\gpu\superslm_gpu.cpp ^
+        %ENG%\src\gpu\gpu_1p0.cpp cell_shader_dir.cpp /Fo:"obj\t2808\\" /Fe:"obj\t2808\cell_shader_dir.exe" ^
+        /link d3d12.lib dxgi.lib dxguid.lib >"obj\t2808\cell_shader_dir.build.log" 2>&1
+    if errorlevel 1 (type "obj\t2808\cell_shader_dir.build.log" & exit /b 2)
+    findstr /C:"error C" /C:"fatal error" /C:"LNK1120" "obj\t2808\cell_shader_dir.build.log" >nul
+    if not errorlevel 1 (type "obj\t2808\cell_shader_dir.build.log" & exit /b 2)
+    echo T-2948 cell_shader_dir linked clean
+    exit /b 0
+)
+
+set OVERALL_LINK_OK=1
+rem T-2243 review finding 5 (D-SLM4113): ANY_LINK_FAILURE tracks a genuine RED BY LINK cell
+rem (LNK2019/LNK1120 -- the undeclared-1.0-API-implementation case this script was ORIGINALLY
+rem written for, T-2113 era) separately from OVERALL_LINK_OK (a compile error or unexpected
+rem error class). Before this fix the exit code never distinguished the two: it was always 1
+rem once linking succeeded (every cell LINKED CLEAN, the shipped-since-T-2113 state) or 2 on a
+rem real compile error -- contradicting this file own header comment ("this script own exit
+rem code inverts to 0 ONLY once linking succeeds") and silently defeating run_green.bat own
+rem "call build_link_red.bat; if errorlevel 1 exit /b 1" gate, which always tripped.
+set ANY_LINK_FAILURE=0
+for %%f in (dim1_lifetime_red.cpp dim2_hostile_red.cpp dim3_concurrency_red.cpp dim4_shape_red.cpp dim5_failure_red.cpp dim6_determinism_red.cpp dim8_composition_red.cpp dim9_persistence_red.cpp dim10_functional_red.cpp dim11_guard_red.cpp s2_bind_red.cpp cell_rebind_serial.cpp) do (
+    echo ===== %%f =====
+    rem T-2114 (S4): the two allocation-fault-injection macros build.bat's own test-binary line
+    rem already defines (superslm_tests.exe) -- needed here so dim9's own SeqRestore injection
+    rem site (gpu_port.h's kO11AllocInjectionSiteSeqRestore) compiles into this suite's binaries
+    rem too; zero-overhead unarmed everywhere else (MaybeThrowInjectedO11AllocFault's own header
+    rem comment), so defining them does not change any OTHER cell's behavior.
+    cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_O11_ALLOC_INJECTION /I%ENG%\include /I%ENG%\tests /I. ^
+        %ENG%\src\artifact.cpp %ENG%\src\sha256.cpp %ENG%\src\tokenizer.cpp %ENG%\src\model.cpp ^
+        %ENG%\src\intmath.cpp %ENG%\src\silu_lut.cpp %ENG%\src\matmul.cpp %ENG%\src\proof_manifest.cpp ^
+        %ENG%\src\trace_hook.cpp %ENG%\src\forward\checked_chain_funnel.cpp ^
+        %ENG%\src\forward\forward_sites.cpp %ENG%\src\decode_digest.cpp %ENG%\src\gpu\superslm_gpu.cpp ^
+        %ENG%\src\gpu\gpu_1p0.cpp ^
+        "%%f" /Fo:"obj\\" /Fe:"obj\%%~nf.exe" ^
+        /link d3d12.lib dxgi.lib dxguid.lib > "obj\%%~nf.log" 2>&1
+    findstr /C:"error C" "obj\%%~nf.log" >nul
+    if not errorlevel 1 (
+        echo    COMPILE ERROR -- unexpected, this cell should compile clean ^(dim-7 claim^):
+        type "obj\%%~nf.log"
+        set OVERALL_LINK_OK=0
+    ) else (
+        findstr /C:"LNK2019" /C:"LNK1120" "obj\%%~nf.log" >nul
+        if not errorlevel 1 (
+            echo    RED BY LINK -- unresolved external^(s^) on the undeclared 1.0 API implementation:
+            findstr /C:"LNK2019" "obj\%%~nf.log"
+            set ANY_LINK_FAILURE=1
+        ) else (
+            findstr /C:"error" "obj\%%~nf.log" >nul
+            if not errorlevel 1 (
+                echo    UNEXPECTED ERROR CLASS -- see obj\%%~nf.log
+                type "obj\%%~nf.log"
+                set OVERALL_LINK_OK=0
+            ) else (
+                echo    LINKED CLEAN -- this cell's own implementation now exists; run the .exe.
+            )
+        )
+    )
+)
+echo.
+if "%OVERALL_LINK_OK%"=="0" (
+    echo SUITE STATUS: an unexpected error class was found -- see logs above.
+    exit /b 2
+) else if "%ANY_LINK_FAILURE%"=="1" (
+    echo SUITE STATUS: RED BY LINK -- one or more cells did not link against the real, shipped
+    echo 1.0 API. Expected pre-build ^(T-2113^); a real defect on any build where the API is
+    echo shipped -- see the per-cell LNK2019 lines above.
+    exit /b 1
+) else (
+    echo SUITE STATUS: LINKED CLEAN -- every cell links against the real, shipped 1.0 API.
+    exit /b 0
+)

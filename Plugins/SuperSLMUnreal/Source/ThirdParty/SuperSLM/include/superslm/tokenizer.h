@@ -1,0 +1,71 @@
+// Integer-only byte-level BPE tokenizer over a loaded `.sslm`.
+//
+// Deterministic and dependency-free: NFC normalization and the \p{L}/\p{N}/\s
+// property classes come from the pinned Unicode tables in the artifact's
+// UnicodeTables section, never a platform Unicode or regex library. The
+// algorithm mirrors tools/convert_tokenizer.py's reference encode(), which is proven
+// bit-for-bit against the upstream Hugging Face tokenizer.
+#ifndef SUPERSLM_TOKENIZER_H
+#define SUPERSLM_TOKENIZER_H
+#include "superslm/api.h"
+
+#include "superslm/artifact.h"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace superslm {
+
+class TokenizerView {
+public:
+	SUPERSLM_API TokenizerView();
+	SUPERSLM_API ~TokenizerView();
+	TokenizerView(TokenizerView&&) noexcept;
+	SUPERSLM_API TokenizerView& operator=(TokenizerView&&) noexcept;
+	TokenizerView(const TokenizerView&) = delete;
+	TokenizerView& operator=(const TokenizerView&) = delete;
+
+	// Bind to a loaded artifact by parsing its Tokenizer + UnicodeTables sections.
+	// Returns false (and sets *err, if non-null) when either section is absent or
+	// malformed; the artifact's integrity is already verified by the loader, so this
+	// parse trusts the bytes and only sanity-checks structure. The artifact must
+	// outlive the view — table pointers reference its bytes. Throws only
+	// std::bad_alloc (S-HARDEN-7, F5).
+	static SUPERSLM_API bool Open(const SslmArtifact& artifact, TokenizerView& out, std::string* err);
+
+	bool Ok() const noexcept;
+	SUPERSLM_API int32_t VocabSize() const noexcept;
+
+	// text -> token ids. A special-token's content appearing in the text is matched
+	// (longest first) and emitted as its id; every other span is NFC-normalized,
+	// pre-tokenized by the fixed Qwen/GPT pattern, byte-level encoded, and BPE-merged.
+	// No BOS/EOS/chat markers are added — that is the caller's (or a template's) job.
+	// Throws only std::bad_alloc (S-HARDEN-7, F5).
+	SUPERSLM_API std::vector<int32_t> Encode(std::string_view text) const;
+
+	// ids -> UTF-8 text: the byte-level bytes each token carries, concatenated and
+	// interpreted as UTF-8 (invalid sequences pass through as replacement chars).
+	// Throws only std::bad_alloc (S-HARDEN-7, F5).
+	std::string Decode(const std::vector<int32_t>& ids) const;
+
+	// Opaque; defined in tokenizer.cpp. Public only so the .cpp's parse helpers can
+	// name it — it is incomplete here, so callers cannot touch it.
+	struct Impl;
+
+private:
+	// S-HARDEN-7 (design Sec3.1): grants src/tokenizer.cpp's
+	// TokenizerViewAccess (defined only there) access to impl_, so
+	// Open/Encode/Decode's *Impl bodies can live entirely in the .cpp
+	// rather than as private member declarations here. See artifact.h's
+	// identical SslmArtifactAccess comment for the full reasoning.
+	friend struct TokenizerViewAccess;
+
+	std::unique_ptr<Impl> impl_;
+};
+
+} // namespace superslm
+
+#endif // SUPERSLM_TOKENIZER_H

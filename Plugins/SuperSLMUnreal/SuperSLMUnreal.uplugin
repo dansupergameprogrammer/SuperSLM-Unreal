@@ -1,0 +1,35 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0.0",
+	"FriendlyName": "SuperSLM For Unreal Engine",
+	"Description": "Unreal Engine 5.8 integration of the SuperSLM runtime: on-device small-language-model inference within a frame budget, deterministic on the CPU backend (verified on Windows x64; GPU determinism is per device and not claimed in 1.0), with engine-owned KV and workspace memory on the CPU backend, frame-budget schedulers for the CPU and GPU backends, and a cooked .sslm asset pipeline. Built on the Apache-2.0-licensed SuperSLM runtime.",
+	"Category": "AI",
+	"CreatedBy": "RageQuitDan",
+	"CreatedByURL": "",
+	"DocsURL": "https://github.com/dansupergameprogrammer/SuperSLM-Unreal",
+	"MarketplaceURL": "",
+	"SupportURL": "https://github.com/dansupergameprogrammer/SuperSLM-Unreal/issues",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"EnabledByDefault": true,
+	"Modules": [
+		{
+			"Name": "SuperSLMUnreal",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "SuperSLMUnrealEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "SuperSLMUnrealTests",
+			"Type": "DeveloperTool",
+			"LoadingPhase": "Default"
+		}
+	]
+}

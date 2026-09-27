@@ -1,0 +1,73 @@
+/* sslm_abi_functions.inc -- the sole source of every sslm_* function DECLARATION this ABI
+ * ships (design Sec8). include/superslm/sslm_abi.h #includes this file, inside its own
+ * extern "C" block, after defining every type the declarations reference (sslm_model,
+ * sslm_status, sslm_config, sslm_detok_state, etc.).
+ *
+ * Split into two pieces: sslm_abi_functions_g5_comparable.inc holds every verb whose signature
+ * uses ONLY types tests/t2130-g5-red-suite/sslm_g5.h itself defines -- included here AND,
+ * separately, from tools/t2139_gate_a_header_parity_check.cpp (macro-renamed) so Gate A checks
+ * the declarations this library actually ships, not a hand-maintained copy of them. The two
+ * workspace-sizing declarations below take the caller-memory call-shape struct, which has no
+ * counterpart in sslm_g5.h at all (design Sec9 residual d) -- they stay directly in this file,
+ * outside the g5-comparable subset, and are correspondingly outside Gate A's own comparison
+ * surface until/unless that struct gains a second, independent definition to compare against.
+ * The text-I/O declaration below takes the incremental-detokenize state struct, the same
+ * residual's other type, for the identical reason.
+ */
+#include "superslm/api.h"
+#include "superslm/sslm_abi_functions_g5_comparable.inc"
+
+/* Versioned decode entry point. The legacy sslm_decode_step declaration lives in the
+ * g5-comparable inventory because it is the v1.1 surface mirrored by that suite. This v2 symbol
+ * is deliberately separate: it may validate and consume sslm_decode_params fields beyond the
+ * shipped four-byte layer_budget prefix without reading past an old caller's allocation. */
+SUPERSLM_API sslm_status sslm_decode_step_v2(sslm_model model, sslm_seq* seqs, int32_t n,
+                                const sslm_decode_params* params, sslm_workspace ws,
+                                int32_t* out_tokens);
+
+/* Initializes the complete v2 params shape. Greedy needs no artifact extension. Damped greedy
+ * selects the B0-ruled alpha/n/k defaults and derives q_ln2/q_b/q_c from this mapped model's
+ * DGC1 section; a model converted without --enable-damped-greedy is rejected. */
+SUPERSLM_API sslm_status sslm_decode_params_init(sslm_model model, int32_t mode, int32_t layer_budget,
+                                    sslm_decode_params* out);
+
+/* Takes the caller-memory call-shape struct (design Sec7.1) -- not part of the g5-comparable
+ * subset (see above).
+ *
+ * Concurrency (matching
+ * include/superslm/gpu_1p0.h's own per-declaration thread-safety convention): a single
+ * sslm_workspace returned by sslm_workspace_create is reusable across an arbitrary SEQUENCE of
+ * calls (design Sec7.1), but is NOT safe to pass to two calls running concurrently -- the
+ * implementation carves per-call scratch out of it, and two concurrent calls sharing one
+ * workspace handle will corrupt each other's scratch. A caller driving multiple sequences
+ * concurrently needs one workspace per concurrently-active call (one per thread is the common
+ * shape), exactly as sslm_kv_pool's own per-block accounting already requires one pool sized for
+ * every concurrently-resident sequence (design Sec7.2). */
+SUPERSLM_API size_t sslm_workspace_size(sslm_model model, const sslm_config* config);
+SUPERSLM_API sslm_status sslm_workspace_create(sslm_model model, const sslm_config* config,
+                                   void* buf, size_t buf_size, sslm_workspace* out);
+
+/* Installs a caller-supplied parallel-for hook on this workspace, or clears it when `pf` is NULL
+ * (superslm/parallel_for.h states the contract the hook's `run` must meet). Takes a type the
+ * g5-comparable subset does not define, so it is declared here, outside that subset.
+ *
+ * - Copies *pf into the workspace. With no hook installed, or with ws NULL at the decode call,
+ *   the token finish runs serially on the calling thread, as in every earlier release.
+ * - Read only by the logits step of the token finish in sslm_decode_step and
+ *   sslm_decode_step_v2 when this workspace is passed. Prefill, prefix prefill and every other
+ *   call ignore it. Tokens are identical with any hook, any max_tasks, and no hook.
+ * - Returns SSLM_INVALID_ARGUMENT, and changes nothing, for: a NULL ws; pf->reserved != 0;
+ *   pf->max_tasks < 0 or > SSLM_PARALLEL_FOR_MAX_TASKS; pf->run NULL with pf->max_tasks > 1.
+ * - Must not run concurrently with a call using the same workspace (the workspace's existing
+ *   rule). pf->host_ctx must outlive every call made with this workspace while the hook is
+ *   installed.
+ * - A hook whose run omits, repeats or invents a task index fails that decode call with
+ *   SSLM_INVALID_ARGUMENT. The sequence is left resting with its final hidden state ready for
+ *   logits and its schema walk and current token unchanged, so a retry recomputes the finish. */
+SUPERSLM_API sslm_status sslm_workspace_set_parallel_for(sslm_workspace ws,
+                                                          const sslm_parallel_for* pf);
+
+/* Takes the incremental-detokenize state struct (design Sec7.4) -- not part of the
+ * g5-comparable subset (see above). */
+SUPERSLM_API sslm_status sslm_detokenize_stream(sslm_model model, sslm_detok_state* state, const int32_t* tokens,
+                                    int32_t n, char* utf8, int32_t* out_n);

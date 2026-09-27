@@ -1,0 +1,9 @@
+SuperSLM-Unreal: the SuperSLMUnrealMCP plugin (optional MCP toolset)
+Copyright 2026 Dan Super (RageQuitDan)
+https://github.com/dansupergameprogrammer/SuperSLM-Unreal
+
+Licensed under the Apache License, Version 2.0 (see LICENSE in this folder).
+
+This plugin depends on the SuperSLMUnreal plugin, which includes SuperSLM
+(https://github.com/dansupergameprogrammer/SuperSLM), Copyright 2026 Dan Super, licensed under
+the Apache License, Version 2.0.

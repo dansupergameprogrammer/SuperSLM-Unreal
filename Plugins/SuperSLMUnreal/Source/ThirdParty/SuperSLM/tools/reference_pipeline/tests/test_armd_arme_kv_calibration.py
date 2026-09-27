@@ -1,0 +1,1216 @@
+"""T-1933 -- Arm D/E's red suite: T-1822 §31.4.4's 11-cell Coverage Model.
+
+Design of record: `Claude/Vitruvius/t1822-activation-scale-remedy-design-2026-08-07.md`
+§31.4.1 (the converter change), §31.4.2 (the five-arm matrix), §31.4.3 (the arithmetic
+corpus), §31.4.4 (the 11-cell Coverage Model table this suite realizes) -- as corrected
+by `Claude/Vitruvius/t1919-armd-correction-fusedq-fold-2026-08-11.md` (13-candidate
+enumeration, Arm E, structural population disjointness). This suite realizes the model;
+it does not amend it -- no cell here required the design to be re-interpreted (§6).
+
+**At this suite's original authoring (T-1933), none of Arm D/E's own machinery existed on
+this tree.** `pipeline.py`'s legacy converter (`_calibrate`/`_observe`/`_derive_scales`/
+`_derive_composition_constants`) computed one K/V scale per LAYER (not per head) and wrote
+it into both `kv_head` slots identically (`pipeline.py:1809-2082` -- see each cell below
+for the exact lines; the standing pins below cells 1/2 confirm this legacy path is still
+what Arms A/B exercise today). At authoring time there was no calibration-policy argument,
+no candidate-scale sweep, no five-arm harness, no arithmetic-distinctness gate, and no
+calibration-policy provenance marker anywhere in this file or elsewhere under
+`Tools/superslm_spike/`; every cell below was therefore authored against symbols this
+suite itself named as the contract the build had to satisfy (§0) -- red by an absent
+symbol, an absent dataclass field, or, where the property was reachable through code that
+already existed, a real assertion failure against the then-current, degenerate behavior.
+
+**The build has since landed** (T-1934/T-1937/T-1938, `Claude/Poirot/7f99a81048-t1937-
+t1938-confirmation.md`): every §0 symbol now exists on `reference_pipeline.pipeline`, and
+every cell in this file runs green against the real, shipped implementation. Each cell's
+own docstring below states what made it RED at authoring time; where a T-1936
+confirmation-review finding showed a cell passing for the wrong reason, the re-authored
+cell (cells 3-5, 7) states the mutation it discriminates now instead.
+
+## §0 -- The contract this suite specifies (declared, not built)
+
+New symbols on `reference_pipeline.pipeline`, named here so the build round has no interface
+question left to resolve on its own initiative (T-1899's own declared-not-defined
+convention, adapted to Python's red-unimplemented shape via `conftest.api`/`require`):
+
+- `calibrate_kv_landing_arm(cfg, float_weight, records, tokenize, *, arm)` -- `arm` one of
+  `"A","B","C","D","E"` (the design's own letters, T-1822 §31.4.2). Returns a `dict`:
+  `"ordering"` (`"legacy"|"fused"`), `"granularity"` (`"per_layer"|"per_head"`),
+  `"observation_domain"` (`"union"|"post_rope_only"|None`), `"kv_landing"`
+  (`{f"{prefix}.k_head{h}": (m, e)}`), `"kv_reciprocals"`, `"softmax_khead"`
+  (`{f"{prefix}.softmax_khead{h}": (m, e)}`), `"candidates"` (arms D/E only:
+  `{f"{prefix}.k_head{h}": [{"offset_eighths_bit": k, "attention_score_error": float,
+  "saturation_rate": float}, ...13 entries, k in {-8..-1,0,8,16,24,32}]}`),
+  `"selected_offset"` (arms D/E only: `{f"{prefix}.k_head{h}": k}`). Realizes cells 1-5, 7.
+- `classify_signed_ratio_resolution(candidate, reference, se, z_crit)` -- returns
+  `"RESOLVED"|"NOT RESOLVED"|"UNDERPOWERED"` from the bare ratio alone (T-1890,
+  D-SLM2324-2327), no `δ_min`-shaped term. Realizes cell 6.
+- `CalibrationPopulationOverlap(ValueError)` and
+  `check_calibration_eval_disjoint(calibration_ids, eval_ids)` -- raises on any collision.
+  Realizes cell 8.
+- `DuplicateArithmeticProblem(ValueError)` and
+  `check_arithmetic_corpus_distinct(problems)` -- `problems` a list of
+  `{"operation": str, "operand_tuple": tuple, ...}`; raises on a duplicate
+  `(operation, operand_tuple)` key. Realizes cell 9.
+- `grade_arithmetic_report(problems, model_answers, float_answers)` -- returns a list of
+  `{"problem_id", "truth_correct": bool, "float_agreement": bool}`, the two columns
+  computed independently (D-SLM2346). Realizes cell 10.
+- `QuantizedModel` gains a new frozen-dataclass field,
+  `kv_calibration_provenance: dict = dataclasses.field(default_factory=dict)`, alongside
+  the existing `composition_constants`/`kv_landing_scales`/`dynamic_biases` fields
+  (`pipeline.py:874-882`) -- `{"arm": str, "ordering": str, "observation_domain": str|None}`
+  per layer/head or per model, distinguishing a per-head-calibrated build from a
+  legacy-union one. `artifact_cache.save_artifact`/`load_artifact` gain the matching
+  serialize/deserialize lines (`artifact_cache.py:328-341` write side,
+  `artifact_cache.py:588-599` reconstruction side). Realizes cell 11.
+
+Every new symbol lives in `reference_pipeline.pipeline` (the converter this design's own
+§31.4.1 reads from, `D:\\Wizard\\Tools\\superslm_spike\\pipeline.py`), matching the
+project's own citation of this file as Arm D/E's home.
+"""
+
+import dataclasses
+import importlib.util
+import json
+import sys
+
+import numpy as np
+import pytest
+
+import conftest
+from conftest import api, require
+
+MODULE = "reference_pipeline.pipeline"
+ARTIFACT_MODULE = "reference_pipeline.artifact_cache"
+
+
+def fixture_config(pipeline):
+    """The suite's own §11 fixture shape (identical to `test_pipeline.py`/
+    `test_artifact_cache.py`'s own `fixture_config` -- two kv_heads is the minimum needed
+    to state a per-head distinctness claim at all)."""
+    return pipeline.ModelConfig(
+        hidden_size=32, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=8, intermediate_size=64, vocab_size=32,
+        rope_theta=10000.0, rms_norm_eps=1e-6, tie_word_embeddings=True, context_cap=16,
+    )
+
+
+def _without_qk_norm(floats, cfg):
+    """(D-SLM6263, external review Minor 2): the SAME §11 fixture `fixture_config` above
+    builds carries non-uniform `q_norm`/`k_norm` gains unconditionally since T-2539 --
+    `calibrate_kv_landing_arm`'s own `"per_head"` arms (C/D/E) now refuse a QK-norm
+    checkpoint by name (Minor 2's own closure). This suite's Arm D/E cells below test the
+    per-head score-error-minimizing sweep itself, a property that predates and is
+    orthogonal to QK-norm -- stripping the two tensors here is what lets them keep
+    exercising that property on an arm the checkpoint they build IS still one this policy
+    supports, matching `test_ask5_trackb_oracle_qk_norm_parity.py`'s own identical
+    `_without_qk_norm` stripping."""
+    stripped = dict(floats)
+    for layer in range(cfg.num_hidden_layers):
+        stripped.pop(f"layer{layer}.q_norm.gain", None)
+        stripped.pop(f"layer{layer}.k_norm.gain", None)
+    return stripped
+
+
+def _expect_field_settable(build, *, field, why):
+    """Attempt a `dataclasses.replace` that sets `field`, converting a `TypeError` (the
+    field not existing on the dataclass) into an ordinary red-unimplemented
+    `AssertionError` -- the dataclass-field analogue of `conftest.api`'s module-attribute
+    check, kept local to this file rather than added to the shared harness (T-1933's own
+    scope is this one suite, not a change to every test file's fixtures). Renamed from
+    `_expect_absent_field` (T-1939 §5.4/D-SLM2643, Minor): the field it once documented as
+    absent has since been added by the build round, so a name and docstring built around
+    "the field does not exist" would misdescribe every call site below. What the helper
+    does is unchanged and still useful once the field exists: it converts a genuine
+    regression (the field removed again, `TypeError` on `dataclasses.replace`) into the
+    suite's own red-unimplemented shape rather than an unrelated crash."""
+    try:
+        return build()
+    except TypeError as exc:
+        raise AssertionError(
+            f"red-unimplemented: {field} ({why}). Observed: {exc}"
+        ) from None
+
+
+# ==============================================================================
+# Cell 1 -- Per-head scale distinctness (§31.4.4 row 1; pipeline.py:1828-1834, 2056-2065)
+# ==============================================================================
+
+def test_today_kv_landing_is_a_degenerate_duplicate_across_both_heads_standing_pin():
+    """GREEN standing pin: the CURRENT converter's own degenerate baseline, so the red
+    cell below is provably a change from something rather than an assertion against
+    nothing.
+
+    `_derive_composition_constants` (`pipeline.py:2056-2058`) writes `kv_landing[...]`
+    from ONE layer-level `k_scale` into BOTH `kv_head` slots, `for head in
+    range(cfg.num_key_value_heads)` reusing the identical `(m_t_k, e_t_k)` pair every
+    iteration -- exactly the gap `pipeline.py:1828-1834`'s own comment names ("the SURFACE
+    is per-head... the granularity of the fixture's calibration is not").
+    """
+    pipeline = require(MODULE)
+    cfg = fixture_config(pipeline)
+    model = pipeline.fixture_model(cfg)
+    assert model.kv_landing_scales["layer0.k_head0"] == model.kv_landing_scales["layer0.k_head1"], (
+        "today's converter is expected to duplicate the layer-level K scale into both "
+        "kv_head slots -- if this now fails, the degenerate baseline changed and this "
+        "pin (and the red cell below) needs re-reading against the new baseline"
+    )
+
+
+def test_fixture_validity_real_per_head_k_activations_genuinely_differ():
+    """Fixture-validity precondition (T-1899's own convention, D-SLM2399): before trusting
+    a red cell that claims per-head distinctness is achievable, confirm by EXECUTION --
+    not by construction -- that this fixture's own two kv_heads produce genuinely
+    different real K activations. If they coincided, a red cell built on this fixture
+    would be vacuous: any per-head implementation, correct or a duplicate-preserving stub,
+    would pass it by accident.
+
+    Computed directly through the REAL, already-shipped `_float_project`/`_float_rope`/
+    `_float_rmsnorm` (the same primitives `_float_layer` itself calls,
+    `pipeline.py:2133-2156`), over the first 20 records of the real 600-record
+    calibration corpus, on the fixture's own real pinned weights. This pass measured:
+    head0 max-abs (pre-RoPE 1.1451, post-RoPE 1.1169), head1 max-abs (pre-RoPE 2.9996,
+    post-RoPE 2.9997) -- head1 is ~2.6x head0 throughout, non-degenerate by construction
+    of the fixture's own per-channel-ranged weights (`_pinned_float_weight`,
+    `pipeline.py:956-971`), not by coincidence of this particular corpus slice.
+    """
+    pipeline = require(MODULE)
+    cfg = fixture_config(pipeline)
+    weights, weight_scales, floats = pipeline._pinned_weights(cfg)
+    float_weight = pipeline._dict_float_source(floats)
+    records = pipeline.calibration_records()[:20]
+    tokenize_prompt = pipeline._fixture_tokenize_prompt(cfg)
+
+    per_head_pre = {0: [], 1: []}
+    per_head_post = {0: [], 1: []}
+    for record in records:
+        tokens = tokenize_prompt(pipeline.run_prompt_messages(record))[: cfg.context_cap]
+        hidden = floats["embed"][list(tokens), :]
+        tensors = pipeline._layer_tensors(float_weight, "layer0")
+        normed = pipeline._float_rmsnorm(hidden, cfg.rms_norm_eps) * tensors["layer0.attn_norm.gain"]
+        k = pipeline._float_project(tensors.__getitem__, "layer0.k_proj", normed).reshape(
+            -1, cfg.num_key_value_heads, cfg.head_dim)
+        for head in range(2):
+            per_head_pre[head].append(float(np.abs(k[:, head, :]).max()))
+        k_rope = pipeline._float_rope(k, cfg.rope_theta)
+        for head in range(2):
+            per_head_post[head].append(float(np.abs(k_rope[:, head, :]).max()))
+
+    head0_max = max(max(per_head_pre[0]), max(per_head_post[0]))
+    head1_max = max(max(per_head_pre[1]), max(per_head_post[1]))
+    assert head0_max != head1_max, (
+        f"the fixture's own two kv_heads produced coincidentally IDENTICAL real K "
+        f"activations (head0={head0_max}, head1={head1_max}) -- this fixture cannot "
+        f"discriminate a genuine per-head calibration from a duplicate-preserving stub "
+        f"and must not be used for the cell below without a different fixture"
+    )
+    assert abs(head0_max - head1_max) / max(head0_max, head1_max) > 0.1, (
+        "the two heads' real activations differ by less than 10%% -- too close to "
+        "confidently discriminate a per-head implementation from rounding noise"
+    )
+
+
+def test_arm_d_per_head_calibration_produces_distinct_kv_head_scales():
+    """§31.4.4 row 1: "For at least one converted artifact, the two `kv_head` slots of
+    at least one layer carry different `(m_t, e_t)` pairs under any per-head calibration
+    policy (Arms C, D, or E) -- a test asserts non-identity, refuting the
+    degenerate-duplicate default." (source: `pipeline.py:1828-1834`; §31.4.1.)
+
+    The fixture is confirmed non-vacuous by the preceding real-execution cell. Originally
+    RED via the absent contract symbol (§0): `calibrate_kv_landing_arm` did not exist on
+    `reference_pipeline.pipeline` at authoring time. The build has since landed; this cell now
+    runs green against the real, shipped `calibrate_kv_landing_arm`.
+    """
+    pipeline = require(MODULE)
+    calibrate_kv_landing_arm = api(MODULE, "calibrate_kv_landing_arm")
+    cfg = fixture_config(pipeline)
+    weights, weight_scales, floats = pipeline._pinned_weights(cfg)
+    # (D-SLM6263, Minor 2): Arm D is a "per_head" arm and now refuses a QK-norm checkpoint
+    # by name -- stripped here since this cell's own claim (per-head scale distinctness)
+    # is orthogonal to QK-norm (see `_without_qk_norm`'s own docstring, above).
+    float_weight = pipeline._dict_float_source(_without_qk_norm(floats, cfg))
+    records = pipeline.calibration_records()
+    tokenize = pipeline._fixture_tokenize_prompt(cfg)
+
+    result = calibrate_kv_landing_arm(cfg, float_weight, records, tokenize, arm="D")
+    assert result["kv_landing"]["layer0.k_head0"] != result["kv_landing"]["layer0.k_head1"], (
+        "Arm D's per-head calibration must not duplicate the same (m_t, e_t) pair into "
+        "both kv_head slots -- that is the legacy default this cell exists to refute"
+    )
+
+
+# ==============================================================================
+# Cell 2 -- softmax_khead regeneration (§31.4.4 row 2; pipeline.py:1917, 2061-2065)
+# ==============================================================================
+
+def test_arm_d_softmax_khead_moves_with_only_its_own_head_scale():
+    """§31.4.4 row 2: "Every `softmax_khead{head}` constant is derived from *that head's
+    own* `k_scale`, not a layer-collapsed one, once any per-head calibration runs -- a
+    test perturbs one head's candidate-scale selection and asserts only that head's
+    `softmax_khead` constant moves." (source: `pipeline.py:1880-1881`
+    [D-SLM2352/§31.4.1's own citation of the composition constant]; §31.4.1's own fourth
+    dependent constant.)
+
+    Mutation fixture: two `float_weight` sources identical in every tensor except
+    `layer0.k_proj`'s own head-1 rows (rows `[head_dim:2*head_dim)` of the K weight
+    matrix), scaled 2.5x. Head 0's own rows, and every Q/norm input feeding both heads,
+    are byte-identical between the two builds -- a correct per-head implementation must
+    therefore leave head 0's own `softmax_khead0` unchanged and move only
+    `softmax_khead1`. Originally RED via the absent contract symbol (§0); the build has
+    since landed and this cell now runs green against the real, shipped
+    `calibrate_kv_landing_arm`.
+    """
+    pipeline = require(MODULE)
+    calibrate_kv_landing_arm = api(MODULE, "calibrate_kv_landing_arm")
+    cfg = fixture_config(pipeline)
+    weights, weight_scales, floats_a = pipeline._pinned_weights(cfg)
+    # (D-SLM6263, Minor 2): stripped for the same reason the sibling cell above strips it --
+    # Arm D refuses a QK-norm checkpoint by name, and this cell's own claim (per-head
+    # softmax_khead regeneration) is orthogonal to QK-norm.
+    floats_a = _without_qk_norm(floats_a, cfg)
+    floats_b = dict(floats_a)
+    k_proj = np.array(floats_a["layer0.k_proj"], copy=True)
+    k_proj[cfg.head_dim:2 * cfg.head_dim, :] *= 2.5   # head 1's rows only
+    floats_b["layer0.k_proj"] = k_proj
+
+    records = pipeline.calibration_records()
+    tokenize = pipeline._fixture_tokenize_prompt(cfg)
+    result_a = calibrate_kv_landing_arm(
+        cfg, pipeline._dict_float_source(floats_a), records, tokenize, arm="D")
+    result_b = calibrate_kv_landing_arm(
+        cfg, pipeline._dict_float_source(floats_b), records, tokenize, arm="D")
+
+    assert result_a["softmax_khead"]["layer0.softmax_khead0"] == \
+        result_b["softmax_khead"]["layer0.softmax_khead0"], (
+        "perturbing ONLY head 1's own K weight rows moved head 0's own softmax_khead "
+        "constant -- the composition constant was regenerated from a layer-collapsed "
+        "value, not that head's own"
+    )
+    assert result_a["softmax_khead"]["layer0.softmax_khead1"] != \
+        result_b["softmax_khead"]["layer0.softmax_khead1"], (
+        "perturbing head 1's own K weight rows did not move head 1's own softmax_khead "
+        "constant at all -- softmax_khead1 was not regenerated from the per-head scale"
+    )
+
+
+# ==============================================================================
+# Cells 3-5 -- the 13-candidate sweep: score-error selection, finer reachability,
+# saturation reported not gated (§31.4.4 rows 3-5; §31.4.1, T-1919 §2(a))
+# ==============================================================================
+#
+# T-1936 §5.1/D-SLM2622 (Critical): the prior authoring of these three cells built an
+# independent reference sweep over a hand-authored Q/K fixture and asserted properties of
+# THAT reference alone, never calling `calibrate_kv_landing_arm` -- with the entire
+# 13-candidate sweep replaced in-process by "always max-abs, empty report", the full
+# suite stayed green (1874 passed, 13 deselected, identical to shipped). Re-authored here
+# to DRIVE THE REAL SWEEP: all three cells below read a single, module-scoped execution
+# of the real, end-to-end `calibrate_kv_landing_arm` (production forward pass, production
+# per-head capture, production 13-candidate score-error sweep) on the suite's OWN
+# already-shared §11 fixture (`fixture_config`, `_pinned_weights`, the full 600-record
+# calibration corpus -- the identical fixture
+# `test_fixture_validity_real_per_head_k_activations_genuinely_differ` above already
+# confirmed by execution is non-degenerate). No synthetic Q/K array is constructed
+# anywhere in this section; every number below is read from a real executed production
+# result (StandardsDocument.md §5.4: verified at source or by execution, never by
+# construction).
+#
+# EXECUTED this pass: on this fixture, Arm D's real sweep at `layer1.k_head0` selects
+# offset -2 (finer than max-abs's offset 0) with attention-score error 591.078 against
+# max-abs's own 665.293 in the SAME executed report. This divergence is naturally present
+# in the suite's existing shared fixture; it did not need to be manufactured.
+#
+# CORRECTED 2026-09-02 (T-2553, `_kv_calibration_capture` and `_vec_forward` both gained
+# the QK-norm call site `_float_layer` already had -- StandardsDocument.md §5.4/§5.6, a
+# ruling contradicted by a measurement is re-opened, not defended): re-executed against
+# the current tree. `layer0.k_head1` (this constant's own prior value) no longer diverges
+# from max-abs at all post-fix (winner_offset == 0 == max-abs's own offset) -- RMSNorm's
+# own bounding of the per-head activation's dynamic range moved this specific head's own
+# score-error landscape. `layer1.k_head0` re-derived by real execution as a head that
+# still diverges the way §31.4.4 rows 3/4 need. Cell 5's own "winner clips MORE than
+# max-abs" property (row 5's strongest form) does not hold at ANY of this fixture's four
+# `(layer, kv_head)` combinations post-fix -- searched by direct execution across every
+# combination, multiple non-uniform k_norm.gain perturbations (single-element spikes at
+# 5x-200x, all-mass-on-one-channel constructions) and multiple non-uniform k_proj
+# per-channel weight perturbations (8x-20x on one output channel of eight, every channel,
+# every head) -- every winning (lowest-error) candidate's own saturation_rate ties
+# max-abs's exactly; every candidate that clips MORE than max-abs has WORSE error and is
+# never selected. RMSNorm bounds the per-token activation's own overall energy tightly
+# enough, before requantization ever runs, that the "clip a little more to buy resolution
+# elsewhere, and still come out ahead on error" trade-off row 5 exercises for an
+# un-normalized activation does not reproduce here — a real, structural consequence of the
+# norm this fixture now correctly applies, not a search-coverage gap (see cell 5's own
+# corrected docstring, below, for the full account and what is retired versus what still
+# holds).
+
+# CORRECTED 2026-09-03 (T-2572, D-SLM6263 Obligation -- StandardsDocument.md §5.4/§5.6, a
+# ruling contradicted by a measurement is re-opened, not defended): the external review
+# `Claude/External/superslm-1p4p0-2026-09-02.md` Minor 2 closed with `calibrate_kv_landing_arm`
+# refusing a QK-norm checkpoint by name for the `"per_head"` arms (C/D/E) -- this suite's own
+# shared fixture (`_armd_arme_real_calibration`, below) now drives those arms on the SAME §11
+# fixture with q_norm/k_norm STRIPPED (`_without_qk_norm`, this file's own top), since Arm D's
+# real sweep is what this cell's own claims are about, not QK-norm. Stripping restores the
+# PRE-T-2553 float data these cells were originally authored against, and re-executing against
+# it re-derives the SAME key T-2553 moved away from: `layer0.k_head1`'s real sweep selects
+# offset -3 (error 1172.115) against max-abs's offset 0 (error 1348.644) -- diverging again,
+# and by a LARGER margin than `layer1.k_head0` ever showed. `layer1.k_head0` (T-2553's own key)
+# no longer diverges from max-abs at all once QK-norm is out of this calibration's own input
+# (winner_offset == 0 == max-abs's own offset), the mirror image of T-2553's own finding about
+# `layer0.k_head1` under the OLD, QK-norm-bearing fixture. The key moves back.
+_ARMD_REAL_SWEEP_KEY = "layer0.k_head1"
+_ARMD_REAL_SWEEP_MAXABS_OFFSET = 0
+
+
+@pytest.fixture(scope="module")
+def _armd_arme_real_calibration():
+    """Drive the REAL, end-to-end `calibrate_kv_landing_arm` for arms B, C, D, and E, on
+    the suite's shared §11 fixture -- the full 600-record calibration corpus through the
+    real float forward pass, the real per-head capture, and (for D/E) the real
+    13-candidate score-error sweep. Computed ONCE per module and shared by cells 3, 4, 5,
+    and 7 below (each arm computed once, not once per cell), so this fixture is the
+    single source every cell in this section reads from -- no cell recomputes or
+    reimplements any part of the sweep.
+    """
+    pipeline = require(MODULE)
+    calibrate_kv_landing_arm = api(MODULE, "calibrate_kv_landing_arm")
+    cfg = fixture_config(pipeline)
+    weights, weight_scales, floats = pipeline._pinned_weights(cfg)
+    # (D-SLM6263, Minor 2): the "per_head" arms this fixture also computes (C/D/E) now
+    # refuse a QK-norm checkpoint by name -- stripped for all four arms computed here
+    # (including B, "per_layer", unaffected either way since no cell in this file reads
+    # this fixture's own "B" entry) so the single shared `float_weight` this function
+    # builds is usable by every arm it drives.
+    float_weight = pipeline._dict_float_source(_without_qk_norm(floats, cfg))
+    records = pipeline.calibration_records()
+    tokenize = pipeline._fixture_tokenize_prompt(cfg)
+    return {
+        arm: calibrate_kv_landing_arm(cfg, float_weight, records, tokenize, arm=arm)
+        for arm in ("B", "C", "D", "E")
+    }
+
+
+def test_arm_d_selection_is_score_error_minimizing_not_max_abs(_armd_arme_real_calibration):
+    """§31.4.4 row 3: "The candidate-scale sweep's selected value is not, in general, the
+    finest legal scale or the max-abs value -- a fixture where max-abs and score-error-
+    minimal diverge asserts the selection picks the latter, over the full 13-candidate
+    enumeration." (source: T-1880 §6.2, D-SLM2360, D-SLM2554.)
+
+    Calls the real `calibrate_kv_landing_arm` (via the module-scoped fixture above, arm
+    D) and reads its actual returned `selected_offset`/`candidates` -- not a
+    recomputation. On this fixture, `layer1.k_head0`'s real sweep selects offset -2, not
+    max-abs's offset 0, and that offset's own reported attention-score error is strictly
+    lower than max-abs's own reported error in the SAME executed report, so the selection
+    genuinely minimizes error rather than landing on a non-max-abs offset by accident.
+
+    RED under the always-max-abs mutation (`_armd_arme_candidate_sweep` ->
+    `return 0, base_scale, []`, T-1936 §4): `selected_offset` collapses to 0 for every
+    head, so the first assertion below fails directly.
+
+    The third assertion below pins the property §31.4.4 row 3 actually names --
+    minimization, not merely "lower error than max-abs". Confirmed by execution
+    (`Claude/Curie/t1933-armd-arme-red-suite-2026-08-11.md`'s T-1940 addendum, at the
+    key/numbers this constant carried before T-2553): a sweep rebound to select the
+    SECOND-lowest-error candidate is still not max-abs, still finer than max-abs, and
+    still lower-error than max-abs, so the first two assertions alone stayed green under
+    that mutation.
+
+    **CORRECTED 2026-09-03 (T-2572, D-SLM6263 Obligation):** re-executed against the
+    QK-norm-stripped shared fixture (this file's own header comment states why), at the
+    re-derived key `layer0.k_head1` (T-2553's own key, restored -- this file's own header
+    comment states why the key moved back). `layer0.k_head1`'s own real winner is offset -3
+    (error 1172.115) against max-abs's offset 0 (error 1348.644); the real second-lowest-
+    error candidate is offset -4 (error 1225.398) -- confirming the tie-break assertion
+    below is genuinely load-bearing at this key too.
+    """
+    result = _armd_arme_real_calibration["D"]
+    reports = {r["offset_eighths_bit"]: r for r in result["candidates"][_ARMD_REAL_SWEEP_KEY]}
+    winner_offset = result["selected_offset"][_ARMD_REAL_SWEEP_KEY]
+    assert winner_offset != _ARMD_REAL_SWEEP_MAXABS_OFFSET, (
+        f"the real 13-candidate sweep selected max-abs (offset "
+        f"{_ARMD_REAL_SWEEP_MAXABS_OFFSET}) for {_ARMD_REAL_SWEEP_KEY} on a fixture whose "
+        f"own report shows a lower-error candidate exists -- selection is not minimizing "
+        f"attention-score error"
+    )
+    assert (reports[winner_offset]["attention_score_error"]
+            < reports[_ARMD_REAL_SWEEP_MAXABS_OFFSET]["attention_score_error"]), (
+        "the selected candidate's own reported attention-score error is not lower than "
+        "max-abs's own reported error in the same executed report -- the selection did "
+        "not actually minimize error"
+    )
+    # Tie-break must match the sweep's own documented rule: ties broken toward the
+    # candidate closer to max-abs (lower abs(k)), not toward enumeration order — the two
+    # disagree exactly when all candidates score identically (T-1939 §11.2.1's all-zero head).
+    true_argmin_offset = min(
+        reports, key=lambda k: (reports[k]["attention_score_error"], abs(k)))
+    assert winner_offset == true_argmin_offset, (
+        f"the real sweep selected offset {winner_offset} for {_ARMD_REAL_SWEEP_KEY}, but "
+        f"the report's own minimum-attention-score-error candidate is offset "
+        f"{true_argmin_offset} (error "
+        f"{reports[true_argmin_offset]['attention_score_error']}) -- the selection is "
+        f"directionally right (lower error than max-abs) but is not the score-error-"
+        f"minimal candidate §31.4.4 row 3 requires"
+    )
+
+
+def test_arm_d_finer_than_max_abs_candidates_are_reachable(_armd_arme_real_calibration):
+    """§31.4.4 row 4 (new, round 5, D-SLM2554): "For at least one `(layer, kv_head)`, the
+    sweep's selected candidate is one of the eight `k<0` (finer-than-max-abs) candidates
+    -- a fixture where a finer candidate genuinely minimizes attention-score error
+    asserts the selection reaches it, refuting a coarser-only implementation that
+    silently ignores the finer half of the enumeration."
+
+    Reads the real sweep's own `selected_offset` (module-scoped fixture above, arm D).
+    `layer0.k_head1`'s real winner (-3, re-derived T-2572 -- this file's own header
+    comment states why the key moved back) is one of the eight finer-than-max-abs
+    candidates.
+
+    RED under BOTH mutations named in T-1936 §4: the always-max-abs mutation collapses
+    `selected_offset` to 0 (caught by `winner_offset < 0` below); the coarser-only
+    enumeration mutation (`_ARMD_ARME_SWEEP_OFFSETS` -> `(0, 8, 16, 24, 32)`) also forces
+    every coarser candidate's own reported error to exceed max-abs's own at this head,
+    confirmed by execution against the QK-norm-stripped tree (T-2572): the four coarse
+    candidates' own errors (1844.531, 3794.579, 5251.738, 9464.426) are all higher than
+    max-abs's own 1348.644.
+    """
+    result = _armd_arme_real_calibration["D"]
+    winner_offset = result["selected_offset"][_ARMD_REAL_SWEEP_KEY]
+    assert winner_offset < 0, (
+        f"{_ARMD_REAL_SWEEP_KEY}'s real sweep selected offset {winner_offset}, not one of "
+        f"the eight k<0 finer-than-max-abs candidates -- the finer half of the "
+        f"enumeration is unreachable"
+    )
+
+
+def test_arm_d_saturation_is_reported_and_does_not_gate_selection(_armd_arme_real_calibration):
+    """§31.4.4 row 5 (corrected round 5): "Every candidate's saturation rate is computed
+    and included in the sweep's own report (alongside attention-score error), for at
+    least one candidate that clips more than max-abs -- a test asserts the report carries
+    that candidate's saturation figure and that the candidate is still selectable on
+    attention-score error alone, refuting both silent omission and a reintroduced hard
+    reject." (source: §31.4.1, D-SLM2555.)
+
+    Reads the real sweep's own report (module-scoped fixture above, arm D). All 13
+    candidates are present with their own saturation figures.
+
+    **CORRECTED 2026-09-03 (T-2572, D-SLM6263 Obligation), restoring row 5's own strongest
+    reading (StandardsDocument.md §5.4/§5.6, a ruling contradicted by a measurement is
+    re-opened, not defended):** T-2553 (2026-09-02) retired this row's strongest form when
+    `_kv_calibration_capture`/`_vec_forward` gained the QK-norm call site, which bounded
+    this fixture's own per-token K activation energy tightly enough that "clip more and
+    still minimize error" stopped reproducing. Minor 2's own closure (external review
+    `Claude/External/superslm-1p4p0-2026-09-02.md`) now has Arm D refuse a QK-norm
+    checkpoint by name, so this suite's own shared fixture computes Arm D with q_norm/k_norm
+    STRIPPED (`_without_qk_norm`) -- restoring the PRE-T-2553 float data. Re-executed: the
+    WINNER (`layer0.k_head1`, offset -3) once again clips MORE codes than max-abs
+    (`saturation_rate` 0.03125 vs. 0.015625) and is still selected on attention-score error
+    alone -- the strongest form of "still selectable" is reachable on this fixture again,
+    not merely the weaker "ties" form T-2553 fell back to.
+
+    RED under the always-max-abs mutation (`_armd_arme_candidate_sweep` ->
+    `return 0, base_scale, []`): `candidates` becomes an empty list, so
+    `len(reports) == 13` fails directly. RED under a mutation that hard-gates selection
+    on minimum saturation (rejecting any candidate whose own saturation exceeds max-abs's
+    when a tie exists): the winner's own `attention_score_error` below would then have to
+    be re-derived from a DIFFERENT (higher-saturation-avoiding) candidate than test 1's
+    own genuinely-minimal one -- not executed as a constructed mutation this round, named
+    as owed rather than silently assumed.
+    """
+    result = _armd_arme_real_calibration["D"]
+    reports = {r["offset_eighths_bit"]: r for r in result["candidates"][_ARMD_REAL_SWEEP_KEY]}
+    assert len(reports) == 13, (
+        f"expected all 13 candidates reported for {_ARMD_REAL_SWEEP_KEY}, got "
+        f"{len(reports)} -- the sweep's own report is not carrying every candidate's "
+        f"saturation figure"
+    )
+    winner_offset = result["selected_offset"][_ARMD_REAL_SWEEP_KEY]
+    winner_saturation = reports[winner_offset]["saturation_rate"]
+    maxabs_saturation = reports[_ARMD_REAL_SWEEP_MAXABS_OFFSET]["saturation_rate"]
+    assert winner_offset != _ARMD_REAL_SWEEP_MAXABS_OFFSET, (
+        f"the selected (winning) candidate IS max-abs (offset "
+        f"{_ARMD_REAL_SWEEP_MAXABS_OFFSET}) -- 'selection is not gated on saturation' is "
+        f"unfalsifiable when the winner and max-abs are the same candidate"
+    )
+    assert winner_saturation > maxabs_saturation, (
+        f"the selected (winning) candidate's own saturation_rate ({winner_saturation}) no "
+        f"longer exceeds max-abs's own ({maxabs_saturation}) at this fixture's own "
+        f"re-derived key -- row 5's own strongest reading (T-2572, restored) is that the "
+        f"winner clips MORE than max-abs and is still selected on attention-score error "
+        f"alone; re-derive against the current tree rather than editing this assertion"
+    )
+    assert winner_saturation > 0.0, "the winning candidate's own saturation_rate must be nonzero"
+
+
+# ==============================================================================
+# Cell 6 -- Five-arm resolution independence from worthwhileness
+# (§31.4.4 row 6; T-1890, D-SLM2324-2327, §31.4.2)
+# ==============================================================================
+
+def test_signed_ratio_resolves_a_statistically_resolved_but_tiny_delta():
+    """§31.4.4 row 6: "The `signed_ratio` resolution verdict for any cell does not
+    reference a `δ_min`-shaped floor; a test constructs a resolved-but-small delta and
+    asserts it prints `RESOLVED`, not `NOT RESOLVED`, distinct from the separate
+    worthwhileness judgment." (source: T-1890, D-SLM2324-2327; §31.4.2.)
+
+    Fixture: `candidate=100.001`, `reference=100.0`, `se=0.0005`, `z_crit=1.96` ->
+    `signed_ratio = 0.001 / (1.96*0.0005) = 1.0204`, |ratio| >= 1 -- statistically
+    resolved by T-1870 §6's own bare-ratio rule. The raw delta (0.001) is far below
+    T-1870's own named `δ_min` defaults (0.05, 0.06) cited at §31.4.2 -- a rule that folds
+    a worthwhileness floor into the resolution verdict would print NOT RESOLVED here;
+    this design's own rule must not. Originally RED via the absent contract symbol; the
+    build has since landed and this cell now runs green against the real, shipped
+    `classify_signed_ratio_resolution`.
+    """
+    classify_signed_ratio_resolution = api(MODULE, "classify_signed_ratio_resolution")
+    candidate, reference, se, z_crit = 100.001, 100.0, 0.0005, 1.96
+    signed_ratio = (candidate - reference) / (z_crit * se)
+    assert abs(signed_ratio) >= 1.0, "fixture sanity: this delta must cross the z-critical threshold"
+    assert abs(candidate - reference) < 0.05, "fixture sanity: the raw delta must be smaller than either named δ_min default"
+    verdict = classify_signed_ratio_resolution(candidate, reference, se, z_crit)
+    assert verdict == "RESOLVED", (
+        f"a statistically resolved delta (signed_ratio={signed_ratio:.4f}) that is far "
+        f"smaller than either named δ_min default printed {verdict!r}, not RESOLVED -- "
+        f"a worthwhileness floor has leaked into the resolution verdict"
+    )
+
+
+# ==============================================================================
+# Cell 7 -- Arm E variable-separation
+# (§31.4.4 row 7, new round 5, D-SLM2556; §31.4.1/§31.4.2)
+# ==============================================================================
+
+def test_arm_to_arm_deltas_isolate_exactly_one_variable_each(_armd_arme_real_calibration):
+    """§31.4.4 row 7: "Each of B->E (granularity), E->D (observation domain), and C->E
+    (ordering) moves exactly one of the matrix's three named variables while holding the
+    other two constant -- a test asserts, for each of the three deltas, that the two
+    arms' own recorded (ordering, granularity, observation-domain) triples differ in
+    exactly one coordinate." (source: §31.4.1/§31.4.2, corrected round 5.)
+
+    Uses the module-scoped real-calibration fixture above (arms B, C, D, E, computed
+    once).
+
+    Label check (unchanged in substance from the original authoring): the three arms'
+    own recorded (ordering, granularity, observation_domain) triples differ in exactly
+    one coordinate per named delta.
+
+    Behaviour pin (T-1936 §5.2/D-SLM2623, Significant): the label check alone passes even
+    if an arm computes the WRONG observation domain while still reporting the RIGHT
+    label -- verified by execution, forcing `_per_head_maxabs`'s own domain argument to
+    `"union"` regardless of the arm (collapsing Arm D's post-RoPE-only restriction into
+    Arm E's) leaves the label check green, because `_ARM_SPECS`'s own strings never
+    change. The behaviour pin below closes that gap: `layer0.k_head0` is a fixture where
+    union max-abs (1.1451) and post-RoPE-only max-abs (1.1169) genuinely diverge
+    (T-1933 §4.1, confirmed again by execution this round), so a correct implementation
+    must land Arms D and E on DIFFERENT computed `kv_landing` scales at that key, not
+    merely different label strings.
+
+    RED under the label-vs-behaviour mutation named above (`_per_head_maxabs` domain
+    forced to `"union"`): with `observation_domain` no longer affecting the computation
+    at all, Arm D's own capture becomes byte-identical to Arm E's, so
+    `results["D"]["kv_landing"]["layer0.k_head0"] == results["E"]["kv_landing"]["layer0.k_head0"]`
+    and the behaviour-pin assertion below fails, while the label check above stays green
+    -- exactly the gap this cell existed to close.
+    """
+    triples = {
+        arm: (result["ordering"], result["granularity"], result["observation_domain"])
+        for arm, result in _armd_arme_real_calibration.items()
+    }
+
+    def differs_in_exactly_one_coordinate(a, b):
+        return sum(1 for x, y in zip(triples[a], triples[b]) if x != y) == 1
+
+    assert differs_in_exactly_one_coordinate("B", "E"), "B->E must isolate granularity alone"
+    assert differs_in_exactly_one_coordinate("E", "D"), "E->D must isolate observation domain alone"
+    assert differs_in_exactly_one_coordinate("C", "E"), "C->E must isolate ordering alone"
+
+    behavior_key = "layer0.k_head0"
+    kv_landing_d = _armd_arme_real_calibration["D"]["kv_landing"][behavior_key]
+    kv_landing_e = _armd_arme_real_calibration["E"]["kv_landing"][behavior_key]
+    assert kv_landing_d != kv_landing_e, (
+        f"Arm D (observation_domain='post_rope_only') and Arm E (observation_domain="
+        f"'union') produced IDENTICAL kv_landing at {behavior_key} despite declaring "
+        f"different observation_domain labels -- the E->D delta the label claims to "
+        f"isolate has no effect on the actual computed scale, so an arm could compute "
+        f"the WRONG domain while still reporting the RIGHT label and the assertions "
+        f"above would not notice"
+    )
+
+
+# ==============================================================================
+# Cell 8 -- Calibration/evaluation population disjointness
+# (§31.4.4 row 8, new round 5, D-SLM2557; §31.4.1)
+# ==============================================================================
+
+def test_calibration_and_grading_populations_must_not_overlap():
+    """§31.4.4 row 8: "No document ID in the 30-document held-out-reserve calibration
+    population collides with any document ID in the 239-document `tuned_on` grading
+    corpus -- a test constructs one collision and asserts the grading tool refuses to
+    emit a verdict, reusing T-1870 §9.3's own mechanism." (source: §31.4.1, D-SLM2557.)
+
+    Originally RED via the absent contract symbol; the build has since landed and this
+    cell now runs green against the real, shipped `check_calibration_eval_disjoint`.
+    """
+    check_calibration_eval_disjoint, overlap_error = api(
+        MODULE, "check_calibration_eval_disjoint", "CalibrationPopulationOverlap")
+    calibration_ids = [f"held_out_{i}" for i in range(30)]
+    eval_ids = [f"tuned_on_{i}" for i in range(239)]
+    eval_ids[100] = calibration_ids[5]  # the constructed collision
+
+    with pytest.raises(overlap_error) as excinfo:
+        check_calibration_eval_disjoint(calibration_ids, eval_ids)
+    assert calibration_ids[5] in str(excinfo.value), (
+        "the refusal must name the colliding document ID, not merely report that a "
+        "collision occurred"
+    )
+
+    # Negative companion: a genuinely disjoint pair must NOT be refused.
+    eval_ids_clean = [f"tuned_on_{i}" for i in range(239)]
+    check_calibration_eval_disjoint(calibration_ids, eval_ids_clean)  # must not raise
+
+
+# ==============================================================================
+# Cell 9 -- Arithmetic distinctness gate (§31.4.4 row 9; D-SLM2345; §31.4.3)
+# ==============================================================================
+
+def test_arithmetic_corpus_distinctness_gate_refuses_a_duplicate_semantic_key():
+    """§31.4.4 row 9: "The grading tool refuses a corpus manifest containing two problems
+    with the same `(operation, operand_tuple)` key; a test constructs one collision and
+    asserts refusal." (source: D-SLM2345; §31.4.3.)
+
+    D-SLM2345's own kill: 8 of 13 phrasings collapsed to 2 semantic keys undetected. The
+    fixture reproduces exactly that shape at small scale -- two DIFFERENT phrasings of
+    `12+15` (`"12+15="`, `"What is 12 plus 15?"`), same `("+", (12, 15))` key. Originally
+    RED via the absent contract symbol; the build has since landed and this cell now runs
+    green against the real, shipped `check_arithmetic_corpus_distinct`.
+    """
+    check_arithmetic_corpus_distinct, duplicate_error = api(
+        MODULE, "check_arithmetic_corpus_distinct", "DuplicateArithmeticProblem")
+    problems = [
+        {"prompt": "12+15=", "operation": "+", "operand_tuple": (12, 15), "ground_truth": 27},
+        {"prompt": "What is 12 plus 15?", "operation": "+", "operand_tuple": (12, 15), "ground_truth": 27},
+        {"prompt": "17*23=", "operation": "*", "operand_tuple": (17, 23), "ground_truth": 391},
+    ]
+    with pytest.raises(duplicate_error) as excinfo:
+        check_arithmetic_corpus_distinct(problems)
+    assert "('+', (12, 15))" in str(excinfo.value) or "(12, 15)" in str(excinfo.value), (
+        "the refusal must name the colliding semantic-identity key"
+    )
+
+    # Negative companion: three genuinely distinct problems must NOT be refused.
+    distinct_problems = [
+        {"prompt": "12+15=", "operation": "+", "operand_tuple": (12, 15), "ground_truth": 27},
+        {"prompt": "17*23=", "operation": "*", "operand_tuple": (17, 23), "ground_truth": 391},
+        {"prompt": "40-9=", "operation": "-", "operand_tuple": (40, 9), "ground_truth": 31},
+    ]
+    check_arithmetic_corpus_distinct(distinct_problems)  # must not raise
+
+
+# ==============================================================================
+# Cell 10 -- Truth/float-agreement separation (§31.4.4 row 10; D-SLM2346; §31.4.2)
+# ==============================================================================
+
+def test_truth_correct_and_float_agreement_are_independent_and_can_disagree():
+    """§31.4.4 row 10: "The arithmetic report carries two distinct columns
+    (truth-correct, float-agreement) for every problem and every arm, never merged; a
+    test asserts both columns are present and independently computed." (source:
+    D-SLM2346; §31.4.2.)
+
+    D-SLM2346's own finding: "correcting toward the reference" and "getting the right
+    answer" are not the same claim -- on two of T-1891's own discordant items, the FLOAT
+    REFERENCE ITSELF answered wrong. The fixture reproduces exactly that shape: one
+    problem where the model's answer matches the float reference's answer (agreement)
+    but the float reference itself is wrong against ground truth (not correct) -- a
+    single merged column could not represent this case at all. Originally RED via the
+    absent contract symbol; the build has since landed and this cell now runs green
+    against the real, shipped `grade_arithmetic_report`.
+    """
+    grade_arithmetic_report = api(MODULE, "grade_arithmetic_report")
+    problems = [
+        {"problem_id": "p1", "operation": "+", "operand_tuple": (12, 15), "ground_truth": 27},
+        {"problem_id": "p2", "operation": "*", "operand_tuple": (17, 23), "ground_truth": 391},
+    ]
+    # p1: float reference is WRONG (26, not 27); model agrees with the (wrong) float
+    # reference. p2: both float reference and model are correct.
+    model_answers = {"p1": 26, "p2": 391}
+    float_answers = {"p1": 26, "p2": 391}
+
+    report = grade_arithmetic_report(problems, model_answers, float_answers)
+    by_id = {row["problem_id"]: row for row in report}
+
+    assert set(by_id["p1"].keys()) >= {"problem_id", "truth_correct", "float_agreement"}
+    assert by_id["p1"]["truth_correct"] is False, "p1's model answer (26) does not match ground truth (27)"
+    assert by_id["p1"]["float_agreement"] is True, "p1's model answer (26) matches the float reference's own (26)"
+    assert by_id["p1"]["truth_correct"] != by_id["p1"]["float_agreement"], (
+        "the fixture's whole point is a case where truth-correct and float-agreement "
+        "DISAGREE -- a merged single column could not represent p1 at all"
+    )
+    assert by_id["p2"]["truth_correct"] is True
+    assert by_id["p2"]["float_agreement"] is True
+
+
+# ==============================================================================
+# Cell 11 -- Artifact metadata / calibration-policy marker
+# (§31.4.4 row 11, new, T-1897 C17/D-SLM2369; §31.4.1's fourth dependent constant)
+# ==============================================================================
+
+def test_kv_calibration_provenance_field_exists_on_quantized_model():
+    """§31.4.4 row 11: "A per-head-calibrated artifact's (Arm C, D, or E)
+    `Provenance`/`Calibration` section carries a policy marker identifying its own
+    calibration policy (union vs. post-RoPE-only) and ordering, distinguishable from a
+    legacy-union-calibrated artifact and from each other; a test omits the marker and
+    asserts the cell then fails to distinguish the builds." (source: §31.4.1's fourth
+    dependent constant.)
+
+    Renamed from `..._is_absent_from_quantized_model` (T-1936 §5.6/finding 6, Minor):
+    that name was correct only while the field genuinely did not exist. The build round
+    (T-1934) added `kv_calibration_provenance` to `QuantizedModel`
+    (`pipeline.py:842-882`), so the helper's own `build()` now SUCCEEDS instead of
+    raising, and the test as previously named asserted nothing explicitly on the result --
+    a presence pin wearing an absence name. The helper (renamed `_expect_field_settable`,
+    T-1939 §5.4/D-SLM2643, Minor -- it was still `_expect_absent_field` when this
+    paragraph was first written) still converts a `TypeError` into a red-unimplemented
+    `AssertionError`, so this cell stays vital against a REGRESSION that removes the
+    field; what changed is the name and the explicit assertion below, not the underlying
+    discipline.
+
+    Pins presence via `dataclasses.replace` -- the same construction `with_rope_tables`
+    (`pipeline.py:906-913`) already uses for every other post-build field change on this
+    frozen dataclass -- and asserts the built model actually carries the value passed in,
+    not merely that construction did not raise.
+    """
+    pipeline = require(MODULE)
+    cfg = fixture_config(pipeline)
+    model = pipeline.fixture_model(cfg)
+    provenance = {"layer0": {"arm": "D", "ordering": "fused",
+                              "observation_domain": "post_rope_only"}}
+
+    def build():
+        return dataclasses.replace(model, kv_calibration_provenance=provenance)
+
+    built = _expect_field_settable(
+        build, field="QuantizedModel.kv_calibration_provenance",
+        why="regression guard -- the build round added this field; a TypeError here "
+            "means it was removed again",
+    )
+    assert built.kv_calibration_provenance == provenance, (
+        "QuantizedModel.kv_calibration_provenance did not carry the value passed to "
+        "dataclasses.replace -- the field exists but does not hold what was set"
+    )
+
+
+def test_kv_calibration_provenance_round_trips_through_save_and_load_artifact(tmp_path):
+    """The provenance marker's own point is to survive to a LOADED artifact, distinct
+    across two builds that differ only in calibration policy -- otherwise a later reader
+    (an auditor, or a re-derivation check) cannot tell which policy built a given saved
+    artifact apart from re-running the whole calibration.
+
+    At this suite's original authoring, `save_artifact`'s own metadata dict
+    (`artifact_cache.py:328-341`) had no `kv_calibration_provenance` key, and
+    `load_artifact`'s own `QuantizedModel(...)` reconstruction (`artifact_cache.py:588-599`)
+    had no matching kwarg -- so even a model carrying the field in memory would have
+    silently lost it on a round trip, a second, independent gap from cell 11's own field-
+    existence precondition above. The build round wired both the write side
+    (`artifact_cache.py:336-350`) and the reconstruction side (`artifact_cache.py:565-625`):
+    this cell now runs green as a standing regression pin on the round trip, not merely on
+    field existence (T-1939 §5.4/D-SLM2643, Minor -- this paragraph previously still
+    claimed the round-trip gap as an open RED precondition after the build closed it).
+    """
+    pipeline = require(MODULE)
+    save_artifact, load_artifact = api(ARTIFACT_MODULE, "save_artifact", "load_artifact")
+    cfg = fixture_config(pipeline)
+    model = pipeline.fixture_model(cfg)
+
+    def build_d():
+        return dataclasses.replace(
+            model, kv_calibration_provenance={"layer0": {"arm": "D", "ordering": "fused",
+                                                           "observation_domain": "post_rope_only"}})
+
+    def build_e():
+        return dataclasses.replace(
+            model, kv_calibration_provenance={"layer0": {"arm": "E", "ordering": "fused",
+                                                           "observation_domain": "union"}})
+
+    model_d = _expect_field_settable(
+        build_d, field="QuantizedModel.kv_calibration_provenance",
+        why="regression guard -- the build round added this field; a TypeError here "
+            "means it was removed again")
+    model_e = _expect_field_settable(
+        build_e, field="QuantizedModel.kv_calibration_provenance",
+        why="regression guard -- the build round added this field; a TypeError here "
+            "means it was removed again")
+
+    save_artifact(model_d, tmp_path / "arm_d")
+    save_artifact(model_e, tmp_path / "arm_e")
+    loaded_d = load_artifact(tmp_path / "arm_d")
+    loaded_e = load_artifact(tmp_path / "arm_e")
+
+    assert loaded_d.kv_calibration_provenance == model_d.kv_calibration_provenance, (
+        "the provenance marker did not survive a save/load round trip"
+    )
+    assert loaded_d.kv_calibration_provenance != loaded_e.kv_calibration_provenance, (
+        "two builds with different calibration policies produced INDISTINGUISHABLE "
+        "loaded provenance -- the marker cannot tell the builds apart, which is the "
+        "whole point of this cell"
+    )
+
+
+# ==============================================================================
+# T-1935 -- pin owed by T-1934's own build log §6: `_compute_fingerprint`
+# (`artifact_cache.py`) hashes `kv_calibration_provenance`, but no cell above checks
+# the FINGERPRINT VALUE for a provenance-carrying build -- the round-trip test above
+# (cell 11) only checks field equality after load, never `manifest.json`'s own
+# `source_fingerprint`. Per the field's own stated purpose ("distinguishable... from
+# each other", `QuantizedModel`'s own docstring), two builds differing only in
+# `kv_calibration_provenance` must fingerprint differently; without the hashing this
+# build landed, they would not.
+# ==============================================================================
+
+def test_source_fingerprint_differs_when_only_kv_calibration_provenance_differs(tmp_path):
+    """Mutation pin for T-1934's pin-owed item (`Claude/Brunel/t1934-armd-arme-build-
+    2026-08-11.md` §6): `_compute_fingerprint` (`artifact_cache.py`) hashes
+    `model.kv_calibration_provenance`, so two `QuantizedModel`s that differ ONLY in that
+    field produce DIFFERENT `manifest.json` `source_fingerprint` values from
+    `save_artifact`.
+
+    Isolates the condition the way cell 11's round-trip test does not: `model_d` and
+    `model_e` are both `dataclasses.replace(model, kv_calibration_provenance=...)` from
+    the SAME base fixture model, so every other field (weights, scales, config, rope
+    tables, biases) is identical between them -- the fingerprint's own determinism
+    property (same model twice -> same hash, `test_artifact_cache.py`'s own
+    `test_the_manifest_carries_the_format_version_and_source_fingerprint`) rules out
+    every other field as the source of a divergence, isolating provenance as the one
+    variable under test.
+
+    If `_compute_fingerprint`'s hashing of `kv_calibration_provenance` is removed, this
+    test goes RED: `manifest_d["source_fingerprint"] == manifest_e["source_fingerprint"]`,
+    because nothing else differs between `model_d` and `model_e`. Confirmed by executing
+    the mutation (removing the `for key in sorted(model.kv_calibration_provenance.keys())`
+    block from `_compute_fingerprint`) -- see `Claude/Curie/t1933-armd-arme-red-suite-
+    2026-08-11.md`'s T-1935 addendum for the quoted red output. Reverted before commit.
+    """
+    save_artifact = api(ARTIFACT_MODULE, "save_artifact")
+    pipeline = require(MODULE)
+    cfg = fixture_config(pipeline)
+    model = pipeline.fixture_model(cfg)
+
+    model_d = dataclasses.replace(
+        model, kv_calibration_provenance={"layer0": {"arm": "D", "ordering": "fused",
+                                                       "observation_domain": "post_rope_only"}})
+    model_e = dataclasses.replace(
+        model, kv_calibration_provenance={"layer0": {"arm": "E", "ordering": "fused",
+                                                       "observation_domain": "union"}})
+
+    path_d = tmp_path / "arm_d"
+    path_e = tmp_path / "arm_e"
+    save_artifact(model_d, path_d)
+    save_artifact(model_e, path_e)
+
+    manifest_d = json.loads((path_d / "manifest.json").read_text())
+    manifest_e = json.loads((path_e / "manifest.json").read_text())
+
+    assert manifest_d["source_fingerprint"] != manifest_e["source_fingerprint"], (
+        "two QuantizedModels differing ONLY in kv_calibration_provenance produced the "
+        "SAME source_fingerprint -- the fingerprint is not sensitive to the provenance "
+        "field, so a per-head-calibrated build (Arm D) and a differently-calibrated "
+        "build (Arm E) saved from otherwise-identical model state would be silently "
+        "indistinguishable by fingerprint alone"
+    )
+
+
+# ==============================================================================
+# T-1940 addendum -- Q-scale equality pin extended to every layer
+# (T-1939 §5.2, Significant, D-SLM2639/D-SLM2643; confirmation review of T-1937's
+# production-fix round)
+# ==============================================================================
+
+def test_arm_d_q_scale_matches_shipped_production_q_path_at_every_layer():
+    """T-1939 §5.2 (Significant), as it stands since `3cb010510e`: this test and its
+    sibling `test_arm_d_q_scale_matches_the_shipped_production_q_path`
+    (`Tools/superslm_spike/tests/test_t1937_production_fix_pins.py`) are BOTH every-layer
+    pins of the equality between Arm D/E's own captured Q scale and the shipped
+    `_derive_scales` Q-scale chain. T-2607 corrects both walks to observe the raw
+    post-projection Q landing domain once: this test's equality remains the proof that
+    Arm D/E quantize Q against the same raw-Q scale the artifact ships.  The loop below
+    preserves that equality for every layer, including the layers where a foreign
+    post-QK-norm/post-RoPE observation previously enlarged the raw-Q maximum.
+
+    Before `3cb010510e` the sibling pin checked `"layer0"` only, a scope T-1939 §5.2
+    showed cannot fail on the dropped-pre-RoPE defect it exists to catch (on that
+    fixture the pre- and post-RoPE observations coincide at layer0 and differ at
+    layer1); the sibling now loops over `range(cfg.num_hidden_layers)`, identically to
+    this test. That sibling file is outside T-1940's own writable scope (this suite's
+    own file is `test_armd_arme_kv_calibration.py`; the flagged pin lives in
+    `test_t1937_production_fix_pins.py`, authored and owned by a different round --
+    T-1933's own casebook already states "no T-1937 pin file" among what this suite's
+    rounds do not touch). This test closes the coverage gap at the SUITE level instead
+    of editing that file: it re-derives the identical equality the sibling pin states,
+    looping over every layer, so the full suite discriminates a divergence between the
+    capture and production raw-Q scales regardless of which file's pin catches it.
+    """
+    pipeline = require(MODULE)
+    cfg = fixture_config(pipeline)
+    weights, weight_scales, floats = pipeline._pinned_weights(cfg)
+    float_weight = pipeline._dict_float_source(floats)
+    records = pipeline.calibration_records()
+    tokenize = pipeline._fixture_tokenize_prompt(cfg)
+    record_tokenize = pipeline._bridge_record_tokenizer(tokenize)
+
+    shipped_maxima = pipeline._calibrate(cfg, float_weight, records, record_tokenize)
+    capture, capture_maxima = pipeline._kv_calibration_capture(
+        cfg, float_weight, records, record_tokenize)
+
+    for layer in range(cfg.num_hidden_layers):
+        prefix = f"layer{layer}"
+        shipped_attn_norm_scale = pipeline._attn_norm_scale(shipped_maxima, weight_scales, prefix)
+        shipped_q_scale = pipeline._projection_scale(
+            shipped_maxima, weight_scales, f"{prefix}.q", f"{prefix}.q_proj", shipped_attn_norm_scale)
+        built_q_scale = pipeline._layer_q_scale(capture_maxima, weight_scales, prefix)
+        assert built_q_scale == pytest.approx(shipped_q_scale, rel=1e-9), (
+            f"Arm D/E's own Q-scale at {prefix} ({built_q_scale}) must equal the shipped "
+            f"production `projection_scale` chain ({shipped_q_scale}) -- a divergence "
+            f"here means the sweep is quantizing Q against a different scale than the "
+            f"artifact will ship"
+        )
+
+
+# ==============================================================================
+# T-2572 (D-SLM6263, external review `Claude/External/superslm-1p4p0-2026-09-02.md` Minor
+# 2): `calibrate_kv_landing_arm` labels a post-norm capture under raw-K keys for a QK-norm
+# checkpoint and emits no `k_normed_head{h}` entry the 1.4.0 loader requires. Closure:
+# reject a QK-norm configuration explicitly, by name, until the per-head policy schema
+# carries both domains.
+# ==============================================================================
+
+def test_calibrate_kv_landing_arm_c_rejects_a_qk_norm_checkpoint_by_name():
+    """Arm C, driven through the repository's own two-layer QK-norm fixture (this file's
+    `fixture_config` -- identical shape to `test_ask5_trackb_oracle_qk_norm_parity.py`'s
+    own `_fixture_config`, and carries non-uniform `q_norm`/`k_norm` gains unconditionally,
+    T-2539) -- must raise `CalibrationArmDoesNotSupportQkNorm` by name, naming the QK-norm
+    layers, rather than silently emitting raw-K-keyed entries derived from post-norm data.
+    """
+    pipeline = require(MODULE)
+    cfg = fixture_config(pipeline)
+    _, _, floats = pipeline._pinned_weights(cfg)
+    float_weight = pipeline._dict_float_source(floats)
+    records = pipeline.calibration_records()
+    tokenize = pipeline._fixture_tokenize_prompt(cfg)
+
+    assert hasattr(pipeline, "CalibrationArmDoesNotSupportQkNorm"), (
+        "red-unimplemented: pipeline.CalibrationArmDoesNotSupportQkNorm does not exist"
+    )
+    with pytest.raises(pipeline.CalibrationArmDoesNotSupportQkNorm) as excinfo:
+        pipeline.calibrate_kv_landing_arm(cfg, float_weight, records, tokenize, arm="C")
+    message = str(excinfo.value)
+    assert "[0, 1]" in message, (
+        f"the rejection must name the QK-norm-carrying layer indices; got: {message!r}"
+    )
+
+
+@pytest.mark.parametrize("arm", ["D", "E"])
+def test_calibrate_kv_landing_arm_d_e_also_reject_a_qk_norm_checkpoint_by_name(arm):
+    """The same rejection, for Arms D and E -- Minor 2's own finding names "Arms C/D/E"
+    collectively (`calibrate_kv_landing_arm`'s single QK-norm-presence check, added ahead
+    of the granularity branch, covers every arm identically rather than one at a time)."""
+    pipeline = require(MODULE)
+    cfg = fixture_config(pipeline)
+    _, _, floats = pipeline._pinned_weights(cfg)
+    float_weight = pipeline._dict_float_source(floats)
+    records = pipeline.calibration_records()
+    tokenize = pipeline._fixture_tokenize_prompt(cfg)
+
+    with pytest.raises(pipeline.CalibrationArmDoesNotSupportQkNorm):
+        pipeline.calibrate_kv_landing_arm(cfg, float_weight, records, tokenize, arm=arm)
+
+
+def test_calibrate_kv_landing_arm_c_still_accepts_a_non_qk_norm_checkpoint():
+    """Must-accept, twinned with the must-reject above: the SAME two-layer fixture geometry
+    with `q_norm.gain`/`k_norm.gain` stripped (the identical stripping
+    `test_ask5_trackb_oracle_qk_norm_parity.py`'s own `_without_qk_norm` performs) must NOT
+    raise -- the rejection is scoped to QK-norm presence, not to this arm becoming
+    permanently unusable. This is also the exact fixture
+    `tests/fixtures/t2572_arm_c_non_qknorm_fixture.sslm` (generated this round from this
+    identical stripped model, via the real converter `convert_model.build_sections`) was
+    built from -- `TestT2572_M2_MarshalLayerAcceptsArmCsNonQkNormOutput` (test_main.cpp)
+    marshals that artifact's own kv_landing_reciprocals/composition_constants entries
+    through the real C++ `MarshalLayer`, the end-to-end half key-presence tests alone do
+    not reach.
+    """
+    pipeline = require(MODULE)
+    cfg = fixture_config(pipeline)
+    _, _, floats_with = pipeline._pinned_weights(cfg)
+    floats_without = dict(floats_with)
+    for layer in range(cfg.num_hidden_layers):
+        floats_without.pop(f"layer{layer}.q_norm.gain", None)
+        floats_without.pop(f"layer{layer}.k_norm.gain", None)
+    float_weight = pipeline._dict_float_source(floats_without)
+    records = pipeline.calibration_records()
+    tokenize = pipeline._fixture_tokenize_prompt(cfg)
+
+    result = pipeline.calibrate_kv_landing_arm(cfg, float_weight, records, tokenize, arm="C")
+    assert sorted(result["kv_landing"].keys()) == [
+        "layer0.k_head0", "layer0.k_head1", "layer1.k_head0", "layer1.k_head1",
+    ], (
+        "Arm C's own kv_landing key set changed shape on a non-QK-norm checkpoint -- the "
+        "must-accept side of this policy is no longer producing what MarshalLayer expects"
+    )
+    assert sorted(result["softmax_khead"].keys()) == [
+        "layer0.softmax_khead0", "layer0.softmax_khead1",
+        "layer1.softmax_khead0", "layer1.softmax_khead1",
+    ]
+    assert not any(".k_normed_head" in key for key in result["kv_landing"]), (
+        "a non-QK-norm checkpoint must never emit a k_normed_head{h} entry"
+    )
+
+
+# ==============================================================================
+# T-2606 round 2 (Poirot e6a07d8-t2608-k-calibration-review.md, S-1): the Q-scale
+# equality cells above run on this suite's own `_pinned_weights` fixture, which carries
+# `q_norm.gain`/`k_norm.gain` unconditionally (T-2539) -- a fixture on which
+# `_kv_calibration_capture`'s conditional post-RoPE raw-Q observation
+# (pipeline.py:2680-2681) never executes. Arms C/D/E reject a QK-norm checkpoint before
+# the capture runs (pipeline.py:2856-2870), so the non-QK-norm branch IS the capture's
+# entire production population, and deleting it moved the shipped Arm D/E Q scale
+# (Poirot's own measurement: Q maximum 0.07798804709462445 -> 0.07126088591358645, Q
+# scale 0.0006140791109812949 -> 0.0005611093379022555) while every then-touched test
+# stayed green. These cells run the identical equality on the converter's real legacy
+# non-QK-norm fixture -- `_calibrate_checkpoint_fixture.build_fixture_checkpoint`, the
+# same construction repair 1's legacy class case and the base-engine golden use -- and
+# pin it with the capture-only deletion mutant.
+# ==============================================================================
+
+
+def _legacy_checkpoint_model(pipeline, tmp_path):
+    """The converter's real legacy (Qwen2-shaped, non-QK-norm) on-disk checkpoint, loaded
+    through the same `pipeline.load_model` the converter's CLI uses."""
+    import _calibrate_checkpoint_fixture as fixture_mod
+    return pipeline.load_model(fixture_mod.build_fixture_checkpoint(tmp_path / "legacy"))
+
+
+def test_arm_d_q_scale_matches_the_shipped_production_q_path_on_the_legacy_checkpoint(tmp_path):
+    """The S-1 half in this suite: on the converter's real legacy non-QK-norm fixture,
+    Arm D/E's own Q-scale (`_layer_q_scale`, over `_kv_calibration_capture`'s own
+    `maxima`) must equal the shipped per-layer `projection_scale` chain at EVERY layer,
+    over the identical calibration corpus and weights -- both walks observing the same
+    raw-projection-plus-RoPE-image union (`_float_layer` conditionally at
+    pipeline.py:3215-3217, the capture conditionally at :2680-2681). A capture that
+    drops the post-RoPE half of the union ships a sweep that quantizes Q against a scale
+    the artifact does not execute -- the exact divergence the deletion-mutant cell below
+    turns red."""
+    pipeline = require(MODULE)
+    legacy = _legacy_checkpoint_model(pipeline, tmp_path)
+    cfg = legacy.config
+    float_weight = legacy.float_source
+    weight_scales = pipeline._weight_scales_from_float_source(cfg, float_weight)
+    records = pipeline.calibration_records()
+    record_tokenize = pipeline._bridge_record_tokenizer(legacy.tokenize_prompt)
+
+    shipped_maxima = pipeline._calibrate(cfg, float_weight, records, record_tokenize)
+    capture, capture_maxima = pipeline._kv_calibration_capture(
+        cfg, float_weight, records, record_tokenize)
+
+    for layer in range(cfg.num_hidden_layers):
+        prefix = f"layer{layer}"
+        shipped_attn_norm_scale = pipeline._attn_norm_scale(shipped_maxima, weight_scales, prefix)
+        shipped_q_scale = pipeline._projection_scale(
+            shipped_maxima, weight_scales, f"{prefix}.q", f"{prefix}.q_proj", shipped_attn_norm_scale)
+        built_q_scale = pipeline._layer_q_scale(capture_maxima, weight_scales, prefix)
+        assert built_q_scale == pytest.approx(shipped_q_scale, rel=1e-9), (
+            f"{prefix}: Arm D/E's own Q-scale on the legacy non-QK-norm checkpoint "
+            f"({built_q_scale}) must equal the shipped production `projection_scale` "
+            f"chain ({shipped_q_scale}) -- a divergence here means the sweep is "
+            f"quantizing Q against a different scale than the artifact will ship"
+        )
+
+
+def _load_mutant_pipeline(transform, tmp_path):
+    """A MUTATED copy of pipeline.py loaded as an isolated module in tmp_path, never
+    committed, never touching the imported module (inlined from
+    test_t2606_calibration_key_domains.py's own `_load_mutant` per this suite's
+    no-cross-module-imports convention)."""
+    pipeline = require(MODULE)
+    real_path = conftest.TOOLS_DIR / "reference_pipeline" / "pipeline.py"
+    real_source = real_path.read_text(encoding="utf-8")
+    mutated = transform(real_source)
+    assert mutated != real_source, "sanity: the transform must actually change the source"
+    mutant_path = tmp_path / "pipeline_mutant.py"
+    mutant_path.write_text(mutated, encoding="utf-8")
+    module_name = f"_armd_pipeline_mutant_{id(mutant_path)}"
+    spec = importlib.util.spec_from_file_location(module_name, mutant_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+    module.CALIBRATION_CORPUS_PATH = pipeline.CALIBRATION_CORPUS_PATH
+    return module
+
+
+def _remove_capture_post_rope_q_observation(text):
+    """Delete `_kv_calibration_capture`'s conditional post-RoPE raw-Q observation
+    (pipeline.py:2680-2681) -- the capture-only half of the non-QK-norm repair, and the
+    branch Arms C/D/E's production population executes. `_float_layer`'s own
+    conditional union at :3215-3217 must survive: this mutant deletes the capture branch
+    only, the exact deletion Poirot's S-1 executed."""
+    anchor = (
+        "            # Arm C/D/E's production callers reject QK-norm checkpoints, so their raw-Q\n"
+        "            # landing grid is the same pre-/post-RoPE union that the legacy engine stores.\n"
+        "            # Keep that union conditional nevertheless: this shared walk can execute a\n"
+        "            # QK-norm fixture, where q_rope is a foreign, post-norm domain.\n"
+        "            if not _has_qk_norm(tensors, prefix):\n"
+        "                _observe(maxima, f\"{prefix}.q\", q_rope)\n"
+    )
+    assert text.count(anchor) == 1, (
+        "sanity: the capture's conditional post-RoPE Q observation must match verbatim, once"
+    )
+    mutated = text.replace(
+        anchor,
+        "            # T-2606 round-2 mutant: capture post-RoPE Q observation deleted\n",
+        1,
+    )
+    assert '                _observe(maxima, f"{prefix}.q", q_rope)\n' not in mutated, (
+        "sanity: the mutant must remove the capture's post-RoPE Q observation entirely"
+    )
+    layer_start = mutated.index("def _float_layer(")
+    layer_end = mutated.find("\ndef ", layer_start)
+    assert layer_end != -1, "sanity: `_float_layer` must be followed by another top-level function"
+    assert mutated[layer_start:layer_end].count("    if not _has_qk_norm(tensors, prefix):\n") == 1, (
+        "sanity: _float_layer's own non-QK-norm conditional must survive -- the mutant "
+        "deletes the capture branch only"
+    )
+    return mutated
+
+
+def test_the_legacy_q_scale_equality_rejects_the_capture_post_rope_deletion_mutant(tmp_path):
+    """The S-1 proof in this suite: with only `_kv_calibration_capture`'s conditional
+    post-RoPE raw-Q observation deleted, the equality cell above goes RED on the legacy
+    fixture -- the capture's `maxima[q]` loses the RoPE half of its union, so
+    `_layer_q_scale` builds a Q scale the shipped `_derive_scales` chain (whose own
+    union, in `_float_layer`, the mutant leaves intact) does not match. This is the
+    cell Poirot's review found missing: under this deletion every then-touched test
+    stayed green."""
+    mutant = _load_mutant_pipeline(_remove_capture_post_rope_q_observation, tmp_path)
+    legacy = _legacy_checkpoint_model(mutant, tmp_path)
+    cfg = legacy.config
+    float_weight = legacy.float_source
+    weight_scales = mutant._weight_scales_from_float_source(cfg, float_weight)
+    records = mutant.calibration_records()
+    record_tokenize = mutant._bridge_record_tokenizer(legacy.tokenize_prompt)
+
+    shipped_maxima = mutant._calibrate(cfg, float_weight, records, record_tokenize)
+    capture, capture_maxima = mutant._kv_calibration_capture(
+        cfg, float_weight, records, record_tokenize)
+
+    with pytest.raises(AssertionError, match="quantizing Q against a different scale"):
+        for layer in range(cfg.num_hidden_layers):
+            prefix = f"layer{layer}"
+            shipped_attn_norm_scale = mutant._attn_norm_scale(
+                shipped_maxima, weight_scales, prefix)
+            shipped_q_scale = mutant._projection_scale(
+                shipped_maxima, weight_scales, f"{prefix}.q", f"{prefix}.q_proj",
+                shipped_attn_norm_scale)
+            built_q_scale = mutant._layer_q_scale(capture_maxima, weight_scales, prefix)
+            assert built_q_scale == pytest.approx(shipped_q_scale, rel=1e-9), (
+                f"{prefix}: Arm D/E's own Q-scale on the legacy non-QK-norm checkpoint "
+                f"({built_q_scale}) must equal the shipped production `projection_scale` "
+                f"chain ({shipped_q_scale}) -- a divergence here means the sweep is "
+                f"quantizing Q against a different scale than the artifact will ship"
+            )

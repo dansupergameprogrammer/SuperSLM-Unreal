@@ -1,0 +1,35 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0.0",
+	"FriendlyName": "SuperSLM MCP Toolset",
+	"Description": "MCP tools over SuperSLM: describe models, run the conversion pre-check, inspect sequences, report calibration, and run schema-constrained inference over project data: a read source (a UDataTable column, or prompts) and a pluggable, transactional, undoable write sink (UDataTable rows), all on local hardware. Builds against the engine's Experimental ToolsetRegistry plugin; an MCP client reaches the tools through the engine's Experimental ModelContextProtocol plugin, enabled in your project (in practice, both need a GitHub-source engine build).",
+	"Category": "AI",
+	"CreatedBy": "RageQuitDan",
+	"CreatedByURL": "",
+	"DocsURL": "https://github.com/dansupergameprogrammer/SuperSLM-Unreal",
+	"MarketplaceURL": "",
+	"SupportURL": "https://github.com/dansupergameprogrammer/SuperSLM-Unreal/issues",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": true,
+	"Installed": false,
+	"EnabledByDefault": false,
+	"Modules": [
+		{
+			"Name": "SuperSLMUnrealMCP",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "ToolsetRegistry",
+			"Enabled": true
+		},
+		{
+			"Name": "SuperSLMUnreal",
+			"Enabled": true
+		}
+	]
+}

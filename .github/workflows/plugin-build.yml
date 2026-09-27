@@ -1,0 +1,119 @@
+# PREREQUISITE: READ BEFORE DISPATCHING THIS WORKFLOW
+#
+# Every job here needs a SELF-HOSTED Windows runner with Unreal Engine 5.8 installed, registered
+# with the labels `self-hosted`, `windows`, `unreal`. GitHub's hosted runners do not offer Unreal
+# Engine, and faking a build on one would defeat the purpose of this workflow, which is to catch
+# a break that hosted CI cannot see.
+#
+# To provision the runner:
+#   1. Install Unreal Engine 5.8 on the host.
+#   2. Set the machine-level environment variable UE_ROOT to the engine directory (the folder
+#      that contains `Engine\Build\BatchFiles`).
+#   3. Install the GitHub Actions self-hosted runner and register it with the labels
+#      self-hosted, windows, unreal.
+#   4. Give the runner account a scratch directory with several GB free.
+#   5. For the GPU tests, the host needs a D3D12 GPU. Without one, the GPU tests report that no
+#      device is available.
+#   6. Set the test-input variables CONTRIBUTING.md lists (Testing, Test inputs) as machine-level
+#      environment variables the runner account sees: SUPERSLM_ARTIFACTS_DIR (the release asset),
+#      SUPERSLM_HF_CACHE (the Hugging Face snapshots and the unpublished models; without them
+#      the tests that need them fail by name). SUPERSLM_BUILD_ROOT is not needed here: no
+#      workflow runs Plugins/SuperSLMUnreal/ci/tests; it is for running that suite by hand
+#      (CONTRIBUTING.md).
+#   7. Import the release asset into ExampleProject as /Game/SuperSLMExample/ExampleModel, or set
+#      SUPERSLM_EXAMPLE_MODEL_FILE to it, for the example project's test.
+
+name: plugin-build
+
+# TRIGGER: manual only, deliberately. No runner answers these labels unless the maintainer has
+# provisioned one, and a push-triggered job would then wait forever: a gate that looks like it
+# runs and never does. The maintainer dispatches it when he chooses to run CI.
+on:
+  workflow_dispatch:
+
+env:
+  UPROJECT: ExampleProject/ExampleProject.uproject
+  PLUGIN_UPLUGIN: Plugins/SuperSLMUnreal/SuperSLMUnreal.uplugin
+  # The routine suite (CONTRIBUTING.md, Testing): every SuperSLM test and the example project's
+  # own test (SuperSLMExample), less the one test that needs editor rendering on the reference GPU
+  # (SuperSLM.L2S3.QueryWindow.GpuSliceDurationSweepWithRendering), which refuses by name under
+  # -nullrhi. The calibration groups (SuperSLM.U1.Calibration, SuperSLM.U1.Relevance) need an idle
+  # machine and are left out. CONTRIBUTING.md's command uses this same filter.
+  TEST_FILTER: SuperSLM.L2S0+SuperSLM.L2S1+SuperSLM.L2S2+SuperSLM.U1.Cpu+SuperSLM.U1.Gpu+SuperSLM.L2S3.AdapterSwitch+SuperSLM.L2S3.Blueprint+SuperSLM.L2S3.PreCheck+SuperSLM.L2S3.PromptResult+SuperSLM.L2S3.Query.+SuperSLM.L2S3.QueryWindow.Checkbox+SuperSLM.L2S3.QueryWindow.GpuQueryRunsWithinDrainBound+SuperSLM.L2S3.QueryWindow.InvariantHolds+SuperSLM.L2S3.MCP+SuperSLMExample
+
+jobs:
+  editor-build:
+    runs-on: [self-hosted, windows, unreal]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build Editor target (Development)
+        shell: pwsh
+        run: |
+          & "$env:UE_ROOT\Engine\Build\BatchFiles\Build.bat" `
+            ExampleProjectEditor Win64 Development `
+            -Project="$PWD\$env:UPROJECT" -WaitMutex
+          if ($LASTEXITCODE -ne 0) { throw "Editor build failed (exit $LASTEXITCODE)" }
+
+  automation-tests:
+    needs: editor-build
+    runs-on: [self-hosted, windows, unreal]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build Editor target (Development)
+        shell: pwsh
+        run: |
+          & "$env:UE_ROOT\Engine\Build\BatchFiles\Build.bat" `
+            ExampleProjectEditor Win64 Development `
+            -Project="$PWD\$env:UPROJECT" -WaitMutex
+          if ($LASTEXITCODE -ne 0) { throw "Editor build failed (exit $LASTEXITCODE)" }
+      - name: Run the automation suite (headless)
+        # Headless (-nullrhi): the GPU tests still run, because the GPU backend creates its own
+        # D3D12 device, separate from the engine's renderer. The one test that measures slices with
+        # the editor rendering is not in TEST_FILTER, because it refuses by name under -nullrhi.
+        shell: pwsh
+        run: |
+          $logPath = "$PWD\Saved\Logs\AutomationTests.log"
+          & "$env:UE_ROOT\Engine\Binaries\Win64\UnrealEditor-Cmd.exe" `
+            "$PWD\$env:UPROJECT" `
+            -ExecCmds="Automation RunTests $env:TEST_FILTER;Quit" `
+            -unattended -nopause -nullrhi -log="$logPath"
+          $exit = $LASTEXITCODE
+          if (Test-Path $logPath) { Get-Content $logPath }
+          if ($exit -ne 0) { throw "Automation test run failed (exit $exit)" }
+          $log = Get-Content $logPath -Raw
+          if ($log -notmatch "Automation Test Succeeded" -or $log -match "Automation Test Failed") {
+            throw "The $env:TEST_FILTER automation suite did not report a clean pass"
+          }
+
+  shipping-build:
+    # A Shipping compile catches what the Editor build's precompiled headers can mask, such as a
+    # missing include.
+    needs: editor-build
+    runs-on: [self-hosted, windows, unreal]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build Win64 Shipping
+        shell: pwsh
+        run: |
+          & "$env:UE_ROOT\Engine\Build\BatchFiles\Build.bat" `
+            ExampleProject Win64 Shipping `
+            -Project="$PWD\$env:UPROJECT" -WaitMutex
+          if ($LASTEXITCODE -ne 0) { throw "Shipping build failed (exit $LASTEXITCODE)" }
+
+  package-plugin:
+    needs: [automation-tests, shipping-build]
+    runs-on: [self-hosted, windows, unreal]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: RunUAT BuildPlugin
+        shell: pwsh
+        run: |
+          $out = "$env:RUNNER_TEMP\SuperSLMUnreal-package"
+          & "$env:UE_ROOT\Engine\Build\BatchFiles\RunUAT.bat" BuildPlugin `
+            -Plugin="$PWD\$env:PLUGIN_UPLUGIN" -Package="$out" -TargetPlatforms=Win64 -Rocket
+          if ($LASTEXITCODE -ne 0) { throw "RunUAT BuildPlugin failed (exit $LASTEXITCODE)" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: SuperSLMUnreal-packaged-plugin
+          path: ${{ runner.temp }}/SuperSLMUnreal-package
+          if-no-files-found: error

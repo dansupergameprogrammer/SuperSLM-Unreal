@@ -1,0 +1,110 @@
+name: release
+
+# Cuts the release tag from CI instead of by hand, so a tag can never disagree with the .uplugin
+# version or the CHANGELOG. Manual, on purpose: a release is a decision, not something that
+# fires on a push.
+#
+# Before dispatching:
+#   - set `VersionName` in SuperSLMUnreal.uplugin to the release version (and `IsBetaVersion`
+#     as intended);
+#   - date the top CHANGELOG.md entry (remove "Unreleased");
+#   - confirm private vulnerability reporting is enabled in the repository's security settings
+#     (SECURITY.md sends reports there);
+#   - merge to main.
+#
+# The release carries exactly two assets, and nothing else (no packaged plugin: the plugin ships as
+# source in this repository, and plugin-build.yml's `package-plugin` job is a CI check, not a
+# release artifact):
+#   - the example model artifact, named `qwen2.5-0.5b-instruct-cap4096.sslm` (the name README and
+#     GETTING_STARTED give; an upload keeps the file's own name, so the file must have it);
+#   - its licence, `qwen2.5-0.5b-instruct-cap4096-LICENSE.txt`: the attribution line
+#     "Qwen2.5-0.5B-Instruct by the Qwen team (Alibaba Cloud), Apache-2.0; converted and quantized
+#     (modified) by this project", then the line "Copyright 2024 Alibaba Cloud", a blank line,
+#     then this repository's LICENSE (Apache License 2.0).
+# After uploading, check both assets' names and sizes on the release, then download both and check
+# their SHA-256s against the files uploaded (the model's is in README).
+#
+# What this workflow does NOT do: build, convert or attach anything. The example model artifact is
+# converted separately.
+
+on:
+  workflow_dispatch: {}
+
+env:
+  PLUGIN_DIR: Plugins/SuperSLMUnreal
+  UPLUGIN: Plugins/SuperSLMUnreal/SuperSLMUnreal.uplugin
+  CHANGELOG: CHANGELOG.md
+  VENDORED_DIRS: Plugins/SuperSLMUnreal/Source/ThirdParty/SuperSLM
+  SUPERSLM_UPSTREAM: https://github.com/dansupergameprogrammer/SuperSLM.git
+
+permissions:
+  contents: write
+
+jobs:
+  cut-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.x"
+
+      - name: Refuse to release from anything but main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::dispatch release.yml on main (got $GITHUB_REF)"
+            exit 1
+          fi
+
+      - name: Coherence gate (must pass before a tag is cut)
+        run: |
+          args=""
+          for d in $VENDORED_DIRS; do
+            python .github/scripts/check_vendored_against_tag.py \
+              --vendored-dir "$d" --upstream "$SUPERSLM_UPSTREAM" \
+              --manifest-checker "$PLUGIN_DIR/ci/check_vendored_tree_matches_manifest.py"
+            args="$args --vendored-dir $d"
+          done
+          python "$PLUGIN_DIR/ci/check_vendored_wrappers_complete.py" --plugin-root "$PLUGIN_DIR"
+          python .github/scripts/check_version_identity.py \
+            --uplugin "$UPLUGIN" --changelog "$CHANGELOG" $args --allow-untagged --release
+
+      - name: Read the release version from the .uplugin
+        id: version
+        run: |
+          v=$(python -c "import json; print(json.load(open('$UPLUGIN'))['VersionName'])")
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to re-cut an existing tag
+        run: |
+          if git rev-parse -q --verify "refs/tags/v${{ steps.version.outputs.version }}" >/dev/null; then
+            echo "::error::tag v${{ steps.version.outputs.version }} already exists"
+            exit 1
+          fi
+
+      - name: Tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${{ steps.version.outputs.version }}" -m "SuperSLM-Unreal v${{ steps.version.outputs.version }}"
+          git push origin "v${{ steps.version.outputs.version }}"
+
+      - name: Version identity, tagged (the tag just cut must agree)
+        run: |
+          args=""
+          for d in $VENDORED_DIRS; do args="$args --vendored-dir $d"; done
+          python .github/scripts/check_version_identity.py \
+            --uplugin "$UPLUGIN" --changelog "$CHANGELOG" $args --release
+
+      - name: Release notes from CHANGELOG.md
+        run: python .github/scripts/changelog_notes.py "$CHANGELOG" > "$RUNNER_TEMP/release-notes.md"
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.version.outputs.version }}" \
+            --title "SuperSLM-Unreal v${{ steps.version.outputs.version }}" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"

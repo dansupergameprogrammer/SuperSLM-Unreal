@@ -1,0 +1,962 @@
+cmake_minimum_required(VERSION 3.16)
+project(superslm VERSION 1.9.0 LANGUAGES CXX)
+
+# C++20: the S-LoRA delta path is specified at -std=c++20 (SuperSLM_Plan.md §19),
+# and the core carries wide-integer (int64) composition arithmetic throughout. One
+# standard across the project avoids a later per-target split.
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# T-2115 (D-SLM3432): the versioned install surface (GNUInstallDirs for the
+# standard destination layout, CMakePackageConfigHelpers for the generated
+# find_package() config) needed by every install() rule below.
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+include(CTest)
+
+# T-2115 fix round (S1, Claude/Poirot/6f60491-t2115-cmake-product-surface.md):
+# the fixed, non-config-dependent install destination for the compiled GPU
+# shaders -- defined unconditionally (not only inside `if(TARGET
+# superslm_gpu)` below) so configure_package_config_file's PATH_VARS entry
+# for it always resolves, whether or not this configure actually built the
+# GPU target. Under CMAKE_INSTALL_DATADIR (GNUInstallDirs' own data-files
+# convention), not LIBDIR/BINDIR: the .cso files are neither a library nor an
+# executable, and this destination is never assumed to sit beside a
+# consumer's own binary (see cmake/superslmConfig.cmake.in's own comment).
+set(SUPERSLM_INSTALL_GPU_SHADER_DIR "${CMAKE_INSTALL_DATADIR}/superslm/gpu-shaders")
+
+# The core library. Layer 1 is independently embeddable — no Unreal, no third-party
+# runtime dependency in its graph (DecisionLog D-SLM13). Standard library only.
+set(SUPERSLM_CORE_SOURCES
+	src/artifact.cpp
+	src/sha256.cpp
+	src/tokenizer.cpp
+	src/model.cpp
+	src/intmath.cpp
+	src/silu_lut.cpp
+	src/matmul.cpp
+	src/proof_manifest.cpp
+	src/trace_hook.cpp
+	src/forward/checked_chain_funnel.cpp
+	src/forward/forward_sites.cpp
+	src/decode_digest.cpp
+	src/sslm_abi.cpp
+	src/damped_greedy_antilm.cpp
+	src/damped_greedy_topk.cpp
+	src/damped_greedy_phaseD.cpp
+	src/damped_greedy_phaseD_loop.cpp
+)
+
+add_library(superslm STATIC ${SUPERSLM_CORE_SOURCES})
+target_compile_features(superslm PUBLIC cxx_std_20)
+# BUILD_INTERFACE/INSTALL_INTERFACE: consumers building against this tree see
+# the source-tree include/ path; consumers of an installed package see the
+# installed header destination (CMAKE_INSTALL_INCLUDEDIR) instead — the same
+# target property serves both without a second target definition.
+target_include_directories(superslm PUBLIC
+	$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+	$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+
+# Determinism: forbid FP contraction. Implicit fused multiply-add would change
+# rounding and break the scalar/SIMD bit-equality the whole project is built on
+# (SuperSLM_Plan.md §6, §13). The kernel set (S2) will add explicit, mirrored FMA;
+# until then the rule is simply "no implicit contraction anywhere."
+if(MSVC)
+	target_compile_options(superslm PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(superslm PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
+# S-HARDEN-7's test-only fault-injection seam (tests/support/bad_alloc_
+# injection.h) lets the test suite prove the "throws only std::bad_alloc"
+# contract without any production consumer of this library ever compiling a
+# reference to tests/support/*. A second compile of the SAME sources, built
+# only with SUPERSLM_ENABLE_BAD_ALLOC_INJECTION defined, backs the test
+# binary; every other consumer (sslm_verify, sslm_inspect, tok_verify, and every
+# tool built outside CMake by a tools/build_*.bat recipe) links the clean
+# `superslm` above, or compiles the same clean sources, which never
+# defines the macro and so never even includes the seam header
+# (src/bad_alloc_wrap.h #ifdef-gates it out entirely -- Layer 1 stays
+# independently embeddable, D-SLM13).
+if(BUILD_TESTING)
+add_library(superslm_test_injection STATIC ${SUPERSLM_CORE_SOURCES})
+target_include_directories(superslm_test_injection PUBLIC include)
+target_include_directories(superslm_test_injection PRIVATE tests)
+target_compile_definitions(superslm_test_injection PRIVATE SUPERSLM_ENABLE_BAD_ALLOC_INJECTION)
+if(MSVC)
+	target_compile_options(superslm_test_injection PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(superslm_test_injection PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
+add_executable(superslm_tests tests/test_main.cpp tests/test_slm18x_saturation_census.cpp
+	tests/test_slm19x_schema_damped_greedy.cpp)
+target_link_libraries(superslm_tests PRIVATE superslm_test_injection)
+if(MSVC)
+	target_compile_options(superslm_tests PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(superslm_tests PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
+# T-2152 (outside strike item 1): tests/test_main.cpp's own T-2019/T-2024 GPU-serial-port
+# section calls `superslm_gpu::*` directly (#ifdef _WIN32-guarded in that file so the same
+# test_main.cpp still compiles on the Linux/macOS CI legs, which take neither branch below) --
+# on WIN32 this target must also compile src/gpu/superslm_gpu.cpp and link d3d12/dxgi/dxguid,
+# unconditionally, matching build.bat's own superslm_tests.exe recipe (build.bat, the "quick
+# MSVC build + test" path, has never gated this behind an opt-in flag: it is the only build
+# recipe that has ever produced a superslm_tests.exe that actually links, so its own shape is
+# the ONE test_main truth this target now matches). This is deliberately independent of the
+# SUPERSLM_BUILD_GPU option above: that option controls whether the public superslm_gpu
+# library and its install() rule exist; superslm_tests needs the same GPU sources compiled in
+# to link *at all* on Windows regardless of whether a consumer opts into the installed GPU
+# target. T-2578 adds src/gpu/gpu_1p0.cpp too: the stale-shader real-path cell now consumes the
+# production public-status mapper doors, so the test binary proves the actual 1.0 mapping rather
+# than a suite-side transcription. build.bat carries the identical source pair.
+if(WIN32)
+	target_sources(superslm_tests PRIVATE src/gpu/superslm_gpu.cpp src/gpu/gpu_1p0.cpp)
+	target_compile_definitions(superslm_tests PRIVATE SUPERSLM_ENABLE_GPU_API_FAILURE_INJECTION)
+	target_include_directories(superslm_tests PRIVATE src/gpu)
+	target_link_libraries(superslm_tests PRIVATE d3d12 dxgi dxguid)
+endif()
+
+enable_testing()
+add_test(NAME superslm_tests COMMAND superslm_tests)
+endif()
+
+# The §13 item 7 independent converter verifier (S-HARDEN-3, F13): loads a
+# `.sslm` through the same SslmModel::Load every other consumer uses, then
+# writes a proof manifest (include/superslm/proof_manifest.h) from what the
+# loader actually accepted -- never from the Python writer's own arrays.
+# convert_model.py invokes this binary after every write; §17.3 cell 2's
+# integration test invokes it directly as the independent oracle.
+add_executable(sslm_verify tools/sslm_verify.cpp)
+target_link_libraries(sslm_verify PRIVATE superslm)
+if(MSVC)
+	target_compile_options(sslm_verify PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(sslm_verify PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
+add_executable(sslm_generate tools/sslm_generate.cpp)
+target_link_libraries(sslm_generate PRIVATE superslm)
+if(MSVC)
+	target_compile_options(sslm_generate PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(sslm_generate PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
+# The artifact inspector and the tokenizer golden-file verifier. Linking `superslm` takes the
+# library's own source list, so a translation unit the library needs cannot be missing from
+# these tools (tools/build_inspect.bat is the no-CMake recipe for the same two binaries).
+add_executable(sslm_inspect tools/sslm_inspect.cpp)
+target_link_libraries(sslm_inspect PRIVATE superslm)
+if(MSVC)
+	target_compile_options(sslm_inspect PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(sslm_inspect PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
+add_executable(tok_verify tools/tok_verify.cpp)
+target_link_libraries(tok_verify PRIVATE superslm)
+if(MSVC)
+	target_compile_options(tok_verify PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(tok_verify PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
+# T-2693 slice 2: a converter-adjacent, CPU-only prefix snapshot/clone probe.
+# It is intentionally an ABI consumer: the existing prefill path remains the
+# only forward path, and no forward-site arithmetic changes here.
+add_executable(t2693_prefix_clone tools/t2693_prefix_clone.cpp)
+target_link_libraries(t2693_prefix_clone PRIVATE superslm)
+if(MSVC)
+	target_compile_options(t2693_prefix_clone PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(t2693_prefix_clone PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
+# T-2700: the same ABI snapshot/clone driver, with the converter-only capture
+# sink bound before the first sequence is created.
+add_executable(t2700_fused_k_capture tools/t2700_fused_k_capture.cpp)
+target_link_libraries(t2700_fused_k_capture PRIVATE superslm)
+if(MSVC)
+	target_compile_options(t2700_fused_k_capture PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(t2700_fused_k_capture PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
+# T-2701 slice 7: artifact-backed CPU/GPU diagnostics. These need the D3D12
+# substrate and generated shaders, so keep them out of the CPU-only default.
+if(WIN32 AND (SUPERSLM_BUILD_GPU OR BUILD_TESTING))
+	foreach(_t2701_tool IN ITEMS t2701_cpu_forward_probe t2701_gpu_tokens)
+		add_executable(${_t2701_tool} tools/${_t2701_tool}.cpp)
+		target_link_libraries(${_t2701_tool} PRIVATE superslm d3d12 dxgi dxguid)
+		target_sources(${_t2701_tool} PRIVATE src/gpu/superslm_gpu.cpp src/gpu/gpu_1p0.cpp)
+		target_include_directories(${_t2701_tool} PRIVATE tools src/gpu)
+		if(MSVC)
+			target_compile_options(${_t2701_tool} PRIVATE /W4 /fp:precise)
+		else()
+			target_compile_options(${_t2701_tool} PRIVATE -Wall -Wextra -ffp-contract=off)
+		endif()
+	endforeach()
+	unset(_t2701_tool)
+endif()
+
+# T-2700 step 0: the independent Python oracle drives these compiled forced tiers.
+# The forced tiers are x86-64 SIMD (matmul.cpp #errors on any other target), so these
+# default-build executables exist only on x86-64 -- on arm64 they broke the macOS build.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64|X64)$")
+	add_executable(t2700_fused_k_oracle_sse2_forced tools/t2700_fused_k_oracle.cpp)
+	target_link_libraries(t2700_fused_k_oracle_sse2_forced PRIVATE superslm_sse2_forced)
+	add_executable(t2700_fused_k_oracle_avx2_forced tools/t2700_fused_k_oracle.cpp)
+	target_link_libraries(t2700_fused_k_oracle_avx2_forced PRIVATE superslm_avx2_forced)
+	add_executable(t2700_fused_k_oracle_avx512_forced tools/t2700_fused_k_oracle.cpp)
+	target_link_libraries(t2700_fused_k_oracle_avx512_forced PRIVATE superslm_avx512_forced)
+endif()
+
+# T-2046 (design §24.2 D-SLM3162, closing Poirot c81e48c review Significant 6): dumps an adapter
+# artifact's DeltaFoldScales/UFoldScales/Weights sections, loaded through the REAL B0b typed path,
+# as JSON -- the write->load round-trip proof's own read side (tools/sslm_adapter_dump.cpp).
+add_executable(sslm_adapter_dump tools/sslm_adapter_dump.cpp)
+target_link_libraries(sslm_adapter_dump PRIVATE superslm)
+if(MSVC)
+	target_compile_options(sslm_adapter_dump PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(sslm_adapter_dump PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
+# S-HARDEN-6 (design Sec2.1 component 2/3, T-410): the cross-toolchain /
+# cross-optimization axis-digest harness, promoted from a disposable
+# commission instrument into committed CI tooling
+# (tools/ci/sslm_axis_digest.cpp). sslm_axis_digest links the clean
+# `superslm` (the SIMD-enabled path on x64, matching production); a second
+# executable, sslm_axis_digest_scalar_forced, links a third compile of the
+# same core sources with SUPERSLM_FORCE_SCALAR_MATMUL defined -- the
+# component-3 axis the digest-compare job needs a scalar-only build to
+# compare against.
+add_executable(sslm_axis_digest tools/ci/sslm_axis_digest.cpp)
+target_link_libraries(sslm_axis_digest PRIVATE superslm)
+if(MSVC)
+	target_compile_options(sslm_axis_digest PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(sslm_axis_digest PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
+add_library(superslm_scalar_forced STATIC ${SUPERSLM_CORE_SOURCES})
+target_include_directories(superslm_scalar_forced PUBLIC include)
+target_compile_definitions(superslm_scalar_forced PRIVATE SUPERSLM_FORCE_SCALAR_MATMUL)
+if(MSVC)
+	target_compile_options(superslm_scalar_forced PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(superslm_scalar_forced PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
+add_executable(sslm_axis_digest_scalar_forced tools/ci/sslm_axis_digest.cpp)
+target_link_libraries(sslm_axis_digest_scalar_forced PRIVATE superslm_scalar_forced)
+if(MSVC)
+	target_compile_options(sslm_axis_digest_scalar_forced PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(sslm_axis_digest_scalar_forced PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
+# T-2149 (Claude/Vitruvius/t2149-avx-kernel-design-2026-08-18.md) / T-2158 red suite
+# (Claude/Curie/t2158-t2149-avx-red-suite-2026-08-18.md): the AVX2/AVX-512 matmul tiers,
+# the cached CPUID dispatch (DetectBestDotRowTier), and the four-macro force selection
+# (SUPERSLM_FORCE_{SCALAR,SSE2,AVX2,AVX512}_MATMUL, design §6.1) now exist (design §11
+# step 1, landed). Default flipped ON (T-2159 §11 steps 7-10 close): the option's own
+# prior comment named this flip as owed the moment step 1 landed ("whoever builds step 1
+# turns this ON") -- until it happened, the two T-2158 red-suite cells that depend on it
+# (dispatch-cache lifetime, first-call-race concurrency; design §10 dimensions 1/3)
+# compiled into nothing anywhere in CI, a guard that could not fire (StandardsDocument.md
+# §5.4's guard-vitality rule). ON by default now exercises both cells in every one of the
+# ten pre-existing, non-forced CI legs (design §17.2 Population B rows 1-10) without
+# editing .github/workflows/tests.yml at all. OFF remains available for anyone who needs
+# to build the pre-T-2149 test-suite shape for comparison or bisection.
+option(SUPERSLM_T2149_AVX_TIERS_BUILT
+	"T-2149: the AVX2/AVX-512 matmul tiers and cached dispatch exist in src/matmul.cpp. ON (default) builds T-2158's tier-dependent red-suite cells (dispatch-cache lifetime, first-call race) into every non-forced and forced-tier test/digest binary. OFF reproduces the pre-T-2149 test-suite shape."
+	ON)
+if(BUILD_TESTING AND SUPERSLM_T2149_AVX_TIERS_BUILT)
+	target_compile_definitions(superslm_test_injection PUBLIC
+		SUPERSLM_T2149_AVX_TIERS_BUILT
+		SUPERSLM_ENABLE_MATMUL_DISPATCH_INSTRUMENT)
+endif()
+
+# T-2149 design §8.1/§8.3, §11 step 5 (fold round 3, D-SLM3520): three new forced
+# full-suite libraries+executables and three new forced digest executables, mirroring
+# superslm_scalar_forced/sslm_axis_digest_scalar_forced's own shape exactly (above) --
+# with one stated deviation, audited against the sibling per StandardsDocument.md §7:
+# each of these nine targets carries EXCLUDE_FROM_ALL. superslm_scalar_forced correctly
+# has no such guard (DotRowScalar compiles on every platform); these nine compile leaf
+# functions declared only under the x64 SIMD gate (src/matmul.cpp), so an unqualified
+# `cmake --build build` on a non-x64 target (macos-arm64 CI, .github/workflows/tests.yml)
+# must never attempt them. EXCLUDE_FROM_ALL does not protect a non-excluded target that
+# links an excluded one, so each *_forced library and its dependent test/digest
+# executable both carry the guard (design §8.1's own note; the t2139_gate_* targets
+# below are this codebase's own precedent for this exact mechanism).
+foreach(_sslm_tier SSE2 AVX2 AVX512)
+	string(TOLOWER "${_sslm_tier}" _sslm_tier_lower)
+
+	add_library(superslm_${_sslm_tier_lower}_forced STATIC EXCLUDE_FROM_ALL ${SUPERSLM_CORE_SOURCES})
+	target_include_directories(superslm_${_sslm_tier_lower}_forced PUBLIC include)
+	target_compile_definitions(superslm_${_sslm_tier_lower}_forced PUBLIC SUPERSLM_FORCE_${_sslm_tier}_MATMUL)
+	# S-HARDEN-7's bad-alloc-injection seam (src/bad_alloc_wrap.h) is what
+	# superslm_test_injection's own PRIVATE SUPERSLM_ENABLE_BAD_ALLOC_INJECTION (above) wires
+	# in, and tests/test_main.cpp's twenty-site injection suite runs unconditionally, not
+	# gated on whether the linked library defines the seam -- a forced-tier library built
+	# without it left the seam "not consulted" (26 real check failures, found by the first
+	# actual execution of these three binaries to completion, T-2159 §11 step 10). Every
+	# forced-tier full-suite binary needs the identical seam superslm_test_injection has.
+	target_compile_definitions(superslm_${_sslm_tier_lower}_forced PRIVATE SUPERSLM_ENABLE_BAD_ALLOC_INJECTION)
+	# Both the bad-alloc-injection seam above (src/bad_alloc_wrap.h) and the dispatch-
+	# instrument seam below (src/matmul.cpp) #include "support/*.h" headers that resolve
+	# against a "tests" search directory -- the same PRIVATE include superslm_test_injection
+	# already carries for the identical reason. Unconditional (not nested in the option
+	# check below): the bad-alloc seam is unconditional too.
+	target_include_directories(superslm_${_sslm_tier_lower}_forced PRIVATE tests)
+	# The dispatch-cache cell's "== 0 in each forced binary" half (design §10 dimension 1,
+	# tests/test_main.cpp's TestMatmulDotRowTierProbeSelectedOnceAndReusedAcrossCalls) is
+	# gated behind SUPERSLM_T2149_AVX_TIERS_BUILT the same way the non-forced binary's "== 1"
+	# half is -- without this, that function does not compile into any forced binary at all
+	# and the "== 0" assertion never exists to run. PUBLIC so it reaches
+	# superslm_tests_${_sslm_tier_lower}_forced's own compile of tests/test_main.cpp exactly
+	# as SUPERSLM_FORCE_${_sslm_tier}_MATMUL already does, below. Follows the same option
+	# gate as superslm_test_injection above so `-DSUPERSLM_T2149_AVX_TIERS_BUILT=OFF`
+	# reproduces the pre-T-2149 shape uniformly across every binary, not only the default one.
+	if(SUPERSLM_T2149_AVX_TIERS_BUILT)
+		target_compile_definitions(superslm_${_sslm_tier_lower}_forced PUBLIC
+			SUPERSLM_T2149_AVX_TIERS_BUILT
+			SUPERSLM_ENABLE_MATMUL_DISPATCH_INSTRUMENT)
+	endif()
+	if(MSVC)
+		target_compile_options(superslm_${_sslm_tier_lower}_forced PRIVATE /W4 /fp:precise)
+	else()
+		target_compile_options(superslm_${_sslm_tier_lower}_forced PRIVATE -Wall -Wextra -ffp-contract=off)
+	endif()
+
+	# The forced full-suite executable: a fresh compile of tests/test_main.cpp (not
+	# only the library) linked against the corresponding forced library, so the ENTIRE
+	# 34184-check suite becomes this tier's own proof for free (design §8.1). The
+	# SUPERSLM_FORCE_*_MATMUL definition must reach test_main.cpp's OWN compile too
+	# (T-2158 casebook §2 item 4) -- PUBLIC on the forced library already propagates it
+	# to any target linking that library, which satisfies this without a second
+	# target_compile_definitions call.
+	add_executable(superslm_tests_${_sslm_tier_lower}_forced EXCLUDE_FROM_ALL tests/test_main.cpp
+		tests/test_slm18x_saturation_census.cpp tests/test_slm19x_schema_damped_greedy.cpp)
+	target_link_libraries(superslm_tests_${_sslm_tier_lower}_forced PRIVATE superslm_${_sslm_tier_lower}_forced)
+	target_include_directories(superslm_tests_${_sslm_tier_lower}_forced PRIVATE tests)
+	if(MSVC)
+		target_compile_options(superslm_tests_${_sslm_tier_lower}_forced PRIVATE /W4 /fp:precise)
+	else()
+		target_compile_options(superslm_tests_${_sslm_tier_lower}_forced PRIVATE -Wall -Wextra -ffp-contract=off)
+	endif()
+	if(WIN32)
+		target_sources(superslm_tests_${_sslm_tier_lower}_forced PRIVATE
+			src/gpu/superslm_gpu.cpp src/gpu/gpu_1p0.cpp)
+		target_include_directories(superslm_tests_${_sslm_tier_lower}_forced PRIVATE src/gpu)
+		target_link_libraries(superslm_tests_${_sslm_tier_lower}_forced PRIVATE d3d12 dxgi dxguid)
+	endif()
+
+	# The forced digest executable (design §8.3), mirroring sslm_axis_digest_scalar_forced.
+	add_executable(sslm_axis_digest_${_sslm_tier_lower}_forced EXCLUDE_FROM_ALL tools/ci/sslm_axis_digest.cpp)
+	target_link_libraries(sslm_axis_digest_${_sslm_tier_lower}_forced PRIVATE superslm_${_sslm_tier_lower}_forced)
+	if(MSVC)
+		target_compile_options(sslm_axis_digest_${_sslm_tier_lower}_forced PRIVATE /W4 /fp:precise)
+	else()
+		target_compile_options(sslm_axis_digest_${_sslm_tier_lower}_forced PRIVATE -Wall -Wextra -ffp-contract=off)
+	endif()
+endforeach()
+
+# T-2200 (post-1.1 errand: does the AVX-512 tier actually run faster than AVX2 on real
+# AVX-512 silicon -- CHANGELOG's own "Known gaps" entry for 1.1). tools/t2147_chunk_batched_pins.cpp
+# already carries the real-artifact --speedup mode T-2159's own achievement measurement used
+# (Claude/Brunel/t2159-t2149-avx-build-2026-08-18.md §12): one sslm_prefill call at
+# chunk_budget=1 (per-token) vs one call at chunk_budget=N (batched), same prompt, same
+# artifact. That measurement was taken via two disposable, uncommitted direct `cl`
+# invocations against SUPERSLM_FORCE_SSE2_MATMUL / SUPERSLM_FORCE_AVX2_MATMUL (build log §12's
+# own note: "disposable, not committed to CMakeLists.txt"). sslm_bench_prefill and its
+# forced-tier pair below commit that same measurement as ordinary build targets so it is
+# repeatable without a hand-built binary.
+#
+# sslm_bench_prefill links the clean, dispatch-live `superslm` -- the production path, which
+# auto-selects AVX-512 on capable hardware and falls back to AVX2/SSE2 elsewhere (the number a
+# real consumer actually gets). sslm_bench_prefill_avx2_forced / sslm_bench_prefill_avx512_forced
+# mirror the superslm_tests_${tier}_forced / sslm_axis_digest_${tier}_forced pair above exactly:
+# EXCLUDE_FROM_ALL, linked against the same tier-forced library (no second compile of the core
+# sources), same MSVC/Wall-Wextra option split. Only AVX2 and AVX-512 are built here -- unlike
+# the full-suite/digest pair, this bench has no scalar/SSE2 arm; the throughput question this
+# errand asks is specifically "AVX-512 vs AVX2." A compiled AVX-512-forced bench runs clean on
+# any x64 target (MSVC does not gate _mm512_* intrinsics behind /arch) and SIGILLs at runtime
+# (STATUS_ILLEGAL_INSTRUCTION) on hardware lacking AVX-512F/BW -- the same documented, expected
+# outcome as this project's forced-suite/digest AVX-512 pair (F:\t2149-avx512-run\README.txt).
+add_executable(sslm_bench_prefill tools/t2147_chunk_batched_pins.cpp)
+target_link_libraries(sslm_bench_prefill PRIVATE superslm)
+if(MSVC)
+	target_compile_options(sslm_bench_prefill PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(sslm_bench_prefill PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
+foreach(_sslm_bench_tier AVX2 AVX512)
+	string(TOLOWER "${_sslm_bench_tier}" _sslm_bench_tier_lower)
+	add_executable(sslm_bench_prefill_${_sslm_bench_tier_lower}_forced EXCLUDE_FROM_ALL tools/t2147_chunk_batched_pins.cpp)
+	target_link_libraries(sslm_bench_prefill_${_sslm_bench_tier_lower}_forced PRIVATE superslm_${_sslm_bench_tier_lower}_forced)
+	if(MSVC)
+		target_compile_options(sslm_bench_prefill_${_sslm_bench_tier_lower}_forced PRIVATE /W4 /fp:precise)
+	else()
+		target_compile_options(sslm_bench_prefill_${_sslm_bench_tier_lower}_forced PRIVATE -Wall -Wextra -ffp-contract=off)
+	endif()
+endforeach()
+
+# T-2158 dimension 7 item (d) (design §10, D-SLM3510): a persisted CI guard for the
+# AVX-isolation claim (design §6.4) -- no construct in this file, in
+# .github/workflows/tests.yml's cmake/environment invocations, or in any file under
+# this repository's own tree carrying a direct compiler invocation naming
+# src/matmul.cpp may set a translation-unit-wide AVX2/AVX-512 flag (six CMakeLists.txt
+# spellings x five channels -- CLI, workflow/environment, batch/shell environment,
+# direct invocation -- fold round 4, D-SLM3570; widened fold round 5, D-SLM3583;
+# widened a third time fold round 6, D-SLM3601/D-SLM3602, which also retired the
+# per-fold pattern-list widening itself in favor of a committed
+# validation population (tools/ci/matmul_avx_isolation_population.json) exercised
+# by the second `add_test` below -- see tools/ci/check_matmul_avx_isolation.py's own
+# header for the full matrix and its mutation-vitality proof, executed and recorded
+# in the T-2159 build log. Run by the `matmul-avx-isolation-guard` CI job
+# (.github/workflows/tests.yml, D-SLM3604), independent of
+# SUPERSLM_T2149_AVX_TIERS_BUILT: the claim it protects ("only two function-attributed
+# sites may use these instructions") is already true (vacuously, since neither
+# attributed site exists yet) and stays true once they land -- this is exactly the
+# guard design §10 dimension 7 commissions as a standing check, not a one-time
+# build-time probe like its dimension-7c/7g siblings (§11 steps 4b/4d).
+# T-2179 fix round 5 (Finding 1): T-2177's own FATAL_ERROR remedy for the silent-skip
+# defect below made a host Python 3 interpreter a hard configure requirement for the
+# whole project -- this repository's README states the opposite ("none is required to
+# build or to pass the suite"), and no CI job in .github/workflows/tests.yml that runs
+# `cmake -B build` declares `setup-python`, so the dependency was silent everywhere it
+# reached. SUPERSLM_REQUIRE_CI_CHECK_TOOLS scopes the hard failure to the one job that
+# actually needs these two ctest entries to exist -- `-DSUPERSLM_REQUIRE_CI_CHECK_TOOLS=ON`
+# on the matmul-avx-isolation-guard job's own `cmake -B build` (.github/workflows/tests.yml)
+# -- and OFF everywhere else, so a bare `cmake -B build` on a Python-less host configures
+# clean, exactly as the README promises. `--no-tests=error` on that job's own `ctest` line
+# already turns an empty test selection into a hard failure independently and
+# unconditionally, so the empty-selection half of the original defect stays closed with no
+# coverage lost by scoping the FATAL_ERROR this way.
+option(SUPERSLM_REQUIRE_CI_CHECK_TOOLS
+	"Fail configuration if the Python 3 interpreter needed by the tools/ci checks is absent (set by the matmul-avx-isolation-guard CI job only)"
+	OFF)
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+	# T-2441 (Poirot 327ee29-t2438-ask5-tracka-review.md, Significant 3, D-SLM5437): the
+	# geometry site census (design Claude/Vitruvius/t2408-superslm-ask5-qwen3-arch-design-
+	# 2026-08-29.md Sec2.5) is specified as "run as a test-suite cell, not a human step" --
+	# T-2432's own build committed the registry and the script but wired them into no build
+	# step at all. Registered here unconditionally (not gated behind
+	# SUPERSLM_REQUIRE_CI_CHECK_TOOLS, which is scoped to the two AVX-isolation entries
+	# immediately below by that option's own docstring) -- a bare `cmake -B build` with
+	# Python3 present now also gets this ctest entry for free, matching the design's own
+	# "test-suite cell" framing rather than a job-specific opt-in.
+	add_test(NAME geometry_site_census
+		COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/geometry_site_census.py
+			--repo-root ${CMAKE_SOURCE_DIR})
+	add_test(NAME check_matmul_avx_isolation
+		COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/check_matmul_avx_isolation.py
+			--cmakelists ${CMAKE_SOURCE_DIR}/CMakeLists.txt
+			--workflow ${CMAKE_SOURCE_DIR}/.github/workflows/tests.yml
+			--repo-root ${CMAKE_SOURCE_DIR})
+	# Fold round 6 (D-SLM3601): the checker's own committed validation population,
+	# self-tested against a scratch copy of this repository so a future widening
+	# of check_matmul_avx_isolation.py is required to reproduce green against the
+	# whole population before it is trusted -- never a fresh subset the widening's
+	# own author chose. Picked up by the matmul-avx-isolation-guard CI job by the
+	# same `^check_matmul_avx_isolation` name prefix as the checker itself.
+	add_test(NAME check_matmul_avx_isolation_population_vitality
+		COMMAND ${Python3_EXECUTABLE} -m pytest
+			${CMAKE_SOURCE_DIR}/tests/ci/test_matmul_avx_isolation_population.py -q)
+	# T-2919 (TE-372 S3): "Nothing in ctest or CI runs any compiler test" -- the G5-1 schema
+	# compiler's pytest suite (tests/t2130-g5-red-suite/) had no ctest entry and no CI
+	# workflow step at all. Registered here, unconditionally like geometry_site_census
+	# above (pure Python, no build/GPU dependency): every file except
+	# g5_1_schema_compiler_fuzz_red.py, which is a deliberately BUILD-TIME/LOCAL-only fuzz
+	# suite (SETTLED, D-SLM3442/D-SLM3444 -- its own module docstring), not per-commit CI.
+	# Every real-model/real-checkpoint cell inside these files is gated on
+	# SUPERSLM_G5_REAL_MODEL_TESTS (tests/t2130-g5-red-suite/t2913_common.py) and skips
+	# cleanly when it is unset, which it is here and in every CI job below. Running this
+	# entry needs `pip install -r requirements.txt` on the invoking interpreter (pydantic,
+	# added in this same fold, is a real cell dependency -- t2916_s1_keyword_allowlist_red.py's
+	# pydantic-generated-schema cell) -- ${Python3_EXECUTABLE} is whatever `find_package(Python3)`
+	# resolved, which is not necessarily the interpreter `pip install` was run against on a
+	# box with more than one Python installed.
+	# WORKING_DIRECTORY is CMAKE_SOURCE_DIR, not the default CMAKE_CURRENT_BINARY_DIR: these
+	# test files do `from tools.sslm_convert_schema import ...`, a dotted import over `tools/`
+	# as an implicit namespace package (no `tools/__init__.py`), which `python -m pytest` only
+	# resolves when the process's own working directory is the repo root (that is what puts
+	# the repo root at sys.path[0] -- `-m`'s own documented behavior, distinct from the
+	# `sys.path.insert` each file does for its own directory and for `tools/` itself).
+	add_test(NAME t2919_g5_schema_compiler_tests
+		COMMAND ${Python3_EXECUTABLE} -m pytest
+			tests/t2130-g5-red-suite/t2899_string_leaf_red.py
+			tests/t2130-g5-red-suite/t2908_byte_level_red.py
+			tests/t2130-g5-red-suite/t2910_boundary_red.py
+			tests/t2130-g5-red-suite/t2912_value_level_red.py
+			tests/t2130-g5-red-suite/t2916_c1_special_exclusion_red.py
+			tests/t2130-g5-red-suite/t2916_s1_keyword_allowlist_red.py
+			tests/t2130-g5-red-suite/t2916_s2_str_vocab_refused_red.py
+			tests/t2130-g5-red-suite/t2919_te372_s2_nullable_enum_red.py
+			tests/t2130-g5-red-suite/t2920_te372_s2_list_type_mismatch_pin.py
+			tests/t2130-g5-red-suite/t2921_frozen_fixture_integrity.py
+			tests/t2130-g5-red-suite/t2922_schema_query_contract.py
+			-q
+		WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+	# T-2933 / §3.10.8: keep the schema-query/lifecycle red population as its own
+	# named CTest boundary.  This portable contract test verifies the independent
+	# native cells, exact mutation anchors, public-surface oracle, and fail-closed
+	# real-model gate; the native Windows runner remains directly executable.
+	add_test(NAME t2933_schema_query_contract
+		COMMAND ${Python3_EXECUTABLE} -m pytest
+			tests/t2130-g5-red-suite/t2922_schema_query_contract.py -q
+		WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+	if(WIN32)
+		add_test(NAME t2933_schema_query_native_state
+			COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File
+				${CMAKE_SOURCE_DIR}/tests/t2130-g5-red-suite/verify_t2922_query_state.ps1)
+		add_test(NAME t2933_schema_lifecycle_native_state
+			COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File
+				${CMAKE_SOURCE_DIR}/tests/t2130-g5-red-suite/verify_t2922_lifecycle_state.ps1)
+		add_test(NAME t2933_schema_real_model
+			COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File
+				${CMAKE_SOURCE_DIR}/tests/t2130-g5-red-suite/run_t2922_real_model.ps1)
+	endif()
+elseif(SUPERSLM_REQUIRE_CI_CHECK_TOOLS)
+	# T-2177 Finding 2: this branch used to print a message(STATUS) no CI step
+	# reads and configure clean -- the matmul-avx-isolation-guard job's own
+	# `ctest -R '^check_matmul_avx_isolation'` would then select nothing,
+	# report "No tests were found!!!", and exit 0, so the guard silently
+	# stopped running while its own CI job stayed green. A missing Python3
+	# interpreter is a hard configuration failure here, not a silent skip --
+	# the two ctest entries this branch would have added are the only thing
+	# that job exists to run. T-2179 fix round 5 (Finding 1): scoped behind
+	# SUPERSLM_REQUIRE_CI_CHECK_TOOLS (see the option() above) so this failure
+	# reaches only the one CI job that opts in, never a bare `cmake -B build`.
+	message(FATAL_ERROR "T-2158/T-2177: Python3 interpreter not found -- cannot register check_matmul_avx_isolation or check_matmul_avx_isolation_population_vitality. The matmul-avx-isolation-guard CI job (.github/workflows/tests.yml) exists to run exactly these two ctest entries; configuring without them would let that job report success having run nothing.")
+else()
+	# T-2179 fix round 5 (Finding 1): SUPERSLM_REQUIRE_CI_CHECK_TOOLS is OFF (the
+	# default) -- a consumer building this library without a Python 3 interpreter
+	# on the host configures clean, as README.md's own "none is required to build
+	# or to pass the suite" promises. The matmul-avx-isolation-guard job is the
+	# only caller that sets the option ON.
+	message(STATUS "T-2158: Python3 interpreter not found -- check_matmul_avx_isolation and check_matmul_avx_isolation_population_vitality are not registered (non-fatal; set -DSUPERSLM_REQUIRE_CI_CHECK_TOOLS=ON to make this fatal, as the matmul-avx-isolation-guard CI job does).")
+endif()
+
+# C1 fix round (S9/S8 residual, Claude/Poirot/2c18dab-t2139-abi-build-review.md): Gate A and Gate
+# C's own must-accept/must-reject constructions (tools/t2139_gate_a_header_parity_check*.cpp,
+# tools/t2139_gate_c_type_identity_check*.cpp) were previously compiled ONLY by build.bat (MSVC
+# x64) -- the design's own stated CI-matrix closure mechanism ("re-run as part of every real
+# slot's CI build across that matrix") did not exist for either gate. Wired here as CMake targets
+# so `cmake --build` on ANY configured toolchain (not only build.bat's MSVC x64) exercises them.
+#
+# EXCLUDE_FROM_ALL: none of these four is meant to LINK into anything or run as a program (Gate A
+# is compile-only by design Sec9's own construction; Gate C the same) -- they are pure
+# compilation checks, so they are built on demand by the ctest entries below rather than by every
+# plain `cmake --build`. The must-reject targets are EXPECTED TO FAIL TO COMPILE; the must-accept
+# targets are expected to succeed, both of them -- Gate C's own sslm_g5.h ordinal-17 collision
+# (SSLM_TOKEN_ID_UNMAPPED vs SSLM_SCHEMA_NOT_FOUND) reconciled at curie/t2130-g5-red-suite@59e26ff,
+# closing S8 for real.
+#
+# N1 (Claude/Poirot/2c18dab-t2139-abi-build-review.md Sec6.3): the WILL_FAIL TRUE below on Gate C's
+# own must-accept entry was written when the reconciliation above was still pending, with a comment
+# saying to flip it once reconciliation landed -- reconciliation landed two rounds later and the
+# flag was never revisited (the exact rule-enforced-by-memory class this arc has been fighting
+# elsewhere). Left in place, this ctest entry inverts: it reports FAILURE (ctest exit 8) on a
+# healthy tree, and would report SUCCESS the day Gate C genuinely regresses -- the one entry whose
+# whole job is catching header drift silently saying the opposite of what it finds. Fixed here:
+# WILL_FAIL removed (the target now must actually compile, matching its Gate A sibling), and the
+# entry renamed off its own now-false "known_pending" name.
+if(BUILD_TESTING)
+add_executable(t2139_gate_a_must_accept EXCLUDE_FROM_ALL
+	tools/t2139_gate_a_header_parity_check.cpp)
+target_include_directories(t2139_gate_a_must_accept PRIVATE include tests)
+
+add_executable(t2139_gate_a_must_reject EXCLUDE_FROM_ALL
+	tools/t2139_gate_a_header_parity_check_negative.cpp)
+target_include_directories(t2139_gate_a_must_reject PRIVATE include tools tests)
+
+add_executable(t2139_gate_c_must_accept EXCLUDE_FROM_ALL
+	tools/t2139_gate_c_type_identity_check.cpp)
+target_include_directories(t2139_gate_c_must_accept PRIVATE include)
+
+add_executable(t2139_gate_c_must_reject EXCLUDE_FROM_ALL
+	tools/t2139_gate_c_type_identity_check_negative.cpp)
+target_include_directories(t2139_gate_c_must_reject PRIVATE include)
+
+# S1's structural remedy (Claude/Poirot/3bcbe43-t2139-fourth-confirmation-review.md, owed remedy
+# 5): the THIRD Gate C TU -- includes the REAL tests/t2130-g5-red-suite/sslm_g5.h directly (not a
+# transcription) alongside the library's own SSLM_STATUS_ENUM_LIST expansion, so a divergence in
+# the real suite header itself (not just a stale hand-transcription of it) fails here. Needs
+# `tests` on its include path to resolve the real suite header (matching Gate A's own convention).
+add_executable(t2139_gate_c_real_suite_side_check EXCLUDE_FROM_ALL
+	tools/t2139_gate_c_real_suite_side_check.cpp)
+target_include_directories(t2139_gate_c_real_suite_side_check PRIVATE include tests)
+
+# S4's owed must-reject constructions (same casebook): one per NEW mechanism this round's own Gate
+# C remedy added, each exercising the REAL SSLM_STATUS_ENUM_LIST/SSLM_STATUS_NEXT_FREE machinery
+# rather than a toy hand-written enum (tools/t2139_gate_c_type_identity_check_negative.cpp's own
+# sibling, unchanged, still covers the generic "does static_assert work" case).
+add_executable(t2139_gate_c_xmacro_must_reject EXCLUDE_FROM_ALL
+	tools/t2139_gate_c_xmacro_check_negative.cpp)
+target_include_directories(t2139_gate_c_xmacro_must_reject PRIVATE include)
+
+add_executable(t2139_gate_c_sentinel_must_reject EXCLUDE_FROM_ALL
+	tools/t2139_gate_c_sentinel_negative.cpp)
+target_include_directories(t2139_gate_c_sentinel_must_reject PRIVATE include)
+
+# T-2141 (Claude/Poirot/3bcbe43-t2139-fourth-confirmation-review.md O3; Claude/Zelda/Board.md
+# T-2141 row): the t2138 red suite's own sslm_abi.h enum copy (tests/t2138-abi-red-suite/
+# sslm_abi.h) was guarded only by the 564-cell link, never by a compile-time parity check --
+# that file's own header comment names the gap. This must-accept/must-reject pair closes it for
+# sslm_status, same generated-per-name-plus-sentinel shape as t2139_gate_c_type_identity_check
+# above, but reading the REAL suite header (namespaced, to avoid the extern "C" function-name
+# collision the real library header's own SUPERSLM_ABI_ENUM_ONLY escape hatch exists for --
+# executed and confirmed, see tools/t2141_gate_c_t2138_suite_side_check.cpp's own header
+# comment for the exact collision this construction hit and routed around).
+add_executable(t2141_gate_c_t2138_suite_side_must_accept EXCLUDE_FROM_ALL
+	tools/t2141_gate_c_t2138_suite_side_check.cpp)
+target_include_directories(t2141_gate_c_t2138_suite_side_must_accept PRIVATE include tests)
+
+add_executable(t2141_gate_c_t2138_suite_side_must_reject EXCLUDE_FROM_ALL
+	tools/t2141_gate_c_t2138_suite_side_check_negative.cpp)
+target_include_directories(t2141_gate_c_t2138_suite_side_must_reject PRIVATE include)
+
+enable_testing()
+add_test(NAME t2139_gate_a_must_accept_compiles
+	COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target t2139_gate_a_must_accept --config $<CONFIG>)
+# T-2139 sixth confirmation review (Claude/Poirot/5fbd04d-t2139-sixth-confirmation-review.md S1):
+# these two were still WILL_FAIL-only (exit-code-only) after S3 gave the X-macro/sentinel pair
+# below the marker-text discrimination -- the same class the fifth casebook's S3 named in class
+# terms, not instance terms. Both now go through tools/ci/check_negative_compile_marker.cmake with
+# their own static_assert marker text, matching their two siblings' convention.
+add_test(NAME t2139_gate_a_must_reject_fails_to_compile
+	COMMAND ${CMAKE_COMMAND}
+		-DBUILD_DIR=${CMAKE_BINARY_DIR} -DBUILD_TARGET=t2139_gate_a_must_reject -DBUILD_CONFIG=$<CONFIG>
+		-DSOURCE_FILE=tools/t2139_gate_a_header_parity_check_negative.cpp
+		-DMARKER_TEXT=sslm_model_map:\ library\ signature\ diverges\ from\ tests/t2130-g5-red-suite/sslm_g5.h
+		-P ${CMAKE_SOURCE_DIR}/tools/ci/check_negative_compile_marker.cmake)
+add_test(NAME t2139_gate_c_must_reject_fails_to_compile
+	COMMAND ${CMAKE_COMMAND}
+		-DBUILD_DIR=${CMAKE_BINARY_DIR} -DBUILD_TARGET=t2139_gate_c_must_reject -DBUILD_CONFIG=$<CONFIG>
+		-DSOURCE_FILE=tools/t2139_gate_c_type_identity_check_negative.cpp
+		-DMARKER_TEXT=SSLM_ARTIFACT_REJECTED\ diverges
+		-P ${CMAKE_SOURCE_DIR}/tools/ci/check_negative_compile_marker.cmake)
+# Gate C must-accept: a plain must-pass compile check, matching its Gate A sibling. The known
+# ordinal-interleaving block this entry previously disclosed (P2, Claude/Poirot/
+# 2c18dab-t2139-abi-build-review.md Sec7.4) closed when sslm_g5.h took the T-2133 Sec6 registry
+# mirror (curie/t2130-g5-red-suite@52dc6cd): sslm_g5.h mirrors sslm_status's full append-only
+# ordinal registry verbatim, so the type-identity construction compiles and this entry must pass.
+add_test(NAME t2139_gate_c_must_accept_compiles
+	COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target t2139_gate_c_must_accept --config $<CONFIG>)
+
+# S1's structural remedy: the third TU is a plain must-pass compile check, matching its two
+# siblings above.
+add_test(NAME t2139_gate_c_real_suite_side_check_compiles
+	COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target t2139_gate_c_real_suite_side_check --config $<CONFIG>)
+
+# S4's owed must-reject constructions: both MUST fail to compile, same convention as
+# t2139_gate_a_must_reject_fails_to_compile and t2139_gate_c_must_reject_fails_to_compile above
+# (all four negative-compile constructions now run through the marker script; see S1 comment
+# above them for the finding that made this true of all four rather than just these two).
+#
+# T-2139 fifth confirmation review (Claude/Poirot/ce5aff2-t2139-fifth-confirmation-review.md S3):
+# a plain WILL_FAIL entry only inverts the build's exit code -- it cannot tell the construction's
+# own assertion firing apart from any other compile failure, and the sentinel construction proved
+# this live (one governed append to both real headers desynchronizes its own extra enumerator from
+# the real sentinels, so it still fails to compile, but for an unrelated C2039 name-lookup reason,
+# with WILL_FAIL still reporting green). tools/ci/check_negative_compile_marker.cmake requires BOTH
+# the build failing AND the target's own static_assert marker text appearing in the captured
+# output, so a degeneration of the underlying mechanism is a hard ctest failure instead of a silent
+# pass. WILL_FAIL must never be set on an entry that invokes this script -- see the script's own
+# header comment for why (T-2139 sixth confirmation review S2): the script's exit code is already
+# correct (0 only when both conditions hold), and WILL_FAIL on top of it inverts the check.
+# T-2142 (Claude/Poirot/aea6116-t2139-seventh-confirmation-review.md M1, the residual half): both
+# MARKER_TEXT values below were TRUNCATED fragments of their construction's own full
+# static_assert message until this fix -- reproduced and confirmed before fixing
+# (tools/ci/verify_negative_compile_marker_source.py against each source file with the OLD
+# truncated text: FAILED, correctly). The xmacro entry was missing its macro-generated suffix
+# " (deliberate corruption, must-reject construction)"; the sentinel entry was missing its
+# literal prefix "registry-top divergence (deliberate one-sided append, must-reject
+# construction): the two ". Both passed the compiler-output substring check vacuously the whole
+# time -- a truncated fragment of a real message IS a substring of that message -- which is
+# exactly the class check_negative_compile_marker.cmake's own new SOURCE_FILE argument now closes
+# structurally rather than by a fourth careful transcription.
+add_test(NAME t2139_gate_c_xmacro_must_reject_fails_to_compile
+	COMMAND ${CMAKE_COMMAND}
+		-DBUILD_DIR=${CMAKE_BINARY_DIR} -DBUILD_TARGET=t2139_gate_c_xmacro_must_reject -DBUILD_CONFIG=$<CONFIG>
+		-DSOURCE_FILE=tools/t2139_gate_c_xmacro_check_negative.cpp
+		-DMARKER_TEXT=SSLM_ARTIFACT_REJECTED\ diverges\ \(deliberate\ corruption,\ must-reject\ construction\)
+		-P ${CMAKE_SOURCE_DIR}/tools/ci/check_negative_compile_marker.cmake)
+add_test(NAME t2139_gate_c_sentinel_must_reject_fails_to_compile
+	COMMAND ${CMAKE_COMMAND}
+		-DBUILD_DIR=${CMAKE_BINARY_DIR} -DBUILD_TARGET=t2139_gate_c_sentinel_must_reject -DBUILD_CONFIG=$<CONFIG>
+		-DSOURCE_FILE=tools/t2139_gate_c_sentinel_negative.cpp
+		"-DMARKER_TEXT=registry-top divergence (deliberate one-sided append, must-reject construction): the two SSLM_STATUS_NEXT_FREE sentinels no longer agree"
+		-P ${CMAKE_SOURCE_DIR}/tools/ci/check_negative_compile_marker.cmake)
+
+# T-2141's must-accept/must-reject pair (see the add_executable block above for the construction
+# itself): must-accept is a plain must-pass compile check, matching every Gate A/C sibling's own
+# convention; must-reject goes through the same marker script as every other must-reject entry.
+add_test(NAME t2141_gate_c_t2138_suite_side_must_accept_compiles
+	COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target t2141_gate_c_t2138_suite_side_must_accept --config $<CONFIG>)
+add_test(NAME t2141_gate_c_t2138_suite_side_must_reject_fails_to_compile
+	COMMAND ${CMAKE_COMMAND}
+		-DBUILD_DIR=${CMAKE_BINARY_DIR} -DBUILD_TARGET=t2141_gate_c_t2138_suite_side_must_reject -DBUILD_CONFIG=$<CONFIG>
+		-DSOURCE_FILE=tools/t2141_gate_c_t2138_suite_side_check_negative.cpp
+		-DMARKER_TEXT=SSLM_ARTIFACT_REJECTED\ diverges\ \(deliberate\ corruption,\ must-reject\ construction\)
+		-P ${CMAKE_SOURCE_DIR}/tools/ci/check_negative_compile_marker.cmake)
+endif()
+
+# D3D12/HLSL sources and shaders are needed only by the opt-in public GPU target
+# or the Windows test suite. BUILD_TESTING=OFF plus the default GPU option keeps
+# a CPU product configure independent of DXC, D3D12 sources, and shader builds.
+option(SUPERSLM_BUILD_GPU "Build and install the D3D12/HLSL GPU acceleration library (Windows/MSVC only)" OFF)
+option(SUPERSLM_GPU_TEST_SEAMS "Test builds only: compile the GPU library with the T-2851 allocation and device-logits test seams" OFF)
+
+if(SUPERSLM_BUILD_GPU AND NOT WIN32)
+	message(FATAL_ERROR "SUPERSLM_BUILD_GPU requires Windows: src/gpu/*.cpp is a D3D12/HLSL implementation with no non-Windows backend.")
+endif()
+
+if(WIN32 AND (SUPERSLM_BUILD_GPU OR BUILD_TESTING))
+	# T-2115 round 4 (NEW-3, Claude/Poirot/6f60491-t2115-cmake-product-
+	# surface.md, second confirmation), narrowed by T-2152: the project's own
+	# declared floor is 3.16 for CPU-only builds, which never reach this block
+	# (CPU-only Layer 1 embeddability, D-SLM13, stays reachable on CMake
+	# 3.16-3.19). On WIN32, GPU and GPU-bearing test builds need
+	# 3.20: SUPERSLM_GPU_SHADER_OUT_DIR carries a $<CONFIG> generator
+	# expression on multi-config generators, and that string reaches
+	# add_custom_command(OUTPUT ...) -- CMake's own Help/command/
+	# add_custom_command.rst documents generator expressions in OUTPUT as
+	# `.. versionadded:: 3.20`. Below 3.20 the genex is not expanded, so the
+	# build would attempt to create and write into a directory literally
+	# named "$<CONFIG>" -- an illegible path error (`<`/`>` are invalid
+	# Windows path characters) instead of the legible one-line refusal
+	# cmake_minimum_required exists to give. CPU-only BUILD_TESTING=OFF
+	# configures do not enter this block.
+	if(CMAKE_VERSION VERSION_LESS "3.20")
+		message(FATAL_ERROR "A Windows GPU or test build requires CMake 3.20 or higher because shader outputs use generator expressions in add_custom_command(OUTPUT). Configure with -DBUILD_TESTING=OFF and leave SUPERSLM_BUILD_GPU=OFF for the CMake 3.16-compatible CPU-only product build.")
+	endif()
+
+	# dxc.exe (the DirectX Shader Compiler) is not reliably on PATH; build.bat
+	# hardcodes one Windows Kits 10 version. Search PATH first, then fall back
+	# to a glob over every installed Windows Kits 10 SDK version's x64 dxc.exe,
+	# preferring the highest (last, after a lexical sort -- SDK version
+	# directories are dot-separated zero-padded numerals, e.g. 10.0.19041.0,
+	# so a lexical sort is also a numeric sort here).
+	find_program(SUPERSLM_DXC_EXECUTABLE NAMES dxc.exe dxc)
+	if(NOT SUPERSLM_DXC_EXECUTABLE)
+		file(GLOB SUPERSLM_DXC_CANDIDATES
+			"$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/*/x64/dxc.exe"
+			"C:/Program Files (x86)/Windows Kits/10/bin/*/x64/dxc.exe"
+		)
+		if(SUPERSLM_DXC_CANDIDATES)
+			list(SORT SUPERSLM_DXC_CANDIDATES)
+			list(REVERSE SUPERSLM_DXC_CANDIDATES)
+			list(GET SUPERSLM_DXC_CANDIDATES 0 SUPERSLM_DXC_EXECUTABLE)
+		endif()
+	endif()
+	if(NOT SUPERSLM_DXC_EXECUTABLE)
+		message(FATAL_ERROR "dxc.exe (DirectX Shader Compiler) was not found on PATH or under any installed Windows Kits 10 SDK. Install the Windows SDK, pass -DSUPERSLM_DXC_EXECUTABLE=<path to dxc.exe>, or configure the CPU-only product with -DBUILD_TESTING=OFF and SUPERSLM_BUILD_GPU=OFF.")
+	endif()
+	message(STATUS "SuperSLM GPU: compiling shaders with ${SUPERSLM_DXC_EXECUTABLE}")
+
+	# Every compute shader compiles to cs_6_2, -O3, -HV 2018, -WX -- the same
+	# pinned target and flags build.bat uses (T-1986 GPU-serial port, Sec5.7).
+	# superslm_gpu::harness::ShaderPath() (src/gpu/superslm_gpu.cpp) resolves
+	# "<exe_dir>/shaders/<name>.cso" from GetModuleFileNameA at runtime -- the
+	# directory beside whatever executable is actually running, not a fixed
+	# build-tree path. superslm_tests.exe lands directly in ${CMAKE_BINARY_DIR}
+	# on a single-config generator (Ninja, Makefiles) and in
+	# ${CMAKE_BINARY_DIR}/$<CONFIG>/ on a multi-config one (Visual Studio), so
+	# the shader output directory below carries the same $<CONFIG> generator
+	# expression on multi-config generators and resolves to
+	# ${CMAKE_BINARY_DIR}/shaders on a single-config one -- matching
+	# build.bat's own out\shaders-beside-out\*.exe layout in both cases, and
+	# now the directory superslm_tests.exe itself looks in at runtime, not
+	# only a hypothetical future in-tree GPU-dispatching executable's.
+	file(GLOB SUPERSLM_GPU_SHADER_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/shaders/*.hlsl")
+	file(GLOB SUPERSLM_GPU_SHADER_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/shaders/*.hlsli")
+
+	get_property(SUPERSLM_GPU_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+	if(SUPERSLM_GPU_IS_MULTI_CONFIG)
+		set(SUPERSLM_GPU_SHADER_OUT_DIR "${CMAKE_BINARY_DIR}/$<CONFIG>/shaders")
+	else()
+		set(SUPERSLM_GPU_SHADER_OUT_DIR "${CMAKE_BINARY_DIR}/shaders")
+	endif()
+
+	# T-2115 fix round 3 (NEW-1, Claude/Poirot/6f60491-t2115-cmake-product-
+	# surface.md): a second, FIXED copy of every compiled .cso, independent of
+	# $<CONFIG>, staged here purely so install(FILES ...) below never needs a
+	# generator expression in its file list -- install(FILES ...) resolving a
+	# $<CONFIG>-bearing path against `cmake --install --config <cfg>` is not,
+	# on inspection of CMake's own documentation, gated on a cmake_minimum_
+	# required floor above 3.16 the way an earlier round of this fix
+	# incorrectly justified (that round cited install(FILES RENAME ...)'s own
+	# 3.20 addition, a feature this file does not use). Avoided entirely by
+	# never putting a generator expression in an install(FILES ...) list: this
+	# staging copy is a plain, configure-time-known path, unconditionally the
+	# same string on every generator and every configuration. A single
+	# file(MAKE_DIRECTORY ...) below (not a build-time step) is correct here,
+	# unlike SUPERSLM_GPU_SHADER_OUT_DIR above -- this path carries no
+	# generator expression for file(MAKE_DIRECTORY ...) to fail to evaluate.
+	set(SUPERSLM_GPU_SHADER_STAGE_DIR "${CMAKE_BINARY_DIR}/gpu-shaders-staged")
+	file(MAKE_DIRECTORY "${SUPERSLM_GPU_SHADER_STAGE_DIR}")
+
+	set(SUPERSLM_GPU_SHADER_OUTPUTS "")
+	set(SUPERSLM_GPU_SHADER_STAGED "")
+	foreach(_superslm_shader ${SUPERSLM_GPU_SHADER_SOURCES})
+		get_filename_component(_superslm_shader_name "${_superslm_shader}" NAME_WE)
+		set(_superslm_shader_cso "${SUPERSLM_GPU_SHADER_OUT_DIR}/${_superslm_shader_name}.cso")
+		set(_superslm_shader_staged "${SUPERSLM_GPU_SHADER_STAGE_DIR}/${_superslm_shader_name}.cso")
+		add_custom_command(
+			OUTPUT "${_superslm_shader_cso}" "${_superslm_shader_staged}"
+			# The output directory is created here, at build time, rather than via a
+			# configure-time file(MAKE_DIRECTORY ...): SUPERSLM_GPU_SHADER_OUT_DIR
+			# carries a $<CONFIG> generator expression on multi-config generators,
+			# which file(MAKE_DIRECTORY ...) cannot evaluate (it only ever sees the
+			# literal, un-expanded string at configure time).
+			COMMAND "${CMAKE_COMMAND}" -E make_directory "${SUPERSLM_GPU_SHADER_OUT_DIR}"
+			COMMAND "${SUPERSLM_DXC_EXECUTABLE}" -T cs_6_2 -E main -Fo "${_superslm_shader_cso}" "${_superslm_shader}" -O3 -HV 2018 -WX
+			COMMAND "${CMAKE_COMMAND}" -E copy "${_superslm_shader_cso}" "${_superslm_shader_staged}"
+			DEPENDS "${_superslm_shader}" ${SUPERSLM_GPU_SHADER_HEADERS}
+			COMMENT "dxc: ${_superslm_shader_name}.hlsl -> ${_superslm_shader_name}.cso"
+			VERBATIM
+		)
+		list(APPEND SUPERSLM_GPU_SHADER_OUTPUTS "${_superslm_shader_cso}")
+		list(APPEND SUPERSLM_GPU_SHADER_STAGED "${_superslm_shader_staged}")
+	endforeach()
+	unset(_superslm_shader)
+	unset(_superslm_shader_name)
+	unset(_superslm_shader_cso)
+	unset(_superslm_shader_staged)
+
+	add_custom_target(superslm_gpu_shaders DEPENDS ${SUPERSLM_GPU_SHADER_OUTPUTS} ${SUPERSLM_GPU_SHADER_STAGED})
+
+	# T-2152: superslm_tests dispatches real GPU shaders on WIN32 (the T-2019
+	# GPU-serial-port suite) and must not start until they exist -- matching
+	# build.bat's own ordering (dxc runs before the test binary compiles).
+	if(BUILD_TESTING)
+		add_dependencies(superslm_tests superslm_gpu_shaders)
+	endif()
+
+	if(SUPERSLM_BUILD_GPU)
+		add_library(superslm_gpu STATIC
+			src/gpu/gpu_1p0.cpp
+			src/gpu/superslm_gpu.cpp
+		)
+		# PUBLIC link to superslm: the GPU sources use SslmModelView/SslmModel::Load
+		# (model.h) and the checked-chain-funnel/forward-sites declarations
+		# (gpu_port.h), and this also carries superslm's own PUBLIC include/
+		# interface (BUILD_INTERFACE/INSTALL_INTERFACE above) through transitively,
+		# so superslm_gpu needs no separate include_directories(... PUBLIC include)
+		# of its own.
+		target_link_libraries(superslm_gpu PUBLIC superslm)
+		# d3d12_harness.h (src/gpu/, not installed -- GPU-internal) is a private
+		# implementation include, matching build.bat's own /Iinclude (public) with
+		# no separate GPU include path: the two GPU .cpp files #include
+		# "d3d12_harness.h" directly, which only resolves because src/gpu is each
+		# translation unit's own containing directory -- adding it explicitly here
+		# makes that dependency visible rather than relying on the implicit
+		# same-directory search every compiler also does.
+		target_include_directories(superslm_gpu PRIVATE src/gpu)
+		target_link_libraries(superslm_gpu PRIVATE d3d12 dxgi dxguid)
+		# MSVC-guarded, not WIN32-guarded: WIN32 is also true under a MinGW or
+		# GNU-frontend-clang toolchain, where MSVC is false and /W4/-fp:precise
+		# are not valid flags (the compiler chokes on /W4 as a filename) --
+		# matching the if(MSVC)/else() convention every other target in this file
+		# already uses, rather than assuming WIN32 implies MSVC.
+		if(MSVC)
+			target_compile_options(superslm_gpu PRIVATE /W4 /fp:precise)
+		else()
+			target_compile_options(superslm_gpu PRIVATE -Wall -Wextra -ffp-contract=off)
+		endif()
+		add_dependencies(superslm_gpu superslm_gpu_shaders)
+		# T-2851: a TEST build of the GPU library carrying the occurrence-indexed allocation
+		# fault seam and its siblings (SUPERSLM_GPU_ALLOC_FAULT_INJECTION; gpu_port.h), which the
+		# token-finish red suite (tests/t2956-token-finish-red-suite/) links against. Never set
+		# for a library that ships: the seams count every device allocation.
+		if(SUPERSLM_GPU_TEST_SEAMS)
+			target_compile_definitions(superslm_gpu PRIVATE SUPERSLM_GPU_ALLOC_FAULT_INJECTION)
+		endif()
+	endif()
+endif()
+
+# T-2115 (D-SLM3432): the versioned install surface. Only the product library
+# (or libraries, when SUPERSLM_BUILD_GPU=ON) and the public headers are
+# installed -- superslm_test_injection, superslm_tests, and every tool/
+# executable above are internal to this repository's own build and test loop,
+# not part of what an external consumer links against, so none of them gets
+# an install() rule.
+install(TARGETS superslm
+	EXPORT superslmTargets
+	ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+	LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+	RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+if(TARGET superslm_gpu)
+	install(TARGETS superslm_gpu
+		EXPORT superslmTargets
+		ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+	)
+
+	# S1 (Claude/Poirot/6f60491-t2115-cmake-product-surface.md): superslm_gpu
+	# is unusable without its compiled .cso shaders -- every real GPU
+	# dispatch reaches superslm_gpu::harness::GetOrBuildPipeline/
+	# GetOrBuildComposedPipeline (src/gpu/superslm_gpu.cpp), which throws if
+	# ShaderPath()'s file is missing, and every call site along that path
+	# catches std::exception and returns a generic failure status -- an
+	# installed package with the library but not the shaders links and runs
+	# sslm_gpu_context_create cleanly, then fails opaquely at first dispatch.
+	# Installs from SUPERSLM_GPU_SHADER_STAGED (NEW-1 fix, round 3), the fixed,
+	# non-config-dependent copy staged above -- no generator expression
+	# anywhere in this FILES list. The .cso bytecode itself does not vary by
+	# Debug/Release -- only the build-tree path used to reach it does -- so a
+	# single staged copy, produced once regardless of which configuration was
+	# actually built, is correct for every `cmake --install` regardless of
+	# `--config`.
+	install(FILES ${SUPERSLM_GPU_SHADER_STAGED}
+		DESTINATION ${SUPERSLM_INSTALL_GPU_SHADER_DIR}
+	)
+endif()
+
+# T-2150 (D-SLM3423 scrub gate, P2-8): gpu_1p0_bench_bridge.h is a build-seat-only bench
+# accessor header (its own banner: "NOT part of the shipped 1.0 API surface"; its only
+# intended includers are tools/t2113_b3_sequence_smoke.cpp and the other in-tree diagnostic/
+# bench tools, none of which are installed) -- it stays in the source tree for those tools to
+# include, but is excluded from the public install surface.
+install(DIRECTORY include/superslm/
+	DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/superslm
+	PATTERN "gpu_1p0_bench_bridge.h" EXCLUDE
+)
+
+install(EXPORT superslmTargets
+	FILE superslmTargets.cmake
+	NAMESPACE superslm::
+	DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/superslm
+)
+
+write_basic_package_version_file(
+	"${CMAKE_CURRENT_BINARY_DIR}/superslmConfigVersion.cmake"
+	VERSION ${PROJECT_VERSION}
+	COMPATIBILITY SameMajorVersion
+)
+
+configure_package_config_file(
+	"${CMAKE_CURRENT_SOURCE_DIR}/cmake/superslmConfig.cmake.in"
+	"${CMAKE_CURRENT_BINARY_DIR}/superslmConfig.cmake"
+	INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/superslm
+	PATH_VARS SUPERSLM_INSTALL_GPU_SHADER_DIR
+)
+
+install(FILES
+	"${CMAKE_CURRENT_BINARY_DIR}/superslmConfig.cmake"
+	"${CMAKE_CURRENT_BINARY_DIR}/superslmConfigVersion.cmake"
+	DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/superslm
+)

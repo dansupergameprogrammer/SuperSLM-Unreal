@@ -1,0 +1,37 @@
+# Every text file is stored with LF line endings, whatever the committer's own line-ending
+# settings. Without this line a file type named nowhere below (the vendored tree's .txt files,
+# CMakeLists.txt) could be committed CRLF and stop matching its upstream blob, and the
+# coherence checks' vendored check would fail on line endings alone.
+* text=auto
+
+# Binary Unreal and image assets route through Git LFS.
+*.png    filter=lfs diff=lfs merge=lfs -text
+*.jpg    filter=lfs diff=lfs merge=lfs -text
+*.jpeg   filter=lfs diff=lfs merge=lfs -text
+*.uasset filter=lfs diff=lfs merge=lfs -text
+*.umap   filter=lfs diff=lfs merge=lfs -text
+
+# Model artifacts are never committed at model size. The example model ships as a GitHub
+# release asset, not through LFS, so clones stay small. The small .sslm test fixtures that are
+# committed are plain binary files.
+*.sslm   binary
+
+# Normalize text sources to LF in the repository, so a Windows checkout and a Linux CI
+# checkout compare identically.
+*.cpp    text eol=lf
+*.h      text eol=lf
+*.cs     text eol=lf
+*.py     text eol=lf
+*.md     text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.json   text eol=lf
+*.ini    text eol=lf
+*.uplugin  text eol=lf
+*.uproject text eol=lf
+
+# The vendored SuperSLM source is a byte-exact copy of an upstream release tag, checked blob
+# for blob by .github/scripts/check_vendored_against_tag.py. Nothing in it may be converted to
+# an LFS pointer, because a pointer is a different blob. Its own .gitattributes (vendored with
+# it) governs its line endings.
+Plugins/SuperSLMUnreal/Source/ThirdParty/** -filter -diff -merge
