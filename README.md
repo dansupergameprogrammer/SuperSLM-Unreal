@@ -28,7 +28,7 @@ repeatable output.
 - **AI you can replay and test.** Because the same input gives the same output, an AI moment can be
   reproduced exactly: in a replay, in a bug report, in an automated test.
 
-## Schema-constrained generation (JSON!)
+## Schema-constrained generation
 
 This is the feature that turns a language model from a chat toy into a game system.
 
