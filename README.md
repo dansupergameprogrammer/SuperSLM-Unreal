@@ -28,7 +28,7 @@ repeatable output.
 - **AI you can replay and test.** Because the same input gives the same output, an AI moment can be
   reproduced exactly: in a replay, in a bug report, in an automated test.
 
-## JSON your game can act on
+## Schema-constrained generation (JSON!)
 
 This is the feature that turns a language model from a chat toy into a game system.
 
@@ -48,7 +48,7 @@ And it costs you nothing in repeatability: a schema-constrained answer is exactl
 as a free-text one. Schemas are compiled into the model file ahead of time and bound per request by
 name. See [Assets and Import](docs/ASSETS_AND_IMPORT.md#schemas).
 
-## Runtime LoRA adapters: one model, a whole cast
+## Runtime-switchable LoRA adapters
 
 Fine-tune a small **LoRA adapter** for each character, faction or job (the blacksmith, the oracle,
 the quest-giver who only speaks in riddles), convert it with SuperSLM's tools, and swap it onto a
