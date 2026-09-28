@@ -1,6 +1,6 @@
 # SuperSLM for Unreal Engine
 
-**A real language model, running inside your game.** On the player's own machine, inside Unreal
+**A deterministic language model, running inside your game.** On the player's own machine, inside Unreal
 Engine 5.8, never on the game thread, and giving the same answer to the same prompt every time.
 
 No server. No API key. No per-request bill. No internet connection. The model ships with your game
