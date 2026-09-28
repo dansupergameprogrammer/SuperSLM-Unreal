@@ -3,8 +3,8 @@
 > **Status: 1.0.** Every number is a measurement, or computed where marked, labelled with where it
 > came from.
 
-Start with the repository [README](../README.md) for what the plugin does, what 1.0 claims, and
-the supported platforms.
+Start with the repository [README](../README.md) for what the plugin does, and
+[STATUS.md](STATUS.md) for exactly what 1.0 claims, the supported platforms, and every measured figure.
 
 ## Reading order
 
@@ -18,6 +18,7 @@ the supported platforms.
 
 | Document | Scope |
 |---|---|
+| [STATUS.md](STATUS.md) | What 1.0 has been built and tested on, what it does not claim, platforms, and the measured figures. |
 | [ASSETS_AND_IMPORT.md](ASSETS_AND_IMPORT.md) | The `.sslm` model asset, import validation, cooking, schemas, adapters, the GPU head option. |
 | [DETERMINISM.md](DETERMINISM.md) | What is guaranteed, the per-device GPU question, and the self-check with its limits. |
 | [PROFILING.md](PROFILING.md) | Trace channels, timing scopes, counters, stats, CSV categories and bookmarks. |
