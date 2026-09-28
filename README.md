@@ -19,14 +19,52 @@ repeatable output.
 
 - **Characters that understand the player.** A shopkeeper who reads *"two health potions, and be
   quick about it"* and knows it is a purchase, of health potions, two of them, and not very polite.
-- **Text or voice commands that drive gameplay.** Turn free-form player input into structured data
-  your code can act on, not a paragraph you have to parse and hope about.
+- **Text or voice commands that drive gameplay.** Turn free-form player input into JSON your code
+  can act on, not a paragraph you have to parse and hope about.
 - **Dialogue that stays in character,** generated in-engine, on demand, with no round trip to a
   service.
-- **A cast of specialists from one model.** Keep one base model loaded and point each character at
-  its own small adapter, instead of shipping a full model per character.
+- **A cast of specialists from one model.** Keep one base model loaded and give each character its
+  own small LoRA adapter, swapped in at runtime.
 - **AI you can replay and test.** Because the same input gives the same output, an AI moment can be
   reproduced exactly: in a replay, in a bug report, in an automated test.
+
+## JSON your game can act on
+
+This is the feature that turns a language model from a chat toy into a game system.
+
+Give the model a **JSON schema** and it *cannot* write anything that breaks it. Every token it
+considers is checked against the schema before it is picked, so an invalid token is never even a
+candidate. What comes out is the keys you declared, in the order you declared them, with every
+enum value one your game already knows, and it parses whenever the model finishes within its token
+budget.
+
+That means the model's answer goes straight into gameplay code: no retry loop, no regex, no
+prompt-begging for "valid JSON please", no "the AI said something weird." Ask a guard whether the
+player's excuse convinced him and get back `{ "convinced": true, "mood": "suspicious" }`. Turn
+*"grab the torch and meet me at the bridge"* into an action your AI controller can execute. The
+schema is the contract, and the model can't break it.
+
+And it costs you nothing in repeatability: a schema-constrained answer is exactly as deterministic
+as a free-text one. Schemas are compiled into the model file ahead of time and bound per request by
+name. See [Assets and Import](docs/ASSETS_AND_IMPORT.md#schemas).
+
+## Runtime LoRA adapters: one model, a whole cast
+
+Fine-tune a small **LoRA adapter** for each character, faction or job (the blacksmith, the oracle,
+the quest-giver who only speaks in riddles), convert it with SuperSLM's tools, and swap it onto a
+running model **at runtime**. The base model stays loaded; only the small adapter changes.
+
+- **Fast.** Switching adapters took 0.128 s in SuperSLM's own measurement, against 7.52 s to reload
+  a model with the adapter merged in: about 58 times faster (1.5B model, RTX 2080 SUPER).
+- **Per conversation.** Each sequence picks its own adapter, so the blacksmith and the oracle can
+  run from the same base model side by side.
+- **Small to ship.** A cast of specialists is one base model plus a handful of small adapters, not
+  a full model per character.
+- **Safe.** An adapter is validated against its base model when you import it, and a swap takes
+  effect cleanly between tokens.
+
+Prefer a single file per specialist? A LoRA merged into its own `.sslm` works too. See
+[Assets and Import](docs/ASSETS_AND_IMPORT.md#adapters).
 
 ## Why it works in a game
 
@@ -39,10 +77,6 @@ choose the slice size, so you choose what AI costs your frame.
 model, prompt and settings produce the same tokens every time, no matter how the work was sliced
 or how many frames it took. The plugin even ships a determinism self-check you can run in a
 packaged build, on your player's hardware.
-
-**Output your code can trust.** Give the model a JSON schema and it can only write output that fits
-it: the keys you declared, in your order, with values from your enums. No retries, no regex, no
-"the AI said something weird."
 
 **Memory you decide up front.** You size the model's working memory when you configure it, and
 nothing the plugin keeps grows while requests run. A cooked model is memory-mapped, not copied: a
