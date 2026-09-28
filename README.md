@@ -1,132 +1,115 @@
 # SuperSLM for Unreal Engine
 
-**A deterministic language model, running inside your game.** On the player's own machine, inside Unreal
-Engine 5.8, never on the game thread, and giving the same answer to the same prompt every time.
+**A deterministic language model that runs inside your game.** SuperSLM-Unreal is the Unreal
+Engine 5.8 reference implementation of [SuperSLM](https://github.com/dansupergameprogrammer/SuperSLM),
+a small-language-model runtime written for games. The model runs on the player's own machine, off
+the game thread, and gives the same answer to the same prompt every time.
 
-No server. No API key. No per-request bill. No internet connection. The model ships with your game
-as an ordinary Unreal asset, and the plugin runs it in the background while your game keeps its
-frame rate.
+It needs no server, API key or internet connection. The model ships with your game as an Unreal
+asset, and the plugin schedules its work around your frame.
 
-SuperSLM-Unreal is the Unreal reference implementation of
-[SuperSLM](https://github.com/dansupergameprogrammer/SuperSLM), a small-language-model runtime
-built from the ground up for games. We don't know of anything else that does what it does: a
-0.5B to 1.5B parameter model, on CPU or GPU, scheduled into your frame budget, with exactly
-repeatable output.
+> **Status: pre-release.** The source is public ahead of the first release, 1.0. It is built and
+> tested on Windows x64. Performance tuning is the current focus: expect generation to take many
+> frames, and measure on your own target hardware before you design around it. What 1.0 covers
+> and does not cover is in [What 1.0 covers](docs/STATUS.md).
 
 ---
 
-## What you can build with it
+## What it is for
 
-- **Characters that understand the player.** A shopkeeper who reads *"two health potions, and be
-  quick about it"* and knows it is a purchase, of health potions, two of them, and not very polite.
-- **Text or voice commands that drive gameplay.** Turn free-form player input into JSON your code
-  can act on, not a paragraph you have to parse and hope about.
-- **Dialogue that stays in character,** generated in-engine, on demand, with no round trip to a
-  service.
-- **A cast of specialists from one model.** Keep one base model loaded and give each character its
-  own small LoRA adapter, swapped in at runtime.
-- **AI you can replay and test.** Because the same input gives the same output, an AI moment can be
-  reproduced exactly: in a replay, in a bug report, in an automated test.
+- **Understanding what the player says.** Turn typed or transcribed player input into structured
+  data your game can act on: a shopkeeper that recognises *"two health potions, please"* as a
+  purchase of two health potions.
+- **In-character dialogue,** generated in-engine on demand.
+- **Several specialised characters from one model,** by giving each its own LoRA adapter.
+- **Reproducible AI.** The same input gives the same output, so an AI moment can be reproduced in a
+  replay, a bug report or an automated test.
 
-## Schema-constrained generation
+## Features
 
-This is the feature that turns a language model from a chat toy into a game system.
+### Schema-constrained generation
 
-Give the model a **JSON schema** and it *cannot* write anything that breaks it. Every token it
-considers is checked against the schema before it is picked, so an invalid token is never even a
-candidate. What comes out is the keys you declared, in the order you declared them, with every
-enum value one your game already knows, and it parses whenever the model finishes within its token
-budget.
+Give the model a JSON schema and its output is guaranteed to fit it. Each candidate token is checked
+against the schema before it is chosen, so the result contains the keys you declared, in the order
+you declared them, with enum values from your own lists. It parses whenever generation finishes
+within its token budget, so your code can read the answer directly rather than validating and
+retrying.
 
-That means the model's answer goes straight into gameplay code: no retry loop, no regex, no
-prompt-begging for "valid JSON please", no "the AI said something weird." Ask a guard whether the
-player's excuse convinced him and get back `{ "convinced": true, "mood": "suspicious" }`. Turn
-*"grab the torch and meet me at the bridge"* into an action your AI controller can execute. The
-schema is the contract, and the model can't break it.
+Schemas are compiled into the model file ahead of time and selected by name per request. At the
+current SuperSLM version they support objects with required keys in a fixed order, enums, booleans
+and free-text strings. Constrained output is exactly as deterministic as free text. See
+[Assets and Import](docs/ASSETS_AND_IMPORT.md#schemas).
 
-And it costs you nothing in repeatability: a schema-constrained answer is exactly as deterministic
-as a free-text one. Schemas are compiled into the model file ahead of time and bound per request by
-name. See [Assets and Import](docs/ASSETS_AND_IMPORT.md#schemas).
+### Runtime-switchable LoRA adapters
 
-## Runtime-switchable LoRA adapters
-
-Fine-tune a small **LoRA adapter** for each character, faction or job (the blacksmith, the oracle,
-the quest-giver who only speaks in riddles), convert it with SuperSLM's tools, and swap it onto a
-running model **at runtime**. The base model stays loaded; only the small adapter changes.
-
-- **Fast.** Switching adapters took 0.128 s in SuperSLM's own measurement, against 7.52 s to reload
-  a model with the adapter merged in: about 58 times faster (1.5B model, RTX 2080 SUPER).
-- **Per conversation.** Each sequence picks its own adapter, so the blacksmith and the oracle can
-  run from the same base model side by side.
-- **Small to ship.** A cast of specialists is one base model plus a handful of small adapters, not
-  a full model per character.
-- **Safe.** An adapter is validated against its base model when you import it, and a swap takes
-  effect cleanly between tokens.
-
-Prefer a single file per specialist? A LoRA merged into its own `.sslm` works too. See
+Keep one base model loaded and switch a LoRA adapter onto it at runtime, per sequence, so different
+characters can use different adapters on the same base model at the same time. Adapters are
+converted from standard PEFT LoRA checkpoints with SuperSLM's tools and validated against their base
+model at import. A switch takes effect between tokens. In SuperSLM's own measurement (1.5B model,
+RTX 2080 SUPER), switching an adapter took 0.128 s, against 7.52 s to reload a model with the
+adapter merged in. A LoRA merged into its own `.sslm` file is also supported. See
 [Assets and Import](docs/ASSETS_AND_IMPORT.md#adapters).
 
-## Why it works in a game
+### Off the game thread, on CPU or GPU
 
-**It never blocks the game thread.** Inference runs on the plugin's own worker threads (CPU) or on
-the GPU. On the GPU, each token is split into slices of a few layers, one slice per frame: at 4
-layers per slice, a slice measured about 2 ms on an RTX 2080 SUPER with the 0.5B example model. You
-choose the slice size, so you choose what AI costs your frame.
+The **CPU backend** runs inference on the plugin's own worker threads and sizes each job to a time
+budget you set. The **GPU backend** (D3D12, Windows) splits each token into slices of whole
+transformer layers and issues a set number of layers per frame, so you decide how much GPU work a
+frame carries. Neither backend runs inference on the game thread.
 
-**Same prompt, same answer.** SuperSLM does its math in integers, so on the CPU backend the same
-model, prompt and settings produce the same tokens every time, no matter how the work was sliced
-or how many frames it took. The plugin even ships a determinism self-check you can run in a
-packaged build, on your player's hardware.
+### Deterministic
 
-**Memory you decide up front.** You size the model's working memory when you configure it, and
-nothing the plugin keeps grows while requests run. A cooked model is memory-mapped, not copied: a
-510 MB model mapped with about 108 KB of heap in a packaged build.
+SuperSLM computes in integers. On the CPU backend, the same model, prompt and settings produce the
+same tokens every time, however the work was sliced and however many frames it took. The plugin
+includes a determinism self-check that runs in the editor or a packaged build and reports what it
+verified. GPU determinism depends on the device and is not claimed in 1.0. See
+[Determinism](docs/DETERMINISM.md).
 
-**Models are Unreal assets.** Drag a `.sslm` file into the Content Browser. The whole file is
-validated at import, so a broken model fails in the editor with a reason, never in a player's game.
+### Built for shipping
 
-**And the rest of what a shipping game needs:** save and restore a conversation, share one long
-system prompt across many characters, Blueprint nodes and a C++ API, and Unreal Insights trace
-channels on both backends.
+- **Fixed memory.** The model's working memory is sized when you configure the plugin, and nothing
+  the plugin keeps grows while requests run. A cooked model is memory-mapped rather than copied into
+  the heap.
+- **Models are assets.** A `.sslm` file imports through the Content Browser and is fully validated
+  there, so a corrupt or unsupported file fails in the editor with a reason.
+- **Conversation state.** Save and restore a sequence, and share one long prompt prefix across many
+  sequences (CPU backend).
+- **Blueprint and C++.** Latent Blueprint nodes for loading and querying, and a full C++ API.
+- **Profiling.** Unreal Insights trace channels, timing scopes and counters on both backends.
 
-## See it: the potion shop
+## The example: a potion shop
 
-The example project is a tiny potion shop. You type what you'd say at the counter, and the model
-does two things with it.
-
-First it **records your order**, constrained to the shop's schema, so the result is always
-something the game can use directly. For example:
+`ExampleProject` is a small potion shop. You type what you would say at the counter, and the model
+does two things with it. First it records your order against the shop's schema, for example:
 
 ```json
-{ "intent": "buy", "item": "health_potion", "quantity": "two", "polite": false }
+{ "intent": "buy", "item": "health_potion", "quantity": "two", "polite": true }
 ```
 
-`intent` can only be `buy`, `sell`, `ask_price`, `haggle` or `leave`; `item` can only be something
-the shop stocks. The model cannot invent a potion or a field.
+`intent` can only be `buy`, `sell`, `ask_price`, `haggle` or `leave`, and `item` only something the
+shop stocks. Then the shopkeeper answers in one short sentence, in character, knowing what you
+ordered. Both run across frames while the scene renders, on the backend you choose. The example is
+plain C++ over the public API: [`ExampleProject/Source/ExampleProject`](ExampleProject/Source/ExampleProject).
 
-Then the shopkeeper **answers you in character**, in one short sentence, knowing what you ordered.
+## Requirements
 
-Both run across frames while the scene keeps rendering, on the backend you pick. The example is
-plain C++ over the plugin's public API, so it doubles as sample code:
-[`ExampleProject/Source/ExampleProject`](ExampleProject/Source/ExampleProject).
+- Unreal Engine 5.8.
+- Windows x64. Linux x64 and macOS share the sources but have not been built or tested.
+- A C++ project and the Visual Studio toolchain UE 5.8 requires. The plugin compiles from source.
+- The Windows SDK's DirectX Shader Compiler (`dxc.exe`), used to build the GPU shaders.
+- For the GPU backend, a D3D12 GPU.
+- A model of 0.5B to 1.5B parameters, the range the plugin is designed for.
 
 ## Quick start
 
-You need **Unreal Engine 5.8** on **Windows x64**, a C++ project, and the Windows SDK (the build
-uses its `dxc.exe` for the GPU shaders). The plugin compiles from source; nothing is downloaded at
-build time.
-
 1. **Install.** Copy [`Plugins/SuperSLMUnreal`](Plugins/SuperSLMUnreal) into your project's
    `Plugins/` folder, regenerate project files and build.
-2. **Get a model.** Each release attaches a ready-to-use model, Qwen2.5-0.5B-Instruct converted
-   for SuperSLM, on the [Releases](https://github.com/dansupergameprogrammer/SuperSLM-Unreal/releases)
-   page (the first release, 1.0, is being finished now). Or convert a model you choose with
-   SuperSLM's converter.
-3. **Import.** Drag the `.sslm` into the Content Browser.
-4. **Ask it something.** In Blueprint: **Load SuperSLM Model**, then **Create Query**,
-   **Begin Query** with your prompt, and **Tick Query** once per frame until it finishes.
+2. **Get a model.** See [Models](#models) below.
+3. **Import.** Drag the `.sslm` file into the Content Browser.
+4. **Query it.** In Blueprint: **Load SuperSLM Model**, then **Create Query**, **Begin Query** with
+   your prompt, and **Tick Query** once per frame until it finishes.
 
-The same thing in C++, once the model is loaded:
+The same in C++, once the model is loaded:
 
 ```cpp
 FString Error;
@@ -134,13 +117,13 @@ Query = USuperSLMQuery::CreateQuery(this, Model, Error);   // keep Query in a UP
 
 FSuperSLMQueryConfig Config;
 Config.Backend = ESuperSLMBackendBP::GPU;      // or CPU
-Config.FrameBudgetLayers = 4;                  // 4 layers of work per frame
+Config.FrameBudgetLayers = 4;                  // layers of work per frame
 Config.StopTokenIds = { 151645, 151643 };      // end of turn / end of text for Qwen2.5
 
 Query->BeginQuery(TEXT("<|im_start|>user\nWhat do you sell?<|im_end|>\n<|im_start|>assistant\n"),
                   /*MaxNewTokens*/ 64, Config, Error);
 
-// Then every frame, for example from your actor's Tick:
+// Then once per frame, for example from an actor's Tick:
 bool bSucceeded = false;
 FSuperSLMQueryReadout Readout;
 if (Query->TickQuery(DeltaSeconds, bSucceeded, Readout, Error) && bSucceeded)
@@ -149,21 +132,53 @@ if (Query->TickQuery(DeltaSeconds, bSucceeded, Readout, Error) && bSucceeded)
 }
 ```
 
-The full walkthrough, including the lower-level C++ API with sequences, schemas and adapters, is in
-[Getting Started](docs/GETTING_STARTED.md).
+[Getting Started](docs/GETTING_STARTED.md) covers the full setup and the lower-level API
+(sequences, schemas, adapters, save and restore).
 
-## Where it runs
+## Models
+
+**The example model.** Each release attaches one ready-to-use model: Qwen2.5-0.5B-Instruct,
+converted with SuperSLM at a context length of 4096, with the example project's schemas. It is a
+release download rather than a file in the repository, and will appear on the
+[Releases](https://github.com/dansupergameprogrammer/SuperSLM-Unreal/releases) page with 1.0.
 
 | | |
 |---|---|
-| Engine | Unreal Engine 5.8 |
-| Platform | Windows x64, verified. Linux and macOS share the sources but have not been built or tested yet. |
-| CPU backend | Any x64 CPU; SuperSLM picks SSE2, AVX2 or AVX-512 at startup. Deterministic, verified on Windows. |
-| GPU backend | D3D12, Windows. Runs on its own device alongside the engine's renderer. |
-| Model size | 0.5B to 1.5B parameters, the range a game can afford in memory and frame time. |
+| File | `qwen2.5-0.5b-instruct-cap4096.sslm` |
+| Size | 510,316,184 bytes |
+| SHA-256 | `9ccf7e378bbe47aa0ffd3810aa82875926cbe51af1bdfa08393c3fae657463da` |
+| License | Apache-2.0, from the source checkpoint: Qwen2.5-0.5B-Instruct by the Qwen team (Alibaba Cloud), converted and quantized by this project |
 
-For the precise picture, including what 1.0 has been tested on, what it does not claim yet, and
-every measured figure with the machine it came from, see [What 1.0 covers](docs/STATUS.md).
+**Your own models.** No other converted models are distributed. Download a checkpoint under its own
+license, convert it with SuperSLM's converter, and import the `.sslm`. The plugin is not tied to one
+model. See [Assets and Import](docs/ASSETS_AND_IMPORT.md).
+
+## How it relates to SuperSLM
+
+SuperSLM is the engine-independent runtime: the `.sslm` format, the converter, the inference kernels,
+constrained decoding and the determinism guarantee. This plugin builds SuperSLM's sources, vendored
+unmodified at a pinned release tag (currently `v1.9.0`), with the engine's own toolchain. Nothing is
+downloaded at build time and no prebuilt library is used. For the runtime's internals, see the
+[SuperSLM repository](https://github.com/dansupergameprogrammer/SuperSLM).
+
+## Known limitations
+
+- Windows x64 only for now. The GPU backend is Windows-only.
+- GPU determinism is not claimed in 1.0, and the self-check's GPU verdict is withheld.
+- Shared prompt prefixes are CPU-only.
+- The plugin uses greedy decoding; sampling is not exposed.
+- Performance is still being tuned, and published figures come from one development machine.
+
+The complete list, with every measured figure and the machine it came from, is in
+[What 1.0 covers](docs/STATUS.md) and the [changelog](CHANGELOG.md).
+
+## Also in this repository
+
+- **`Plugins/SuperSLMUnrealMCP`**, an optional MCP toolset through which an AI agent can inspect a
+  model and run schema-constrained inference into data tables from the editor. It is disabled by
+  default, experimental, and needs the engine's experimental MCP plugins.
+- **`ExampleProject`**, the potion shop.
+- **`docs/`**, the documentation below.
 
 ## Documentation
 
@@ -171,17 +186,19 @@ every measured figure with the machine it came from, see [What 1.0 covers](docs/
 |---|---|
 | [Getting Started](docs/GETTING_STARTED.md) | Install, import a model, make a first request, run the example. |
 | [Blueprint and C++ API](docs/BLUEPRINT_API.md) | Every node and call. |
-| [Assets and Import](docs/ASSETS_AND_IMPORT.md) | Models, schemas, adapters, cooking. |
+| [Assets and Import](docs/ASSETS_AND_IMPORT.md) | Models, schemas, adapters and cooking. |
 | [Architecture](docs/ARCHITECTURE.md) | How the two backends schedule work, and where memory lives. |
-| [Determinism](docs/DETERMINISM.md) | What "same answer every time" guarantees, and the self-check. |
-| [Profiling](docs/PROFILING.md) and [Tooling](docs/TOOLING.md) | Unreal Insights, editor tools, and the optional, experimental MCP toolset. |
-| [What 1.0 covers](docs/STATUS.md) | Tested platforms, limits, and measurements. |
+| [Determinism](docs/DETERMINISM.md) | What is guaranteed, and the self-check. |
+| [Profiling](docs/PROFILING.md) and [Tooling](docs/TOOLING.md) | Unreal Insights, editor tools, calibration and the MCP toolset. |
+| [What 1.0 covers](docs/STATUS.md) | Tested platforms, limits and measurements. |
 
-## License
+## Contributing, security and license
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for building and testing, and [SECURITY.md](SECURITY.md) to
+report a vulnerability privately.
 
 Apache License 2.0, the same as SuperSLM. See [LICENSE](LICENSE) and [NOTICE](NOTICE). The example
-model is Qwen2.5-0.5B-Instruct by the Qwen team (Alibaba Cloud), Apache-2.0, converted and
-quantized by this project.
+model is distributed under its source checkpoint's license, as above.
 
 Unreal and Unreal Engine are trademarks or registered trademarks of Epic Games, Inc. in the United
 States of America and elsewhere. This project is not affiliated with, endorsed by or sponsored by
