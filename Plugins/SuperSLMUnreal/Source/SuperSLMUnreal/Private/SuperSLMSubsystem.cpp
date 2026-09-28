@@ -377,6 +377,8 @@ namespace
 
 		// True once a queued Restore has reserved this (otherwise-free) slot but the worker has
 		// not yet delivered the restore -- excluded from vend/due processing until it delivers.
+		// Only that restore's own delivery (or drop) ends it: a previous holder's restore still
+		// queued or in flight on the slot does not.
 		bool bAwaitingRestore = false;
 
 		// D-SLM7946: the slot's one lifecycle job in flight, as the one-generation projection reads
@@ -3661,7 +3663,14 @@ namespace
 		auto Deliver = [&S, SlotIndex, HandleId, Owner, Out, bParsed, bModelMatches, bAdapterOk, bAdapterPinned, ParseErrorCap, ContentsCap, AdapterId](double)
 		{
 			FSlot& Slot = S.Slots[SlotIndex];
-			Slot.bAwaitingRestore = false;
+			// The reservation this restore made ends here -- unless its holder returned the slot
+			// first and a newer restore has reserved it since (QueueRestore()'s fallback onto an
+			// undrained slot). That reservation is the newer holder's and ends at its own restore's
+			// delivery (D-SLM7946: ProjectGenerationTurn() reads it).
+			if (Slot.VendedId == 0 || Slot.VendedId == Owner)
+			{
+				Slot.bAwaitingRestore = false;
+			}
 			--Slot.OutstandingJobCount;
 			if (bAdapterPinned)
 			{
@@ -3814,7 +3823,7 @@ namespace
 				{
 					S.Fault(Slot, ESuperSLMDecodeOutcome::Generating, kSchedulingDomainFault);
 				}
-				if (bRestore)
+				if (bRestore && (Slot.VendedId == 0 || bOwnerHolds)) // a newer restore's reservation stands (DispatchRestore())
 				{
 					Slot.bAwaitingRestore = false;
 				}
@@ -4977,7 +4986,8 @@ namespace
 		// Reserve a slot at once (a fresh vend, valid immediately, D-SLM7457: Restore always vends
 		// fresh and cannot collide with a busy sequence's own queue). A drained free slot is
 		// preferred; when none is drained the reservation falls back to FreeSlots[0], behind that
-		// slot's queued recycle (H10, kept as built: which physical slot a restore takes may depend
+		// slot's queued recycle and any restore its previous holder queued, whose delivery leaves
+		// this reservation standing (H10, kept as built: which physical slot a restore takes may depend
 		// on worker pace, and no claim depends on the slot index, T-2991 §5.1 #7).
 		int32 FreePos = 0;
 		for (int32 I = 0; I < S.FreeSlots.Num(); ++I)

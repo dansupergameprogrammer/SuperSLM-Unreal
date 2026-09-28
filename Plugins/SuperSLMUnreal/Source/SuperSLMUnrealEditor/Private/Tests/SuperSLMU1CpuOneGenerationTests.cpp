@@ -810,7 +810,8 @@ bool FSuperSLMU1CpuGenerationAcceptedWhileResetInFlightTest::RunTest(const FStri
 	// its handle is still Pending. A job posted in a tick's Plan is delivered no earlier than the
 	// next tick's Apply, so the window is always observed unless the reset resolves first.
 	int32 Ticks = 0;
-	while (Ticks < 120 && Cpu->GetLifecycleOpResult(HReset) == ESuperSLMRestoreResult::Pending && Cpu->GetPendingLifecycleOperationCount(Seq) != 0)
+	const double WindowStart = FPlatformTime::Seconds();
+	while (FPlatformTime::Seconds() - WindowStart < kCpuOneGenDeadlineSeconds && Cpu->GetLifecycleOpResult(HReset) == ESuperSLMRestoreResult::Pending && Cpu->GetPendingLifecycleOperationCount(Seq) != 0)
 	{
 		CpuOneGenTick(*Cpu);
 		++Ticks;
@@ -916,7 +917,8 @@ bool FSuperSLMU1CpuGenerationRefusedAtCallBehindRestoreTest::RunTest(const FStri
 			return false;
 		}
 		int32 Ticks = 0;
-		while (Ticks < 120 && Cpu->GetLifecycleOpResult(HRestore) == ESuperSLMRestoreResult::Pending && Cpu->GetPendingLifecycleOperationCount(R) != 0)
+		const double WindowStart = FPlatformTime::Seconds();
+		while (FPlatformTime::Seconds() - WindowStart < kCpuOneGenDeadlineSeconds && Cpu->GetLifecycleOpResult(HRestore) == ESuperSLMRestoreResult::Pending && Cpu->GetPendingLifecycleOperationCount(R) != 0)
 		{
 			CpuOneGenTick(*Cpu);
 			++Ticks;
@@ -1217,9 +1219,11 @@ bool FSuperSLMU1CpuGenerationAcceptedBehindResetAndAdoptTest::RunTest(const FStr
 // a Complete sequence, a restore of a blob saved mid-generation, and a restore of an Idle blob
 // holding an adopted prefix -- the begin is issued after n paced ticks, for n = 0 .. N + 1, where N
 // is the tick count at which the enabling handle first read resolved in a calibration run of the
-// same arm, and once more after the enabling handle resolves, with a fresh sequence and enabling
-// call per point. Every point gives the arm's verdict: accepted, refused, accepted. An accepted
-// point's generation is driven to Complete; a refused point's request is not run on. ---
+// same arm, and on past N + 1 until a point's begin finds its enabling handle resolved; then once
+// more after the enabling handle resolves, with a fresh sequence and enabling call per point. N is
+// the worker's pace, so nothing bounds it but the deadline every drive has. Every point gives the
+// arm's verdict: accepted, refused, accepted. An accepted point's generation is driven to Complete;
+// a refused point's request is not run on. ---
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FSuperSLMU1CpuOneGenerationVerdictIndependentOfTicksTest,
 	"SuperSLM.U1.Cpu.OneGenerationVerdictIndependentOfTicks",
@@ -1277,7 +1281,11 @@ bool FSuperSLMU1CpuOneGenerationVerdictIndependentOfTicksTest::RunTest(const FSt
 
 	for (const FArm& Arm : Arms)
 	{
-		// Calibration: the paced ticks until the enabling handle first reads resolved.
+		// Calibration: the paced ticks until the enabling handle first reads resolved. The handle
+		// resolves only once the worker has run the job, and a paced tick is a Tick() and a 2 ms
+		// sleep, so N measures the worker's wall time at this run's pace: it sets how many points
+		// run and nothing is asserted on its size. Like every drive in this file, the calibration is
+		// bounded by the deadline, and the handle must resolve within it.
 		int32 N = 0;
 		{
 			FSuperSLMSequence Seq;
@@ -1286,22 +1294,40 @@ bool FSuperSLMU1CpuOneGenerationVerdictIndependentOfTicksTest::RunTest(const FSt
 			{
 				return false;
 			}
-			while (N < 1000 && Cpu->GetLifecycleOpResult(H) == ESuperSLMRestoreResult::Pending)
+			const double Start = FPlatformTime::Seconds();
+			while (Cpu->GetLifecycleOpResult(H) == ESuperSLMRestoreResult::Pending && FPlatformTime::Seconds() - Start < kCpuOneGenDeadlineSeconds)
 			{
 				CpuOneGenTick(*Cpu);
 				++N;
 			}
+			const bool bResolved = Cpu->GetLifecycleOpResult(H) != ESuperSLMRestoreResult::Pending;
 			Cpu->ReturnSequence(Seq);
 			AddInfo(FString::Printf(TEXT("%s: calibration N = %d"), Arm.Name, N));
-			if (!TestTrue(*FString::Printf(TEXT("precondition: %s: the calibration's N is at most 120 (%d)"), Arm.Name, N), N <= 120))
+			if (!TestTrue(*FString::Printf(TEXT("precondition: %s: the calibration's enabling handle resolves within %.0f s (%d paced ticks)"), Arm.Name, kCpuOneGenDeadlineSeconds, N), bResolved))
 			{
 				return false;
 			}
 		}
-		// Points n = 0 .. N + 1, then one after the enabling handle has resolved.
-		for (int32 Point = 0; Point <= N + 2; ++Point)
+		// Points n = 0 .. N + 1, and on past N + 1 until a point's begin finds its enabling handle
+		// already resolved, so the points span the call to the resolution at their own pace too;
+		// then one after the enabling handle has resolved.
+		bool bSawResolvedAtBegin = false;
+		double PastNStart = -1.0;
+		for (int32 Point = 0; ; ++Point)
 		{
-			const bool bAfterResolved = Point == N + 2;
+			const bool bAfterResolved = Point > N + 1 && bSawResolvedAtBegin;
+			if (Point > N + 1 && !bSawResolvedAtBegin)
+			{
+				if (PastNStart < 0.0)
+				{
+					PastNStart = FPlatformTime::Seconds();
+				}
+				if (!TestTrue(*FString::Printf(TEXT("%s: a point past N + 1 finds the enabling handle resolved within %.0f s (n = %d)"), Arm.Name, kCpuOneGenDeadlineSeconds, Point),
+						FPlatformTime::Seconds() - PastNStart < kCpuOneGenDeadlineSeconds))
+				{
+					return false;
+				}
+			}
 			FSuperSLMSequence Seq;
 			FSuperSLMLifecycleOpHandle H;
 			if (!Enable(Arm.Kind, Seq, H))
@@ -1314,10 +1340,19 @@ bool FSuperSLMU1CpuOneGenerationVerdictIndependentOfTicksTest::RunTest(const FSt
 			}
 			else
 			{
+				const double Start = FPlatformTime::Seconds();
 				for (int32 T = 0; T < Point; ++T)
 				{
 					CpuOneGenTick(*Cpu);
 				}
+				const bool bResolvedAtBegin = Cpu->GetLifecycleOpResult(H) != ESuperSLMRestoreResult::Pending;
+				if (!bResolvedAtBegin && !TestTrue(*FString::Printf(TEXT("%s: the enabling handle resolves within %.0f s (n = %d)"), Arm.Name, kCpuOneGenDeadlineSeconds, Point),
+						FPlatformTime::Seconds() - Start < kCpuOneGenDeadlineSeconds))
+				{
+					Cpu->ReturnSequence(Seq);
+					return false;
+				}
+				bSawResolvedAtBegin |= bResolvedAtBegin;
 			}
 			const FString PointName = bAfterResolved ? FString(TEXT("after the enabling handle resolved")) : FString::Printf(TEXT("n = %d"), Point);
 			FString Error;
@@ -1332,9 +1367,146 @@ bool FSuperSLMU1CpuOneGenerationVerdictIndependentOfTicksTest::RunTest(const FSt
 			{
 				return false;
 			}
+			if (bAfterResolved)
+			{
+				break;
+			}
 		}
 	}
 	return true;
+}
+
+// --- C11: a restore that reserves a returned slot still holding its previous holder's undelivered
+// restore keeps its own reservation until its own delivery. Three sequences are held, so one slot is
+// free; a restore of the mid-generation blob takes it (precondition: a vend is then refused
+// PoolExhausted) and its holder returns it before any tick, the restore still pending; a second
+// restore of the same blob must take that slot, behind the first holder's restore and the recycle.
+// After every paced tick, until three ticks after the second restore's handle resolves, a begin on
+// the second sequence is refused at the call and queues nothing: the first holder's restore
+// delivering, the recycle, the second restore in flight and its delivery each leave the verdict a
+// restore that carries a generation gives. The drive is bounded by the file's deadline, and the tick
+// the second restore resolved at is logged. Preconditions: it resolves, and some tick saw it in
+// flight (handle Pending, nothing queued). The second restore succeeds and its generation
+// completes. ---
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FSuperSLMU1CpuOneGenerationRestoreBehindPreviousHoldersRestoreTest,
+	"SuperSLM.U1.Cpu.OneGenerationRestoreBehindPreviousHoldersRestore",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FSuperSLMU1CpuOneGenerationRestoreBehindPreviousHoldersRestoreTest::RunTest(const FString& Parameters)
+{
+	FTestWorldWrapper W;
+	if (!W.CreateTestWorld(EWorldType::Game))
+	{
+		return false;
+	}
+	USuperSLMSubsystem* Cpu = nullptr;
+	USuperSLMModel* Model = nullptr;
+	if (!CpuOneGenSetUp(*this, W.GetTestWorld(), Cpu, Model))
+	{
+		return false;
+	}
+	TArray<uint8> MidBlob;
+	TArray<int32> TokensAtSave;
+	if (!CpuOneGenSaveMidGeneration(*this, *Cpu, MidBlob, TokensAtSave))
+	{
+		return false;
+	}
+
+	FSuperSLMSequence Held[3];
+	auto ReturnHeld = [Cpu, &Held]()
+	{
+		for (const FSuperSLMSequence& H : Held)
+		{
+			Cpu->ReturnSequence(H);
+		}
+	};
+	for (FSuperSLMSequence& H : Held)
+	{
+		if (!CpuOneGenVend(*this, *Cpu, H, TEXT("a held sequence")))
+		{
+			ReturnHeld();
+			return false;
+		}
+	}
+
+	FSuperSLMSequence First, Second;
+	FSuperSLMLifecycleOpHandle HFirst, HSecond;
+	if (!CpuOneGenRestore(*this, *Cpu, Model, MidBlob, First, HFirst, TEXT("the first holder's restore")))
+	{
+		ReturnHeld();
+		return false;
+	}
+	FSuperSLMSequence Probe;
+	const ESuperSLMVendResult ProbeResult = Cpu->VendSequence(Probe);
+	if (ProbeResult == ESuperSLMVendResult::Success)
+	{
+		Cpu->ReturnSequence(Probe);
+	}
+	if (!TestEqual(TEXT("precondition: the first holder's restore took the last free slot (a vend is refused)"), (uint8)ProbeResult, (uint8)ESuperSLMVendResult::PoolExhausted) ||
+		!TestEqual(TEXT("precondition: the first holder returns its sequence with its restore pending"), (uint8)Cpu->GetLifecycleOpResult(HFirst), (uint8)ESuperSLMRestoreResult::Pending))
+	{
+		Cpu->ReturnSequence(First);
+		ReturnHeld();
+		return false;
+	}
+	Cpu->ReturnSequence(First);
+	if (!CpuOneGenRestore(*this, *Cpu, Model, MidBlob, Second, HSecond, TEXT("the second holder's restore, on the slot the first returned")))
+	{
+		ReturnHeld();
+		return false;
+	}
+
+	// The second restore resolves after three jobs run in series on the slot (the first holder's
+	// restore, the recycle, the second restore), so the drive is bounded by the file's deadline, not
+	// a tick count. InFlightTicks counts ticks at which the second restore was in flight: its handle
+	// Pending with nothing left in the sequence's queue -- the only state in which the begin's
+	// verdict depends on the reservation outliving the first holder's delivery.
+	bool bOk = true;
+	int32 TicksAfterResolved = -1;
+	int32 ResolvedAtTick = -1;
+	int32 InFlightTicks = 0;
+	int32 Tick = 0;
+	const double DriveStart = FPlatformTime::Seconds();
+	for (; TicksAfterResolved < 3 && FPlatformTime::Seconds() - DriveStart < kCpuOneGenDeadlineSeconds; ++Tick)
+	{
+		if (Tick > 0)
+		{
+			CpuOneGenTick(*Cpu);
+		}
+		if (Cpu->GetLifecycleOpResult(HSecond) != ESuperSLMRestoreResult::Pending)
+		{
+			if (ResolvedAtTick < 0)
+			{
+				ResolvedAtTick = Tick;
+			}
+			++TicksAfterResolved;
+		}
+		const int32 PendingBefore = Cpu->GetPendingLifecycleOperationCount(Second);
+		if (ResolvedAtTick < 0 && PendingBefore == 0)
+		{
+			++InFlightTicks;
+		}
+		FString Error;
+		const bool bAccepted = Cpu->BeginGeneration(Second, CpuOneGenQ(), Error);
+		if (!TestFalse(*FString::Printf(TEXT("a begin on a restore that took the slot behind its previous holder's restore is refused at every tick (tick %d, phase %s; %s)"),
+				Tick, CpuOneGenPhaseName(Cpu->GetPhase(Second)), *Error), bAccepted))
+		{
+			Cpu->ReturnSequence(Second);
+			ReturnHeld();
+			return false;
+		}
+		bOk &= TestEqual(*FString::Printf(TEXT("the refused begin queues nothing (tick %d)"), Tick), Cpu->GetPendingLifecycleOperationCount(Second), PendingBefore);
+	}
+	AddInfo(FString::Printf(TEXT("the second restore resolved at tick %d; in flight (handle Pending, nothing queued) at %d tick(s)"), ResolvedAtTick, InFlightTicks));
+	bOk &= TestTrue(*FString::Printf(TEXT("precondition: the second restore resolves within %.0f s (%d ticks)"), kCpuOneGenDeadlineSeconds, Tick), TicksAfterResolved >= 0);
+	bOk &= TestTrue(*FString::Printf(TEXT("precondition: some tick observed the second restore in flight (handle Pending, nothing queued) (%d ticks)"), InFlightTicks), InFlightTicks > 0);
+	bOk &= TestEqual(TEXT("the second holder's restore succeeds"), (uint8)Cpu->GetLifecycleOpResult(HSecond), (uint8)ESuperSLMRestoreResult::Success);
+	bOk &= TestTrue(TEXT("the second holder's restored generation completes"),
+		CpuOneGenDriveToEnd(*Cpu, Second) && Cpu->GetPhase(Second) == ESuperSLMSequencePhase::Complete);
+	Cpu->ReturnSequence(Second);
+	ReturnHeld();
+	return bOk;
 }
 
 #endif // SUPERSLM_WITH_L2S1_ASYNC
