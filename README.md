@@ -8,8 +8,7 @@ the game thread, and gives the same answer to the same prompt every time.
 It needs no server, API key or internet connection. The model ships with your game as an Unreal
 asset, and the plugin schedules its work around your frame.
 
-> **Status: pre-release.** The source is public ahead of the first release, 1.0. It is built and
-> tested on Windows x64. Performance tuning is the current focus: expect generation to take many
+> **Status: 1.0.** Released; built and tested on Windows x64. Performance tuning is the current focus: expect generation to take many
 > frames, and measure on your own target hardware before you design around it. What 1.0 covers
 > and does not cover is in [What 1.0 covers](docs/STATUS.md).
 
