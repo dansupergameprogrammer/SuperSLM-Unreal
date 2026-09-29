@@ -4,7 +4,7 @@ All notable changes to SuperSLM-Unreal are recorded here. Versions follow the `V
 `Plugins/SuperSLMUnreal/SuperSLMUnreal.uplugin`. The plugin versions independently of SuperSLM; each entry
 names the SuperSLM release it vendors.
 
-## 1.0.0 (Unreleased)
+## 1.0.0 - 2026-09-28
 
 First release. Unreal Engine 5.8. **Windows x64**, CPU and GPU (D3D12) backends. Linux x64 and
 macOS (Apple Silicon) share the same sources but have not been built or tested as an Unreal plugin.
@@ -108,9 +108,9 @@ macOS (Apple Silicon) share the same sources but have not been built or tested a
 - A GPU restore that fails because the GPU device was lost reads `Malformed`, not a result of its
   own.
 - GPU throughput: 1.0 states no GPU tokens-per-second figure. What the GPU backend buys is CPU
-  time; see the README's section "The GPU claim: frame cost, not speed".
+  time; see "The GPU claim: frame cost, not speed" in `docs/STATUS.md`.
 - Under rendering, the GPU's per-slice time is a span that includes the renderer's own work on the
-  same GPU, so it bounds the slice's cost from above (README, *Measured*).
+  same GPU, so it bounds the slice's cost from above (`docs/STATUS.md`, *Measured*).
 - The calibration command's layer measurement under-prices layers run inside a real job; this is
   not fixed in 1.0 (see the first item).
 - The CPU re-issue after a lost GPU device has no automated test: a device loss cannot be produced
