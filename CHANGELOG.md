@@ -103,7 +103,7 @@ macOS (Apple Silicon) share the same sources but have not been built or tested a
 - Shared prefixes are CPU-only.
 - The self-check compares tokens, not logits.
 - The GPU backend has been run in a source-built engine's editor and in a packaged build. In an
-  installed (launcher) engine's editor it has {INSTALLED_ENGINE_GPU}.
+  installed (launcher) engine's editor it has not been run.
 - Saves do not carry across a change of the plugin's SuperSLM pin.
 - A GPU restore that fails because the GPU device was lost reads `Malformed`, not a result of its
   own.

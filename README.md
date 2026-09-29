@@ -161,13 +161,29 @@ unmodified at a pinned release tag (currently `v1.9.0`), with the engine's own t
 downloaded at build time and no prebuilt library is used. For the runtime's internals, see the
 [SuperSLM repository](https://github.com/dansupergameprogrammer/SuperSLM).
 
+## Performance today
+
+Measured in a packaged Development build of the example on one machine (AMD Ryzen 9 3950X,
+NVIDIA RTX 2080 SUPER), with the 0.5B example model and the frame rate capped at 60:
+
+| | CPU backend | GPU backend, 4 layers per frame |
+|---|---|---|
+| Potion-shop query (order plus reply), start to answer | about 9.6 s (579 frames) | about 15.8 s (946 frames) |
+| Generation rate | about 7 tokens per second | |
+| GPU time per 4-layer slice, nothing else on the GPU | | 1.36 ms median |
+
+The game thread's own cost stays small throughout: the CPU backend's per-frame bookkeeping stays
+under 1 ms, which the example's test checks on every tick. Most of the answer time is spent reading the prompt (about 44 ms per prompt token
+on the CPU), and speeding that up is the current work. Every figure, with its conditions, is in
+[What 1.0 covers](docs/STATUS.md#measured).
+
 ## Known limitations
 
 - Windows x64 only for now. The GPU backend is Windows-only.
 - GPU determinism is not claimed in 1.0, and the self-check's GPU verdict is withheld.
 - Shared prompt prefixes are CPU-only.
 - The plugin uses greedy decoding; sampling is not exposed.
-- Performance is still being tuned, and published figures come from one development machine.
+- Performance is still being tuned, and every published figure comes from one development machine.
 
 The complete list, with every measured figure and the machine it came from, is in
 [What 1.0 covers](docs/STATUS.md) and the [changelog](CHANGELOG.md).
