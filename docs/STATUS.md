@@ -79,7 +79,7 @@ which you enable in your project. In practice both mean a source-built engine.
   compute shaders from the plugin's own directory.
 - The GPU backend has been run in a source-built engine's editor and in a packaged Development
   build. In an installed (launcher) engine's editor it has
-  {INSTALLED_ENGINE_GPU}.
+  not been run.
 
 ## Relationship to SuperSLM
 
@@ -150,14 +150,16 @@ Every figure here is a measurement, or computed where marked, with the machine i
 | GPU device-resident head, VRAM per mapped 0.5B model | 137,353,728 B requested buffers (a lower bound on what the driver occupies) | Computed from the model's shape (not a measurement); SuperSLM measured 137,433,088 B on the RTX 2080 SUPER |
 | GPU time per slice, 4 layers per slice | Below the table | NVIDIA RTX 2080 SUPER, 0.5B example model |
 | Cooked-load heap growth for a memory-mapped model, packaged Windows build | 108,418 bytes peak net allocation while mapping the 510,316,184-byte example model (0.02 %) | Packaged Windows Development build of the example, AMD Ryzen 9 3950X |
+| Example query (extraction plus reply), start to answer, CPU backend, 60 fps cap | 579 frames, 9,649 ms; about 7.0 tokens per second; prompt reading about 43.6 ms per prompt token | Packaged Windows Development build of the example, AMD Ryzen 9 3950X |
+| Example query (extraction plus reply), start to answer, GPU backend at 4 layers per slice, 60 fps cap | 946 frames, about 15,766 ms | Packaged Windows Development build of the example, NVIDIA RTX 2080 SUPER |
 
 **GPU time per slice.** Measured on one RTX 2080 SUPER at 4 layers per slice (the example
 project's setting): the
-median GPU slice takes {HEADLESS_MS} ms with nothing else on the GPU. With the example scene
-rendering at {FPS} frames per second, the measured slice span has a median of {RENDERED_MS} ms.
+median GPU slice takes 1.36 ms with nothing else on the GPU. With the example scene
+rendering at 60 frames per second, the measured slice span has a median of 5.38 ms.
 That span includes time the GPU spent on the scene's own rendering while the slice ran, so it is an
 upper bound on the slice's own cost. In the editor, with its viewport rendering, the median at 4
-layers was {RS3F_MS} ms.
+layers was 1.98 ms.
 
 A caller who configures the GPU backend directly sets the slice size (`DispatchBudget` is
 required). The Blueprint Load node and a default query run a whole token per tick, and 4 layers
