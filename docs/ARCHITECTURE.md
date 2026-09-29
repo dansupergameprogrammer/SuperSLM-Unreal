@@ -234,7 +234,7 @@ configuration joins the worker threads); they are listed under *Blocking calls* 
   never switched while it runs:
   - the **composed path** splits a token into a caller-set number of whole layers per tick. At 4
     layers on an RTX 2080 SUPER with the 0.5B model, a slice measured about 2 ms (see the
-    [README's Measured section](../README.md#measured)). Concurrent sequences share the tick's
+    [Measured section of STATUS.md](STATUS.md#measured)). Concurrent sequences share the tick's
     budget through SuperSLM's batch call, in an order that rotates each tick so none starves;
   - the **one-call path** runs a whole token per call, one token per tick across all its
     sequences in rotation.
@@ -262,7 +262,7 @@ Where a figure below names a "default", it names its host:
 
 - **The example project** runs 4 layers per slice, selected from slice-cost measurements on an
   NVIDIA RTX 2080 SUPER with the 0.5B example model. The measured slice times are in the
-  [README's Measured section](../README.md#measured).
+  [Measured section of STATUS.md](STATUS.md#measured).
 - **The Load SuperSLM Model node** sets the tick's budget to the model's whole depth, shared by the
   sequences in flight. Set a smaller slice from C++, or per query with
   `FSuperSLMQueryConfig::FrameBudgetLayers`.
