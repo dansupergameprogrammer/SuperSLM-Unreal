@@ -169,6 +169,19 @@ project's setting): the
 median GPU slice takes 1.36 ms with nothing else on the GPU (1.0). With the example scene
 rendering at 60 frames per second, the measured slice span has a median of 5.38 ms at 1.0 and
 3.35 to 3.67 ms at 1.2 (three runs).
+
+At 1.2 the example query was also timed at other slice sizes, in the same packaged Development
+build at the 60 fps cap, three runs each, with the same tokens in every run:
+
+| Layers per frame | Frames to answer | Start to answer | Slice span median, scene rendering |
+|---|---|---|---|
+| 4 (the example's setting) | 946 to 949 | 15,766 to 15,816 ms | 3.35 to 3.67 ms |
+| 8 | 481 | 8,001 to 9,171 ms | 3.84 to 3.88 ms |
+| 12 | 326 | 5,417 ms | 4.23 to 4.94 ms |
+| 24, whole token (one call per frame) | 171 | 2,834 ms | 6.56 to 6.58 ms |
+
+The GPU backend issues one slice per frame, so frames to answer scale with 24 divided by the layers
+per frame. The 8-layer run at 9,171 ms took the same 481 frames at a lower frame rate.
 That span includes time the GPU spent on the scene's own rendering while the slice ran, so it is an
 upper bound on the slice's own cost. In the editor, with its viewport rendering, the median at 4
 layers was 1.98 ms.
