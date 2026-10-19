@@ -1,0 +1,17 @@
+{
+	"artifact_path": "qwen2.5-1.5b-instruct.sslm",
+	"artifact_hash": "811978f69bdb3aab7e9c89e03becd399c8549990c817465e596e1046d6cc113e",
+	"cap": 32768,
+	"tasks": 4,
+	"blocks_per_mode": 3,
+	"block_scope": "Three sequential measurement blocks per mode in one process; actual full-context setup is prepared once per mode. No independence or accuracy bound is claimed.",
+	"warmup_per_arm_mode": 50,
+	"timed_per_arm_mode": 50,
+	"timer_ms_per_cycle": 9.9999999999999991e-05,
+	"elapsed_s": 13992.021683800966,
+	"whole_run_box_busy_pct": 13.493095504493036,
+	"whole_run_own_pct": 3.1412657554289938,
+	"whole_run_foreign_pct": 10.351829749064041,
+	"load_scope": "Whole-run interval averages including actual full-context preparation; not per-call load, not an idle-box verdict or an accuracy bound.",
+	"observations": "observed_* are actual ABI sequence stats: the adopter, restored sequence, or an adopter of the newly frozen empty Begin prefix. call_budget is the target's pre-existing adopt budget or the restore/Begin budget."
+}

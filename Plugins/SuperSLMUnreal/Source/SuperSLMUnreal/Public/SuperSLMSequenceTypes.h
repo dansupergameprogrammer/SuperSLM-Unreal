@@ -31,6 +31,11 @@ enum class ESuperSLMDecodeOutcome : uint8
 	Generating = 1,            // ABI sentinel -1: mid-token, re-queue and retry with the same state
 	SchemaDeadEnd = 2,         // ABI sentinel -2: schema-bound walk has no legal continuation
 	SequenceNoLongerValid = 3, // ABI sentinel -3: released concurrently -- never re-queue
+	// Plugin paging plan §3.3: a budget holder reached its own limit, min(origin + budget, cap),
+	// below the cap: at activation (prefix + prompt > limit) or at the token boundary after the
+	// limit's ready token (engine token law E7). At the cap the existing cap outcome fires
+	// instead. Appended last so every earlier value keeps its number.
+	KvBudgetExceeded = 4,
 };
 
 // One vended sequence. Wraps the subsystem's own private lookup key -- never a raw sslm_seq --
@@ -185,15 +190,32 @@ struct SUPERSLMUNREAL_API FSuperSLMWorkerJobReport
 	double PlannedJobMs = 0.0;         // the static-cost-model figure for Kind/composition (plan §5)
 	int32 K = 0;                       // max(1, ceil(PlannedJobMs / TickBudgetMs)) at plan time (D-SLM7407)
 	int32 PlannedAtTick = 0;           // the game-thread tick number Plan committed this job on
-	int32 CommittedDeliveryTick = 0;   // PlannedAtTick + K; never revised after planning
+	int32 CommittedDeliveryTick = 0;   // PlannedAtTick + ChainedWaitTicks + K; never revised after planning
+
+	// 1.1 worker continuation (plan §5 item 1a). A continuation is a generation's next prefill or
+	// decode job, posted while the job before it is still running and queued behind it on the same
+	// worker lane, so the worker starts it the moment that job finishes instead of at the next
+	// tick. It is committed from the tick the job it follows is committed to: ChainedWaitTicks is
+	// that tick minus PlannedAtTick (0 when that tick has already passed, and 0 for every job that
+	// is not a continuation), and the hitch rule below allows for it. A continuation leaves out each
+	// member whose generation turned out to be over when it reached the worker: SkippedMembers
+	// counts them (the composition fields above still describe the job as planned), and
+	// bSkippedContinuation marks one that left out every member and made no Layer-1 call.
+	bool bContinuation = false;
+	int32 ChainedWaitTicks = 0;
+	int32 SkippedMembers = 0;
+	bool bSkippedContinuation = false;
 
 	int32 DeliveredAtTick = -1;        // -1 until Apply actually delivers this job's result(s); may
 	                                    // exceed CommittedDeliveryTick without being a hitch (below)
 	                                    // but is never earlier and results are never reordered (R-S1b (iv))
 	double WorkerCallMs = -1.0;        // the worker's own measured wall-clock time inside this job's
 	                                    // Layer-1 call(s); -1 until measured
-	bool bWorkerOverran = false;       // a Layer-1 call inside this job measured over TickBudgetMs,
-	                                    // reported on this job regardless of K's own headroom (R-S1b (v))
+	bool bWorkerOverran = false;       // this job's own worker time (WorkerCallMs) exceeded its own
+	                                    // planned K ticks, K x TickBudgetMs (R-S1b (v); slice 1P). K is
+	                                    // this job's own K, never ChainedWaitTicks + K; at K = 1 this is
+	                                    // 1.0's "over TickBudgetMs". A job planned for K ticks is not an
+	                                    // overrun at tick 2
 	uint32 WorkerThreadId = 0;         // the OS thread id that actually ran this job's Layer-1 call(s)
 	                                    // (R-S1b (ii)/R-S1g: never the game thread's own id)
 	double WorkerSpanMs = -1.0;        // real wall-clock time from the job's post (its planning tick)
@@ -202,11 +224,12 @@ struct SUPERSLMUNREAL_API FSuperSLMWorkerJobReport
 	                                    // this (below), so a test applies the same rule (review R4-S1)
 
 	// D-SLM7407 ("What counts as a hitch", plan §5): true exactly when DeliveredAtTick >
-	// CommittedDeliveryTick AND WorkerSpanMs > K x TickBudgetMs -- the worker was left at least that
+	// CommittedDeliveryTick AND WorkerSpanMs > (ChainedWaitTicks + K) x TickBudgetMs -- the worker was left at least that
 	// many ticks' worth of real wall-clock time to run it and still needed more (a
 	// harness ticking faster than real time does not blame the worker for its own pace, T-2826
 	// §4 Q4's accepted reading for the GPU path, mirrored here). GetHitchCount() sums bHitch across
-	// the ledger (R-S1b (iii)) plus every bWorkerOverran (R-S1b (v)) -- late-by-tick-count ALONE
+	// the ledger (R-S1b (iii)) plus every bWorkerOverran (R-S1b (v): worker time over the job's own
+	// K x TickBudgetMs, slice 1P) -- late-by-tick-count ALONE
 	// (DeliveredAtTick > CommittedDeliveryTick with bHitch false) is not itself a violation of
 	// anything: R-S1b (iv) only requires never early and never reordered, which this allows.
 	bool bHitch = false;
@@ -224,10 +247,10 @@ struct SUPERSLMUNREAL_API FSuperSLMTickReport
 	double PlanMs = 0.0;               // the game thread's own time inside this tick's Plan step
 	double ApplyMs = 0.0;              // the game thread's own time inside this tick's Apply step
 	double DurationMs = 0.0;           // PlanMs + ApplyMs -- R-S1g's own bound; never a worker/Layer-1 cost
-	int32 JobsPlannedThisTick = 0;     // 0 or 1 per lane (plan §5: "hand the whole job ... as one unit"); jobs actually posted (D-SLM7803, T-3006 O1)
+	int32 JobsPlannedThisTick = 0;     // 0, 1 or, with a 1.1 continuation (plan §5 item 1a), 2 per lane (plan §5: "hand the whole job ... as one unit"); jobs actually posted (D-SLM7803, T-3006 O1)
 	int32 JobsDeliveredThisTick = 0;   // results Apply delivered this tick, of any job kind
 	int32 LateJobsThisTick = 0;        // of JobsDeliveredThisTick, how many were hitches by bHitch's
-	                                    // plan §5 rule (late by tick AND WorkerSpanMs > K x TickBudgetMs)
+	                                    // plan §5 rule (late by tick AND WorkerSpanMs > (ChainedWaitTicks + K) x TickBudgetMs)
 };
 
 // Mirrors sslm_stats_out (sslm_abi.h) one-for-one -- the plugin transports Layer 1's own

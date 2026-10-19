@@ -17,6 +17,12 @@
 // src/forward/forward_sites.cpp.
 #ifndef SUPERSLM_FORWARD_SITES_H
 #define SUPERSLM_FORWARD_SITES_H
+// Cell 7.9's must-reject mutant (KvPageRunSlot, below) builds only as the superslm_mr_opt target, which defines the
+// acknowledgement beside it (tests/paged-kv/paged_kv.cmake). A mutant definition that reaches any other compile, by a
+// global flag or the CL environment variable, is refused here (T-3202 F-4).
+#if defined(SUPERSLM_MUTANT_PKV_MR_OPT) && !defined(SUPERSLM_MUTANT_PKV_MR_OPT_TARGET)
+#error "SUPERSLM_MUTANT_PKV_MR_OPT is 7.9-MR-OPT's mutant: only the superslm_mr_opt target builds it"
+#endif
 #include "superslm/api.h"
 
 #include <cstddef>
@@ -500,11 +506,11 @@ struct SequenceLayerState {
 	// RunLayerLoop/RunLayerLoopChunkBatched -- reset on sequence create / `sslm_seq_reset` is the
 	// caller's own responsibility, per LandingRescale's own header.
 	// The sum holds for every sequence the engine counts from zero: created, reset, prefilled,
-	// adopted from a prefix, decoded, or restored from an 'SSB5' blob of such a sequence. It does
-	// not hold after `sslm_seq_restore` of an 'SSB4', 'SSB3' or 'SSB2' blob, which record only this
-	// total: the restored per-site counts are 0, so they sum to less than this field until reset,
-	// including through any 'SSB5' blob later saved from that sequence (sslm_abi.cpp,
-	// kSeqBlobMagicV5).
+	// adopted from a prefix, decoded, or restored from an 'SSB5' or 'SSB6' blob of such a sequence.
+	// It does not hold after `sslm_seq_restore` of an 'SSB4', 'SSB3' or 'SSB2' blob, which record
+	// only this total: the restored per-site counts are 0, so they sum to less than this field until
+	// reset, including through any 'SSB5' or 'SSB6' blob later saved from that sequence
+	// (sslm_abi.cpp, kSeqBlobMagicV5).
 	uint64_t kv_saturation_count = 0;
 
 	// (T-2577, D-SLM6280): the four per-site breakdowns `kv_saturation_count` (above) sums --
@@ -1106,6 +1112,152 @@ SUPERSLM_API SslmForwardStatus RunLayerLoopChunkBatched(int8_t* hidden_codes_chu
                                             uint64_t* out_rope_q_saturation_count = nullptr,
                                             uint64_t* out_rope_k_saturation_count = nullptr);
 
+// Decode-threading plan rev 1.2 (§3.4): which parallel-for hook, if any, a layer loop's one-row
+// (M = 1) projections may split their output rows across. `row` is the hook when the host set
+// SSLM_PARALLEL_FOR_MATVEC on it, else null; `batched` is reserved for the batched-prefill split
+// (SSLM_PARALLEL_FOR_PREFILL, tiled-matmul plan slice 2) and is null in this build. The ABI layer
+// builds this from the workspace's hook and its `reserved` bits; forward-pass code never reads
+// `reserved`. All-null (the default) is the serial path.
+struct GemmThreading {
+	const sslm_parallel_for* row = nullptr;
+	const sslm_parallel_for* batched = nullptr;
+};
+
+// Paged-KV plan §3.1/§3.2 item 1: a K/V page view. The K/V store is `mapped_pages` logical pages of
+// `page_positions` (B) positions each; logical page `j` is the physical page `page_table[j]` of the
+// pool at `pool_base`, `page_bytes` apart. A page holds `runs = L * 2 * H_kv` runs of B rows, one per
+// (layer, K|V, kv_head), each row `head_dim` one-byte codes, and the runs rotate (§3.1, D-SLM8285): run
+// `r = (layer * 2 + half) * num_kv_heads + kv_head` of logical page `j = pos / B` sits in slot
+// `(r + j) mod runs`, so successive pages' copies of one run land on different cache sets. The row of
+// (layer, half, kv_head, pos) is at
+//   pool_base + page_table[j] * page_bytes + ((r + j) mod runs) * B * head_dim + (pos % B) * head_dim,
+// which KvPageInPageOffset (below) computes for every address site: these accessors, the ABI's holder
+// row and its legacy gather. The flat workspace is the one-page view: `pool_base = workspace`,
+// `page_table = {0}`, `mapped_pages = 1`, `page_positions = context_cap`, `page_bytes =
+// workspace_size`. Its `j` is 0 at every position, so its slot is `r` whatever `runs` holds and the
+// formula reduces to the flat accessors' own term for term (§3.1's one-page identity); the flat
+// overloads of the layer loops are thin wrappers that build exactly that view. `runs` is the slot
+// count rotation reduces by; 0 or 1 leaves every slot at `r` (a view built without it is unrotated,
+// which only the one-page view may be). `page_bytes` is used only as the stride between pages, so a
+// one-entry table never reads it for addressing; the layer loops check it against the per-page
+// product `L * 2 * H_kv * B * D` (guard 5's view meaning). Every pointer is the caller's; the view
+// owns nothing.
+#define SUPERSLM_HAS_KV_PAGE_VIEW 1
+struct KvPageView {
+	uint8_t* pool_base;
+	const uint32_t* page_table;
+	uint32_t mapped_pages;
+	int64_t page_positions;
+	size_t page_bytes;
+	uint32_t runs;
+};
+
+// §3.1's rotation: the slot of run `run` on logical page `logical_page`, `(run + logical_page) mod
+// runs` for `run < runs`, and `run` itself when `runs` is 0 or 1. Neither operand of the sum reaches
+// `runs`, so it cannot wrap.
+inline size_t KvPageRunSlot(size_t run, size_t logical_page, size_t runs) noexcept {
+#if defined(SUPERSLM_MUTANT_PKV_MR_OPT)
+	// Cell 7.9's must-reject, 7.9-MR-OPT (D-SLM8423): the slot ignores the logical page (the unrotated layout). Built
+	// only into the superslm_mr_opt library. The production library refuses the definition at configure time
+	// (CMakeLists.txt) and at compile time (the #error at the top of this header and of src/sslm_abi.cpp).
+	(void)logical_page;
+	(void)runs;
+	return run;
+#else
+	return runs > 1 ? (run + logical_page % runs) % runs : run;
+#endif
+}
+
+// §3.1's in-page byte offset of run `run` at `position`, pages of `page_positions` (B) positions and
+// rows of `head_dim` bytes: `((run + j) mod runs) * B * head_dim + (position % B) * head_dim`, with
+// `j = position / B`. The one formula every page address goes through.
+inline size_t KvPageInPageOffset(size_t run, size_t runs, size_t page_positions, size_t head_dim,
+                                 size_t position) noexcept {
+	return KvPageRunSlot(run, position / page_positions, runs) * page_positions * head_dim +
+	       (position % page_positions) * head_dim;
+}
+
+// The threaded overloads of the two layer loops (§3.4): the same parameters as the overloads
+// above, all of them explicit, plus a trailing `threading` with no default. New overloads rather
+// than defaulted parameters, so the existing exported symbols keep their mangled names and forward
+// here with no threading. With `threading.row` set, a hook with max_tasks >= 2, and a group whose
+// weight bytes reach the minimum work per task, each one-row projection group (q, k + v, o,
+// gate + up and down in RunLayerLoop; q, k, v, o, gate, up and down, each alone, in a
+// RunLayerLoopChunkBatched call whose chunk is exactly one token) splits its output rows across
+// the hook's `run`; every row is still one DotRow on one thread, so every output byte equals the
+// serial path's. A `run` that breaks exactly-once fails the call with ParallelForIncomplete; in
+// RunLayerLoop the failing layer's five saturation counters are then restored to their values at
+// that layer's start, and the sequence rests at its last committed layer.
+// Not in the SUPERSLM_API export slot: only the engine's own ABI layer calls them, and the slot
+// carries only the symbols a module in another shared library calls (tests/t2807-api-slot X2).
+SslmForwardStatus RunLayerLoop(SequenceLayerState& seq, const LayerWeights* layers,
+                                 uint32_t num_hidden_layers, uint32_t layer_budget,
+                                 size_t hidden_size, size_t head_dim, size_t num_key_value_heads,
+                                 size_t intermediate_size, int64_t context_cap,
+                                 const SslmTensorManifest& rope_tables, uint8_t* workspace,
+                                 size_t workspace_size, std::string_view site_prefix,
+                                 size_t token_index, SslmTraceHookState* trace_hook_state,
+                                 size_t q_width, const GemmThreading& threading);
+SslmForwardStatus RunLayerLoop(SequenceLayerState& seq, const LayerWeights* layers,
+                                 uint32_t num_hidden_layers, uint32_t layer_budget,
+                                 size_t hidden_size, size_t head_dim, size_t num_key_value_heads,
+                                 size_t intermediate_size, int64_t context_cap,
+                                 const SslmTensorManifest& rope_tables, uint8_t* workspace,
+                                 size_t workspace_size, OptionGKLandingMode option_g_k_landing_mode,
+                                 std::string_view site_prefix, size_t token_index,
+                                 SslmTraceHookState* trace_hook_state, size_t q_width,
+                                 const GemmThreading& threading);
+SslmForwardStatus RunLayerLoopChunkBatched(int8_t* hidden_codes_chunk, CarriedScale* hidden_scales,
+                                            size_t chunk_tokens, const LayerWeights* layers,
+                                            uint32_t num_hidden_layers, size_t hidden_size,
+                                            size_t head_dim, size_t num_key_value_heads,
+                                            size_t intermediate_size, int64_t context_cap,
+                                            int64_t context_length_start,
+                                            const SslmTensorManifest& rope_tables,
+                                            uint8_t* workspace, size_t workspace_size,
+                                            bool option_g_fused_k_landing,
+                                            uint64_t* kv_saturation_count,
+                                            std::string_view site_prefix,
+                                            SslmTraceHookState* trace_hook_state,
+                                            size_t q_width,
+                                            uint64_t* out_kv_landing_saturation_count,
+                                            uint64_t* out_k_channel_landing_saturation_count,
+                                            uint64_t* out_rope_q_saturation_count,
+                                            uint64_t* out_rope_k_saturation_count,
+                                            const GemmThreading& threading);
+
+// Paged-KV plan (rev 16.1) §3.2 item 2: the page-view overloads of the two layer loops -- the
+// threaded overloads above with `(workspace, workspace_size)` replaced by `const KvPageView&`, every
+// parameter explicit. Every flat overload above is a thin wrapper over these that builds the
+// one-page view (KvPageView, above), so a flat call's statuses, their order and its bytes are
+// unchanged. Guard 5 takes the view meaning: an overflow of the per-page product
+// `num_hidden_layers * 2 * num_key_value_heads * page_positions * head_dim` (or `page_positions <
+// 1`) is `InvalidContextCap`; a null `pool_base` or `page_table`, or a `page_bytes` below the per-page
+// product, is `WorkspaceTooSmall`. The coverage guard (§3.2 item 4), the last guard before the first
+// write, requires the view to map every row the call writes -- `context_length + 1 <= mapped_pages *
+// page_positions`, and for the chunk `context_length_start + chunk_tokens <= mapped_pages *
+// page_positions` -- else `KvPageUnmapped`. Attention reads the K/V rows one page run at a time
+// (§3.2 item 3); for the one-page view that is one run of the whole width, the call made before.
+SslmForwardStatus RunLayerLoop(SequenceLayerState& seq, const LayerWeights* layers, uint32_t num_hidden_layers,
+                               uint32_t layer_budget, size_t hidden_size, size_t head_dim,
+                               size_t num_key_value_heads, size_t intermediate_size, int64_t context_cap,
+                               const SslmTensorManifest& rope_tables, const KvPageView& view,
+                               OptionGKLandingMode option_g_k_landing_mode, std::string_view site_prefix,
+                               size_t token_index, SslmTraceHookState* trace_hook_state, size_t q_width,
+                               const GemmThreading& threading);
+SslmForwardStatus RunLayerLoopChunkBatched(int8_t* hidden_codes_chunk, CarriedScale* hidden_scales,
+                                           size_t chunk_tokens, const LayerWeights* layers,
+                                           uint32_t num_hidden_layers, size_t hidden_size, size_t head_dim,
+                                           size_t num_key_value_heads, size_t intermediate_size,
+                                           int64_t context_cap, int64_t context_length_start,
+                                           const SslmTensorManifest& rope_tables, const KvPageView& view,
+                                           bool option_g_fused_k_landing, uint64_t* kv_saturation_count,
+                                           std::string_view site_prefix, SslmTraceHookState* trace_hook_state,
+                                           size_t q_width, uint64_t* out_kv_landing_saturation_count,
+                                           uint64_t* out_k_channel_landing_saturation_count,
+                                           uint64_t* out_rope_q_saturation_count,
+                                           uint64_t* out_rope_k_saturation_count, const GemmThreading& threading);
+
 // (design Sec31.2's own "int64-input, __int128-intermediate sibling of
 // the RoPE pair primitive, Q2.30 tables unchanged" -- Sec12 "Wide-RoPE
 // overflow domain"). The rotated wide pair -- matches `RopePair`'s own shape
@@ -1173,6 +1325,20 @@ int8_t* MutableValueRow(uint8_t* workspace, uint32_t layer, int64_t context_cap,
                          size_t num_kv_heads, size_t head_dim, size_t kv_head,
                          int64_t position) noexcept;
 
+// Paged-KV plan (rev 16.1) §3.2 item 1: the page-view accessors -- the same four rows, addressed
+// through a KvPageView by §3.1's formula (KvPageView's comment, above). For the one-page view each
+// returns exactly the flat accessor's address. No bounds checking, as for the flat accessors:
+// `position < mapped_pages * page_positions` and `kv_head < num_kv_heads` are the caller's, as the
+// layer loops' guards establish before any accessor call they make.
+const int8_t* KeyRow(const KvPageView& view, uint32_t layer, size_t num_kv_heads, size_t head_dim,
+                     size_t kv_head, int64_t position) noexcept;
+const int8_t* ValueRow(const KvPageView& view, uint32_t layer, size_t num_kv_heads, size_t head_dim,
+                       size_t kv_head, int64_t position) noexcept;
+int8_t* MutableKeyRow(const KvPageView& view, uint32_t layer, size_t num_kv_heads, size_t head_dim,
+                      size_t kv_head, int64_t position) noexcept;
+int8_t* MutableValueRow(const KvPageView& view, uint32_t layer, size_t num_kv_heads, size_t head_dim,
+                        size_t kv_head, int64_t position) noexcept;
+
 // (design §2.2/§3/§4/§6 Track B steps 1/2): the per-head QK-norm forward call site, shared by
 // both `RunLayerLoopImpl` (the single-token path) and `RunLayerLoopChunkBatched` (the
 // chunk-batched path) -- one function, called once per (layer, token), so the composition is
@@ -1238,6 +1404,18 @@ SslmForwardStatus ApplyQkNormSite(int8_t* q_codes, CarriedScale* q_scales, uint8
                                    uint64_t* out_saturation_count = nullptr,
                                    uint64_t* out_k_channel_landing_saturation_count = nullptr);
 
+// Paged-KV plan (rev 16.1) §3.2 item 6: the page-view overload. The K branch reads and writes the
+// just-landed row at `position` through the view accessors; everything else is the flat overload's
+// contract, above, which is now a thin wrapper building the one-page view over `workspace`
+// (`page_table = {0}`, `page_positions = context_cap`), so its test callers are unchanged.
+SslmForwardStatus ApplyQkNormSite(int8_t* q_codes, CarriedScale* q_scales, const KvPageView& view,
+                                  const SslmTensorManifest& rope_tables, uint32_t layer, int64_t context_cap,
+                                  int64_t position, size_t num_heads, size_t num_key_value_heads,
+                                  size_t head_dim, const LayerWeights& lw, std::string_view site_prefix,
+                                  size_t token_index, SslmTraceHookState* trace_hook_state,
+                                  uint64_t* out_saturation_count = nullptr,
+                                  uint64_t* out_k_channel_landing_saturation_count = nullptr);
+
 // Source compatibility for pre-QKC1 unit callers.
 inline SslmForwardStatus ApplyQkNormSite(int8_t* q_codes, CarriedScale* q_scales,
                                          uint8_t* workspace, uint32_t layer,
@@ -1265,6 +1443,16 @@ int64_t QkQ31ScoreScalarRef(const int8_t* q, const int8_t* k, const int64_t* rat
 int64_t QkQ31ScoreForTier(const int8_t* q, const int8_t* k, const int64_t* ratio_q31,
                            size_t head_dim, QkQ31ScoreTier tier);
 int64_t QkQ31Score(const int8_t* q, const int8_t* k, const int64_t* ratio_q31, size_t head_dim);
+
+// Attention and per-row sites plan (rev 3.1), slice S5 (§4.5, §5.5): every key's Q31 score for one query
+// head, the internal entry both layer loops call in place of their per-key QkQ31Score loops. `keys` holds
+// `width` rows of `head_dim` int8 codes, row j at keys + j * head_dim (one KV head's K store, or any run of
+// it); out[j] receives QkQ31Score(q, keys + j * head_dim, ratio_q31, head_dim) for every j in [0, width).
+// On the AVX2 and AVX-512 tiers, with head_dim <= 512 and every ratio in [0, 2^32), the row runs the §5.5
+// limb kernel (w = q * ratio split into three 16-bit pieces, int16 multiply-add over blocked, packed keys);
+// otherwise it loops over QkQ31Score exactly as the loops did. Not exported (C5).
+void QkQ31ScoreRow(const int8_t* q, const int8_t* keys, const int64_t* ratio_q31, size_t head_dim, size_t width,
+                   int64_t* out);
 
 // --- S3.6: the head and the greedy decode loop (SuperSLM_S3a_WalkingSkeleton_
 // Plan.md §11 S3.6; §9.1; master plan §6.4; C16). This is
@@ -1333,6 +1521,11 @@ SslmForwardStatus LogitsSite(const int8_t* final_codes, size_t hidden_size,
 // - Narrowing: NarrowRowChecked over the whole row, once, serially, after `run` returns -- the
 //   same call on the same row as LogitsSite.
 // No heap allocation; the check's state is a fixed array on the stack.
+// The partition and the exactly-once check are the shared ones of src/forward/parallel_split.h
+// (SplitColumns at alignment 64 with no minimum work, and RunExactlyOnce), which the one-row
+// projection groups of the layer loops use too (decode-threading plan rev 1.2, §3.2). This step
+// keeps its own rule for calling `run`: whenever the hook has max_tasks >= 2, a one-task call
+// included; the projection groups call it only for two or more tasks.
 // No SUPERSLM_API export slot: that slot is for the C ABI and for the C++ declarations sibling
 // Unreal modules call (api.h), and no such module calls this function; the engine's own decode
 // paths do.

@@ -60,17 +60,39 @@ Double-click a `USuperSLMModel` asset. Two tabs:
 
 - **The `.sslm` importer.** Validates on import and reports a specific reason on failure. See
   [ASSETS_AND_IMPORT.md](ASSETS_AND_IMPORT.md).
-- **`SuperSLM.CalibrateCosts <path-to-model.sslm>`**, a console command that measures the CPU
-  scheduler's per-unit costs on the machine it runs on, after a warm-up pass. It checks that the
-  machine is idle and refuses to report when another process is loading the CPU, naming the
-  processes it saw. **It runs synchronously on the game thread**: it prefills the model to each
-  measured depth, up to one token below the context capacity (4,095 tokens for the example model),
-  then times each cost, and the editor or game does not respond until it finishes. It writes its figures to `Saved/SuperSLM/CalibratedCosts.ini` in the project:
-  the eleven costs under `[SuperSLM.CalibratedCosts]`, named as the `FSuperSLMRuntimeConfig`
-  fields they correspond to, and the per-depth medians under `[SuperSLM.CalibratedCosts.Depths]`.
-  The plugin does not read the file back; copy the values into `FSuperSLMRuntimeConfig` before
-  `Configure()`. **Its layer measurement under-prices layers run inside a real job**; see
-  [ARCHITECTURE.md](ARCHITECTURE.md#the-cpu-backend) before using its output.
+- **`SuperSLM.EstimateCosts "<path-to-model.sslm>" [--write-ini]`**, a console command that
+  estimates the CPU scheduler's thirteen per-unit costs on the machine it runs on, for both decode
+  modes, at the `FinishParallelTasks` the next `Configure()` would resolve. Its report is headed
+  `CALIBRATION ESTIMATE — not verified`. Per mode it warms up with five repetitions of every
+  measured call, then times twelve, and reports each call's median and spread (the IQR, which is
+  the within-run spread of serial calls, not a confidence interval), thirteen suggested costs
+  rounded up, and the CPU load other processes put on the machine (250 ms interval averages,
+  which disclose the load and never stop the estimate). The per-call and per-sample series are kept
+  under `Saved/SuperSLM/Estimates/<run id>/`. Each reset starts from the deepest prepared context
+  (capacity minus one token) and must leave it empty; input restoration and verification are
+  outside its timed call. This measures releasing the live pages rather than an empty reset.
+  **It runs synchronously on the game thread**: it
+  prefills the model to each measured depth, up to one token below the context capacity (4,095
+  tokens for the example model), and the editor or game does not respond until it finishes, about
+  4-5 minutes for the example model. A run that cannot complete (an invalid model, a failed call,
+  a non-finite figure) is reported as an incomplete estimate and suggests nothing. Only
+  `--write-ini` writes: after a complete run, both modes' suggestions, with the artifact hash, the
+  mode and the task count, replace `Saved/SuperSLM/CalibratedCosts.ini` in one step. The next
+  `Configure()` reads a profile from it when the artifact, the effective decode mode and the task
+  count match, for every cost field the caller left unset. From a command line, separate commands
+  with a comma and end with the editor's exit command:
+
+  ```
+  UnrealEditor-Cmd.exe "<Project>.uproject" -unattended -log "-ExecCmds=SuperSLM.EstimateCosts C:/Models/model.sslm,QUIT_EDITOR"
+  ```
+
+  Add `--write-ini` inside the quotes, after the path, to save the result.
+- **`SuperSLM.SetDecodeMode 0|1 [--save]`** and **`SuperSLM.SetFinishParallelTasks <0..256> [--save]`**,
+  console commands that choose the CPU decode mode (1 splits one-row decode projections across the
+  finish hook's tasks) and the finish task count for the next `Configure()` whose config leaves
+  them unset. A configuration already made keeps its settings. `--save` also keeps the choice in
+  `Saved/SuperSLM/RuntimeSettings.ini`, which later sessions, packaged games included, load before
+  their first configuration. Both work in the editor and in packaged builds.
 - **The conversion pre-check** (`SuperSLMConversionPreCheck::Run`, editor module, C++). It reads a
   checkpoint's configuration and tokenizer files and reports, before you spend time converting,
   every blocker it finds, the context length, the KV block size and the predicted reset and adopt
@@ -86,7 +108,7 @@ and not a 1.0 claim**. It builds against the engine's Experimental ToolsetRegist
 MCP client reaches its tools through the engine's Experimental ModelContextProtocol plugin, which
 you enable in your project; in practice both mean a source-built engine. Its read tools
 describe a model, run the conversion pre-check, inspect a sequence and report the determinism
-self-check's prior runs (not the cost calibration). Its action tools are the next section's.
+self-check's prior runs (not the cost estimate). Its action tools are the next section's.
 
 ## Not a 1.0 claim: the MCP action tier
 

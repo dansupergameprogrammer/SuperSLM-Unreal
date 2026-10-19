@@ -1,10 +1,15 @@
 #include "SuperSLMSubsystem.h"
 
+#include "Core/SuperSLMPageLedgerCore.h"
 #include "SuperSLMFinishHook.h"
 #include "SuperSLMLog.h"
 #include "SuperSLMModel.h"
+#include "SuperSLMPagedTestSeam.h"
+#include "SuperSLMPrefillPlanning.h"
+#include "SuperSLMRuntimeResolve.h"
 #include "SuperSLMRuntimeRegistry.h"
 #include "SuperSLMSchedulingTestAccess.h"
+#include "SuperSLMConfigureTestAccess.h"
 #include "SuperSLMSaveBlob.h"
 #include "SuperSLMSequenceLifecycleBudget.h"
 #include "SuperSLMStatusMapping.h"
@@ -86,6 +91,28 @@ namespace
 	int64 GNextSequenceId = 1;
 	int64 GNextPrefixId = 1;
 
+#if WITH_DEV_AUTOMATION_TESTS
+	// Plugin paging plan §3.9: the test seams' hold ids, never reused across Configure() calls, so
+	// a hold a test kept from an ended state can never name one of the next state's. (K2 review F7:
+	// its only users are the seams.)
+	int64 GNextPagedHoldId = 1;
+#endif
+
+	// Plugin paging plan §3.9: the request kinds a hold or a Layer-1 status override names, as this
+	// file keeps them (ESuperSLMPagedRequestKind, which the seam header declares only under
+	// WITH_DEV_AUTOMATION_TESTS, maps onto these one to one).
+	enum class EPagedJobKind : uint8
+	{
+		Reset,
+		Return,
+		Adopt,
+		Restore,
+		PrefixBuild,
+		NestedBuild,
+		PrefixRelease,
+		Count
+	};
+
 	FString StatusText(sslm_status Status)
 	{
 		return FString(ANSI_TO_TCHAR(SuperSLMStatusMapping::ToDiagnosticText(Status)));
@@ -136,6 +163,32 @@ namespace
 		// the blob when the request is accepted (QueueRestore()). The one-generation projection
 		// reads it while the op is queued, and from FSlot::InFlightRestorePhase once it is posted.
 		ESuperSLMSequencePhase RestoreProjectedPhase = ESuperSLMSequencePhase::Idle;
+
+		// Plugin paging plan §3.2 ("admission at the head of the sequence's queue"): set when the op
+		// first reaches the head and is admitted (DispatchSlotLifecycleOp). In budget mode a Reset
+		// (the recycle included) or an Adopt takes its page-ledger ticket there, never at queue
+		// time; the ticket is applied at the job's delivery. The two hold ids are the test seams'
+		// (§3.9), taken at the same instant; 0 is none.
+		bool bAdmitted = false;
+		SuperSLMPaging::FTicket LedgerTicket = SuperSLMPaging::InvalidTicket;
+		int64 StartHoldId = 0;
+		int64 ApplyHoldId = 0;
+
+		// Plugin paging plan §3.5 (step K3), budget mode. A restore waiting on region H: admitted
+		// to the ledger's wait queue at the head, and not dispatched until the ledger resolves its
+		// ticket Admitted (ResolveWaitingRestores). A reset the ledger made a create-first
+		// normalization (FAdmission::bNormalizes).
+		bool bWaiting = false;
+		bool bNormalizes = false;
+
+		// Restore, budget mode: what QueueRestore() read from the Layer-1 payload header (never the
+		// wrapper), and the hint prefix it pinned (0: none, or a whole-reserve payload, which
+		// ignores its hint).
+		SuperSLMPaging::ERestorePayload RestorePayload = SuperSLMPaging::ERestorePayload::Budget;
+		int64 RestoreBudget = 0;
+		int64 RestoreOrigin = 0;
+		int64 RestoreContextLength = 0;
+		int64 RestoreHintPrefixId = 0;
 	};
 
 	// A small, per-prefix administrative op (D-SLM7342, priced by D-SLM7504): PrefixBegin (the
@@ -163,6 +216,26 @@ namespace
 		// correct for Release, since nothing reads a released prefix's pin again afterward.
 		sslm_prefix ReleaseHandle = nullptr;
 		int32 PinnedLane = INDEX_NONE;
+
+		// Budget mode (plugin paging plan §3.3), Release only: the page-ledger ticket its delivery
+		// applies. A built prefix's release was admitted at ReleasePrefix() (AdmitPrefixRelease),
+		// and its delivery applies that ticket (ApplyPrefixRelease). A prefix whose build never
+		// applied (faulted, or released before its freeze) has no release admission: its delivery
+		// fails the build's own ticket instead (ApplyPrefixBuild(false)), which refunds the whole
+		// charge once the engine has freed the pages (bReleaseFailsBuild).
+		SuperSLMPaging::FTicket LedgerTicket = SuperSLMPaging::InvalidTicket;
+		bool bReleaseFailsBuild = false;
+
+		// The test seams' holds (§3.9), taken when the op is admitted; 0 is none.
+		int64 StartHoldId = 0;
+		int64 ApplyHoldId = 0;
+
+		// Budget mode (plugin paging plan §3.3, step K3), Begin only: a nested child's Begin is
+		// sslm_prefix_begin_from on its parent's frozen handle, captured at CreatePrefixFrom(). The
+		// ledger pins the parent from that admission until the child's build applies, so
+		// ReleasePrefix() refuses it (PrefixPinned) and the handle stays live.
+		bool bNested = false;
+		sslm_prefix NestedParentHandle = nullptr;
 	};
 
 	struct FPrefixEntry
@@ -174,6 +247,27 @@ namespace
 		FString FaultMessage;
 		int32 PendingAdopts = 0;
 		bool bAdminJobInFlight = false; // a Begin or Release job is currently on a worker
+
+		// Budget mode (plugin paging plan §3.3): the page-ledger node this build minted, and the
+		// build's ticket while it is open (admitted at CreatePrefix(), applied at the freeze's
+		// delivery, or failed when the Begin is refused or the prefix is released unbuilt).
+		// bLedgerBuilt is set once the build applied: only then may the prefix be adopted, and only
+		// then is its release a ledger release (AdmitPrefixRelease).
+		SuperSLMPaging::FNodeId LedgerNode = SuperSLMPaging::InvalidNode;
+		SuperSLMPaging::FTicket BuildTicket = SuperSLMPaging::InvalidTicket;
+		bool bLedgerBuilt = false;
+
+		// The test seams' HoldApply(PrefixBuild) (§3.9), taken at CreatePrefix(): it holds the
+		// apply of the job that freezes the prefix (the build's ledger apply). 0 is none.
+		int64 BuildApplyHoldId = 0;
+
+		// Budget mode (plugin paging plan §3.3, §3.5; step K3). OriginLength is the parent's length
+		// for a nested child (its positions start there), 0 for a root, so the prefix's length is
+		// OriginLength + Tokens.Num(). PendingHintedRestores counts restores queued with this
+		// prefix as their hint and not yet delivered or refused: ReleasePrefix() refuses while any
+		// is, as it does for PendingAdopts (the ledger's own pin covers only admitted ones).
+		int64 OriginLength = 0;
+		int32 PendingHintedRestores = 0;
 
 		// D-SLM7528/D-SLM7530 (plan §5 item 3): the prefix-side half of lane-pinned admission --
 		// INDEX_NONE until this prefix's first-ever job (its own PrefixBegin) posts, resolved and
@@ -199,6 +293,59 @@ namespace
 		bool bCarried = false;    // captured by a posted, not yet delivered job
 		bool bPinned = false;     // holds one registry pin on AdapterId (T-2987 L2)
 	};
+
+	// 1.1 worker continuation (plan §5 item 1a, ruled 2026-09-29): one
+	// generation's stop signal, shared by the game thread and the worker lane its jobs run on.
+	// Every prefill or decode job of the generation updates it on the worker, right after its
+	// Layer-1 call, by the same rule its Deliver() applies on the game thread: a failed call, a
+	// token in StopTokenIds, the MaxNewTokens-th token, or any sentinel other than -1 ends the
+	// generation. A continuation job, queued behind the job it follows, reads it at its head and
+	// makes no Layer-1 call once it is set, so a sequence never runs past its own end. The game
+	// thread sets it when it faults the sequence or the holder returns it.
+	//
+	// Produced is written only on the worker. All of one generation's jobs run on its one pinned
+	// lane, whose single thread runs them in post order, so no lock is needed for it.
+	struct FGenerationGate
+	{
+		std::atomic<bool> bStop{false};
+		int32 Produced = 0;
+		int32 MaxNewTokens = 0;
+		TArray<int32> StopTokenIds;
+
+		void Stop() { bStop.store(true, std::memory_order_release); }
+		bool IsStopped() const { return bStop.load(std::memory_order_acquire); }
+
+		// Worker only: a decode job's result for this member, by Deliver()'s own terminal rule.
+		void NoteDecodeToken(int32 Token)
+		{
+			if (Token >= 0)
+			{
+				++Produced;
+				if (StopTokenIds.Contains(Token) || Produced >= MaxNewTokens)
+				{
+					Stop();
+				}
+			}
+			else if (Token != -1)
+			{
+				Stop(); // -2 (schema dead end), -3 (no longer live), or an unrecognized value
+			}
+		}
+	};
+	using FGenerationGatePtr = TSharedPtr<FGenerationGate, ESPMode::ThreadSafe>;
+
+	// 1.1 worker continuation (plan §5 item 1a): one member's claim on a posted, not yet started
+	// continuation. A request that must precede the holder's next job (a held schema or adapter
+	// request, or a queued lifecycle op) cancels it from the game thread; the continuation reads it
+	// at its head on the worker, and a cancelled member is left out exactly as a stopped one is, so
+	// the request is carried by the next job ordinary planning posts, as row 20 says. The boundary
+	// is the worker head: a request made after the continuation has started lands after it, as a
+	// request made while any job runs lands after that job.
+	struct FContinuationTicket
+	{
+		std::atomic<bool> bCancelled{false};
+	};
+	using FContinuationTicketPtr = TSharedPtr<FContinuationTicket, ESPMode::ThreadSafe>;
 
 	// Plan §2.5 row 20 rule 1 (D-SLM7701, D-SLM7706): every caller-owned field of a slot, in one
 	// struct. FSlot inherits it, and ReleaseUser() -- the only code that ends a hold -- resets it
@@ -226,6 +373,11 @@ namespace
 		// later prefill or decode job of the generation carries adapter entries only.
 		int64 ActiveGenerateOrdinal = 0;
 		bool bGenerateFirstJobPosted = false;
+
+		// 1.1 worker continuation: the active generation's gate, made by its first prefill or
+		// decode job (GenerationGateFor) and dropped with the generation. Stopped before this
+		// struct is reset by value (ReleaseUser), so a queued continuation of the old holder skips.
+		FGenerationGatePtr Gate;
 
 		// K7: the layer-budget pin.
 		int32 PinnedLayerBudget = 0;   // 0: the scheduler chooses per job
@@ -266,6 +418,7 @@ namespace
 			TimeToFirstTokenMs = -1.0;
 			ActiveGenerateOrdinal = 0;
 			bGenerateFirstJobPosted = false;
+			Gate.Reset(); // activation follows every earlier delivery, so no job holds the old one
 		}
 
 		bool IsGenerating() const
@@ -333,11 +486,28 @@ namespace
 		// because it is also consulted for a second, narrower purpose: protecting a DIRECT, inline
 		// Layer-1 call this module makes from the game thread (SetSchema()/RequestAdapterSwap() on
 		// an otherwise-idle sequence) from racing a worker job that has been posted to a lane's
-		// queue but has not yet reached the front and run. It is never expected to exceed 1 now
-		// that admission itself is gated on it; a value above 1 would mean this rule has a second
-		// hole somewhere else.
+		// queue but has not yet reached the front and run. Ordinary admission never takes it above
+		// 1. The one exception is the 1.1 continuation (plan §5 item 1a, PlanContinuations): a
+		// second prefill or decode job of the same generation, on the same pinned lane, whose
+		// single thread runs the two in order, so it reaches 2 and never more.
 		int32 OutstandingJobCount = 0;
 		bool HasUndeliveredJob() const { return OutstandingJobCount > 0; }
+
+		// 1.1 worker continuation (plan §5 item 1a): the JobId of this slot's most recently posted
+		// prefill or decode job. PlanContinuations() reads it against the lane's one pending job to
+		// find the job's members; a stale value never matches, because JobIds are never reused.
+		int64 ContinuableJobId = 0;
+
+		// 1.1: the ticket of this slot's posted, undelivered continuation (null when there is none),
+		// cleared at that continuation's delivery.
+		FContinuationTicketPtr QueuedContinuation;
+		void CancelQueuedContinuation()
+		{
+			if (QueuedContinuation.IsValid())
+			{
+				QueuedContinuation->bCancelled.store(true, std::memory_order_release);
+			}
+		}
 
 		int64 ContextUsed = 0;         // committed KV positions (mirrors Layer 1's context_length)
 
@@ -369,9 +539,10 @@ namespace
 		// decrements it unconditionally, mirroring OutstandingJobCount. D-SLM7515 (plan §5 item 3)
 		// has since added `!HasUndeliveredJob()` to IsDue() itself, which bounds
 		// OutstandingJobCount -- and therefore this counter, which never exceeds it -- to 0 at
-		// every point IsDue() is evaluated; this cap's own condition can no longer be reached in
-		// practice, and it is left in place as a named, harmless invariant rather than removed,
-		// since removing it is no part of closing the race this round fixes.
+		// every point IsDue() is evaluated, so ordinary admission never reaches this cap. The 1.1
+		// continuation (plan §5 item 1a) does: PlanContinuations reads it, with a job already in
+		// flight, to decide whether that job's token is the generation's last, and then posts no
+		// continuation.
 		int32 SpeculativeFinishesQueued = 0;
 		bool bAdopted = false;         // holds an adopted prefix's context
 
@@ -402,6 +573,11 @@ namespace
 		// carrying a stale binding or an unknown state, so the slot is withheld from vending
 		// until the subsystem is torn down. Logged by name when set.
 		bool bWithheld = false;
+
+		// Plugin paging plan §3.9 (FSuperSLMPagedTestSeam::SlotHolderGeneration()): rises each time
+		// this slot's Layer-1 holder is replaced -- a reset that creates a fresh sequence, or a
+		// restore -- at that job's successful delivery. Slot-owned; never reset.
+		int64 HolderGeneration = 0;
 
 		int32 EffectiveQueueDepth() const
 		{
@@ -591,38 +767,40 @@ namespace
 	}
 
 	// D-SLM7793/D-SLM7794: the sum of the positions of Chunk prompt tokens starting at depth d,
-	// Chunk x d + Chunk x (Chunk - 1) / 2 -- reported as PromptPositionSum and priced by
-	// PromptTokenCostPerPositionMs.
-	int64 PromptChunkPositionSum(int32 Chunk, int64 StartDepth)
+	// Chunk x d + Chunk x (Chunk - 1) / 2 -- reported as PromptPositionSum and priced by the
+	// per-position term of the pair the chunk selects.
+	using SuperSLMPrefillPlanning::PromptChunkPositionSum;
+
+	// Slice 1P (tiled-matmul plan §4A.1 item 2): the two prompt prices a configuration carries --
+	// the chunk-1 pair for a chunk below 8 tokens, the batched pair from 8 up -- read from the
+	// resolved configuration (decode-threading D4, D-SLM8144).
+	SuperSLMPrefillPlanning::FPromptPrice Chunk1PromptPrice(const FSuperSLMResolvedCpuConfig& Costs)
 	{
-		return static_cast<int64>(Chunk) * StartDepth + static_cast<int64>(Chunk) * (Chunk - 1) / 2;
+		return { Costs.PromptTokenCostMs, Costs.PromptTokenCostPerPositionMs };
+	}
+
+	SuperSLMPrefillPlanning::FPromptPrice BatchedPromptPrice(const FSuperSLMResolvedCpuConfig& Costs)
+	{
+		return { Costs.BatchedPromptTokenCostMs, Costs.BatchedPromptTokenCostPerPositionMs };
 	}
 
 	// A prefill chunk of Chunk tokens starting at depth d costs
-	// Chunk x PromptTokenCostMs + PromptTokenCostPerPositionMs x (Chunk x d + Chunk x (Chunk - 1) / 2).
-	double PrefillChunkCostMs(int32 Chunk, int64 StartDepth, double PromptTokenCostMs, double PromptTokenCostPerPositionMs)
+	// Chunk x TokenMs + PerPositionMs x (Chunk x d + Chunk x (Chunk - 1) / 2), with the pair the
+	// chunk's own size selects (SuperSLMPrefillPlanning::SelectPromptPrice).
+	double PrefillChunkCostMs(int32 Chunk, int64 StartDepth, const FSuperSLMResolvedCpuConfig& Costs)
 	{
-		return Chunk * PromptTokenCostMs + PromptTokenCostPerPositionMs * static_cast<double>(PromptChunkPositionSum(Chunk, StartDepth));
+		return SuperSLMPrefillPlanning::PrefillChunkCostMs(Chunk, StartDepth, Chunk1PromptPrice(Costs), BatchedPromptPrice(Costs));
 	}
 
-	// The largest chunk (at least 1, at most MaxChunk) whose depth-priced cost fits ShareMs -- the
-	// sequence prefill (depth = the slot's ContextUsed) and the prefix prefill (depth = the
-	// prefix's own Consumed) both size their chunk here (D-SLM7794's third and fourth sites).
-	int32 PlanPrefillChunk(int32 MaxChunk, int64 StartDepth, double ShareMs, double PromptTokenCostMs, double PromptTokenCostPerPositionMs)
+	// The chunk one prefill job carries (at least 1, at most MaxChunk): the largest whose
+	// pair-selected, depth-priced cost fits ShareMs, raised to min(MinPrefillChunk, MaxChunk)
+	// (slice 1P's floor). The sequence prefill (depth = the slot's ContextUsed) and the prefix prefill
+	// (depth = the prefix's own Consumed) both size their chunk here (D-SLM7794's third and fourth
+	// sites), and so does every continuation of a sequence prefill (1.1, PlanContinuations).
+	int32 PlanPrefillChunk(int32 MaxChunk, int64 StartDepth, double ShareMs, int32 MinPrefillChunk, const FSuperSLMResolvedCpuConfig& Costs)
 	{
-		int32 Chunk = 1;
-		for (int32 C = 2; C <= MaxChunk; ++C)
-		{
-			if (PrefillChunkCostMs(C, StartDepth, PromptTokenCostMs, PromptTokenCostPerPositionMs) <= ShareMs)
-			{
-				Chunk = C;
-			}
-			else
-			{
-				break;
-			}
-		}
-		return Chunk;
+		return SuperSLMPrefillPlanning::PlanPrefillChunk(MaxChunk, StartDepth, ShareMs, MinPrefillChunk,
+			Chunk1PromptPrice(Costs), BatchedPromptPrice(Costs));
 	}
 
 	// D-SLM7414 (plan §5): "the Plan step picks the largest composition whose planned cost fits
@@ -673,7 +851,7 @@ namespace
 	// configuration only if every job it can plan has a finite planned cost and a K no larger than
 	// kMaxJobTicks (about 4.85 h of 60 Hz ticks for one job). The CPU subsystem plans nothing at or
 	// past kTickHorizon, so TickIndex + K never exceeds INT32_MAX.
-	constexpr int32 kMaxJobTicks = 1 << 20;
+	constexpr int32 kMaxJobTicks = SuperSLMRuntimeResolve::kMaxJobTicks;
 	constexpr int32 kTickHorizon = TNumericLimits<int32>::Max() - kMaxJobTicks;
 
 	// The fault a run-time guard raises. Both guards are defensive after Configure()'s domain check,
@@ -707,76 +885,6 @@ namespace
 			return false;
 		}
 		OutTick = TickIndex + K;
-		return true;
-	}
-
-	// D-SLM7799 rule 3 (plan §5 "The scheduler's numeric domain"): the largest planned cost each job
-	// kind can reach, computed in double with every product checked. With B = BlockCount, M =
-	// MaxLayerBudget, P = min(MaxPrefillChunkBudget, context_cap) and D = context_cap - 1:
-	//   decode:      B x (M x (LayerCostMs + LayerCostPerPositionMs x context_cap) + FinishCostMs)
-	//   prefill:     P x PromptTokenCostMs + PromptTokenCostPerPositionMs x (P x (D - P + 1) + P x (P - 1) / 2)
-	//   lifecycle:   the largest of the six op costs
-	// A non-finite bound, or one whose ceil(bound / TickBudgetMs) exceeds kMaxJobTicks, refuses the
-	// configuration. Each bound over-approximates what the four pricing sites and the op dispatch
-	// can compute. There are two depth limits (D-SLM7803, T-3006 N1):
-	//   - a decode prices its layers at depths up to context_cap itself. A prompt of exactly
-	//     context_cap tokens is admitted and prefill leaves ContextUsed at the cap; the next decode
-	//     job is priced at the cap, and only its Layer-1 call refuses (SSLM_CONTEXT_CAP_EXCEEDED). Bounding decode at
-	//     the cap keeps that refusal the caller's context-cap error, never the plugin-defect fault;
-	//   - a prefill position never exceeds D, because a prompt holds at most context_cap tokens.
-	// A job's layers never exceed M, and its chunk never exceeds P.
-	bool CheckCostDomain(const FSuperSLMRuntimeConfig& Config, int64 ContextCap, FString& OutError)
-	{
-		bool bFinite = true;
-		auto Mul = [&bFinite](double A, double B)
-		{
-			const double R = A * B;
-			bFinite = bFinite && FMath::IsFinite(R);
-			return R;
-		};
-		auto Add = [&bFinite](double A, double B)
-		{
-			const double R = A + B;
-			bFinite = bFinite && FMath::IsFinite(R);
-			return R;
-		};
-		const double B = static_cast<double>(Config.BlockCount);
-		const double M = static_cast<double>(Config.MaxLayerBudget);
-		const double P = static_cast<double>(FMath::Min<int64>(Config.MaxPrefillChunkBudget, ContextCap));
-		const double D = static_cast<double>(FMath::Max<int64>(0, ContextCap - 1));
-		const double DecodeDepth = static_cast<double>(FMath::Max<int64>(0, ContextCap)); // N1: decode prices up to the cap
-
-		struct FBound { const TCHAR* Kind; double Ms; bool bFinite; };
-		FBound Bounds[3];
-
-		bFinite = true;
-		const double LayerAtCap = Add(Config.LayerCostMs, Mul(Config.LayerCostPerPositionMs, DecodeDepth));
-		const double Decode = Mul(B, Add(Mul(M, LayerAtCap), Config.FinishCostMs));
-		Bounds[0] = { TEXT("decode"), Decode, bFinite };
-
-		bFinite = true;
-		const double Positions = Add(Mul(P, D - P + 1.0), Mul(P, P - 1.0) / 2.0);
-		const double Prefill = Add(Mul(P, Config.PromptTokenCostMs), Mul(Config.PromptTokenCostPerPositionMs, Positions));
-		Bounds[1] = { TEXT("prefill"), Prefill, bFinite };
-
-		const double Lifecycle = FMath::Max(FMath::Max(FMath::Max(Config.ResetCostMs, Config.AdoptCostMs), FMath::Max(Config.SaveCostMs, Config.RestoreCostMs)),
-			FMath::Max(Config.PrefixBeginCostMs, Config.PrefixReleaseCostMs));
-		Bounds[2] = { TEXT("lifecycle"), Lifecycle, FMath::IsFinite(Lifecycle) };
-
-		for (const FBound& Bound : Bounds)
-		{
-			const double K = Bound.bFinite ? std::ceil(Bound.Ms / Config.TickBudgetMs) : TNumericLimits<double>::Max();
-			if (!Bound.bFinite || !FMath::IsFinite(K) || K > static_cast<double>(kMaxJobTicks))
-			{
-				OutError = FString::Printf(
-					TEXT("InvalidCostDomain: the %s job's largest planned cost is %s ms, which implies K = %s at TickBudgetMs %g; K must not exceed kMaxJobTicks = %d"),
-					Bound.Kind,
-					Bound.bFinite ? *FString::Printf(TEXT("%g"), Bound.Ms) : TEXT("not finite"),
-					(Bound.bFinite && FMath::IsFinite(K)) ? *FString::Printf(TEXT("%.0f"), K) : TEXT("not finite"),
-					Config.TickBudgetMs, kMaxJobTicks);
-				return false;
-			}
-		}
 		return true;
 	}
 
@@ -896,8 +1004,9 @@ namespace
 	};
 
 	// One lane's own record of a job it posted, oldest (soonest-committed) first. Delivery
-	// (Apply) drains strictly from the front: a job later in this array is never delivered
-	// before an earlier one, matching "results apply in committed order, never reordered."
+	// (Apply) drains from the front. Per-entity order is always preserved, because each sequence
+	// or prefix has at most one undelivered job; entries for different entities may apply out of
+	// lane order, and only behind a test seam's HoldApply() hold (plugin paging plan §3.9, K3).
 	struct FLanePendingDelivery
 	{
 		FQueuedWorkerJobPtr WorkerJob; // Ptr, not Ref -- see FQueuedWorkerJobPtr's own comment;
@@ -914,6 +1023,11 @@ namespace
 		int64 JobId = 0;
 		ESuperSLMWorkerJobKind Kind = ESuperSLMWorkerJobKind::DecodeOrPrefill;
 		int32 K = 0;
+		int32 ChainedWaitTicks = 0; // 1.1: a continuation's ticks queued behind the job it follows
+		// Plugin paging plan §3.9: the test seams' HoldApply() hold on this job's delivery (0 for
+		// none). Apply leaves this job undelivered while it holds; later entries on its lane, which
+		// belong to other entities, deliver past it (K3).
+		int64 ApplyHoldId = 0;
 	};
 
 	struct FLane
@@ -929,8 +1043,9 @@ namespace
 		// read only up to the bytes that save reports.
 		void* SaveStaging = nullptr;
 
-		// Game-thread only (Plan appends at the back, Apply removes from the front) -- never
-		// touched by the worker thread, which only ever sees FQueuedWorkerJob via its OWN queue.
+		// Game-thread only (Plan appends at the back; Apply removes from the front, or past an entry
+		// a test hold keeps, K3) -- never touched by the worker thread, which only ever sees
+		// FQueuedWorkerJob via its OWN queue.
 		TArray<FLanePendingDelivery> Pending;
 
 		// D-SLM7403/D-SLM7407: this lane is available to PLAN a new job once its own schedule
@@ -951,6 +1066,7 @@ namespace
 			Entry.JobId = Job.JobId;
 			Entry.Kind = Job.Kind;
 			Entry.K = Job.K;
+			Entry.ChainedWaitTicks = Job.ChainedWaitTicks;
 			Pending.Add(MoveTemp(Entry));
 			Runnable->Enqueue(MoveTemp(WorkerJob));
 		}
@@ -1117,12 +1233,25 @@ namespace
 	}
 }
 
+// Plugin paging plan §3.4 "Prefixes" (K7): the GPU subsystem mints its prefix ids from this file's
+// counter, so the two backends' prefix handles never coincide and a handle that crosses backends is
+// refused as unknown. Game thread, as every CPU prefix verb. Declared in SuperSLMGpuSubsystem.cpp.
+int64 SuperSLMMintPrefixId();
+int64 SuperSLMMintPrefixId()
+{
+	return GNextPrefixId++;
+}
+
 struct FSuperSLMSubsystemState
 {
 	sslm_model Model = nullptr;
 	uint8 ArtifactHash[32] = {};
 	SuperSLMRuntime::FModelShape Shape;
 	FSuperSLMRuntimeConfig Config;
+	// Decode-threading D4 (D-SLM8144, D-SLM8165): the mode, task count and thirteen costs this
+	// configuration resolved on the calling thread. Every lane, the hook install and every price
+	// read these, never Config's optional fields.
+	FSuperSLMResolvedCpuConfig Resolved;
 
 	void* KvBuffer = nullptr;
 	int64 KvBytes = 0;
@@ -1141,6 +1270,29 @@ struct FSuperSLMSubsystemState
 	TMap<int64, FPrefixEntry> Prefixes;
 	TArray<FPrefixAdminOp> PrefixAdminQueue; // FIFO of pending Begin/Release ops
 
+	// 1.1 (plan §5 item 1a, "Lane depth"): a prefix the caller released whose worker work is not
+	// done yet -- a job still in flight, or its release still queued or in flight. It leaves
+	// Prefixes (the caller's view) at ReleasePrefix(), but keeps its PrefixBlockCount place for
+	// admission until its release delivers: a new prefix's Begin is not admitted while begun and
+	// retiring prefixes already fill PrefixBlockCount. So a prefix never has more than one job
+	// posted and undelivered, create/release cycling cannot stack jobs on a lane, and a Begin never
+	// needs a pool block a release has not yet returned. An orphaned Begin's block is released,
+	// not dropped. CreatePrefix() itself still counts only live prefixes.
+	struct FRetiringPrefix
+	{
+		int32 PinnedLane = INDEX_NONE;
+		bool bJobInFlight = false; // a Begin or prefill job posted before the release has not delivered
+
+		// Budget mode (plugin paging plan §3.3): a prefix released before its build applied keeps
+		// the build's open ticket here; the release its Begin's delivery queues fails the build
+		// once the engine has freed the pages (FPrefixAdminOp::bReleaseFailsBuild). The two hold ids
+		// are the release's own (§3.9), taken at ReleasePrefix() and handed to that release op.
+		SuperSLMPaging::FTicket BuildTicket = SuperSLMPaging::InvalidTicket;
+		int64 ReleaseStartHoldId = 0;
+		int64 ReleaseApplyHoldId = 0;
+	};
+	TMap<int64, FRetiringPrefix> RetiringPrefixes;
+
 	int64 NextOrdinal = 1;   // D-SLM7428: global request ordinal, cross-sequence admission order
 	int64 NextHandleId = 1;
 	int64 NextJobId = 1;
@@ -1156,6 +1308,137 @@ struct FSuperSLMSubsystemState
 	// Game thread.
 	sslm_status TestNextResetStatus = SSLM_OK;
 #endif
+
+	// ---- Plugin paging plan, step K2: CPU budget mode -----------------------------------------
+	//
+	// The page ledger (Core/SuperSLMPageLedgerCore.h), configured only when
+	// FSuperSLMRuntimeConfig::SequenceBudget > 0. Game thread only: every admission is taken where
+	// the request reaches the head of its queue, and every apply at its job's delivery. Legacy
+	// mode leaves it unconfigured, so IsBudgetMode() is the one mode switch.
+	SuperSLMPaging::FPageLedger Ledger;
+	bool IsBudgetMode() const { return Ledger.IsConfigured(); }
+
+	// B and the bytes per page, read from the engine at Configure() (budget mode only).
+	int64 PagePositions = 0;
+	uint64 PageBytes = 0;
+
+#if WITH_DEV_AUTOMATION_TESTS
+	// Every budget-mode prefix's ledger node, by prefix id, kept after ReleasePrefix() so the
+	// test seams can read a released prefix as a ghost (§3.9). K2 review F6: the seams are its only
+	// reader, so it exists only where they do and never grows in a Shipping session.
+	TMap<int64, SuperSLMPaging::FNodeId> PrefixIdToNode;
+#endif
+
+	// The engine's sslm_kv_pool_stats as the last applied job that read it saw it (diagnostic;
+	// GetKvPageStats()).
+	bool bHasPoolSnapshot = false;
+	sslm_kv_pool_stats_out LastPoolStats = {};
+
+	// The HoldApply() hold the next PostLedgerJob() attaches to the job it posts; consumed there.
+	int64 NextPostApplyHoldId = 0;
+
+	// §3.7: the engine returned KV_POOL_EXHAUSTED to one of this plan's own (admitted) requests,
+	// which a correct ledger never lets happen. Counted, and logged by name as a ledger fault.
+	void NoteLedgerFault(const TCHAR* Verb)
+	{
+		Ledger.NoteEngineExhaustion();
+		UE_LOG(LogSuperSLM, Warning, TEXT("SuperSLM ledger fault: %s returned SSLM_KV_POOL_EXHAUSTED to a request the page ledger admitted (%llu so far); the ledger under-charged it."),
+			Verb, static_cast<uint64>(Ledger.LedgerFaults()));
+	}
+
+	// K2 review F3: the ledger refused, at the head of a slot's queue, an op it should always admit
+	// (a plugin defect). The op is refused by name and never runs untracked; the refusal is counted
+	// with the ledger faults and logged as one.
+	void NoteLedgerRefusal(int32 SlotIndex, const FString& Reason)
+	{
+		Ledger.NoteEngineExhaustion();
+		UE_LOG(LogSuperSLM, Error, TEXT("SuperSLM ledger fault: slot %d: %s; the op was refused, nothing was posted (%llu so far; plugin defect)."),
+			SlotIndex, *Reason, static_cast<uint64>(Ledger.LedgerFaults()));
+	}
+
+#if WITH_DEV_AUTOMATION_TESTS
+	// FSuperSLMPagedTestSeam's holds (§3.9), in arming order. A hold is armed by HoldStart() or
+	// HoldApply(), attached to the next admitted job of its kind, reached when that job arrives at
+	// the hold point, and released by ReleaseHold(). They live and die with this state, so
+	// Configure() and Deinitialize() release every one of them.
+	struct FPagedHold
+	{
+		int64 Id = 0;
+		EPagedJobKind Kind = EPagedJobKind::Reset;
+		bool bApply = false;
+		bool bAttached = false;
+		bool bReached = false;
+		bool bReleased = false;
+	};
+	TArray<FPagedHold> PagedHolds;
+
+	// SetNextLayer1StatusOverride(): one-shot statuses by request kind, SSLM_OK when unset.
+	sslm_status Layer1Overrides[static_cast<int32>(EPagedJobKind::Count)] = {};
+
+	FPagedHold* FindPagedHold(int64 Id)
+	{
+		return Id != 0 ? PagedHolds.FindByPredicate([Id](const FPagedHold& H) { return H.Id == Id; }) : nullptr;
+	}
+#endif
+
+	// The oldest armed hold of Kind (start or apply), attached to the job admitted now. 0 when none.
+	int64 TakeArmedHold(EPagedJobKind Kind, bool bApply)
+	{
+#if WITH_DEV_AUTOMATION_TESTS
+		for (FPagedHold& Hold : PagedHolds)
+		{
+			if (Hold.Kind == Kind && Hold.bApply == bApply && !Hold.bAttached && !Hold.bReleased)
+			{
+				Hold.bAttached = true;
+				return Hold.Id;
+			}
+		}
+		return 0;
+#else
+		(void)Kind;
+		(void)bApply;
+		return 0;
+#endif
+	}
+
+	// True while the hold Id holds its job (attached or not, until ReleaseHold()).
+	bool IsHoldBlocking(int64 Id)
+	{
+#if WITH_DEV_AUTOMATION_TESTS
+		const FPagedHold* Hold = FindPagedHold(Id);
+		return Hold != nullptr && !Hold->bReleased;
+#else
+		(void)Id;
+		return false;
+#endif
+	}
+
+	void MarkHoldReached(int64 Id)
+	{
+#if WITH_DEV_AUTOMATION_TESTS
+		if (FPagedHold* Hold = FindPagedHold(Id))
+		{
+			Hold->bReached = true;
+		}
+#else
+		(void)Id;
+#endif
+	}
+
+	// The one-shot Layer-1 status override for the next job of Kind, taken (cleared) now. SSLM_OK
+	// when none is set: the job calls Layer 1.
+	sslm_status TakeLayer1Override(EPagedJobKind Kind)
+	{
+#if WITH_DEV_AUTOMATION_TESTS
+		sslm_status& Entry = Layer1Overrides[static_cast<int32>(Kind)];
+		const sslm_status Status = Entry;
+		Entry = SSLM_OK;
+		return Status;
+#else
+		(void)Kind;
+		return SSLM_OK;
+#endif
+	}
 
 	// D-SLM7799: the run-time guards' plugin-defect fault is logged once per configuration.
 	bool bSchedulingDefectLogged = false;
@@ -1272,6 +1555,10 @@ struct FSuperSLMSubsystemState
 
 	void Fault(FSlot& S, ESuperSLMDecodeOutcome Outcome, const FString& Message)
 	{
+		if (S.Gate.IsValid())
+		{
+			S.Gate->Stop(); // 1.1: a queued continuation of this generation makes no Layer-1 call
+		}
 		S.Phase = ESuperSLMSequencePhase::Faulted;
 		S.LastOutcome = Outcome;
 		S.FaultMessage = Message;
@@ -1347,6 +1634,10 @@ struct FSuperSLMSubsystemState
 			return Op.Kind == ESlotOpKind::Generate && Op.Owner == Owner;
 		});
 		ReleaseHeldPins(Slot.Held);
+		if (Slot.Gate.IsValid())
+		{
+			Slot.Gate->Stop(); // 1.1: the old holder's queued continuation, if any, skips its call
+		}
 		static_cast<FSlotUser&>(Slot) = FSlotUser();
 		Slot.ClearMirrorsIfDrained();
 
@@ -1449,6 +1740,8 @@ void USuperSLMSubsystem::Deinitialize()
 {
 	// TearDown() first, so every continuation still queued finds its serial stale and discards.
 	TearDown();
+	// Plugin paging plan §3.5 (K3): the world's end drops every tombstone.
+	LifecycleTombstones.Empty();
 	// Review W5: a prepare still running is waited for (its work is bounded: the map, the
 	// bandwidth measurement and the allocations), then its state is freed here, synchronously,
 	// since the pool task that would otherwise free it may not run at exit.
@@ -1473,8 +1766,9 @@ void USuperSLMSubsystem::BeginDestroy()
 // Fold-round ruling 1: TearDown()'s body, over a state pointer rather than the subsystem's own
 // member, so a state a worker prepared (BeginConfigure()) can be unwound on a failure or a
 // superseded load without ever having been published. It touches only S and Layer 1, never the
-// UObject, so it may run on any thread that owns S outright.
-static void DestroyCpuStateContents(FSuperSLMSubsystemState& S)
+// UObject, so it may run on any thread that owns S outright. OutTombstones (TearDown() only)
+// receives the handle ids a budget-mode epoch leaves Pending (plugin paging plan §3.5, K3).
+static void DestroyCpuStateContents(FSuperSLMSubsystemState& S, TArray<int64>* OutTombstones = nullptr)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.PoolFree", SuperSLMChannel);
 
@@ -1662,10 +1956,35 @@ static void DestroyCpuStateContents(FSuperSLMSubsystemState& S)
 		SuperSLMRuntime::ReleaseModelMapping(S.Model);
 	}
 
+	// Plugin paging plan §3.5 "When a lifecycle exit ends a wait" (step K3, cell 1.11): before the
+	// entries go, a budget-mode epoch records every entry still Pending -- a waiting restore, a
+	// queued request, a job whose apply will not come -- as a tombstone the subsystem keeps, so the
+	// game reads NotConfigured, not a Pending it cannot tell from a request still queued. Every job
+	// that ran was delivered above, so what is Pending now never resolves. Legacy mode is unchanged.
+	if (OutTombstones != nullptr && S.IsBudgetMode())
+	{
+		for (const TPair<int64, FSuperSLMSubsystemState::FHandleResult>& Entry : S.HandleResults)
+		{
+			if (Entry.Value.Result == ESuperSLMRestoreResult::Pending)
+			{
+				OutTombstones->Add(Entry.Key);
+			}
+		}
+	}
+
 	// Plan §2.5 row 19 (D-SLM7763): TearDown() releases every lifecycle-op handle entry, and with
 	// them every save blob nobody took.
 	S.HandleResults.Empty();
 	S.RetainedResultBytes = 0;
+
+	// Plugin paging plan §3.5 "Fit and wait", cell 1.11: the page ledger's epoch ends with the
+	// pool. Every job that ran has been delivered above (and applied its ticket); every op still
+	// queued, parked at a test hold or never dispatched, is dropped with this state, and its
+	// charge with the epoch. LedgerFaults survives (TearDown() carries it forward).
+	if (S.Ledger.IsConfigured())
+	{
+		S.Ledger.EndEpoch(SuperSLMPaging::EEpochEnd::Teardown);
+	}
 }
 
 static void DestroyCpuState(FSuperSLMSubsystemState* S)
@@ -1687,7 +2006,11 @@ void USuperSLMSubsystem::TearDown()
 		ConfiguredModel = nullptr;
 		return;
 	}
-	DestroyCpuStateContents(*State);
+	TArray<int64> Tombstones;
+	DestroyCpuStateContents(*State, &Tombstones);
+	LifecycleTombstones.Append(Tombstones); // plugin paging plan §3.5 (K3)
+	// Plugin paging plan §3.7: the ledger-fault counter is cumulative across re-Configure().
+	PriorLedgerFaults += State->Ledger.LedgerFaults();
 	delete State;
 	State = nullptr;
 	ConfiguredModel = nullptr;
@@ -1699,7 +2022,13 @@ void USuperSLMSubsystem::TearDown()
 // whole-file SHA-256 and copy), the lifecycle bandwidth measurement, the KV/workspace/save
 // allocations, the lane threads' creation and the warm sequences all happen here. OutState is
 // set only on Success; every failure unwinds what it built. Model is null for no model.
-static FSuperSLMConfigureReport PrepareCpuState(const SuperSLMRuntime::FModelBytes* Model, const FSuperSLMRuntimeConfig& Config, FSuperSLMSubsystemState*& OutState)
+//
+// Decode-threading D4 (D-SLM8144): Resolved is what the calling thread resolved from Config
+// (SuperSLMRuntimeResolve::Resolve) before this runs. Every check and install below that concerns
+// the decode mode, the task count or a cost reads Resolved; Config supplies the call shape. The
+// checks keep their order and messages, now over the resolved values.
+static FSuperSLMConfigureReport PrepareCpuState(const SuperSLMRuntime::FModelBytes* Model, const FSuperSLMRuntimeConfig& Config,
+	const FSuperSLMResolvedCpuConfig& Resolved, FSuperSLMSubsystemState*& OutState)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.PoolAlloc", SuperSLMChannel);
 	OutState = nullptr;
@@ -1746,6 +2075,13 @@ static FSuperSLMConfigureReport PrepareCpuState(const SuperSLMRuntime::FModelByt
 		return Refuse(ESuperSLMConfigureResult::InvalidCallShape, FString::Printf(
 			TEXT("max_layer_budget (MaxLayerBudget) must be at least 1 (got %d)"), Config.MaxLayerBudget));
 	}
+	// Slice 1P (tiled-matmul plan §4A.1 item 1): the chunk floor is a count of tokens; 1 is 1.0's
+	// prefill, and nothing below 1 means anything.
+	if (Config.MinPrefillChunk <= 0)
+	{
+		return Refuse(ESuperSLMConfigureResult::InvalidCallShape, FString::Printf(
+			TEXT("MinPrefillChunk must be at least 1 (got %d); 1 restores one-token prefill jobs, 8 reaches the tiled GEMM"), Config.MinPrefillChunk));
+	}
 	if (Config.MaxConcurrentCalls <= 0)
 	{
 		return Refuse(ESuperSLMConfigureResult::InvalidCallShape, FString::Printf(
@@ -1767,22 +2103,25 @@ static FSuperSLMConfigureReport PrepareCpuState(const SuperSLMRuntime::FModelByt
 		return Refuse(ESuperSLMConfigureResult::InvalidCallShape, FString::Printf(
 			TEXT("MaxQueuedOperationsPerSequence must be at least 1 (got %d)"), Config.MaxQueuedOperationsPerSequence));
 	}
-	if (!SuperSLMFinishHook::IsValidTaskCount(Config.FinishParallelTasks))
+	if (!SuperSLMFinishHook::IsValidTaskCount(Resolved.ParallelTasks))
 	{
 		return Refuse(ESuperSLMConfigureResult::InvalidCallShape, FString::Printf(
-			TEXT("FinishParallelTasks must lie in [0, %d] (got %d): it is the most blocks one token finish is split into; 0 or 1 runs the finish serially"),
-			SuperSLMFinishHook::MaxFinishParallelTasks, Config.FinishParallelTasks));
+			TEXT("FinishParallelTasks must lie in [0, %d] (got %d): it is the most tasks one token finish, one decode projection, or one prefill GEMM is split into; 0 or 1 installs no hook"),
+			SuperSLMFinishHook::MaxFinishParallelTasks, Resolved.ParallelTasks));
 	}
 	// T-2999 S1: the consumer refuses a cost the scheduler cannot size K from, whatever produced
-	// it (the calibration command, a project's config, or a hand edit) -- a non-finite or
-	// non-positive per-unit cost is refused by name.
+	// it (a caller's config, a saved estimate the resolver accepted, or a hand edit) -- a
+	// non-finite or non-positive per-unit cost is refused by name.
 	{
 		const TPair<const TCHAR*, double> Costs[] = {
-			{ TEXT("LayerCostMs"), Config.LayerCostMs }, { TEXT("FinishCostMs"), Config.FinishCostMs },
-			{ TEXT("PromptTokenCostMs"), Config.PromptTokenCostMs }, { TEXT("ResetCostMs"), Config.ResetCostMs },
-			{ TEXT("AdoptCostMs"), Config.AdoptCostMs }, { TEXT("SaveCostMs"), Config.SaveCostMs },
-			{ TEXT("RestoreCostMs"), Config.RestoreCostMs }, { TEXT("PrefixBeginCostMs"), Config.PrefixBeginCostMs },
-			{ TEXT("PrefixReleaseCostMs"), Config.PrefixReleaseCostMs },
+			{ TEXT("LayerCostMs"), Resolved.LayerCostMs }, { TEXT("FinishCostMs"), Resolved.FinishCostMs },
+			{ TEXT("PromptTokenCostMs"), Resolved.PromptTokenCostMs }, { TEXT("ResetCostMs"), Resolved.ResetCostMs },
+			{ TEXT("AdoptCostMs"), Resolved.AdoptCostMs }, { TEXT("SaveCostMs"), Resolved.SaveCostMs },
+			{ TEXT("RestoreCostMs"), Resolved.RestoreCostMs }, { TEXT("PrefixBeginCostMs"), Resolved.PrefixBeginCostMs },
+			{ TEXT("PrefixReleaseCostMs"), Resolved.PrefixReleaseCostMs },
+			// Slice 1P (plan §4A.1 item 2, rev 11.1 audit F6): the batched pair, refused as the
+			// chunk-1 pair is.
+			{ TEXT("BatchedPromptTokenCostMs"), Resolved.BatchedPromptTokenCostMs },
 		};
 		for (const TPair<const TCHAR*, double>& Cost : Costs)
 		{
@@ -1792,11 +2131,12 @@ static FSuperSLMConfigureReport PrepareCpuState(const SuperSLMRuntime::FModelByt
 					TEXT("%s must be a finite, positive number of milliseconds (got %f)"), Cost.Key, Cost.Value));
 			}
 		}
-		// D-SLM7793/D-SLM7794: the two per-position depth terms may be 0 (a flat cost), never
+		// D-SLM7793/D-SLM7794: the per-position depth terms may be 0 (a flat cost), never
 		// negative or non-finite.
 		const TPair<const TCHAR*, double> Slopes[] = {
-			{ TEXT("LayerCostPerPositionMs"), Config.LayerCostPerPositionMs },
-			{ TEXT("PromptTokenCostPerPositionMs"), Config.PromptTokenCostPerPositionMs },
+			{ TEXT("LayerCostPerPositionMs"), Resolved.LayerCostPerPositionMs },
+			{ TEXT("PromptTokenCostPerPositionMs"), Resolved.PromptTokenCostPerPositionMs },
+			{ TEXT("BatchedPromptTokenCostPerPositionMs"), Resolved.BatchedPromptTokenCostPerPositionMs },
 		};
 		for (const TPair<const TCHAR*, double>& Slope : Slopes)
 		{
@@ -1823,18 +2163,38 @@ static FSuperSLMConfigureReport PrepareCpuState(const SuperSLMRuntime::FModelByt
 		return Refuse(ESuperSLMConfigureResult::InvalidCallShape, FString::Printf(
 			TEXT("max_layer_budget %d exceeds the model's num_hidden_layers (%d)"), Config.MaxLayerBudget, Shape.NumHiddenLayers));
 	}
-	// D-SLM7799 rule 3: the derived domain, now that the model shape is known.
+	// D-SLM7799 rule 3: the derived domain, now that the model shape is known. The resolver has
+	// already replaced a tripping saved estimate with the mode profile where that clears it
+	// (D-SLM8145, D-SLM8167); this is the final set's check, and it refuses as before.
 	{
 		FString DomainError;
-		if (!CheckCostDomain(Config, Shape.ContextCap, DomainError))
+		if (!SuperSLMRuntimeResolve::CheckCostDomain(Config, Resolved, Shape.ContextCap, DomainError))
 		{
 			return Refuse(ESuperSLMConfigureResult::InvalidCostDomain, DomainError);
 		}
+	}
+	// Plugin paging plan §3.1 (cell 5): SequenceBudget is 0 (legacy mode) or a budget in
+	// [1, context_cap]; anything else is refused by name before anything is allocated.
+	if (Config.SequenceBudget < 0 || static_cast<int64>(Config.SequenceBudget) > Shape.ContextCap)
+	{
+		return Refuse(ESuperSLMConfigureResult::InvalidSequenceBudget, FString::Printf(
+			TEXT("SequenceBudget must lie in [0, %lld] (got %d): 0 keeps legacy mode, and a budget-mode sequence may write at most the model's context_cap (%lld) positions"),
+			Shape.ContextCap, Config.SequenceBudget, Shape.ContextCap));
+	}
+	const bool bBudgetMode = Config.SequenceBudget > 0;
+	// Slice 1P (tiled-matmul plan §4A.1 item 5): a warning, never a refusal. A prefill call of fewer
+	// than kTiledMinTokens tokens runs the engine's serial GEMM, so a call shape or floor below it
+	// gives up the tiled kernel. Every shipped call shape uses 64 or 512.
+	if (Config.MaxPrefillChunkBudget < SuperSLMPrefillPlanning::kTiledMinTokens || Config.MinPrefillChunk < SuperSLMPrefillPlanning::kTiledMinTokens)
+	{
+		UE_LOG(LogSuperSLM, Warning, TEXT("SuperSLM Configure: MaxPrefillChunkBudget %d, MinPrefillChunk %d: prefill will not reach the tiled GEMM (a prefill call needs at least %d tokens); tokens are unchanged."),
+			Config.MaxPrefillChunkBudget, Config.MinPrefillChunk, SuperSLMPrefillPlanning::kTiledMinTokens);
 	}
 
 	FSuperSLMSubsystemState* NewState = new FSuperSLMSubsystemState();
 	NewState->Shape = Shape;
 	NewState->Config = Config;
+	NewState->Resolved = Resolved;
 	if (!SuperSLMRuntime::ReadArtifactHash(*Model, NewState->ArtifactHash))
 	{
 		delete NewState;
@@ -1852,20 +2212,76 @@ static FSuperSLMConfigureReport PrepareCpuState(const SuperSLMRuntime::FModelByt
 	FSuperSLMSubsystemState& S = *NewState;
 	auto TearDown = [NewState]() { DestroyCpuState(NewState); };
 
+	// Plugin paging plan §3.2 (step K2): budget mode reads the page geometry from the engine on
+	// this thread (the mapping is held) and sizes the page ledger's regions from it, before the
+	// lifecycle budget, which prices a budget holder's reservation (§3.3 "Lifecycle pricing").
+	if (bBudgetMode)
+	{
+		S.PagePositions = static_cast<int64>(sslm_kv_page_positions(S.Model));
+		S.PageBytes = static_cast<uint64>(sslm_kv_page_size(S.Model));
+		SuperSLMPaging::FPageLedgerConfig LedgerConfig;
+		LedgerConfig.PagePositions = S.PagePositions;
+		LedgerConfig.PageBytes = S.PageBytes;
+		LedgerConfig.ContextCap = Shape.ContextCap;
+		LedgerConfig.EngineContextCap = 0; // the CPU's two caps are one: Cp = Ce (§3.2 "Two caps")
+		LedgerConfig.SequenceBudget = Config.SequenceBudget;
+		LedgerConfig.BlockCount = Config.BlockCount;
+		LedgerConfig.PrefixBlockCount = Config.PrefixBlockCount;
+		LedgerConfig.RestoreHeadroomBlocks = Config.RestoreHeadroomBlocks;
+		LedgerConfig.CacheGhostBlocks = Config.CacheGhostBlocks;
+		LedgerConfig.bCacheConfigured = false; // no prefix cache in the paging release: A and C are 0
+		LedgerConfig.CacheRegionPages = 0;
+		const SuperSLMPaging::ELedgerConfigure LedgerResult = S.Ledger.Configure(LedgerConfig);
+		switch (LedgerResult)
+		{
+			case SuperSLMPaging::ELedgerConfigure::Ok:
+				break;
+			case SuperSLMPaging::ELedgerConfigure::InvalidSequenceBudget:
+				TearDown();
+				return Refuse(ESuperSLMConfigureResult::InvalidSequenceBudget, FString::Printf(
+					TEXT("SequenceBudget %d is outside [1, context_cap %lld]"), Config.SequenceBudget, Shape.ContextCap));
+			case SuperSLMPaging::ELedgerConfigure::InvalidGeometry:
+			{
+				const FString Message = FString::Printf(
+					TEXT("the page ledger refused the geometry (B %lld, page %llu bytes, context_cap %lld, BlockCount %d, PrefixBlockCount %d, RestoreHeadroomBlocks %d, CacheGhostBlocks %d): every count must be 0 or more and the pool must fit 2^32 - 1 pages"),
+					S.PagePositions, S.PageBytes, Shape.ContextCap, Config.BlockCount, Config.PrefixBlockCount, Config.RestoreHeadroomBlocks, Config.CacheGhostBlocks);
+				TearDown();
+				return Refuse(ESuperSLMConfigureResult::InvalidCallShape, Message);
+			}
+
+			case SuperSLMPaging::ELedgerConfigure::LegacyMode:
+				TearDown();
+				return Refuse(ESuperSLMConfigureResult::InvalidCallShape, FString::Printf(
+					TEXT("the page ledger read SequenceBudget %d as legacy mode (plugin defect)"), Config.SequenceBudget));
+		}
+	}
+
 	// §5: the Sequence Lifecycle Budget is checked BEFORE anything is allocated. The same figure
 	// SuperSLMSequenceLifecycleBudget::CheckModel() computes -- Layer 1's block size on the shared
-	// mapping, over this box's measured bandwidths -- read from the mapping already held.
+	// mapping, over this box's measured bandwidths -- read from the mapping already held. Plugin
+	// paging plan §3.3 "Lifecycle pricing" (cell 7.1): in budget mode a create or reset is priced
+	// at R(SequenceBudget) x page_bytes, the reservation it touches, in place of the block size.
+	const uint64 BudgetPricedBytes = bBudgetMode
+		? SuperSLMPaging::BudgetModeLifecyclePricedBytes(S.PagePositions, Shape.ContextCap, Config.SequenceBudget, S.PageBytes)
+		: 0;
+	const int64 LifecyclePricedBytes = bBudgetMode ? static_cast<int64>(BudgetPricedBytes) : static_cast<int64>(sslm_kv_block_size(S.Model));
 	double WriteBytesPerSec = 0.0;
 	double AdoptToResetRatio = 0.0;
 	SuperSLMSequenceLifecycleBudget::MeasureHostBandwidthAndAdoptRatio(WriteBytesPerSec, AdoptToResetRatio);
 	const FSuperSLMSequenceLifecycleReport Lifecycle = SuperSLMSequenceLifecycleBudget::Predict(
-		static_cast<int64>(sslm_kv_block_size(S.Model)), WriteBytesPerSec, AdoptToResetRatio, Config.SequenceLifecycleBudgetMs);
+		LifecyclePricedBytes, WriteBytesPerSec, AdoptToResetRatio, Config.SequenceLifecycleBudgetMs);
 	if (!Lifecycle.bWithinBudget)
 	{
-		const FString Message = FString::Printf(
-			TEXT("predicted reset %.2f ms / adopt %.2f ms for a %lld-byte KV block exceed the Sequence Lifecycle Budget of %.2f ms. ")
-			TEXT("The block size is linear in context_cap (%lld for this model): reconvert at a smaller context_cap, or raise the budget."),
-			Lifecycle.PredictedResetMs, Lifecycle.PredictedAdoptMs, Lifecycle.KvBlockSizeBytes, Config.SequenceLifecycleBudgetMs, Shape.ContextCap);
+		const FString Message = bBudgetMode
+			? FString::Printf(
+				TEXT("predicted reset %.2f ms / adopt %.2f ms for a %lld-byte KV reservation (R(SequenceBudget %d) = %lld pages of %llu bytes) exceed the Sequence Lifecycle Budget of %.2f ms. ")
+				TEXT("The reservation grows with SequenceBudget: lower it, or raise the budget."),
+				Lifecycle.PredictedResetMs, Lifecycle.PredictedAdoptMs, Lifecycle.KvBlockSizeBytes, Config.SequenceBudget,
+				S.PageBytes > 0 ? static_cast<int64>(BudgetPricedBytes / S.PageBytes) : int64(0), S.PageBytes, Config.SequenceLifecycleBudgetMs)
+			: FString::Printf(
+				TEXT("predicted reset %.2f ms / adopt %.2f ms for a %lld-byte KV block exceed the Sequence Lifecycle Budget of %.2f ms. ")
+				TEXT("The block size is linear in context_cap (%lld for this model): reconvert at a smaller context_cap, or raise the budget."),
+				Lifecycle.PredictedResetMs, Lifecycle.PredictedAdoptMs, Lifecycle.KvBlockSizeBytes, Config.SequenceLifecycleBudgetMs, Shape.ContextCap);
 		TearDown();
 		return Refuse(ESuperSLMConfigureResult::SequenceLifecycleBudgetExceeded, Message);
 	}
@@ -1883,14 +2299,28 @@ static FSuperSLMConfigureReport PrepareCpuState(const SuperSLMRuntime::FModelByt
 	check(PoolBlocks64 > 0 && PoolBlocks64 <= static_cast<int64>(MAX_int32));
 	const int32 PoolBlocks = static_cast<int32>(PoolBlocks64);
 	const size_t BlockBytes = sslm_kv_block_size(S.Model);
-	const size_t OverheadBytes = sslm_kv_pool_overhead_size(S.Model, static_cast<uint32_t>(PoolBlocks));
+	const size_t OverheadBytes = bBudgetMode ? 0 : sslm_kv_pool_overhead_size(S.Model, static_cast<uint32_t>(PoolBlocks));
 	const size_t WorkspaceBytes = sslm_workspace_size(S.Model, &CallShape);
 	const size_t StateBytes = sslm_seq_state_size(S.Model);
-	if (BlockBytes == 0 || WorkspaceBytes == 0 || StateBytes == 0 || OverheadBytes == SIZE_MAX ||
-		BlockBytes > (SIZE_MAX - OverheadBytes) / static_cast<size_t>(PoolBlocks))
+	if (BlockBytes == 0 || WorkspaceBytes == 0 || StateBytes == 0 ||
+		(!bBudgetMode && (OverheadBytes == SIZE_MAX || BlockBytes > (SIZE_MAX - OverheadBytes) / static_cast<size_t>(PoolBlocks))))
 	{
 		TearDown();
 		return Refuse(ESuperSLMConfigureResult::InvalidCallShape, TEXT("Layer 1 could not size the pool/workspace for this model and call shape"));
+	}
+
+	// Plugin paging plan §3.2: in budget mode the pool is a page pool of exactly the ledger's
+	// S + P + H (+ A + C, 0 here) pages, so the engine's own KV_POOL_EXHAUSTED is reachable only
+	// past a charge the ledger got wrong (a ledger fault, §3.7).
+	const uint32 PoolPages = bBudgetMode ? S.Ledger.PoolPages() : 0u;
+	const size_t PageBytes = bBudgetMode ? static_cast<size_t>(S.PageBytes) : 0;
+	const size_t PageOverheadBytes = bBudgetMode ? sslm_kv_page_pool_overhead_size(S.Model, PoolPages) : 0;
+	if (bBudgetMode && (PoolPages == 0 || PageBytes == 0 || PageOverheadBytes == SIZE_MAX ||
+		PageBytes > (SIZE_MAX - PageOverheadBytes) / static_cast<size_t>(PoolPages)))
+	{
+		TearDown();
+		return Refuse(ESuperSLMConfigureResult::InvalidCallShape, FString::Printf(
+			TEXT("Layer 1 could not size a page pool of %u pages of %llu bytes for this model"), PoolPages, static_cast<uint64>(PageBytes)));
 	}
 
 	auto AllocFail = [&TearDown, &Refuse](const FString& What)
@@ -1899,17 +2329,23 @@ static FSuperSLMConfigureReport PrepareCpuState(const SuperSLMRuntime::FModelByt
 		return Refuse(ESuperSLMConfigureResult::AllocationFailed, What);
 	};
 
-	// KV = sslm_kv_block_size * blocks + sslm_kv_pool_overhead_size (§4), 64-byte aligned.
-	S.KvBytes = static_cast<int64>(BlockBytes * static_cast<size_t>(PoolBlocks) + OverheadBytes);
+	// Legacy: KV = sslm_kv_block_size * blocks + sslm_kv_pool_overhead_size (§4), 64-byte aligned.
+	// Budget mode: pages * sslm_kv_page_size + sslm_kv_page_pool_overhead_size, as
+	// sslm_kv_page_pool_create requires.
+	S.KvBytes = bBudgetMode
+		? static_cast<int64>(PageBytes * static_cast<size_t>(PoolPages) + PageOverheadBytes)
+		: static_cast<int64>(BlockBytes * static_cast<size_t>(PoolBlocks) + OverheadBytes);
 	S.KvBuffer = FMemory::Malloc(static_cast<SIZE_T>(S.KvBytes), SSLM_ABI_ALIGNMENT_BYTES);
 	if (S.KvBuffer == nullptr)
 	{
 		return AllocFail(FString::Printf(TEXT("could not allocate the %lld-byte KV pool"), S.KvBytes));
 	}
-	sslm_status Status = sslm_kv_pool_create(S.Model, S.KvBuffer, static_cast<size_t>(S.KvBytes), static_cast<uint32_t>(PoolBlocks), &S.Pool);
+	sslm_status Status = bBudgetMode
+		? sslm_kv_page_pool_create(S.Model, S.KvBuffer, static_cast<size_t>(S.KvBytes), PoolPages, &S.Pool)
+		: sslm_kv_pool_create(S.Model, S.KvBuffer, static_cast<size_t>(S.KvBytes), static_cast<uint32_t>(PoolBlocks), &S.Pool);
 	if (Status != SSLM_OK)
 	{
-		return AllocFail(FString::Printf(TEXT("sslm_kv_pool_create failed (%s)"), *StatusText(Status)));
+		return AllocFail(FString::Printf(TEXT("%s failed (%s)"), bBudgetMode ? TEXT("sslm_kv_page_pool_create") : TEXT("sslm_kv_pool_create"), *StatusText(Status)));
 	}
 
 	// §4, D-SLM7341/D-SLM7407: one persistent worker thread and one workspace per lane; lanes =
@@ -1933,15 +2369,18 @@ static FSuperSLMConfigureReport PrepareCpuState(const SuperSLMRuntime::FModelByt
 		// Plan §2.5 row 2 (D-SLM7663): the finish hook, installed right after the workspace is
 		// created and before this lane's worker thread starts, so it never runs concurrently with
 		// a call on the workspace.
-		if (SuperSLMFinishHook::ShouldInstall(Config.FinishParallelTasks))
+		// The resolved decode mode rides on this hook (D-SLM8166): at 0 or 1 task none is installed,
+		// and the effective mode is then off.
+		if (SuperSLMFinishHook::ShouldInstall(Resolved.ParallelTasks))
 		{
-			const sslm_parallel_for Hook = SuperSLMFinishHook::Make(Config.FinishParallelTasks);
+			const sslm_parallel_for Hook = SuperSLMFinishHook::Make(Resolved.ParallelTasks,
+				Resolved.bDecodeModeEffective ? SSLM_PARALLEL_FOR_MATVEC : 0);
 			Status = sslm_workspace_set_parallel_for(Lane.Workspace, &Hook);
 			if (Status != SSLM_OK)
 			{
 				TearDown();
 				return Refuse(ESuperSLMConfigureResult::InvalidCallShape, FString::Printf(
-					TEXT("sslm_workspace_set_parallel_for refused the finish hook at FinishParallelTasks %d (%s)"), Config.FinishParallelTasks, *StatusText(Status)));
+					TEXT("sslm_workspace_set_parallel_for refused the finish hook at FinishParallelTasks %d (%s)"), Resolved.ParallelTasks, *StatusText(Status)));
 			}
 		}
 		// §4: save buffers are sized by sslm_seq_state_size (an upper bound) and created at
@@ -1967,10 +2406,15 @@ static FSuperSLMConfigureReport PrepareCpuState(const SuperSLMRuntime::FModelByt
 	S.Slots.SetNum(Config.BlockCount);
 	for (int32 I = 0; I < Config.BlockCount; ++I)
 	{
-		Status = sslm_seq_create(S.Model, &S.Pool, &S.Slots[I].Seq);
+		// Plugin paging plan §3.2: in budget mode each warm holder reserves R(SequenceBudget)
+		// pages, the slot's share of region S, which the ledger charged in full at its Configure.
+		Status = bBudgetMode
+			? sslm_seq_create_budgeted(S.Model, &S.Pool, Config.SequenceBudget, &S.Slots[I].Seq)
+			: sslm_seq_create(S.Model, &S.Pool, &S.Slots[I].Seq);
 		if (Status != SSLM_OK)
 		{
-			return AllocFail(FString::Printf(TEXT("sslm_seq_create failed for warm sequence %d of %d (%s)"), I + 1, Config.BlockCount, *StatusText(Status)));
+			return AllocFail(FString::Printf(TEXT("%s failed for warm sequence %d of %d (%s)"),
+				bBudgetMode ? TEXT("sslm_seq_create_budgeted") : TEXT("sslm_seq_create"), I + 1, Config.BlockCount, *StatusText(Status)));
 		}
 		S.Slots[I].Prompt.Reserve(Config.MaxPrefillChunkBudget);
 		S.FreeSlots.Add(I);
@@ -1992,11 +2436,24 @@ static FSuperSLMConfigureReport PrepareCpuState(const SuperSLMRuntime::FModelByt
 
 	S.PublishStats(FSuperSLMTickReport());
 	Report.Result = ESuperSLMConfigureResult::Success;
+	if (bBudgetMode)
+	{
+		using SuperSLMPaging::ERegion;
+		Report.Message = FString::Printf(
+			TEXT("budget mode (SequenceBudget %d): KV page pool %lld bytes (%u pages of %llu bytes, B = %lld: S %u for %d sequences, P %u, H %u; + %llu overhead), %d worker lane(s) with a %lld-byte workspace and a %lld-byte save buffer each, token finish %s; predicted reset %.2f ms, adopt %.2f ms"),
+			Config.SequenceBudget, S.KvBytes, PoolPages, static_cast<uint64>(PageBytes), S.PagePositions,
+			S.Ledger.RegionCapacity(ERegion::S), Config.BlockCount, S.Ledger.RegionCapacity(ERegion::P), S.Ledger.RegionCapacity(ERegion::H),
+			static_cast<uint64>(PageOverheadBytes), S.Lanes.Num(), S.WorkspaceBytesEach, S.SaveStagingBytes,
+			SuperSLMFinishHook::ShouldInstall(Resolved.ParallelTasks) ? *FString::Printf(TEXT("split into at most %d ParallelFor tasks"), Resolved.ParallelTasks) : TEXT("serial"),
+			Lifecycle.PredictedResetMs, Lifecycle.PredictedAdoptMs);
+		OutState = NewState;
+		return Report;
+	}
 	Report.Message = FString::Printf(
 		TEXT("KV pool %lld bytes (%d sequence + %d prefix blocks of %llu bytes, + %llu overhead), %d worker lane(s) with a %lld-byte workspace and a %lld-byte save buffer each, token finish %s; predicted reset %.2f ms, adopt %.2f ms"),
 		S.KvBytes, Config.BlockCount, Config.PrefixBlockCount, static_cast<uint64>(BlockBytes), static_cast<uint64>(OverheadBytes),
 		S.Lanes.Num(), S.WorkspaceBytesEach, S.SaveStagingBytes,
-		SuperSLMFinishHook::ShouldInstall(Config.FinishParallelTasks) ? *FString::Printf(TEXT("split into at most %d ParallelFor tasks"), Config.FinishParallelTasks) : TEXT("serial"),
+		SuperSLMFinishHook::ShouldInstall(Resolved.ParallelTasks) ? *FString::Printf(TEXT("split into at most %d ParallelFor tasks"), Resolved.ParallelTasks) : TEXT("serial"),
 		Lifecycle.PredictedResetMs, Lifecycle.PredictedAdoptMs);
 	OutState = NewState;
 	return Report;
@@ -2014,15 +2471,54 @@ FSuperSLMConfigureReport USuperSLMSubsystem::Configure(USuperSLMModel* Model, co
 	{
 		Bytes = SuperSLMRuntime::CaptureModelBytes(*Model);
 	}
+	// Decode-threading D4 (D-SLM8144): the mode, task count and costs resolve here, on the calling
+	// thread, from Config, this process's selection and the two Saved/SuperSLM INI files.
+	const FSuperSLMResolvedCpuConfig Resolved = SuperSLMRuntimeResolve::Resolve(Config, Model != nullptr ? &Bytes : nullptr);
 	FSuperSLMSubsystemState* NewState = nullptr;
-	const FSuperSLMConfigureReport Report = PrepareCpuState(Model != nullptr ? &Bytes : nullptr, Config, NewState);
+	FSuperSLMConfigureReport Report = PrepareCpuState(Model != nullptr ? &Bytes : nullptr, Config, Resolved, NewState);
+	Report.Resolved = Resolved;
 	if (NewState != nullptr)
 	{
+		NewState->NextHandleId = FirstHandleIdAfterTombstones(); // plugin paging plan §3.5 (K3)
 		State = NewState;
 		ConfiguredModel = Model;
+		UE_LOG(LogSuperSLM, Display, TEXT("%s"), *SuperSLMRuntimeResolve::ConfigureLine(Resolved));
 	}
 	return Report;
 }
+
+const FSuperSLMResolvedCpuConfig* USuperSLMSubsystem::GetResolvedConfig() const
+{
+	return State != nullptr ? &State->Resolved : nullptr;
+}
+
+#if WITH_DEV_AUTOMATION_TESTS
+namespace
+{
+	// FSuperSLMConfigureTestAccess: the release event the next BeginConfigure() pool job waits on.
+	// Game thread.
+	TSharedPtr<FEventRef, ESPMode::ThreadSafe> GHeldPoolJobRelease;
+	bool bGHoldNextPoolJob = false;
+}
+
+void FSuperSLMConfigureTestAccess::HoldNextPoolJob()
+{
+	check(IsInGameThread());
+	GHeldPoolJobRelease = MakeShared<FEventRef, ESPMode::ThreadSafe>(EEventMode::ManualReset);
+	bGHoldNextPoolJob = true;
+}
+
+void FSuperSLMConfigureTestAccess::ReleasePoolJob()
+{
+	check(IsInGameThread());
+	bGHoldNextPoolJob = false;
+	if (GHeldPoolJobRelease.IsValid())
+	{
+		(*GHeldPoolJobRelease)->Trigger();
+		GHeldPoolJobRelease.Reset();
+	}
+}
+#endif
 
 void USuperSLMSubsystem::BeginConfigure(USuperSLMModel* Model, const FSuperSLMRuntimeConfig& Config, TUniqueFunction<void(const FSuperSLMConfigureReport&)> OnDone)
 {
@@ -2044,16 +2540,36 @@ void USuperSLMSubsystem::BeginConfigure(USuperSLMModel* Model, const FSuperSLMRu
 		// alive by Bytes.Pin (review S5), which a reload of the asset meanwhile does not free.
 		Hold = MakeShared<TStrongObjectPtr<USuperSLMModel>>(Model);
 	}
+	// Decode-threading D4 (D-SLM8144): resolution runs here, on the calling (game) thread, before
+	// the pool job is queued; a selection or --save made after this call applies to the next
+	// configuration. The pool job reads only Resolved.
+	const FSuperSLMResolvedCpuConfig Resolved = SuperSLMRuntimeResolve::Resolve(Config, bHasModel ? &Bytes : nullptr);
 	TWeakObjectPtr<USuperSLMSubsystem> WeakThis(this);
 	TSharedPtr<FSuperSLMCpuConfigureFlight, ESPMode::ThreadSafe> Flight = MakeShared<FSuperSLMCpuConfigureFlight, ESPMode::ThreadSafe>();
 	InFlightConfigures.Add(Flight);
 
+	// FSuperSLMConfigureTestAccess::HoldNextPoolJob(): this pool job waits for ReleasePoolJob().
+	TSharedPtr<FEventRef, ESPMode::ThreadSafe> HeldRelease;
+#if WITH_DEV_AUTOMATION_TESTS
+	if (bGHoldNextPoolJob)
+	{
+		bGHoldNextPoolJob = false;
+		HeldRelease = GHeldPoolJobRelease;
+	}
+#endif
+
 	// Pool thread: PrepareCpuState(), every heavy step of Configure().
 	Async(EAsyncExecution::ThreadPool,
-		[WeakThis, Serial, bHasModel, Bytes = MoveTemp(Bytes), Hold = MoveTemp(Hold), Flight, Config, OnDone = MoveTemp(OnDone)]() mutable
+		[WeakThis, Serial, bHasModel, Bytes = MoveTemp(Bytes), Hold = MoveTemp(Hold), Flight, Config, Resolved, HeldRelease, OnDone = MoveTemp(OnDone)]() mutable
 		{
+			if (HeldRelease.IsValid())
+			{
+				// A test seam only: bounded, so a test that never releases cannot hang the pool.
+				(*HeldRelease)->Wait(FTimespan::FromSeconds(120.0));
+			}
 			FSuperSLMSubsystemState* Built = nullptr;
-			const FSuperSLMConfigureReport Report = PrepareCpuState(bHasModel ? &Bytes : nullptr, Config, Built);
+			FSuperSLMConfigureReport Report = PrepareCpuState(bHasModel ? &Bytes : nullptr, Config, Resolved, Built);
+			Report.Resolved = Resolved;
 			{
 				FScopeLock ScopeLock(&Flight->Lock);
 				Flight->Prepared = Built;
@@ -2085,8 +2601,10 @@ void USuperSLMSubsystem::BeginConfigure(USuperSLMModel* Model, const FSuperSLMRu
 					Self->bConfigurePending = false;
 					if (NewState != nullptr)
 					{
+						NewState->NextHandleId = Self->FirstHandleIdAfterTombstones(); // plugin paging plan §3.5 (K3)
 						Self->State = NewState;
 						Self->ConfiguredModel = Hold.IsValid() ? Hold->Get() : nullptr;
+						UE_LOG(LogSuperSLM, Display, TEXT("%s"), *SuperSLMRuntimeResolve::ConfigureLine(NewState->Resolved));
 					}
 					Hold.Reset();
 					if (OnDone)
@@ -2211,6 +2729,7 @@ ESuperSLMRestoreResult USuperSLMSubsystem::ResetSequence(const FSuperSLMSequence
 	Op.HandleId = State->MintHandle();
 	Op.Owner = Slot->VendedId;
 	Slot->OpQueue.Add(Op);
+	Slot->CancelQueuedContinuation(); // 1.1: a queued op precedes the generation's next job
 	Slot->MarkBindEligible(); // plan §2.5 row 4: a queued reset makes the sequence bind-eligible
 	OutHandle.Id = Op.HandleId;
 	return ESuperSLMRestoreResult::Success;
@@ -2299,6 +2818,7 @@ bool USuperSLMSubsystem::SetSchema(const FSuperSLMSequence& Sequence, const FSup
 		Entry.SchemaName = SchemaName;
 		Entry.Ordinal = State->MintOrdinal();
 		Slot->Held.Add(Entry);
+		Slot->CancelQueuedContinuation(); // 1.1: the holder's next job carries it (row 20)
 		return true;
 	}
 	return State->ApplySchemaInline(*Slot, SchemaName, OutError);
@@ -2373,6 +2893,7 @@ void USuperSLMSubsystem::RequestAdapterSwap(const FSuperSLMSequence& Sequence, c
 		Entry.bPinned = true;
 	}
 	Slot->Held.Add(Entry);
+	Slot->CancelQueuedContinuation(); // 1.1: the holder's next job carries it (row 20)
 }
 
 FSuperSLMAdapterHandle USuperSLMSubsystem::GetActiveAdapter(const FSuperSLMSequence& Sequence) const
@@ -2389,6 +2910,92 @@ FSuperSLMAdapterHandle USuperSLMSubsystem::GetActiveAdapter(const FSuperSLMSeque
 // Shared prefixes (D-SLM7342)
 // ---------------------------------------------------------------------------------------------
 
+// The one prefix admission both CreatePrefix() overloads share. Legacy mode keeps its checks and
+// their order: the live count against PrefixBlockCount, then an empty, over-cap or
+// out-of-vocabulary token list. Budget mode (plugin paging plan §3.3, UP-6) admits an empty list
+// (begun with budget 1), checks the tokens, then takes the page ledger's build admission: the
+// count rule (PrefixLimit) and region P's page rule (KvPagesExhausted), charged before the Begin
+// job is queued.
+static ESuperSLMPrefixResult CreatePrefixOnState(FSuperSLMSubsystemState& S, const TArray<int32>& Tokens, FSuperSLMPrefix& OutPrefix, FString& OutError)
+{
+	const bool bBudgetMode = S.IsBudgetMode();
+	if (!bBudgetMode)
+	{
+		if (S.Prefixes.Num() >= S.Config.PrefixBlockCount)
+		{
+			OutError = FString::Printf(TEXT("PrefixBlockCount (%d) prefixes are already live; release one, or configure more prefix blocks"), S.Config.PrefixBlockCount);
+			TRACE_BOOKMARK(TEXT("SuperSLM: prefix pool refusal (%d live)"), S.Prefixes.Num());
+			return ESuperSLMPrefixResult::PrefixLimit;
+		}
+		if (Tokens.Num() == 0)
+		{
+			OutError = TEXT("the prefix is empty");
+			return ESuperSLMPrefixResult::Malformed;
+		}
+	}
+	if (Tokens.Num() > S.Shape.ContextCap)
+	{
+		OutError = FString::Printf(TEXT("the prefix's %d tokens exceed the model's context_cap of %lld"), Tokens.Num(), S.Shape.ContextCap);
+		return ESuperSLMPrefixResult::Malformed;
+	}
+	for (int32 I = 0; I < Tokens.Num(); ++I)
+	{
+		if (Tokens[I] < 0 || Tokens[I] >= S.Shape.VocabSize)
+		{
+			OutError = FString::Printf(TEXT("prefix token %d at index %d is outside the model's vocabulary [0, %d)"), Tokens[I], I, S.Shape.VocabSize);
+			return ESuperSLMPrefixResult::Malformed;
+		}
+	}
+
+	SuperSLMPaging::FAdmission Admission;
+	if (bBudgetMode)
+	{
+		Admission = S.Ledger.AdmitPrefixBuild(Tokens.Num());
+		if (Admission.Outcome == SuperSLMPaging::EPageAdmit::PrefixLimit)
+		{
+			OutError = FString::Printf(TEXT("PrefixBlockCount (%d) prefixes are already live; release one, or configure more prefix blocks"), S.Config.PrefixBlockCount);
+			TRACE_BOOKMARK(TEXT("SuperSLM: prefix pool refusal (%u live)"), S.Ledger.LivePrefixCount());
+			return ESuperSLMPrefixResult::PrefixLimit;
+		}
+		if (Admission.Outcome == SuperSLMPaging::EPageAdmit::KvPagesExhausted)
+		{
+			const uint32 Charge = SuperSLMPaging::PrefixBuildCharge(S.PagePositions, S.Shape.ContextCap, Tokens.Num());
+			OutError = FString::Printf(TEXT("KvPagesExhausted: a %d-token prefix is charged %u pages on the prefix region, which has %u of %u free; release a prefix (or the sequences still adopting a released one), or configure more prefix blocks"),
+				Tokens.Num(), Charge, S.Ledger.RegionFree(SuperSLMPaging::ERegion::P), S.Ledger.RegionCapacity(SuperSLMPaging::ERegion::P));
+			return ESuperSLMPrefixResult::KvPagesExhausted;
+		}
+		if (Admission.Outcome != SuperSLMPaging::EPageAdmit::Admitted)
+		{
+			OutError = FString::Printf(TEXT("the page ledger refused a %d-token prefix build (outcome %d)"), Tokens.Num(), static_cast<int32>(Admission.Outcome));
+			return Admission.Outcome == SuperSLMPaging::EPageAdmit::NotConfigured ? ESuperSLMPrefixResult::NotConfigured : ESuperSLMPrefixResult::Malformed;
+		}
+	}
+
+	const int64 Id = GNextPrefixId++;
+	FPrefixEntry& Entry = S.Prefixes.Add(Id);
+	Entry.Tokens = Tokens;
+	FPrefixAdminOp Op;
+	Op.Kind = EPrefixAdminKind::Begin;
+	Op.Ordinal = S.MintOrdinal();
+	Op.PrefixId = Id;
+	// §3.9: the test seams' PrefixBuild holds, taken at the build's admission. The start hold
+	// parks the Begin; the apply hold parks the delivery of the job that freezes the prefix.
+	Op.StartHoldId = S.TakeArmedHold(EPagedJobKind::PrefixBuild, /*bApply*/ false);
+	Entry.BuildApplyHoldId = S.TakeArmedHold(EPagedJobKind::PrefixBuild, /*bApply*/ true);
+	if (bBudgetMode)
+	{
+		Entry.LedgerNode = Admission.Node;
+		Entry.BuildTicket = Admission.Ticket;
+#if WITH_DEV_AUTOMATION_TESTS
+		S.PrefixIdToNode.Add(Id, Admission.Node);
+#endif
+	}
+	S.PrefixAdminQueue.Add(Op);
+	OutPrefix.Id = Id;
+	S.PublishStats(S.LastReport);
+	return ESuperSLMPrefixResult::Success;
+}
+
 bool USuperSLMSubsystem::CreatePrefix(const TArray<int32>& Tokens, FSuperSLMPrefix& OutPrefix, FString& OutError)
 {
 	OutPrefix = FSuperSLMPrefix();
@@ -2402,43 +3009,146 @@ bool USuperSLMSubsystem::CreatePrefix(const TArray<int32>& Tokens, FSuperSLMPref
 		OutError = State->TickHorizonMessage; // D-SLM7799
 		return false;
 	}
-	FSuperSLMSubsystemState& S = *State;
-	if (S.Prefixes.Num() >= S.Config.PrefixBlockCount)
+	return CreatePrefixOnState(*State, Tokens, OutPrefix, OutError) == ESuperSLMPrefixResult::Success;
+}
+
+ESuperSLMPrefixResult USuperSLMSubsystem::CreatePrefix(const TArray<int32>& Tokens, FSuperSLMPrefix& OutPrefix, FString* OutError)
+{
+	OutPrefix = FSuperSLMPrefix();
+	FString Error;
+	ESuperSLMPrefixResult Result = ESuperSLMPrefixResult::NotConfigured;
+	if (State == nullptr)
 	{
-		OutError = FString::Printf(TEXT("PrefixBlockCount (%d) prefixes are already live; release one, or configure more prefix blocks"), S.Config.PrefixBlockCount);
-		TRACE_BOOKMARK(TEXT("SuperSLM: prefix pool refusal (%d live)"), S.Prefixes.Num());
-		return false;
+		Error = TEXT("the subsystem is not configured");
 	}
-	if (Tokens.Num() == 0)
+	else if (State->bTickHorizonReached)
 	{
-		OutError = TEXT("the prefix is empty");
-		return false;
+		Error = State->TickHorizonMessage; // D-SLM7799
 	}
-	if (Tokens.Num() > S.Shape.ContextCap)
+	else
 	{
-		OutError = FString::Printf(TEXT("the prefix's %d tokens exceed the model's context_cap of %lld"), Tokens.Num(), S.Shape.ContextCap);
-		return false;
+		Result = CreatePrefixOnState(*State, Tokens, OutPrefix, Error);
+	}
+	if (OutError != nullptr)
+	{
+		*OutError = MoveTemp(Error);
+	}
+	return Result;
+}
+
+// Plugin paging plan §3.3 "Nested prefixes" (step K3): a child continuing a frozen, live parent
+// (sslm_prefix_begin_from). Budget mode only; legacy mode refuses by name. The child's budget is
+// its own token count, its charge R(max(T, 1)) on P, settled at its freeze to its private pages.
+// The parent is pinned from this admission until the child's build applies (the ledger's pin), and
+// the child counts against PrefixBlockCount.
+static ESuperSLMPrefixResult CreatePrefixFromOnState(FSuperSLMSubsystemState& S, const FSuperSLMPrefix& Parent, const TArray<int32>& Tokens, FSuperSLMPrefix& OutPrefix, FString& OutError)
+{
+	const FPrefixEntry* ParentEntry = S.Prefixes.Find(Parent.Id);
+	if (ParentEntry == nullptr || !ParentEntry->bLedgerBuilt || ParentEntry->Handle == nullptr || ParentEntry->Phase != ESuperSLMPrefixPhase::Ready)
+	{
+		OutError = ParentEntry == nullptr
+			? TEXT("ParentNotUsable: the parent is not a live prefix of this subsystem (released, or never created here)")
+			: TEXT("ParentNotUsable: the parent is not frozen yet (or faulted); wait for it to reach Ready");
+		return ESuperSLMPrefixResult::ParentNotUsable;
+	}
+	const int64 ParentLength = ParentEntry->OriginLength + ParentEntry->Tokens.Num();
+	const int64 Cap = S.Ledger.GetConfig().ContextCap;
+	if (ParentLength + Tokens.Num() > Cap)
+	{
+		OutError = FString::Printf(TEXT("the parent's %lld positions and the child's %d tokens exceed the context cap of %lld"), ParentLength, Tokens.Num(), Cap);
+		return ESuperSLMPrefixResult::Malformed;
 	}
 	for (int32 I = 0; I < Tokens.Num(); ++I)
 	{
 		if (Tokens[I] < 0 || Tokens[I] >= S.Shape.VocabSize)
 		{
 			OutError = FString::Printf(TEXT("prefix token %d at index %d is outside the model's vocabulary [0, %d)"), Tokens[I], I, S.Shape.VocabSize);
-			return false;
+			return ESuperSLMPrefixResult::Malformed;
 		}
 	}
 
+	const SuperSLMPaging::FAdmission Admission = S.Ledger.AdmitNestedPrefixBuild(ParentEntry->LedgerNode, Tokens.Num());
+	switch (Admission.Outcome)
+	{
+		case SuperSLMPaging::EPageAdmit::Admitted:
+			break;
+		case SuperSLMPaging::EPageAdmit::ParentNotUsable:
+			OutError = TEXT("ParentNotUsable: the page ledger does not hold the parent as a live, built prefix");
+			return ESuperSLMPrefixResult::ParentNotUsable;
+		case SuperSLMPaging::EPageAdmit::PrefixLimit:
+			OutError = FString::Printf(TEXT("PrefixBlockCount (%d) prefixes are already live; release one, or configure more prefix blocks"), S.Config.PrefixBlockCount);
+			return ESuperSLMPrefixResult::PrefixLimit;
+		case SuperSLMPaging::EPageAdmit::KvPagesExhausted:
+		{
+			const uint32 Charge = SuperSLMPaging::PrefixBuildCharge(S.PagePositions, Cap, Tokens.Num());
+			OutError = FString::Printf(TEXT("KvPagesExhausted: a %d-token nested prefix is charged %u pages on the prefix region, which has %u of %u free; release a prefix (or the sequences still adopting a released one), or configure more prefix blocks"),
+				Tokens.Num(), Charge, S.Ledger.RegionFree(SuperSLMPaging::ERegion::P), S.Ledger.RegionCapacity(SuperSLMPaging::ERegion::P));
+			return ESuperSLMPrefixResult::KvPagesExhausted;
+		}
+		case SuperSLMPaging::EPageAdmit::NotConfigured:
+			OutError = TEXT("the page ledger is not configured");
+			return ESuperSLMPrefixResult::NotConfigured;
+		case SuperSLMPaging::EPageAdmit::Waiting:
+		case SuperSLMPaging::EPageAdmit::KvModeMismatch:
+		case SuperSLMPaging::EPageAdmit::PrefixPinned:
+		case SuperSLMPaging::EPageAdmit::InvalidRequest:
+		case SuperSLMPaging::EPageAdmit::ContextCapMismatch:
+			OutError = FString::Printf(TEXT("the page ledger refused a %d-token nested prefix build (outcome %d)"), Tokens.Num(), static_cast<int32>(Admission.Outcome));
+			return ESuperSLMPrefixResult::Malformed;
+	}
+
+	const sslm_prefix ParentHandle = ParentEntry->Handle;
 	const int64 Id = GNextPrefixId++;
-	FPrefixEntry& Entry = S.Prefixes.Add(Id);
+	FPrefixEntry& Entry = S.Prefixes.Add(Id); // ParentEntry is not read after this Add
 	Entry.Tokens = Tokens;
+	Entry.OriginLength = ParentLength;
+	Entry.LedgerNode = Admission.Node;
+	Entry.BuildTicket = Admission.Ticket;
+#if WITH_DEV_AUTOMATION_TESTS
+	S.PrefixIdToNode.Add(Id, Admission.Node);
+#endif
 	FPrefixAdminOp Op;
 	Op.Kind = EPrefixAdminKind::Begin;
 	Op.Ordinal = S.MintOrdinal();
 	Op.PrefixId = Id;
+	Op.bNested = true;
+	Op.NestedParentHandle = ParentHandle;
+	// §3.9: the test seams' NestedBuild holds, taken at the build's admission, as a root's are.
+	Op.StartHoldId = S.TakeArmedHold(EPagedJobKind::NestedBuild, /*bApply*/ false);
+	Entry.BuildApplyHoldId = S.TakeArmedHold(EPagedJobKind::NestedBuild, /*bApply*/ true);
 	S.PrefixAdminQueue.Add(Op);
 	OutPrefix.Id = Id;
 	S.PublishStats(S.LastReport);
-	return true;
+	return ESuperSLMPrefixResult::Success;
+}
+
+ESuperSLMPrefixResult USuperSLMSubsystem::CreatePrefixFrom(const FSuperSLMPrefix& Parent, const TArray<int32>& Tokens, FSuperSLMPrefix& OutPrefix, FString* OutError)
+{
+	OutPrefix = FSuperSLMPrefix();
+	FString Error;
+	ESuperSLMPrefixResult Result = ESuperSLMPrefixResult::NotConfigured;
+	if (State == nullptr)
+	{
+		Error = TEXT("the subsystem is not configured");
+	}
+	else if (!State->IsBudgetMode())
+	{
+		Error = TEXT("NestedRequiresBudgetMode: a nested prefix (sslm_prefix_begin_from) needs budget mode; configure SequenceBudget > 0");
+		Result = ESuperSLMPrefixResult::NestedRequiresBudgetMode;
+	}
+	else if (State->bTickHorizonReached)
+	{
+		Error = State->TickHorizonMessage; // D-SLM7799
+	}
+	else
+	{
+		Result = CreatePrefixFromOnState(*State, Parent, Tokens, OutPrefix, Error);
+	}
+	if (OutError != nullptr)
+	{
+		*OutError = MoveTemp(Error);
+	}
+	return Result;
 }
 
 ESuperSLMPrefixPhase USuperSLMSubsystem::GetPrefixPhase(const FSuperSLMPrefix& Prefix) const
@@ -2486,6 +3196,7 @@ ESuperSLMRestoreResult USuperSLMSubsystem::AdoptPrefix(const FSuperSLMSequence& 
 	Op.Owner = Slot->VendedId;
 	Op.PrefixId = Prefix.Id;
 	Slot->OpQueue.Add(Op);
+	Slot->CancelQueuedContinuation(); // 1.1: a queued op precedes the generation's next job
 	Slot->MarkBindIneligible(EBindIneligibleReason::AdoptedPrefix); // plan §2.5 row 4
 	if (FPrefixEntry* Entry = State->Prefixes.Find(Prefix.Id))
 	{
@@ -2509,12 +3220,59 @@ bool USuperSLMSubsystem::ReleasePrefix(const FSuperSLMPrefix& Prefix, FString& O
 		OutError = FString::Printf(TEXT("%d adopt(s) of this prefix are still queued; release it after they drain"), Entry->PendingAdopts);
 		return false;
 	}
+	// Plugin paging plan §3.5 (K3): a restore hinted with this prefix pins it from its call until
+	// its job delivers (or it is refused).
+	if (Entry->PendingHintedRestores > 0)
+	{
+		OutError = FString::Printf(TEXT("PrefixPinned: %d restore(s) hinted with this prefix are still queued; release it after they apply"), Entry->PendingHintedRestores);
+		return false;
+	}
+	// Plugin paging plan §3.3, budget mode: a built prefix's release is a ledger admission, refused
+	// by name while an admitted adopt, nested build or hinted restore of it is still open
+	// (PrefixPinned). Checked before anything changes.
+	SuperSLMPaging::FTicket ReleaseTicket = SuperSLMPaging::InvalidTicket;
+	if (State->IsBudgetMode() && Entry->Handle != nullptr && Entry->bLedgerBuilt)
+	{
+		const SuperSLMPaging::FAdmission Admission = State->Ledger.AdmitPrefixRelease(Entry->LedgerNode);
+		if (Admission.Outcome == SuperSLMPaging::EPageAdmit::PrefixPinned)
+		{
+			OutError = TEXT("PrefixPinned: an adopt, a nested build (CreatePrefixFrom) or a hinted restore of this prefix is still open; release it after that job applies");
+			return false;
+		}
+		if (Admission.Outcome != SuperSLMPaging::EPageAdmit::Admitted)
+		{
+			OutError = FString::Printf(TEXT("the page ledger refused the release (outcome %d)"), static_cast<int32>(Admission.Outcome));
+			return false;
+		}
+		ReleaseTicket = Admission.Ticket;
+	}
+	if (Entry->Handle == nullptr && Entry->bAdminJobInFlight)
+	{
+		// 1.1: its Begin is on a worker. The entry leaves the caller's view now, and its Begin's
+		// delivery queues the release of the block it made (RetiringPrefixes). In budget mode the
+		// build's open ticket goes with it, failed once the engine frees the pages (§3.3), and the
+		// release's own holds (§3.9) are taken now and handed to the release that delivery queues.
+		FSuperSLMSubsystemState::FRetiringPrefix& Retiring = State->RetiringPrefixes.Add(Prefix.Id);
+		Retiring.PinnedLane = Entry->PinnedLane;
+		Retiring.bJobInFlight = true;
+		Retiring.BuildTicket = Entry->BuildTicket;
+		Retiring.ReleaseStartHoldId = State->TakeArmedHold(EPagedJobKind::PrefixRelease, /*bApply*/ false);
+		Retiring.ReleaseApplyHoldId = State->TakeArmedHold(EPagedJobKind::PrefixRelease, /*bApply*/ true);
+		State->Prefixes.Remove(Prefix.Id);
+		State->PublishStats(State->LastReport);
+		return true;
+	}
 	if (Entry->Handle == nullptr)
 	{
 		// Never began (still Pending with no worker job ever run, or already released):
-		// remove any still-pending Begin op and drop the entry at once.
+		// remove any still-pending Begin op and drop the entry at once. In budget mode the build
+		// drew nothing, so its whole charge returns now.
 		const int64 Id = Prefix.Id;
 		State->PrefixAdminQueue.RemoveAll([Id](const FPrefixAdminOp& Op) { return Op.PrefixId == Id; });
+		if (Entry->BuildTicket != SuperSLMPaging::InvalidTicket)
+		{
+			State->Ledger.ApplyPrefixBuild(Entry->BuildTicket, false);
+		}
 		State->Prefixes.Remove(Id);
 		State->PublishStats(State->LastReport);
 		return true;
@@ -2535,7 +3293,27 @@ bool USuperSLMSubsystem::ReleasePrefix(const FSuperSLMPrefix& Prefix, FString& O
 	Op.PrefixId = Prefix.Id;
 	Op.ReleaseHandle = Entry->Handle;
 	Op.PinnedLane = Entry->PinnedLane;
+	// Plugin paging plan §3.3: a built prefix's release applies its admission at delivery; an
+	// unbuilt one (still prefilling, or faulted) fails its build there instead, once the engine has
+	// freed the pages. §3.9: the release's holds, taken at its admission.
+	if (ReleaseTicket != SuperSLMPaging::InvalidTicket)
+	{
+		Op.LedgerTicket = ReleaseTicket;
+	}
+	else if (Entry->BuildTicket != SuperSLMPaging::InvalidTicket)
+	{
+		Op.LedgerTicket = Entry->BuildTicket;
+		Op.bReleaseFailsBuild = true;
+		Entry->BuildTicket = SuperSLMPaging::InvalidTicket;
+	}
+	Op.StartHoldId = State->TakeArmedHold(EPagedJobKind::PrefixRelease, /*bApply*/ false);
+	Op.ApplyHoldId = State->TakeArmedHold(EPagedJobKind::PrefixRelease, /*bApply*/ true);
 	State->PrefixAdminQueue.Add(Op);
+	// 1.1: keeps its place until the release delivers, and the release waits for a prefill job
+	// still in flight (RetiringPrefixes).
+	FSuperSLMSubsystemState::FRetiringPrefix& Retiring = State->RetiringPrefixes.Add(Prefix.Id);
+	Retiring.PinnedLane = Entry->PinnedLane;
+	Retiring.bJobInFlight = Entry->bAdminJobInFlight;
 	State->Prefixes.Remove(Prefix.Id);
 	State->PublishStats(State->LastReport);
 	return true;
@@ -2749,6 +3527,10 @@ namespace
 		sslm_seq SeqOut = nullptr;
 		int32 Consumed = 0;      // prefill tokens consumed this job
 		TArray<int32> DecodeTokens; // one entry per decode-batch slot, in the same order
+		// 1.1 (plan §5 item 1a): per decode-batch slot, true when a continuation found that member's
+		// generation already over at its head and left it out of the call (its DecodeTokens entry
+		// is then meaningless). A prefill continuation that skips sets bSkipped instead.
+		TArray<bool> MemberSkipped;
 		TArray<uint8> Blob;      // Save's own output
 
 		// One per sequence the job touches (a decode batch: one per slot, in slot order).
@@ -2761,9 +3543,22 @@ namespace
 		sslm_status ReapplySchemaStatus = SSLM_OK;
 		sslm_status ReapplyAdapterStatus = SSLM_OK;
 
-		// Prefix prefill: the freeze at the tail of the prefix's last prefill job (row 22).
+		// Prefix prefill: the freeze at the tail of the prefix's last prefill job (row 22). Budget
+		// mode: an empty prefix's Begin job freezes too (plugin paging plan §3.3 "Empty prefixes").
 		bool bFreezeAttempted = false;
 		sslm_status FreezeStatus = SSLM_OK;
+
+		// Budget mode (plugin paging plan §3.2, GetKvPageStats()): sslm_kv_pool_stats read at the
+		// tail of a job that draws or frees pages, delivered as the subsystem's pool snapshot.
+		bool bPoolStatsRead = false;
+		sslm_kv_pool_stats_out PoolStats = {};
+
+		// Budget mode (plugin paging plan §3.5, step K3). Reset: a create-first normalization's
+		// create status (SSLM_OK when none was attempted or it succeeded) and whether it replaced the
+		// holder. Restore: the engine's out_shared_pages (sslm_seq_restore_shared).
+		sslm_status CreateStatus = SSLM_OK;
+		bool bNormalized = false;
+		uint32 SharedPages = 0;
 
 		// Save: what the sequence has bound at the save's position, read by the save job after
 		// the entries it carries are applied (rule 4, T-2987 F7), and the job's own refusal.
@@ -2864,6 +3659,66 @@ namespace
 			Out.Stats.bSchemaAccepting = Raw.schema_accepting != 0;
 			Out.bStatsValid = true;
 		}
+	}
+
+	// Plugin paging plan §3.2: the engine's page counts at a job's tail, on the worker (the verb
+	// reads them under the pool's own lock). Budget mode only; a diagnostic, never a verdict.
+	void ReadPoolStatsOnWorker(const sslm_kv_pool* PoolPtr, FJobOutput& Out)
+	{
+		if (PoolPtr == nullptr || *PoolPtr == nullptr)
+		{
+			return;
+		}
+		sslm_kv_pool_stats_out Raw = {};
+		Raw.struct_size = static_cast<uint32_t>(sizeof(sslm_kv_pool_stats_out));
+		if (sslm_kv_pool_stats(*PoolPtr, &Raw) == SSLM_OK)
+		{
+			Out.PoolStats = Raw;
+			Out.bPoolStatsRead = true;
+		}
+	}
+
+	// At the job's delivery: the snapshot GetKvPageStats() reports.
+	void DeliverPoolSnapshot(FSuperSLMSubsystemState& S, const FJobOutput& Out)
+	{
+		if (Out.bPoolStatsRead)
+		{
+			S.bHasPoolSnapshot = true;
+			S.LastPoolStats = Out.PoolStats;
+		}
+	}
+
+	// Plugin paging plan §3.5 (step K3): ends the pin a hinted restore took on its hint prefix at
+	// the call (FPrefixEntry::PendingHintedRestores), when its job delivers or it is refused. No-op
+	// for 0 (no hint).
+	void UnpinRestoreHint(FSuperSLMSubsystemState& S, int64 HintPrefixId)
+	{
+		if (HintPrefixId == 0)
+		{
+			return;
+		}
+		if (FPrefixEntry* Hint = S.Prefixes.Find(HintPrefixId))
+		{
+			Hint->PendingHintedRestores = FMath::Max(0, Hint->PendingHintedRestores - 1);
+		}
+	}
+
+	// Plan §2.5 row 19: the last release of a restore blob runs on a worker, never the game thread.
+	// A restore refused before any job (at its admission) hands its share to a lane as a
+	// release-only job, as the teardown does; without a running lane it is released here.
+	void ReleaseBlobOnWorker(FSuperSLMSubsystemState& S, FSharedBlob&& Blob)
+	{
+		for (FLane& Lane : S.Lanes)
+		{
+			if (Lane.Thread != nullptr && Lane.Runnable != nullptr)
+			{
+				FQueuedWorkerJobRef ReleaseJob = MakeShared<FQueuedWorkerJob, ESPMode::ThreadSafe>();
+				ReleaseJob->Execute = [Held = MoveTemp(Blob)]() mutable { Held.Reset(); };
+				Lane.Runnable->Enqueue(MoveTemp(ReleaseJob));
+				return;
+			}
+		}
+		Blob.Reset();
 	}
 
 	// Rule 4's confirmation, at the carrying job's delivery. Every job pin is released. Only
@@ -2984,9 +3839,16 @@ namespace
 		FSuperSLMSubsystemState& S, int32& EntityPinnedLane, TArray<int32>& CandidateLanes, ESuperSLMWorkerJobKind Kind,
 		int32 DecodeLayers, int32 PromptTokens, int32 TokenFinishes, double PlannedJobMs,
 		const FSuperSLMSequence& LifecycleOpSequence, const FSuperSLMLifecycleOpHandle& LifecycleOpHandle,
-		int32 TickIndex, TFunctionRef<TFunction<void()>(int32 LaneIndex)> BuildExecute, TFunction<void(double)> Deliver)
+		int32 TickIndex, TFunctionRef<TFunction<void()>(int32 LaneIndex)> BuildExecute, TFunction<void(double)> Deliver,
+		int32 ChainBaseTick = INDEX_NONE)
 	{
 		const int32 LaneIndex = ChooseLane(EntityPinnedLane, CandidateLanes);
+		// 1.1 worker continuation (plan §5 item 1a): a continuation's delivery is committed from
+		// the tick the job it follows is committed to (ChainBaseTick, PlanContinuations), never
+		// earlier, so each lane's committed ticks stay in post order. Every other job commits from
+		// TickIndex, as before.
+		const bool bContinuation = ChainBaseTick != INDEX_NONE;
+		const int32 BaseTick = bContinuation ? FMath::Max(TickIndex, ChainBaseTick) : TickIndex;
 
 		// The ring's next row, cleared for reuse: writing it never allocates, because Configure()
 		// sized every row's member list for the largest batch.
@@ -3010,14 +3872,16 @@ namespace
 		// range and the defect logged, never wrapped.
 		int32 K = 0;
 		int32 CommittedTick = 0;
-		if (!TryComputeK(PlannedJobMs, S.Config.TickBudgetMs, K) || !TryCommitTick(TickIndex, K, CommittedTick))
+		if (!TryComputeK(PlannedJobMs, S.Config.TickBudgetMs, K) || !TryCommitTick(BaseTick, K, CommittedTick))
 		{
-			S.LogSchedulingDefectOnce(FString::Printf(TEXT("PostLedgerJob: planned %f ms at tick %d"), PlannedJobMs, TickIndex));
+			S.LogSchedulingDefectOnce(FString::Printf(TEXT("PostLedgerJob: planned %f ms at tick %d"), PlannedJobMs, BaseTick));
 			K = kMaxJobTicks;
-			CommittedTick = TickIndex > TNumericLimits<int32>::Max() - K ? TNumericLimits<int32>::Max() : TickIndex + K;
+			CommittedTick = BaseTick > TNumericLimits<int32>::Max() - K ? TNumericLimits<int32>::Max() : BaseTick + K;
 		}
 		Job.K = K;
 		Job.PlannedAtTick = TickIndex;
+		Job.ChainedWaitTicks = BaseTick - TickIndex;
+		Job.bContinuation = bContinuation;
 		Job.CommittedDeliveryTick = CommittedTick;
 		Job.DeliveredAtTick = -1;
 
@@ -3025,6 +3889,9 @@ namespace
 		FQueuedWorkerJobRef WorkerJob = MakeShared<FQueuedWorkerJob, ESPMode::ThreadSafe>();
 		WorkerJob->Execute = BuildExecute(LaneIndex);
 		Lane.Post(WorkerJob, MoveTemp(Deliver), LedgerRow, Job);
+		// Plugin paging plan §3.9: the HoldApply() hold the dispatcher named for this job, if any.
+		Lane.Pending.Last().ApplyHoldId = S.NextPostApplyHoldId;
+		S.NextPostApplyHoldId = 0;
 		return Job.CommittedDeliveryTick;
 	}
 
@@ -3056,10 +3923,17 @@ namespace
 		// recycle carries nothing.
 		const TArray<FCarriedRequest> Carried = bOwnerHoldsAtPost ? CarryHeldRequests(Slot, Op.Ordinal, false) : TArray<FCarriedRequest>();
 
+		// Plugin paging plan §3.5 "Normalization" (step K3): the ledger made this reset a create-first
+		// normalization at its admission. The job creates the configured budgeted holder first and
+		// releases the old one only once the create has succeeded; a refused create keeps the old
+		// holder and resets it in place.
+		const bool bNormalize = Op.bNormalizes && Slot.Seq != nullptr;
+
 		// Row 7: the binding re-apply after a recreating reset re-establishes what sslm_seq_reset
 		// would have kept. The bindings are caller-owned, so it is composed only for an owner that
 		// holds the slot; the recycle a refused restore queues has no owner and re-applies nothing.
-		const bool bReapply = bOwnerHoldsAtPost && Slot.Seq == nullptr;
+		// A normalization recreates the holder too, so it re-applies them on the new one.
+		const bool bReapply = bOwnerHoldsAtPost && (Slot.Seq == nullptr || bNormalize);
 		const FString ReapplySchemaName = bReapply ? Slot.BoundSchemaName : FString();
 		int64 ReapplyAdapterId = 0;
 		sslm_adapter ReapplyAdapter = nullptr;
@@ -3080,20 +3954,74 @@ namespace
 		Out->PerSequence.SetNum(1);
 		const bool bReapplySchema = bReapply && !ReapplySchemaName.IsEmpty();
 		const bool bReapplyAdapter = ReapplyAdapter != nullptr;
+		// Plugin paging plan §3.2: budget mode recreates a holder with the configured budget (the
+		// slot's reservation in region S), and reads the pool's page counts at the job's tail.
+		const bool bBudgetMode = S.IsBudgetMode();
+		const int32 SequenceBudget = S.Config.SequenceBudget;
 #if WITH_DEV_AUTOMATION_TESTS
-		// The test hook is one-shot: this job, the next reset dispatched, takes it.
-		Out->TestResetStatus = S.TestNextResetStatus;
-		S.TestNextResetStatus = SSLM_OK;
+		// The test hooks are one-shot: this job, the next reset dispatched, takes them. The paged
+		// seam's override (§3.9: Reset, or Return for the recycle) wins; the scheduling seam's
+		// is then left for the next reset.
+		const sslm_status PagedOverride = S.TakeLayer1Override(bUnbind ? EPagedJobKind::Return : EPagedJobKind::Reset);
+		if (PagedOverride != SSLM_OK)
+		{
+			Out->TestResetStatus = PagedOverride;
+		}
+		else
+		{
+			Out->TestResetStatus = S.TestNextResetStatus;
+			S.TestNextResetStatus = SSLM_OK;
+		}
 #endif
 
-		auto BuildExecute = [Model, PoolPtr, OldSeq, Carried, bUnbind, bReapplySchema, ReapplySchemaName, bReapplyAdapter, ReapplyAdapter, bOwnerHoldsAtPost, Out](int32 /*LaneIndex*/) -> TFunction<void()>
+		auto BuildExecute = [Model, PoolPtr, OldSeq, Carried, bUnbind, bReapplySchema, ReapplySchemaName, bReapplyAdapter, ReapplyAdapter, bOwnerHoldsAtPost, bBudgetMode, SequenceBudget, bNormalize, Out](int32 /*LaneIndex*/) -> TFunction<void()>
 		{
-			return [Model, PoolPtr, OldSeq, Carried, bUnbind, bReapplySchema, ReapplySchemaName, bReapplyAdapter, ReapplyAdapter, bOwnerHoldsAtPost, Out]()
+			return [Model, PoolPtr, OldSeq, Carried, bUnbind, bReapplySchema, ReapplySchemaName, bReapplyAdapter, ReapplyAdapter, bOwnerHoldsAtPost, bBudgetMode, SequenceBudget, bNormalize, Out]()
 			{
+				ON_SCOPE_EXIT
+				{
+					if (bBudgetMode)
+					{
+						ReadPoolStatsOnWorker(PoolPtr, *Out);
+					}
+				};
 				TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Reset", SuperSLMChannel);
 				FSequenceJobResult& Result = Out->PerSequence[0];
 				sslm_seq Seq = OldSeq;
-				if (OldSeq != nullptr)
+				if (bNormalize)
+				{
+					// Create-first (§3.5): the new holder draws R(SequenceBudget), charged to H at
+					// admission, before the old holder is released. The test hooks' status, when set,
+					// stands in for the create.
+					sslm_seq Fresh = nullptr;
+#if WITH_DEV_AUTOMATION_TESTS
+					Out->CreateStatus = Out->TestResetStatus != SSLM_OK ? Out->TestResetStatus
+						: sslm_seq_create_budgeted(Model, PoolPtr, SequenceBudget, &Fresh);
+					// Taken by the create: a refused create's fallback below is the real reset.
+					Out->TestResetStatus = SSLM_OK;
+#else
+					Out->CreateStatus = sslm_seq_create_budgeted(Model, PoolPtr, SequenceBudget, &Fresh);
+#endif
+					if (Out->CreateStatus == SSLM_OK)
+					{
+						const sslm_status ReleaseStatus = sslm_seq_release(OldSeq);
+						if (ReleaseStatus == SSLM_OK)
+						{
+							Out->bNormalized = true;
+							Out->bBoolFlag = true; // recreated: the tail below re-applies and carries onto it
+							Out->Status = SSLM_OK;
+							Seq = Fresh;
+						}
+						else
+						{
+							// The old holder is kept as it was; the new one goes back to the pool.
+							sslm_seq_release(Fresh);
+							Out->CreateStatus = ReleaseStatus;
+						}
+					}
+				}
+				// A normalized holder is new, so nothing below resets it.
+				if (!Out->bNormalized && OldSeq != nullptr)
 				{
 					ApplyCarriedOnWorker(Model, OldSeq, Carried, Result.CarriedStatuses); // rule 4: at the job's head
 #if WITH_DEV_AUTOMATION_TESTS
@@ -3102,12 +4030,13 @@ namespace
 					Out->Status = sslm_seq_reset(OldSeq);
 #endif
 				}
-				else
+				else if (!Out->bNormalized)
 				{
 #if WITH_DEV_AUTOMATION_TESTS
-					Out->Status = Out->TestResetStatus != SSLM_OK ? Out->TestResetStatus : sslm_seq_create(Model, PoolPtr, &Seq);
+					Out->Status = Out->TestResetStatus != SSLM_OK ? Out->TestResetStatus
+						: (bBudgetMode ? sslm_seq_create_budgeted(Model, PoolPtr, SequenceBudget, &Seq) : sslm_seq_create(Model, PoolPtr, &Seq));
 #else
-					Out->Status = sslm_seq_create(Model, PoolPtr, &Seq);
+					Out->Status = bBudgetMode ? sslm_seq_create_budgeted(Model, PoolPtr, SequenceBudget, &Seq) : sslm_seq_create(Model, PoolPtr, &Seq);
 #endif
 					Out->bBoolFlag = true; // recreated
 					if (Out->Status != SSLM_OK)
@@ -3154,13 +4083,39 @@ namespace
 		};
 
 		const int64 HandleId = Op.HandleId;
-		auto Deliver = [&S, SlotIndex, HandleId, Owner, bUnbind, Carried, ReapplyAdapterId, Out](double)
+		const SuperSLMPaging::FTicket LedgerTicket = Op.LedgerTicket;
+		auto Deliver = [&S, SlotIndex, HandleId, Owner, bUnbind, Carried, ReapplyAdapterId, LedgerTicket, Out](double)
 		{
 			FSlot& Slot = S.Slots[SlotIndex];
 			--Slot.OutstandingJobCount;
 			// D-SLM7946: the reset is no longer in flight, whether it succeeded or was refused and
 			// whoever holds the slot now.
 			Slot.InFlightResetOwner = 0;
+			// Plugin paging plan §3.2/§3.5: the reset's admission is applied with what the job did. A
+			// reset in place (or a recreate, which takes the configured shape) returns the holder's
+			// materialized pages and drops its prefix dependency; a refused one changes nothing. A
+			// create-first normalization (§3.5, K3) that replaced the holder applies Normalized; one
+			// whose create was refused reset the old holder in place, which the ledger reads as
+			// ResetInPlace (normalization is retried at the next reset).
+			DeliverPoolSnapshot(S, *Out);
+			if (LedgerTicket != SuperSLMPaging::InvalidTicket)
+			{
+				S.Ledger.ApplyReset(LedgerTicket, Out->bNormalized ? SuperSLMPaging::EResetResult::Normalized
+					: (Out->Status == SSLM_OK ? SuperSLMPaging::EResetResult::ResetInPlace : SuperSLMPaging::EResetResult::Refused));
+			}
+			if (Out->Status == SSLM_KV_POOL_EXHAUSTED && S.IsBudgetMode())
+			{
+				S.NoteLedgerFault(TEXT("sslm_seq_create_budgeted (a reset's recreate)"));
+			}
+			if (Out->CreateStatus == SSLM_KV_POOL_EXHAUSTED && S.IsBudgetMode())
+			{
+				S.NoteLedgerFault(TEXT("sslm_seq_create_budgeted (a normalization's create)"));
+			}
+			if (Out->CreateStatus != SSLM_OK)
+			{
+				UE_LOG(LogSuperSLM, Log, TEXT("Slot %d: normalization's create was refused (%s); the holder was reset in place and is normalized at its next reset."),
+					SlotIndex, *StatusText(Out->CreateStatus));
+			}
 			if (ReapplyAdapterId != 0)
 			{
 				SuperSLMRuntime::UnpinAdapter(ReapplyAdapterId);
@@ -3200,7 +4155,10 @@ namespace
 				}
 				if (HandleId != 0)
 				{
-					S.HandleResults.FindOrAdd(HandleId).Result = ESuperSLMRestoreResult::Malformed;
+					// K2 review F4 (§3.7): in budget mode an engine exhaustion on an admitted reset is
+					// named KvPagesExhausted (and was counted as a ledger fault above).
+					S.HandleResults.FindOrAdd(HandleId).Result = (S.IsBudgetMode() && Out->Status == SSLM_KV_POOL_EXHAUSTED)
+						? ESuperSLMRestoreResult::KvPagesExhausted : ESuperSLMRestoreResult::Malformed;
 				}
 				return;
 			}
@@ -3214,6 +4172,7 @@ namespace
 			if (Out->bBoolFlag)
 			{
 				Slot.PinnedLane = INDEX_NONE; // D-SLM7530: the same reset path as VendSequence()
+				++Slot.HolderGeneration;      // §3.9: a new Layer-1 holder
 			}
 
 			if (bOwnerHolds)
@@ -3249,7 +4208,8 @@ namespace
 			}
 		};
 
-		Slot.NextAvailableTick = PostLedgerJob(S, Slot.PinnedLane, CandidateLanes, ESuperSLMWorkerJobKind::Reset, 0, 0, 0, S.Config.ResetCostMs,
+		S.NextPostApplyHoldId = Op.ApplyHoldId; // §3.9: HoldApply(Reset or Return)
+		Slot.NextAvailableTick = PostLedgerJob(S, Slot.PinnedLane, CandidateLanes, ESuperSLMWorkerJobKind::Reset, 0, 0, 0, S.Resolved.ResetCostMs,
 			FSuperSLMSequence{Slot.VendedId}, FSuperSLMLifecycleOpHandle{HandleId}, TickIndex, BuildExecute, MoveTemp(Deliver));
 	}
 
@@ -3269,17 +4229,23 @@ namespace
 		const FString FaultText = Prefix == nullptr
 			? TEXT("prefix released before this adopt could run")
 			: (bPrefixOk ? FString() : FString::Printf(TEXT("prefix faulted (%s)"), *Prefix->FaultMessage));
-		const int64 PrefixConsumedSnapshot = Prefix ? Prefix->Consumed : 0;
+		// The prefix's length: a nested child's positions start at its parent's length (§3.3, K3).
+		const int64 PrefixConsumedSnapshot = Prefix ? Prefix->OriginLength + Prefix->Consumed : 0;
 
 		const sslm_model Model = S.Model;
 		const sslm_seq SeqHandle = Slot.Seq;
 		const sslm_prefix PrefixHandle = bPrefixOk ? Prefix->Handle : nullptr;
 		FJobOutputRef Out = MakeShared<FJobOutput, ESPMode::ThreadSafe>();
 		Out->PerSequence.SetNum(1);
+		// Plugin paging plan §3.9: the paged seam's one-shot status for this adopt, in place of the
+		// Layer-1 call. Budget mode reads the pool's page counts at the job's tail (§3.2).
+		const sslm_status ForcedStatus = S.TakeLayer1Override(EPagedJobKind::Adopt);
+		const bool bBudgetMode = S.IsBudgetMode();
+		sslm_kv_pool* PoolPtr = &S.Pool;
 
-		auto BuildExecute = [Model, SeqHandle, PrefixHandle, bPrefixOk, Carried, bOwnerHoldsAtPost, Out](int32 /*LaneIndex*/) -> TFunction<void()>
+		auto BuildExecute = [Model, SeqHandle, PrefixHandle, bPrefixOk, Carried, bOwnerHoldsAtPost, ForcedStatus, bBudgetMode, PoolPtr, Out](int32 /*LaneIndex*/) -> TFunction<void()>
 		{
-			return [Model, SeqHandle, PrefixHandle, bPrefixOk, Carried, bOwnerHoldsAtPost, Out]()
+			return [Model, SeqHandle, PrefixHandle, bPrefixOk, Carried, bOwnerHoldsAtPost, ForcedStatus, bBudgetMode, PoolPtr, Out]()
 			{
 				FSequenceJobResult& Result = Out->PerSequence[0];
 				ApplyCarriedOnWorker(Model, SeqHandle, Carried, Result.CarriedStatuses); // rule 4: at the job's head
@@ -3289,23 +4255,38 @@ namespace
 					return;
 				}
 				TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Adopt", SuperSLMChannel);
-				Out->Status = sslm_seq_adopt_prefix(SeqHandle, PrefixHandle);
+				Out->Status = ForcedStatus != SSLM_OK ? ForcedStatus : sslm_seq_adopt_prefix(SeqHandle, PrefixHandle);
 				if (bOwnerHoldsAtPost)
 				{
 					ReadStatsOnWorker(Model, SeqHandle, Result);
+				}
+				if (bBudgetMode)
+				{
+					ReadPoolStatsOnWorker(PoolPtr, *Out);
 				}
 			};
 		};
 
 		const int64 HandleId = Op.HandleId;
 		const int64 PrefixIdCap = Op.PrefixId;
-		auto Deliver = [&S, SlotIndex, HandleId, Owner, PrefixIdCap, FaultText, Carried, Out, PrefixConsumedSnapshot](double)
+		const SuperSLMPaging::FTicket LedgerTicket = Op.LedgerTicket;
+		auto Deliver = [&S, SlotIndex, HandleId, Owner, PrefixIdCap, FaultText, Carried, Out, PrefixConsumedSnapshot, LedgerTicket](double)
 		{
 			FSlot& Slot = S.Slots[SlotIndex];
 			--Slot.OutstandingJobCount;
 			if (FPrefixEntry* Prefix = S.Prefixes.Find(PrefixIdCap))
 			{
 				Prefix->PendingAdopts = FMath::Max(0, Prefix->PendingAdopts - 1);
+			}
+			// Plugin paging plan §3.3 (UP-14): the adopt's admission applies with its outcome. Success
+			// drops the slot's previous dependency (which may refund a ghost), registers it on the
+			// prefix, returns its materialized pages and sets its origin to the prefix's length, which
+			// is what the generation limit reads (SlotLimit). A budget adopt draws nothing, so it can
+			// never meet the engine's KV_POOL_EXHAUSTED.
+			DeliverPoolSnapshot(S, *Out);
+			if (LedgerTicket != SuperSLMPaging::InvalidTicket)
+			{
+				S.Ledger.ApplyAdopt(LedgerTicket, !Out->bSkipped && Out->Status == SSLM_OK);
 			}
 			const bool bOwnerHolds = Owner != 0 && Owner == Slot.VendedId;
 			ConfirmCarried(S, Slot, bOwnerHolds, Carried, Out->PerSequence[0].CarriedStatuses, /*bCarrierInGeneration*/ false);
@@ -3336,7 +4317,8 @@ namespace
 			}
 		};
 
-		Slot.NextAvailableTick = PostLedgerJob(S, Slot.PinnedLane, CandidateLanes, ESuperSLMWorkerJobKind::Adopt, 0, 0, 0, S.Config.AdoptCostMs,
+		S.NextPostApplyHoldId = Op.ApplyHoldId; // §3.9: HoldApply(Adopt)
+		Slot.NextAvailableTick = PostLedgerJob(S, Slot.PinnedLane, CandidateLanes, ESuperSLMWorkerJobKind::Adopt, 0, 0, 0, S.Resolved.AdoptCostMs,
 			FSuperSLMSequence{Slot.VendedId}, FSuperSLMLifecycleOpHandle{HandleId}, TickIndex, BuildExecute, MoveTemp(Deliver));
 	}
 
@@ -3537,7 +4519,7 @@ namespace
 			}
 		};
 
-		Slot.NextAvailableTick = PostLedgerJob(S, Slot.PinnedLane, CandidateLanes, ESuperSLMWorkerJobKind::Save, 0, 0, 0, S.Config.SaveCostMs,
+		Slot.NextAvailableTick = PostLedgerJob(S, Slot.PinnedLane, CandidateLanes, ESuperSLMWorkerJobKind::Save, 0, 0, 0, S.Resolved.SaveCostMs,
 			FSuperSLMSequence{Slot.VendedId}, FSuperSLMLifecycleOpHandle{HandleId}, TickIndex, BuildExecute, MoveTemp(Deliver));
 	}
 
@@ -3594,12 +4576,28 @@ namespace
 		const bool bWillAttempt = bParsed && bModelMatches && bAdapterOk;
 		FJobOutputRef Out = MakeShared<FJobOutput, ESPMode::ThreadSafe>();
 		Out->PerSequence.SetNum(1);
+		// Plugin paging plan §3.9: the paged seam's one-shot status for this restore, returned in
+		// place of the Layer-1 restore call (in legacy mode the release-first step before it still
+		// runs, as a refused call would leave it).
+		const sslm_status ForcedStatus = S.TakeLayer1Override(EPagedJobKind::Restore);
+
+		// Plugin paging plan §3.5 (step K3), budget mode: restore-first. The job restores into a new
+		// handle with sslm_seq_restore_shared (the hint's frozen handle, or null), and releases the
+		// slot's old holder only once that has succeeded, so a refused or failed restore leaves the
+		// old holder exactly as it was. The hint was pinned at the call and by the ledger's
+		// admission, so its handle is live here. Legacy mode keeps release-first (S5).
+		const bool bBudgetMode = S.IsBudgetMode();
+		const int64 HintPrefixId = Op.RestoreHintPrefixId;
+		const FPrefixEntry* HintEntry = HintPrefixId != 0 ? S.Prefixes.Find(HintPrefixId) : nullptr;
+		const sslm_prefix HintHandle = HintEntry != nullptr ? HintEntry->Handle : nullptr;
+		const SuperSLMPaging::FTicket LedgerTicket = Op.LedgerTicket;
+		const int64 HeaderContextLength = Op.RestoreContextLength;
 
 		// BuildExecute runs once (PostLedgerJob), so it hands its share on by move; the worker
 		// closure is then the blob's last owner and releases it on the worker, on every path.
-		auto BuildExecute = [Model, PoolPtr, OldSeq, Blob = MoveTemp(Blob), AdapterHandle, bWillAttempt, bOwnerHoldsAtPost, Out](int32 /*LaneIndex*/) mutable -> TFunction<void()>
+		auto BuildExecute = [Model, PoolPtr, OldSeq, Blob = MoveTemp(Blob), AdapterHandle, bWillAttempt, bOwnerHoldsAtPost, ForcedStatus, bBudgetMode, HintHandle, Out](int32 /*LaneIndex*/) mutable -> TFunction<void()>
 		{
-			return [Model, PoolPtr, OldSeq, Blob = MoveTemp(Blob), AdapterHandle, bWillAttempt, bOwnerHoldsAtPost, Out]() mutable
+			return [Model, PoolPtr, OldSeq, Blob = MoveTemp(Blob), AdapterHandle, bWillAttempt, bOwnerHoldsAtPost, ForcedStatus, bBudgetMode, HintHandle, Out]() mutable
 			{
 				ON_SCOPE_EXIT { Blob.Reset(); }; // row 19: the last release of the blob runs here, on the worker
 				if (!bWillAttempt)
@@ -3619,6 +4617,50 @@ namespace
 					Out->bSkipped = true;
 					return;
 				}
+				if (bBudgetMode)
+				{
+					// Restore-first (§3.5): the new holder is made beside the old one.
+					sslm_seq Restored = nullptr;
+					uint32_t Shared = 0;
+					Out->Status = ForcedStatus != SSLM_OK ? ForcedStatus
+						: sslm_seq_restore_shared(Model, PoolPtr, WorkerPayload, static_cast<size_t>(WorkerPayloadBytes), HintHandle, &Restored, &Shared);
+					if (Out->Status == SSLM_OK && AdapterHandle != nullptr)
+					{
+						const sslm_status BindStatus = sslm_seq_set_adapter(Restored, AdapterHandle);
+						if (BindStatus != SSLM_OK)
+						{
+							sslm_seq_release(Restored);
+							Out->Status = BindStatus;
+							Out->bBoolFlag = true; // signals "adapter re-bind failed" to Deliver
+						}
+					}
+					if (Out->Status == SSLM_OK && OldSeq != nullptr)
+					{
+						// Only now does the old holder go. Should its release be refused, the new one
+						// goes back instead and the old one stays as it was.
+						const sslm_status ReleaseStatus = sslm_seq_release(OldSeq);
+						if (ReleaseStatus != SSLM_OK)
+						{
+							sslm_seq_release(Restored);
+							Out->Status = ReleaseStatus;
+						}
+						else
+						{
+							Out->bOldHandleReleased = true;
+						}
+					}
+					if (Out->Status == SSLM_OK)
+					{
+						Out->SeqOut = Restored;
+						Out->SharedPages = static_cast<uint32>(Shared);
+						if (bOwnerHoldsAtPost)
+						{
+							ReadStatsOnWorker(Model, Restored, Out->PerSequence[0]);
+						}
+					}
+					ReadPoolStatsOnWorker(PoolPtr, *Out);
+					return;
+				}
 				// The reserved slot's own warm sequence gives its block back first, since
 				// sslm_seq_restore creates its own sequence from the pool.
 				if (OldSeq != nullptr)
@@ -3632,7 +4674,8 @@ namespace
 					Out->bOldHandleReleased = true;
 				}
 				sslm_seq Restored = nullptr;
-				Out->Status = sslm_seq_restore(Model, PoolPtr, WorkerPayload, static_cast<size_t>(WorkerPayloadBytes), &Restored);
+				Out->Status = ForcedStatus != SSLM_OK ? ForcedStatus
+					: sslm_seq_restore(Model, PoolPtr, WorkerPayload, static_cast<size_t>(WorkerPayloadBytes), &Restored);
 				if (Out->Status != SSLM_OK)
 				{
 					return;
@@ -3660,7 +4703,8 @@ namespace
 		const FString ParseErrorCap = ParseError;
 		const SuperSLMSaveBlob::FContents ContentsCap = Contents;
 
-		auto Deliver = [&S, SlotIndex, HandleId, Owner, Out, bParsed, bModelMatches, bAdapterOk, bAdapterPinned, ParseErrorCap, ContentsCap, AdapterId](double)
+		auto Deliver = [&S, SlotIndex, HandleId, Owner, Out, bParsed, bModelMatches, bAdapterOk, bAdapterPinned, ParseErrorCap, ContentsCap, AdapterId,
+			bBudgetMode, HintPrefixId, LedgerTicket, HeaderContextLength](double)
 		{
 			FSlot& Slot = S.Slots[SlotIndex];
 			// The reservation this restore made ends here -- unless its holder returned the slot
@@ -3676,11 +4720,20 @@ namespace
 			{
 				SuperSLMRuntime::UnpinAdapter(AdapterId);
 			}
+			// §3.5 (K3): the hint's pin from the call ends with the job; the ledger's ends at its apply.
+			UnpinRestoreHint(S, HintPrefixId);
+			DeliverPoolSnapshot(S, *Out);
 			const bool bOwnerHolds = Owner != 0 && Owner == Slot.VendedId;
 
 			auto Refuse = [&](ESuperSLMRestoreResult Result, const FString& Message)
 			{
 				UE_LOG(LogSuperSLM, Warning, TEXT("RestoreSequence: %s"), *Message);
+				// §3.5: a refused or failed budget restore gives its whole charge back to H, and the
+				// slot's old holder is untouched (restore-first).
+				if (LedgerTicket != SuperSLMPaging::InvalidTicket)
+				{
+					S.Ledger.ApplyRestore(LedgerTicket, false, 0);
+				}
 				if (HandleId != 0)
 				{
 					S.HandleResults.FindOrAdd(HandleId).Result = Result;
@@ -3728,6 +4781,15 @@ namespace
 					Refuse(ESuperSLMRestoreResult::AdapterUnavailable, FString::Printf(TEXT("adapter unavailable: re-binding failed (%s)"), *StatusText(Out->Status)));
 					return;
 				}
+				// §3.7 (K3): in budget mode the ledger admitted this restore's whole draw, so the
+				// engine's exhaustion is KvPagesExhausted and a ledger fault. Legacy mode keeps its
+				// mapping.
+				if (bBudgetMode && Out->Status == SSLM_KV_POOL_EXHAUSTED)
+				{
+					S.NoteLedgerFault(TEXT("sslm_seq_restore_shared"));
+					Refuse(ESuperSLMRestoreResult::KvPagesExhausted, TEXT("KvPagesExhausted: Layer 1 refused the restore's draw (SSLM_KV_POOL_EXHAUSTED); the old sequence is untouched"));
+					return;
+				}
 				switch (Out->Status)
 				{
 					case SSLM_RESTORE_MODEL_MISMATCH: Refuse(ESuperSLMRestoreResult::ModelMismatch, TEXT("model mismatch: Layer 1 refused the payload (SSLM_RESTORE_MODEL_MISMATCH)")); return;
@@ -3737,9 +4799,20 @@ namespace
 				}
 			}
 
+			// §3.5 (K3): the apply settles the charge to the restore's own draw (R(b) when it shared,
+			// R(b) + E when not, P_blk for a whole-reserve payload) less the old holder's
+			// reservation, gives the slot the payload's shape, and registers a sharer on its hint.
+			if (LedgerTicket != SuperSLMPaging::InvalidTicket)
+			{
+				S.Ledger.ApplyRestore(LedgerTicket, true, Out->SharedPages);
+			}
+
 			// Slot-owned: the restored handle and the Layer-1 mirrors, whoever holds the slot.
+			// Budget mode takes the position from the payload header, never the wrapper (§3.5;
+			// admission refused any blob where the two differ).
 			Slot.Seq = Out->SeqOut;
-			Slot.ContextUsed = ContentsCap.ContextUsed;
+			++Slot.HolderGeneration; // §3.9: a new Layer-1 holder
+			Slot.ContextUsed = bBudgetMode ? HeaderContextLength : ContentsCap.ContextUsed;
 			Slot.LayersDoneInToken = FMath::Min(ContentsCap.LayersDoneInToken, S.Shape.NumHiddenLayers);
 			Slot.bReadyForLogits = ContentsCap.bReadyForLogits;
 			Slot.bAdopted = ContentsCap.Phase == ESuperSLMSequencePhase::Idle && ContentsCap.ContextUsed > 0;
@@ -3783,8 +4856,98 @@ namespace
 			}
 		};
 
-		Slot.NextAvailableTick = PostLedgerJob(S, Slot.PinnedLane, CandidateLanes, ESuperSLMWorkerJobKind::Restore, 0, 0, 0, S.Config.RestoreCostMs,
+		S.NextPostApplyHoldId = Op.ApplyHoldId; // §3.9: HoldApply(Restore)
+		Slot.NextAvailableTick = PostLedgerJob(S, Slot.PinnedLane, CandidateLanes, ESuperSLMWorkerJobKind::Restore, 0, 0, 0, S.Resolved.RestoreCostMs,
 			FSuperSLMSequence{Slot.VendedId}, FSuperSLMLifecycleOpHandle{HandleId}, TickIndex, BuildExecute, MoveTemp(Deliver));
+	}
+
+	// The test seams' request kind of a queued op (§3.9): the recycle is Return, a caller's reset
+	// Reset. False for a kind no hold or override names (a save, a generation).
+	bool PagedKindOf(const FSlotQueuedOp& Op, EPagedJobKind& OutKind)
+	{
+		switch (Op.Kind)
+		{
+			case ESlotOpKind::Reset:   OutKind = Op.bUnbind ? EPagedJobKind::Return : EPagedJobKind::Reset; return true;
+			case ESlotOpKind::Adopt:   OutKind = EPagedJobKind::Adopt; return true;
+			case ESlotOpKind::Restore: OutKind = EPagedJobKind::Restore; return true;
+			case ESlotOpKind::Save:
+			case ESlotOpKind::Generate:
+				return false;
+		}
+		return false;
+	}
+
+	// Plugin paging plan §3.5 (step K3): a restore refused at the head of its queue, before any job
+	// (on arrival: KvPagesExhausted; or by its payload's fields). The op leaves the queue with its
+	// handle resolved by name; nothing was drawn, and the slot it reserved keeps its warm holder
+	// (its reservation ends, as a refused restore's delivery ends it). The caller has settled any
+	// ledger ticket the op held.
+	void RefuseQueuedRestore(FSuperSLMSubsystemState& S, int32 SlotIndex, ESuperSLMRestoreResult Result, const FString& Message)
+	{
+		FSlot& Slot = S.Slots[SlotIndex];
+		FSlotQueuedOp Op = MoveTemp(Slot.OpQueue[0]);
+		Slot.OpQueue.RemoveAt(0, EAllowShrinking::No);
+		UE_LOG(LogSuperSLM, Warning, TEXT("RestoreSequence: %s"), *Message);
+		UnpinRestoreHint(S, Op.RestoreHintPrefixId);
+		if (Op.HandleId != 0)
+		{
+			S.HandleResults.FindOrAdd(Op.HandleId).Result = Result;
+		}
+		ReleaseBlobOnWorker(S, MoveTemp(Op.RestoreBlob));
+		const bool bOwnerHolds = Op.Owner != 0 && Op.Owner == Slot.VendedId;
+		if (Slot.VendedId == 0 || bOwnerHolds) // a newer restore's reservation stands (DispatchRestore())
+		{
+			Slot.bAwaitingRestore = false;
+		}
+		if (bOwnerHolds)
+		{
+			S.ReleaseUser(SlotIndex);
+		}
+	}
+
+	// Plugin paging plan §3.5 "Fit and wait" (step K3): the ledger admits a waiting restore at the
+	// apply that makes it fit (or resolves it NotConfigured at an epoch end). Drained once per
+	// tick, after the apply pass: an admitted waiter becomes dispatchable at its queue's head.
+	void ResolveWaitingRestores(FSuperSLMSubsystemState& S)
+	{
+		if (!S.IsBudgetMode())
+		{
+			return;
+		}
+		for (const SuperSLMPaging::FWaitResolution& Resolution : S.Ledger.DrainResolutions())
+		{
+			for (int32 SlotIndex = 0; SlotIndex < S.Slots.Num(); ++SlotIndex)
+			{
+				FSlot& Slot = S.Slots[SlotIndex];
+				if (Slot.OpQueue.IsEmpty() || !Slot.OpQueue[0].bWaiting || Slot.OpQueue[0].LedgerTicket != Resolution.Ticket)
+				{
+					continue;
+				}
+				if (Resolution.Outcome == SuperSLMPaging::EPageAdmit::Admitted)
+				{
+					Slot.OpQueue[0].bWaiting = false;
+				}
+				else
+				{
+					// An epoch end resolves every waiter NotConfigured; nothing was charged for it.
+					Slot.OpQueue[0].LedgerTicket = SuperSLMPaging::InvalidTicket;
+					RefuseQueuedRestore(S, SlotIndex, ESuperSLMRestoreResult::NotConfigured, TEXT("NotConfigured: the restore was waiting on headroom when the page ledger's epoch ended"));
+				}
+				break;
+			}
+		}
+	}
+
+	// A slot op that has been admitted and is parked at its HoldStart() hold: not a candidate
+	// while the hold stands. Marks the hold reached (the op is at its hold point).
+	bool IsParkedAtStartHold(FSuperSLMSubsystemState& S, const FSlotQueuedOp& Op)
+	{
+		if (Op.bAdmitted && S.IsHoldBlocking(Op.StartHoldId))
+		{
+			S.MarkHoldReached(Op.StartHoldId);
+			return true;
+		}
+		return false;
 	}
 
 	void DispatchSlotLifecycleOp(FSuperSLMSubsystemState& S, TArray<int32>& CandidateLanes, int32 SlotIndex, int32 TickIndex)
@@ -3802,10 +4965,10 @@ namespace
 			const TCHAR* OpName = TEXT("lifecycle");
 			switch (Front.Kind)
 			{
-				case ESlotOpKind::Reset:   OpCostMs = S.Config.ResetCostMs; OpName = TEXT("reset"); break;
-				case ESlotOpKind::Adopt:   OpCostMs = S.Config.AdoptCostMs; OpName = TEXT("adopt"); break;
-				case ESlotOpKind::Save:    OpCostMs = S.Config.SaveCostMs; OpName = TEXT("save"); break;
-				case ESlotOpKind::Restore: OpCostMs = S.Config.RestoreCostMs; OpName = TEXT("restore"); break;
+				case ESlotOpKind::Reset:   OpCostMs = S.Resolved.ResetCostMs; OpName = TEXT("reset"); break;
+				case ESlotOpKind::Adopt:   OpCostMs = S.Resolved.AdoptCostMs; OpName = TEXT("adopt"); break;
+				case ESlotOpKind::Save:    OpCostMs = S.Resolved.SaveCostMs; OpName = TEXT("save"); break;
+				case ESlotOpKind::Restore: OpCostMs = S.Resolved.RestoreCostMs; OpName = TEXT("restore"); break;
 				case ESlotOpKind::Generate: return; // never reaches here; filtered by the caller
 			}
 			if (!TrySchedule(S, OpCostMs, TickIndex, OpName))
@@ -3813,6 +4976,27 @@ namespace
 				const int64 HandleId = Front.HandleId;
 				const int64 Owner = Front.Owner;
 				const bool bRestore = Front.Kind == ESlotOpKind::Restore;
+				// Plugin paging plan §3.2: an op admitted earlier (a test hold parked it) gives its
+				// admission back, since nothing will run: a reset as refused, an adopt as failed.
+				if (Front.LedgerTicket != SuperSLMPaging::InvalidTicket)
+				{
+					if (Front.Kind == ESlotOpKind::Adopt)
+					{
+						S.Ledger.ApplyAdopt(Front.LedgerTicket, false);
+					}
+					else if (Front.Kind == ESlotOpKind::Restore)
+					{
+						S.Ledger.ApplyRestore(Front.LedgerTicket, false, 0);
+					}
+					else
+					{
+						S.Ledger.ApplyReset(Front.LedgerTicket, SuperSLMPaging::EResetResult::Refused);
+					}
+				}
+				if (bRestore)
+				{
+					UnpinRestoreHint(S, Front.RestoreHintPrefixId);
+				}
 				Slot.OpQueue.RemoveAt(0, EAllowShrinking::No);
 				if (HandleId != 0)
 				{
@@ -3830,6 +5014,192 @@ namespace
 				return;
 			}
 		}
+		// Plugin paging plan §3.2 ("admission at the head of the sequence's queue"): the op is
+		// admitted once, here, when it first reaches the head with its slot's previous job
+		// delivered -- never at the call that queued it, so a sequence has at most one admitted
+		// job at a time (the ledger's one-job-per-slot rule, cell 3.5). The test seams' holds
+		// (§3.9) are taken at the same instant; a start hold parks the admitted op at the head,
+		// unposted, until it is released (PlanNextJobs skips it meanwhile).
+		{
+			FSlot& Slot = S.Slots[SlotIndex];
+			FSlotQueuedOp& Front = Slot.OpQueue[0];
+			if (!Front.bAdmitted)
+			{
+				Front.bAdmitted = true;
+				if (S.IsBudgetMode())
+				{
+					if (Front.Kind == ESlotOpKind::Reset)
+					{
+						// A reset (the recycle included). The ledger makes it a create-first
+						// normalization (§3.5) when the holder's shape differs from the configured one,
+						// H has R(SequenceBudget) free and no restore waits; otherwise a reset in place.
+						const SuperSLMPaging::FAdmission Admission = S.Ledger.AdmitReset(SlotIndex);
+						if (Admission.Outcome == SuperSLMPaging::EPageAdmit::Admitted)
+						{
+							Front.LedgerTicket = Admission.Ticket;
+							Front.bNormalizes = Admission.bNormalizes;
+						}
+						else
+						{
+							// K2 review F3: fail closed. A reset the ledger did not admit never runs
+							// untracked: it is refused by name with nothing posted, and counted as a
+							// ledger fault. A recycle's slot is withheld (its ledger state is unknown);
+							// a caller's reset faults its sequence, as a reset Layer 1 refused does.
+							const int64 HandleId = Front.HandleId;
+							const int64 Owner = Front.Owner;
+							const bool bRecycle = Front.bUnbind;
+							Slot.OpQueue.RemoveAt(0, EAllowShrinking::No);
+							const FString Reason = FString::Printf(TEXT("the page ledger did not admit a %s (outcome %d)"),
+								bRecycle ? TEXT("recycle") : TEXT("reset"), static_cast<int32>(Admission.Outcome));
+							S.NoteLedgerRefusal(SlotIndex, Reason);
+							if (HandleId != 0)
+							{
+								S.HandleResults.FindOrAdd(HandleId).Result = ESuperSLMRestoreResult::NotConfigured;
+							}
+							if (bRecycle)
+							{
+								S.WithholdSlot(SlotIndex, Reason);
+							}
+							else if (Owner != 0 && Owner == Slot.VendedId)
+							{
+								S.Fault(Slot, ESuperSLMDecodeOutcome::Generating, FString::Printf(TEXT("NotConfigured: %s; the sequence was not reset"), *Reason));
+							}
+							return;
+						}
+					}
+					else if (Front.Kind == ESlotOpKind::Adopt)
+					{
+						// UP-14: an adopt of a built prefix draws nothing and charges nothing; it pins
+						// the prefix until its apply. A prefix that faulted or was released before its
+						// build applied is not admitted: the adopt's job skips (DispatchAdopt).
+						const FPrefixEntry* Target = S.Prefixes.Find(Front.PrefixId);
+						if (Target != nullptr && Target->bLedgerBuilt)
+						{
+							const SuperSLMPaging::FAdmission Admission = S.Ledger.AdmitAdoptPrefix(SlotIndex, Target->LedgerNode);
+							if (Admission.Outcome == SuperSLMPaging::EPageAdmit::Admitted)
+							{
+								Front.LedgerTicket = Admission.Ticket;
+							}
+							else if (Admission.Outcome == SuperSLMPaging::EPageAdmit::KvModeMismatch)
+							{
+								// §5: a whole-reserve holder adopts only after a reset normalizes it.
+								// Refused by name; nothing is posted.
+								const int64 HandleId = Front.HandleId;
+								const int64 PrefixId = Front.PrefixId;
+								Slot.OpQueue.RemoveAt(0, EAllowShrinking::No);
+								if (FPrefixEntry* Pinned = S.Prefixes.Find(PrefixId))
+								{
+									Pinned->PendingAdopts = FMath::Max(0, Pinned->PendingAdopts - 1);
+								}
+								if (HandleId != 0)
+								{
+									S.HandleResults.FindOrAdd(HandleId).Result = ESuperSLMRestoreResult::KvModeMismatch;
+								}
+								UE_LOG(LogSuperSLM, Warning, TEXT("AdoptPrefix: KvModeMismatch: sequence %lld holds a whole-reserve sequence (restored from a legacy save); reset it, which normalizes it to SequenceBudget, before adopting."),
+									Slot.VendedId);
+								return;
+							}
+							else
+							{
+								// K2 review F3: fail closed, as the KvModeMismatch arm does. An adopt the
+								// ledger did not admit would share the prefix's pages with no edge to its
+								// node, so it is refused by name with nothing posted, and counted as a
+								// ledger fault.
+								const int64 HandleId = Front.HandleId;
+								const int64 PrefixId = Front.PrefixId;
+								Slot.OpQueue.RemoveAt(0, EAllowShrinking::No);
+								if (FPrefixEntry* Pinned = S.Prefixes.Find(PrefixId))
+								{
+									Pinned->PendingAdopts = FMath::Max(0, Pinned->PendingAdopts - 1);
+								}
+								if (HandleId != 0)
+								{
+									S.HandleResults.FindOrAdd(HandleId).Result = ESuperSLMRestoreResult::NotConfigured;
+								}
+								S.NoteLedgerRefusal(SlotIndex, FString::Printf(TEXT("the page ledger did not admit an adopt of a built prefix (outcome %d)"),
+									static_cast<int32>(Admission.Outcome)));
+								return;
+							}
+						}
+					}
+					else if (Front.Kind == ESlotOpKind::Restore)
+					{
+						// §3.5 "Fit and wait" (K3): charged to H from the payload header read at the
+						// call, assuming no sharing. Fit: admitted. Otherwise it waits when the
+						// guaranteed returns ahead cover it, or is refused on arrival with nothing drawn
+						// and the old holder untouched.
+						SuperSLMPaging::FRestoreRequest Request;
+						Request.Slot = SlotIndex;
+						Request.Payload = Front.RestorePayload;
+						Request.Budget = Front.RestoreBudget;
+						Request.Origin = Front.RestoreOrigin;
+						if (const FPrefixEntry* Hint = Front.RestoreHintPrefixId != 0 ? S.Prefixes.Find(Front.RestoreHintPrefixId) : nullptr)
+						{
+							Request.Hint = SuperSLMPaging::EHintKind::Prefix;
+							Request.HintNode = Hint->LedgerNode;
+						}
+						const SuperSLMPaging::FAdmission Admission = S.Ledger.AdmitRestore(Request);
+						ESuperSLMRestoreResult Refusal = ESuperSLMRestoreResult::Success;
+						FString RefusalText;
+						switch (Admission.Outcome)
+						{
+							case SuperSLMPaging::EPageAdmit::Admitted:
+								Front.LedgerTicket = Admission.Ticket;
+								break;
+							case SuperSLMPaging::EPageAdmit::Waiting:
+								Front.LedgerTicket = Admission.Ticket;
+								Front.bWaiting = true;
+								break;
+							case SuperSLMPaging::EPageAdmit::KvPagesExhausted:
+								Refusal = ESuperSLMRestoreResult::KvPagesExhausted;
+								RefusalText = FString::Printf(TEXT("KvPagesExhausted: the restore is charged %u pages on the restore headroom, which has %u of %u free, and the restores ahead of it guarantee too little; nothing was drawn and the old sequence is untouched. Re-issue it after a restore applies, or configure more RestoreHeadroomBlocks"),
+									SuperSLMPaging::RestoreAdmissionCharge(S.PagePositions, S.Ledger.GetConfig().ContextCap, Front.RestorePayload, Front.RestoreBudget, Front.RestoreOrigin),
+									S.Ledger.RegionFree(SuperSLMPaging::ERegion::H), S.Ledger.RegionCapacity(SuperSLMPaging::ERegion::H));
+								break;
+							case SuperSLMPaging::EPageAdmit::ContextCapMismatch:
+								Refusal = ESuperSLMRestoreResult::ContextCapMismatch;
+								RefusalText = FString::Printf(TEXT("ContextCapMismatch: the save's budget %lld or origin %lld is above ContextCap %lld"),
+									Front.RestoreBudget, Front.RestoreOrigin, static_cast<int64>(S.Ledger.GetConfig().ContextCap));
+								break;
+							case SuperSLMPaging::EPageAdmit::InvalidRequest: // K3 review N1: the call already checked the payload's fields
+							case SuperSLMPaging::EPageAdmit::NotConfigured:
+							case SuperSLMPaging::EPageAdmit::PrefixLimit:
+							case SuperSLMPaging::EPageAdmit::ParentNotUsable:
+							case SuperSLMPaging::EPageAdmit::KvModeMismatch:
+							case SuperSLMPaging::EPageAdmit::PrefixPinned:
+								// A plugin defect, never the caller's payload: logged and counted as a
+								// ledger fault (K2 review F3, K3 review N1).
+								Refusal = ESuperSLMRestoreResult::NotConfigured;
+								RefusalText = FString::Printf(TEXT("NotConfigured: the page ledger refused the restore (outcome %d; plugin defect)"), static_cast<int32>(Admission.Outcome));
+								S.NoteLedgerRefusal(SlotIndex, FString::Printf(TEXT("the page ledger did not admit a restore (outcome %d)"), static_cast<int32>(Admission.Outcome)));
+								break;
+						}
+						if (Refusal != ESuperSLMRestoreResult::Success)
+						{
+							RefuseQueuedRestore(S, SlotIndex, Refusal, RefusalText);
+							return;
+						}
+					}
+				}
+				EPagedJobKind HoldKind = EPagedJobKind::Reset;
+				if (PagedKindOf(Front, HoldKind))
+				{
+					Front.StartHoldId = S.TakeArmedHold(HoldKind, /*bApply*/ false);
+					Front.ApplyHoldId = S.TakeArmedHold(HoldKind, /*bApply*/ true);
+				}
+			}
+			// §3.5 (K3): a restore waiting on H stays at its queue's head, unposted, until the ledger
+			// admits it (ResolveWaitingRestores); PlanNextJobs does not offer it meanwhile.
+			if (Front.bWaiting)
+			{
+				return;
+			}
+			if (S.IsHoldBlocking(Front.StartHoldId))
+			{
+				S.MarkHoldReached(Front.StartHoldId);
+				return;
+			}
+		}
 		switch (S.Slots[SlotIndex].OpQueue[0].Kind)
 		{
 			case ESlotOpKind::Reset:   DispatchReset(S, CandidateLanes, SlotIndex, TickIndex); return;
@@ -3840,23 +5210,117 @@ namespace
 		}
 	}
 
+	// Plugin paging plan §3.3 "Generation limit", §7: the engine refused a step past the holder's
+	// limit (SSLM_KV_BUDGET_EXCEEDED). The plugin's pre-checks (ActivateGenerate, PreCheckDecodeStep)
+	// stop every generation before that, so reaching here is a limit fault: logged as one by name,
+	// and the sequence still stops with the outcome the pre-check would have given it.
+	void FaultAtEngineLimit(FSuperSLMSubsystemState& S, FSlot& Slot, const TCHAR* Verb)
+	{
+		UE_LOG(LogSuperSLM, Warning, TEXT("SuperSLM limit fault: %s returned SSLM_KV_BUDGET_EXCEEDED for sequence %lld at %lld positions, past the plugin's own generation-limit pre-check."),
+			Verb, Slot.VendedId, Slot.ContextUsed);
+		S.Fault(Slot, ESuperSLMDecodeOutcome::KvBudgetExceeded, FString::Printf(
+			TEXT("KvBudgetExceeded: %s refused the step at the sequence's generation limit (SSLM_KV_BUDGET_EXCEEDED)"), Verb));
+	}
+
+	// Plugin paging plan §3.3 "Generation limit": the stop a limit pre-check refused, by name.
+	// Below the cap the holder's own budget ran out (KvBudgetExceeded); at the cap it is the
+	// existing cap outcome (Faulted, the outcome left Generating).
+	void FaultAtLimit(FSuperSLMSubsystemState& S, FSlot& Slot, SuperSLMPaging::ELimitVerdict Verdict, int64 Limit, const TCHAR* What)
+	{
+		if (Verdict == SuperSLMPaging::ELimitVerdict::ContextCapExceeded)
+		{
+			S.Fault(Slot, ESuperSLMDecodeOutcome::Generating, FString::Printf(
+				TEXT("%s would pass the model's context_cap of %lld positions (SSLM_CONTEXT_CAP_EXCEEDED)"), What, Limit));
+		}
+		else
+		{
+			S.Fault(Slot, ESuperSLMDecodeOutcome::KvBudgetExceeded, FString::Printf(
+				TEXT("KvBudgetExceeded: %s would pass the sequence's generation limit of %lld positions (its SequenceBudget from its origin)"), What, Limit));
+		}
+	}
+
+	// Budget mode, engine token law E7 (§3.4 "Per-step pre-check"): whether the next decode step of
+	// a decoding sequence may be posted. The step embeds a token unless the sequence rests ready for
+	// logits (a finish-only step); a step already part-way through a token's layers was admitted
+	// when that token's embed began. EffectiveContext is the committed positions the step starts
+	// from. Faults the sequence and returns false on a refusal. Always true in legacy mode.
+	bool PreCheckDecodeStep(FSuperSLMSubsystemState& S, int32 SlotIndex, int64 EffectiveContext, bool bFaultOnRefusal)
+	{
+		if (!S.IsBudgetMode())
+		{
+			return true;
+		}
+		FSlot& Slot = S.Slots[SlotIndex];
+		if (!Slot.bReadyForLogits && Slot.LayersDoneInToken > 0)
+		{
+			return true;
+		}
+		const int64 Limit = S.Ledger.SlotLimit(SlotIndex);
+		const SuperSLMPaging::ELimitVerdict Verdict = SuperSLMPaging::CheckStep(EffectiveContext, Slot.bReadyForLogits, Limit, S.Shape.ContextCap);
+		if (Verdict == SuperSLMPaging::ELimitVerdict::Allowed)
+		{
+			return true;
+		}
+		if (bFaultOnRefusal)
+		{
+			FaultAtLimit(S, Slot, Verdict, Limit, TEXT("the next decode step"));
+		}
+		return false;
+	}
+
+	// Budget mode (plugin paging plan §3.3): the build's ledger apply, at the delivery of the job
+	// whose freeze succeeded. The node's P charge settles to the frozen prefix's own pages, and from
+	// here the prefix may be adopted and its release is a ledger release. No-op in legacy mode.
+	void ApplyPrefixBuilt(FSuperSLMSubsystemState& S, FPrefixEntry& Prefix)
+	{
+		if (Prefix.BuildTicket != SuperSLMPaging::InvalidTicket)
+		{
+			S.Ledger.ApplyPrefixBuild(Prefix.BuildTicket, true);
+			Prefix.BuildTicket = SuperSLMPaging::InvalidTicket;
+			Prefix.bLedgerBuilt = true;
+		}
+	}
+
+	// Budget mode: a build that will never freeze gives its whole charge back (the engine drew
+	// nothing, or has freed what it drew). No-op without an open ticket.
+	void FailPrefixBuild(FSuperSLMSubsystemState& S, SuperSLMPaging::FTicket& BuildTicket)
+	{
+		if (BuildTicket != SuperSLMPaging::InvalidTicket)
+		{
+			S.Ledger.ApplyPrefixBuild(BuildTicket, false);
+			BuildTicket = SuperSLMPaging::InvalidTicket;
+		}
+	}
+
 	void DispatchPrefixAdmin(FSuperSLMSubsystemState& S, TArray<int32>& CandidateLanes, int32 AdminIndex, int32 TickIndex)
 	{
 		// D-SLM7799: checked before any state changes. A failure posts nothing: the op is dropped and
-		// a Begin's prefix faults.
+		// a Begin's prefix faults (in budget mode giving its build's charge back).
 		{
 			const FPrefixAdminOp& Front = S.PrefixAdminQueue[AdminIndex];
 			const bool bBegin = Front.Kind == EPrefixAdminKind::Begin;
-			if (!TrySchedule(S, bBegin ? S.Config.PrefixBeginCostMs : S.Config.PrefixReleaseCostMs, TickIndex, bBegin ? TEXT("prefix begin") : TEXT("prefix release")))
+			if (!TrySchedule(S, bBegin ? S.Resolved.PrefixBeginCostMs : S.Resolved.PrefixReleaseCostMs, TickIndex, bBegin ? TEXT("prefix begin") : TEXT("prefix release")))
 			{
 				if (bBegin)
 				{
 					if (FPrefixEntry* Faulting = S.Prefixes.Find(Front.PrefixId))
 					{
+						FailPrefixBuild(S, Faulting->BuildTicket);
 						S.FaultPrefix(*Faulting, kSchedulingDomainFault);
 					}
 				}
+				else
+				{
+					S.RetiringPrefixes.Remove(Front.PrefixId);
+				}
 				S.PrefixAdminQueue.RemoveAt(AdminIndex, EAllowShrinking::No);
+				return;
+			}
+			// Plugin paging plan §3.9: an op parked at its HoldStart() hold is not dispatched
+			// (PlanNextJobs already skips it; checked again here).
+			if (S.IsHoldBlocking(Front.StartHoldId))
+			{
+				S.MarkHoldReached(Front.StartHoldId);
 				return;
 			}
 		}
@@ -3886,55 +5350,187 @@ namespace
 		const sslm_prefix HandleForRelease = Op.ReleaseHandle;
 		FJobOutputRef Out = MakeShared<FJobOutput, ESPMode::ThreadSafe>();
 
-		auto BuildExecute = [Model, PoolPtr, HandleForRelease, bIsBegin, Out](int32 /*LaneIndex*/) -> TFunction<void()>
+		// Plugin paging plan §3.3: in budget mode a root prefix begins with budget max(L, 1)
+		// (sslm_prefix_begin_budgeted), and an empty one is frozen by its Begin job, since no prefill
+		// job follows it ("Empty prefixes"). The paged seam's one-shot status (§3.9) replaces the
+		// Layer-1 call.
+		const bool bBudgetMode = S.IsBudgetMode();
+		const int32 BeginBudget = bIsBegin ? FMath::Max(Prefix->Tokens.Num(), 1) : 0;
+		const bool bFreezeAtBegin = bIsBegin && bBudgetMode && Prefix->Tokens.Num() == 0;
+		// §3.3 (K3): a nested child begins from its parent's frozen handle (sslm_prefix_begin_from,
+		// budget = its own token count, at least 1); the NestedBuild seams name it.
+		const bool bNested = bIsBegin && Op.bNested;
+		const sslm_prefix NestedParent = Op.NestedParentHandle;
+		const sslm_status ForcedStatus = S.TakeLayer1Override(bIsBegin ? (bNested ? EPagedJobKind::NestedBuild : EPagedJobKind::PrefixBuild) : EPagedJobKind::PrefixRelease);
+
+		auto BuildExecute = [Model, PoolPtr, HandleForRelease, bIsBegin, bBudgetMode, BeginBudget, bFreezeAtBegin, bNested, NestedParent, ForcedStatus, Out](int32 /*LaneIndex*/) -> TFunction<void()>
 		{
-			return [Model, PoolPtr, HandleForRelease, bIsBegin, Out]()
+			return [Model, PoolPtr, HandleForRelease, bIsBegin, bBudgetMode, BeginBudget, bFreezeAtBegin, bNested, NestedParent, ForcedStatus, Out]()
 			{
 				if (bIsBegin)
 				{
 					TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.PrefixBegin", SuperSLMChannel);
 					sslm_prefix NewHandle = nullptr;
-					Out->Status = sslm_prefix_begin(Model, PoolPtr, &NewHandle);
+					if (ForcedStatus != SSLM_OK)
+					{
+						Out->Status = ForcedStatus;
+					}
+					else if (bNested)
+					{
+						Out->Status = sslm_prefix_begin_from(NestedParent, BeginBudget, &NewHandle);
+					}
+					else
+					{
+						Out->Status = bBudgetMode ? sslm_prefix_begin_budgeted(Model, PoolPtr, BeginBudget, &NewHandle) : sslm_prefix_begin(Model, PoolPtr, &NewHandle);
+					}
+					if (Out->Status != SSLM_OK)
+					{
+						NewHandle = nullptr;
+					}
 					Out->SeqOut = reinterpret_cast<sslm_seq>(NewHandle); // opaque pointer, carried through
+					if (Out->Status == SSLM_OK && bFreezeAtBegin)
+					{
+						Out->bFreezeAttempted = true;
+						Out->FreezeStatus = sslm_prefix_freeze(NewHandle);
+					}
 				}
 				else
 				{
 					TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.PrefixRelease", SuperSLMChannel);
-					Out->Status = sslm_prefix_release(HandleForRelease);
+					Out->Status = ForcedStatus != SSLM_OK ? ForcedStatus : sslm_prefix_release(HandleForRelease);
+				}
+				if (bBudgetMode)
+				{
+					ReadPoolStatsOnWorker(PoolPtr, *Out);
 				}
 			};
 		};
 
 		const int64 PrefixIdCap = Op.PrefixId;
-		auto Deliver = [&S, PrefixIdCap, bIsBegin, Out](double)
+		const SuperSLMPaging::FTicket ReleaseTicket = Op.LedgerTicket;
+		const bool bReleaseFailsBuild = Op.bReleaseFailsBuild;
+		auto Deliver = [&S, PrefixIdCap, bIsBegin, bBudgetMode, bNested, ReleaseTicket, bReleaseFailsBuild, Out](double)
 		{
+			DeliverPoolSnapshot(S, *Out);
 			if (bIsBegin)
 			{
+				// §3.7: the ledger admitted this build, so the engine refusing its draw is a ledger fault.
+				const bool bLedgerFault = bBudgetMode && Out->Status == SSLM_KV_POOL_EXHAUSTED;
+				if (bLedgerFault)
+				{
+					S.NoteLedgerFault(bNested ? TEXT("sslm_prefix_begin_from") : TEXT("sslm_prefix_begin_budgeted"));
+				}
 				FPrefixEntry* Prefix = S.Prefixes.Find(PrefixIdCap);
 				if (Prefix == nullptr)
 				{
-					return; // released before this Begin op's own delivery could run
+					// Released while this Begin ran (1.1, RetiringPrefixes): release the block it
+					// made instead of dropping the handle, or give the prefix's place back. In budget
+					// mode the build never applied: the release fails it once the engine has freed
+					// the pages, or, when nothing was made, it fails now.
+					if (FSuperSLMSubsystemState::FRetiringPrefix* Retiring = S.RetiringPrefixes.Find(PrefixIdCap))
+					{
+						Retiring->bJobInFlight = false;
+						const sslm_prefix Made = reinterpret_cast<sslm_prefix>(Out->SeqOut);
+						if (Out->Status == SSLM_OK && Made != nullptr)
+						{
+							FPrefixAdminOp Release;
+							Release.Kind = EPrefixAdminKind::Release;
+							Release.Ordinal = S.MintOrdinal();
+							Release.PrefixId = PrefixIdCap;
+							Release.ReleaseHandle = Made;
+							Release.PinnedLane = Retiring->PinnedLane;
+							Release.LedgerTicket = Retiring->BuildTicket;
+							Release.bReleaseFailsBuild = Retiring->BuildTicket != SuperSLMPaging::InvalidTicket;
+							Release.StartHoldId = Retiring->ReleaseStartHoldId;
+							Release.ApplyHoldId = Retiring->ReleaseApplyHoldId;
+							Retiring->BuildTicket = SuperSLMPaging::InvalidTicket;
+							S.PrefixAdminQueue.Add(Release);
+						}
+						else
+						{
+							FailPrefixBuild(S, Retiring->BuildTicket);
+							S.RetiringPrefixes.Remove(PrefixIdCap);
+						}
+					}
+					return;
 				}
 				Prefix->bAdminJobInFlight = false;
 				if (Out->Status != SSLM_OK)
 				{
 					Prefix->Handle = nullptr;
-					S.FaultPrefix(*Prefix, FString::Printf(TEXT("sslm_prefix_begin failed (%s)"), *StatusText(Out->Status)));
+					FailPrefixBuild(S, Prefix->BuildTicket);
+					S.FaultPrefix(*Prefix, FString::Printf(TEXT("%s failed (%s)"),
+						bNested ? TEXT("sslm_prefix_begin_from") : (bBudgetMode ? TEXT("sslm_prefix_begin_budgeted") : TEXT("sslm_prefix_begin")), *StatusText(Out->Status)));
 				}
 				else
 				{
 					Prefix->Handle = reinterpret_cast<sslm_prefix>(Out->SeqOut);
 					Prefix->Phase = ESuperSLMPrefixPhase::Prefilling;
+					if (Out->bFreezeAttempted)
+					{
+						// An empty budget-mode prefix: frozen by this job.
+						if (Out->FreezeStatus == SSLM_OK)
+						{
+							Prefix->Phase = ESuperSLMPrefixPhase::Ready;
+							ApplyPrefixBuilt(S, *Prefix);
+						}
+						else
+						{
+							S.FaultPrefix(*Prefix, FString::Printf(TEXT("sslm_prefix_freeze failed (%s)"), *StatusText(Out->FreezeStatus)));
+						}
+					}
 				}
 				return;
 			}
 			// ReleasePrefix() already removed the caller-visible entry synchronously; this
 			// delivery is fire-and-forget bookkeeping for the real, worker-side release only.
+			S.RetiringPrefixes.Remove(PrefixIdCap); // 1.1: the prefix's place is free again
 			if (Out->Status != SSLM_OK)
 			{
-				UE_LOG(LogSuperSLM, Warning, TEXT("ReleasePrefix: sslm_prefix_release failed (%s)."), *StatusText(Out->Status));
+				// The engine kept the prefix, so its pages stay charged: the ticket is not applied, since
+				// applying it would refund pages the engine still holds. K2 review F5: the stranded
+				// charge is recorded by name (an over-charge, the safe direction) until the epoch ends.
+				if (ReleaseTicket != SuperSLMPaging::InvalidTicket)
+				{
+					UE_LOG(LogSuperSLM, Error, TEXT("ReleasePrefix: sslm_prefix_release failed (%s); the engine kept prefix %lld, so its ledger pages on region P stay charged until the next Configure() or teardown."),
+						*StatusText(Out->Status), PrefixIdCap);
+				}
+				else
+				{
+					UE_LOG(LogSuperSLM, Warning, TEXT("ReleasePrefix: sslm_prefix_release failed (%s)."), *StatusText(Out->Status));
+				}
+				return;
+			}
+			// Plugin paging plan §3.3: a built prefix's release applies its admission (its pages stay
+			// charged as a ghost while a dependent maps them); an unbuilt one fails its build, which
+			// returns the whole charge now that the engine has freed it.
+			if (ReleaseTicket != SuperSLMPaging::InvalidTicket)
+			{
+				if (bReleaseFailsBuild)
+				{
+					S.Ledger.ApplyPrefixBuild(ReleaseTicket, false);
+				}
+				else
+				{
+					S.Ledger.ApplyPrefixRelease(ReleaseTicket);
+				}
 			}
 		};
+
+		// §3.9: HoldApply(PrefixRelease) holds a release's delivery; HoldApply(PrefixBuild) holds the
+		// delivery of the job that freezes the prefix, which is this Begin for an empty prefix.
+		if (bIsBegin)
+		{
+			if (bFreezeAtBegin)
+			{
+				S.NextPostApplyHoldId = Prefix->BuildApplyHoldId;
+				Prefix->BuildApplyHoldId = 0;
+			}
+		}
+		else
+		{
+			S.NextPostApplyHoldId = Op.ApplyHoldId;
+		}
 
 		// D-SLM7504 (plan §5 item 2, §10.2 item 10): PrefixBegin/PrefixRelease are their own
 		// ESuperSLMWorkerJobKind values now, priced from their own static cost fields -- never the
@@ -3943,24 +5539,42 @@ namespace
 		// LifecycleOpSequence/LifecycleOpHandle are passed invalid, the same way a DecodeOrPrefill
 		// job that batches several sequences already does.
 		PostLedgerJob(S, EntityPinnedLane, CandidateLanes, bIsBegin ? ESuperSLMWorkerJobKind::PrefixBegin : ESuperSLMWorkerJobKind::PrefixRelease,
-			0, 0, 0, bIsBegin ? S.Config.PrefixBeginCostMs : S.Config.PrefixReleaseCostMs,
+			0, 0, 0, bIsBegin ? S.Resolved.PrefixBeginCostMs : S.Resolved.PrefixReleaseCostMs,
 			FSuperSLMSequence{}, FSuperSLMLifecycleOpHandle{}, TickIndex, BuildExecute, MoveTemp(Deliver));
 	}
 
-	void DispatchSequencePrefill(FSuperSLMSubsystemState& S, TArray<int32>& CandidateLanes, int32 SlotIndex, int32 TickIndex)
+	// 1.1 worker continuation (plan §5 item 1a): the slot's gate for its active generation, made
+	// by the generation's first prefill or decode job. Produced starts from the tokens already
+	// delivered, which is 0 at that first job (activation and a restore both start Generated empty).
+	FGenerationGatePtr GenerationGateFor(FSlot& Slot)
+	{
+		if (!Slot.Gate.IsValid())
+		{
+			Slot.Gate = MakeShared<FGenerationGate, ESPMode::ThreadSafe>();
+			Slot.Gate->Produced = Slot.Generated.Num();
+			Slot.Gate->MaxNewTokens = Slot.MaxNewTokens;
+			Slot.Gate->StopTokenIds = Slot.StopTokenIds;
+		}
+		return Slot.Gate;
+	}
+
+	// ChainBaseTick is INDEX_NONE for a job planned the ordinary way; for a continuation it is the
+	// committed tick of the job it follows (PlanContinuations, plan §5 item 1a).
+	void DispatchSequencePrefill(FSuperSLMSubsystemState& S, TArray<int32>& CandidateLanes, int32 SlotIndex, int32 TickIndex,
+		int32 ChainBaseTick = INDEX_NONE)
 	{
 		FSlot& Slot = S.Slots[SlotIndex];
 		const int64 SlotVendedIdCap = Slot.VendedId;
+		const bool bContinuation = ChainBaseTick != INDEX_NONE;
 
 		const int32 Left = Slot.Prompt.Num() - Slot.PromptConsumed;
 		const double ShareMs = S.Config.TickBudgetMs * S.Config.BudgetHeadroom;
 		// D-SLM7794 site 3: the chunk starts at the slot's ContextUsed, then one position per token.
 		const int64 StartDepth = Slot.ContextUsed;
-		const int32 Chunk = PlanPrefillChunk(FMath::Min(S.Config.MaxPrefillChunkBudget, Left), StartDepth, ShareMs,
-			S.Config.PromptTokenCostMs, S.Config.PromptTokenCostPerPositionMs);
-		const double PlannedMs = PrefillChunkCostMs(Chunk, StartDepth, S.Config.PromptTokenCostMs, S.Config.PromptTokenCostPerPositionMs);
-		// D-SLM7799: checked before any state changes.
-		if (!TrySchedule(S, PlannedMs, TickIndex, TEXT("sequence prefill")))
+		const int32 Chunk = PlanPrefillChunk(FMath::Min(S.Config.MaxPrefillChunkBudget, Left), StartDepth, ShareMs, S.Config.MinPrefillChunk, S.Resolved);
+		const double PlannedMs = PrefillChunkCostMs(Chunk, StartDepth, S.Resolved);
+		// D-SLM7799: checked before any state changes, from the tick the job commits from.
+		if (!TrySchedule(S, PlannedMs, bContinuation ? FMath::Max(TickIndex, ChainBaseTick) : TickIndex, TEXT("sequence prefill")))
 		{
 			S.Fault(Slot, ESuperSLMDecodeOutcome::Generating, kSchedulingDomainFault);
 			return;
@@ -3969,6 +5583,12 @@ namespace
 
 		const sslm_model Model = S.Model;
 		const sslm_seq SeqHandle = Slot.Seq;
+		const FGenerationGatePtr Gate = GenerationGateFor(Slot);
+		FContinuationTicketPtr Ticket;
+		if (bContinuation)
+		{
+			Ticket = MakeShared<FContinuationTicket, ESPMode::ThreadSafe>();
+		}
 		// Copied by value, never a raw pointer into Slot.Prompt's own buffer: a job composed for
 		// the NEXT chunk can now be posted to this same lane before this call's Deliver() has run
 		// (the schedule-fixed redesign, §14.8), so nothing may assume it is the only reader.
@@ -3984,15 +5604,26 @@ namespace
 		const TArray<FCarriedRequest> Carried = CarryHeldRequests(Slot,
 			bFirstJob ? Slot.ActiveGenerateOrdinal : TNumericLimits<int64>::Max(), /*bAdaptersOnly*/ !bFirstJob);
 		Slot.bGenerateFirstJobPosted = true;
+		// PlanContinuations admits only a holder with an empty held list, so a continuation carries
+		// nothing, and a skipped one leaves no carried entry unapplied.
+		ensure(!bContinuation || Carried.IsEmpty());
 
 		// D-SLM7528 (plan §5 item 3): the lane is resolved by PostLedgerJob, not chosen here -- the
 		// workspace this call needs is therefore captured through BuildExecute's own resolved-lane
 		// parameter, never read from a LaneIndex this function no longer receives.
-		auto BuildExecute = [&S, Model, SeqHandle, PrefillTokensCopy, Left, Chunk, SpanKind, Carried, Out](int32 LaneIndex) -> TFunction<void()>
+		auto BuildExecute = [&S, Model, SeqHandle, PrefillTokensCopy, Left, Chunk, SpanKind, Carried, Out, Gate, Ticket, bContinuation](int32 LaneIndex) -> TFunction<void()>
 		{
 			const sslm_workspace Workspace = S.Lanes[LaneIndex].Workspace;
-			return [Model, SeqHandle, PrefillTokensCopy, Left, Chunk, SpanKind, Workspace, Carried, Out]()
+			return [Model, SeqHandle, PrefillTokensCopy, Left, Chunk, SpanKind, Workspace, Carried, Out, Gate, Ticket, bContinuation]()
 			{
+				// 1.1 (plan §5 item 1a): a continuation whose generation ended in the job ahead of
+				// it (or was ended from the game thread), or which a later request cancelled, makes
+				// no Layer-1 call.
+				if (bContinuation && (Gate->IsStopped() || Ticket->bCancelled.load(std::memory_order_acquire)))
+				{
+					Out->bSkipped = true;
+					return;
+				}
 				TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Prefill", SuperSLMChannel);
 				FSequenceJobResult& Result = Out->PerSequence[0];
 				ApplyCarriedOnWorker(Model, SeqHandle, Carried, Result.CarriedStatuses); // rule 4: at the job's head
@@ -4002,9 +5633,21 @@ namespace
 					Out->Status = sslm_prefill(Model, SeqHandle, PrefillTokensCopy.GetData(), Left, Chunk, SpanKind, Workspace, &Consumed);
 					Out->Consumed = Consumed;
 				}
+				if (Out->Status != SSLM_OK)
+				{
+					Gate->Stop(); // Deliver() faults the sequence for this, so nothing may follow it
+				}
 				ReadStatsOnWorker(Model, SeqHandle, Result); // row 22: at the job's tail
 			};
 		};
+
+		// 1.1: the mirrors this job advances at post, restored if it is skipped (Deliver, below).
+		const int32 PrePromptConsumed = Slot.PromptConsumed;
+		const int64 PreContextUsed = Slot.ContextUsed;
+		const int32 PreLayersDoneInToken = Slot.LayersDoneInToken;
+		const bool bPreReadyForLogits = Slot.bReadyForLogits;
+		const ESuperSLMSequencePhase PrePhase = Slot.Phase;
+		const int64 LedgerRowCap = S.JobLedger.AppendedCount(); // the row PostLedgerJob appends
 
 		// Speculative, structural, POST-time advancement (§14.8 item 2): Chunk is the size of the
 		// request this job commits to, and the static cost model already prices PlannedMs as
@@ -4023,9 +5666,13 @@ namespace
 			Slot.LayersDoneInToken = 0;
 		}
 
-		auto Deliver = [&S, SlotIndex, SlotVendedIdCap, Carried, Out](double WorkerCallMs)
+		auto Deliver = [&S, SlotIndex, SlotVendedIdCap, Carried, Out, PrePromptConsumed, PreContextUsed, PreLayersDoneInToken, bPreReadyForLogits, PrePhase, LedgerRowCap, Ticket](double WorkerCallMs)
 		{
 			FSlot& Slot = S.Slots[SlotIndex];
+			if (Ticket.IsValid() && Slot.QueuedContinuation == Ticket)
+			{
+				Slot.QueuedContinuation.Reset();
+			}
 			// Decrement unconditionally -- this job's real work is done either way, and a slot
 			// returned mid-flight waits on this count reaching zero regardless of whose content,
 			// if anyone's, the job's real result gets applied to.
@@ -4033,6 +5680,31 @@ namespace
 			// Rule 2: caller-owned state only for the job's owner (the holder at post).
 			const bool bOwnerHolds = Slot.VendedId == SlotVendedIdCap;
 			ConfirmCarried(S, Slot, bOwnerHolds, Carried, Out->PerSequence[0].CarriedStatuses, /*bCarrierInGeneration*/ true);
+			if (Out->bSkipped)
+			{
+				// 1.1 (plan §5 item 1a): a skipped continuation ran nothing. It is the slot's last
+				// posted job (nothing is admitted behind it: its generation has ended, or a queued
+				// request blocks further continuations and ordinary admission waits for it), so the
+				// mirrors it advanced at post go back to what Layer 1 actually holds, and a phase it
+				// advanced speculatively goes back too unless the sequence has since ended.
+				if (FSuperSLMWorkerJobReport* Row = S.JobLedger.Find(LedgerRowCap))
+				{
+					Row->bSkippedContinuation = true;
+					Row->SkippedMembers = 1;
+				}
+				if (bOwnerHolds)
+				{
+					Slot.PromptConsumed = PrePromptConsumed;
+					Slot.ContextUsed = PreContextUsed;
+					Slot.LayersDoneInToken = PreLayersDoneInToken;
+					Slot.bReadyForLogits = bPreReadyForLogits;
+					if (Slot.IsGenerating())
+					{
+						Slot.Phase = PrePhase;
+					}
+				}
+				return;
+			}
 			if (!bOwnerHolds)
 			{
 				return; // returned (and possibly re-vended) since this job was posted
@@ -4048,6 +5720,11 @@ namespace
 			}
 			if (Out->Status != SSLM_OK)
 			{
+				if (Out->Status == SSLM_KV_BUDGET_EXCEEDED)
+				{
+					FaultAtEngineLimit(S, Slot, TEXT("sslm_prefill"));
+					return;
+				}
 				S.Fault(Slot, ESuperSLMDecodeOutcome::Generating, FString::Printf(
 					TEXT("sslm_prefill failed after %d of %d prompt tokens (%s)"), Slot.PromptConsumed, Slot.Prompt.Num(), *StatusText(Out->Status)));
 				return;
@@ -4055,8 +5732,13 @@ namespace
 		};
 
 		Slot.NextAvailableTick = PostLedgerJob(S, Slot.PinnedLane, CandidateLanes, ESuperSLMWorkerJobKind::DecodeOrPrefill, 0, Chunk, 0, PlannedMs,
-			FSuperSLMSequence{SlotVendedIdCap}, FSuperSLMLifecycleOpHandle{}, TickIndex, BuildExecute, MoveTemp(Deliver));
+			FSuperSLMSequence{SlotVendedIdCap}, FSuperSLMLifecycleOpHandle{}, TickIndex, BuildExecute, MoveTemp(Deliver), ChainBaseTick);
 		S.JobLedger.Last()->PromptPositionSum = PromptChunkPositionSum(Chunk, StartDepth); // D-SLM7794 (T-3002 S1)
+		Slot.ContinuableJobId = S.JobLedger.Last()->JobId;
+		if (bContinuation)
+		{
+			Slot.QueuedContinuation = Ticket;
+		}
 	}
 
 	void DispatchPrefixPrefill(FSuperSLMSubsystemState& S, TArray<int32>& CandidateLanes, int64 PrefixId, int32 TickIndex)
@@ -4068,11 +5750,11 @@ namespace
 		}
 		const int32 Left = PrefixPtr->Tokens.Num() - PrefixPtr->Consumed;
 		const double ShareMs = S.Config.TickBudgetMs * S.Config.BudgetHeadroom;
-		// D-SLM7794 site 4: a prefix has no slot, so the chunk starts at the prefix's own Consumed.
-		const int64 StartDepth = PrefixPtr->Consumed;
-		const int32 Chunk = PlanPrefillChunk(FMath::Min(S.Config.MaxPrefillChunkBudget, Left), StartDepth, ShareMs,
-			S.Config.PromptTokenCostMs, S.Config.PromptTokenCostPerPositionMs);
-		const double PlannedMs = PrefillChunkCostMs(Chunk, StartDepth, S.Config.PromptTokenCostMs, S.Config.PromptTokenCostPerPositionMs);
+		// D-SLM7794 site 4: a prefix has no slot, so the chunk starts at the prefix's own Consumed,
+		// after its parent's positions for a nested child (plugin paging plan §3.3, K3).
+		const int64 StartDepth = PrefixPtr->OriginLength + PrefixPtr->Consumed;
+		const int32 Chunk = PlanPrefillChunk(FMath::Min(S.Config.MaxPrefillChunkBudget, Left), StartDepth, ShareMs, S.Config.MinPrefillChunk, S.Resolved);
+		const double PlannedMs = PrefillChunkCostMs(Chunk, StartDepth, S.Resolved);
 		// D-SLM7799: checked before any state changes. A prefix has no member sequence; it faults.
 		if (!TrySchedule(S, PlannedMs, TickIndex, TEXT("prefix prefill")))
 		{
@@ -4088,13 +5770,16 @@ namespace
 		TArray<int32> PrefillTokensCopy;
 		PrefillTokensCopy.Append(PrefixPtr->Tokens.GetData() + PrefixPtr->Consumed, Left);
 		FJobOutputRef Out = MakeShared<FJobOutput, ESPMode::ThreadSafe>();
+		// Plugin paging plan §3.2: in budget mode the job's tail reads the pool's page counts.
+		const bool bBudgetMode = S.IsBudgetMode();
+		const sslm_kv_pool* PoolPtr = &S.Pool;
 
 		// D-SLM7528 (plan §5 item 3): the lane is resolved by PostLedgerJob; the workspace it
 		// requires is read from BuildExecute's own resolved-lane parameter.
-		auto BuildExecute = [&S, Model, PrefixHandle, PrefillTokensCopy, Left, Chunk, Out](int32 LaneIndex) -> TFunction<void()>
+		auto BuildExecute = [&S, Model, PrefixHandle, PrefillTokensCopy, Left, Chunk, bBudgetMode, PoolPtr, Out](int32 LaneIndex) -> TFunction<void()>
 		{
 			const sslm_workspace Workspace = S.Lanes[LaneIndex].Workspace;
-			return [Model, PrefixHandle, PrefillTokensCopy, Left, Chunk, Workspace, Out]()
+			return [Model, PrefixHandle, PrefillTokensCopy, Left, Chunk, Workspace, bBudgetMode, PoolPtr, Out]()
 			{
 				TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.PrefixPrefill", SuperSLMChannel);
 				{
@@ -4111,14 +5796,24 @@ namespace
 					Out->bFreezeAttempted = true;
 					Out->FreezeStatus = sslm_prefix_freeze(PrefixHandle);
 				}
+				if (bBudgetMode)
+				{
+					ReadPoolStatsOnWorker(PoolPtr, *Out);
+				}
 			};
 		};
 
-		auto Deliver = [&S, PrefixId, Out](double WorkerCallMs)
+		auto Deliver = [&S, PrefixId, bBudgetMode, Out](double WorkerCallMs)
 		{
+			DeliverPoolSnapshot(S, *Out);
 			FPrefixEntry* Prefix = S.Prefixes.Find(PrefixId);
 			if (Prefix == nullptr)
 			{
+				// Released while this job ran (1.1, RetiringPrefixes): its queued release may go now.
+				if (FSuperSLMSubsystemState::FRetiringPrefix* Retiring = S.RetiringPrefixes.Find(PrefixId))
+				{
+					Retiring->bJobInFlight = false;
+				}
 				return;
 			}
 			Prefix->bAdminJobInFlight = false;
@@ -4129,6 +5824,13 @@ namespace
 			}
 			if (Out->Status != SSLM_OK)
 			{
+				// Budget mode: the build's admission covered every page this prefill draws, so an
+				// exhausted pool is a ledger fault (§3.7); the faulted prefix keeps its build open
+				// until its release frees the pages and fails it (ReleasePrefix()).
+				if (bBudgetMode && Out->Status == SSLM_KV_POOL_EXHAUSTED)
+				{
+					S.NoteLedgerFault(TEXT("sslm_prefix_prefill"));
+				}
 				S.FaultPrefix(*Prefix, FString::Printf(TEXT("sslm_prefix_prefill failed after %d of %d tokens (%s)"),
 					Prefix->Consumed, Prefix->Tokens.Num(), *StatusText(Out->Status)));
 				return;
@@ -4138,6 +5840,7 @@ namespace
 				if (Out->FreezeStatus == SSLM_OK)
 				{
 					Prefix->Phase = ESuperSLMPrefixPhase::Ready;
+					ApplyPrefixBuilt(S, *Prefix); // plugin paging plan §3.3: the build applies here
 				}
 				else
 				{
@@ -4146,6 +5849,13 @@ namespace
 			}
 		};
 
+		// §3.9: HoldApply(PrefixBuild) holds the delivery of the job that freezes the prefix: the
+		// one that prefills its last tokens.
+		if (Chunk >= Left)
+		{
+			S.NextPostApplyHoldId = PrefixPtr->BuildApplyHoldId;
+			PrefixPtr->BuildApplyHoldId = 0;
+		}
 		PostLedgerJob(S, PrefixPtr->PinnedLane, CandidateLanes, ESuperSLMWorkerJobKind::DecodeOrPrefill, 0, Chunk, 0, PlannedMs,
 			FSuperSLMSequence{}, FSuperSLMLifecycleOpHandle{}, TickIndex, BuildExecute, MoveTemp(Deliver));
 		S.JobLedger.Last()->PromptPositionSum = PromptChunkPositionSum(Chunk, StartDepth); // D-SLM7794 (T-3002 S1)
@@ -4156,8 +5866,11 @@ namespace
 	// on one lane. PinnedBudget == 0 means scheduler-chosen (sized from the static cost model,
 	// the largest composition whose planned cost fits the share); a nonzero PinnedBudget always
 	// runs as pinned, unscanned.
-	void DispatchDecodeBatch(FSuperSLMSubsystemState& S, TArray<int32>& CandidateLanes, const TArray<int32>& SlotIndices, int32 PinnedBudget, int32 TickIndex)
+	// ChainBaseTick: as DispatchSequencePrefill's (INDEX_NONE unless this is a continuation).
+	void DispatchDecodeBatch(FSuperSLMSubsystemState& S, TArray<int32>& CandidateLanes, const TArray<int32>& SlotIndices, int32 PinnedBudget, int32 TickIndex,
+		int32 ChainBaseTick = INDEX_NONE)
 	{
+		const bool bContinuation = ChainBaseTick != INDEX_NONE;
 		const int32 NumHiddenLayers = S.Shape.NumHiddenLayers;
 		FDecodeComposition Composition;
 		if (PinnedBudget > 0)
@@ -4175,17 +5888,17 @@ namespace
 					++Composition.TotalFinishes;
 				}
 			}
-			Composition.PlannedMs = DecodeCompositionCostMs(Composition, S.Config.LayerCostMs, S.Config.LayerCostPerPositionMs, S.Config.FinishCostMs);
+			Composition.PlannedMs = DecodeCompositionCostMs(Composition, S.Resolved.LayerCostMs, S.Resolved.LayerCostPerPositionMs, S.Resolved.FinishCostMs);
 		}
 		else
 		{
 			const double ShareMs = S.Config.TickBudgetMs * S.Config.BudgetHeadroom;
 			Composition = PlanDecodeBatch(SlotIndices, S.Slots, NumHiddenLayers, S.Config.MaxLayerBudget, ShareMs,
-				S.Config.LayerCostMs, S.Config.LayerCostPerPositionMs, S.Config.FinishCostMs);
+				S.Resolved.LayerCostMs, S.Resolved.LayerCostPerPositionMs, S.Resolved.FinishCostMs);
 		}
 		// D-SLM7799: the checked K and tick, before any state changes; a failure posts nothing and
-		// faults every member.
-		if (!TrySchedule(S, Composition.PlannedMs, TickIndex, TEXT("decode")))
+		// faults every member. A continuation is checked from the tick it commits from.
+		if (!TrySchedule(S, Composition.PlannedMs, bContinuation ? FMath::Max(TickIndex, ChainBaseTick) : TickIndex, TEXT("decode")))
 		{
 			for (int32 Idx : SlotIndices)
 			{
@@ -4212,6 +5925,18 @@ namespace
 		const bool bAllFinishOnly = Composition.TotalLayers == 0 && Composition.TotalFinishes > 0;
 		FJobOutputRef Out = MakeShared<FJobOutput, ESPMode::ThreadSafe>();
 		Out->PerSequence.SetNum(SlotIndices.Num());
+		Out->MemberSkipped.SetNumZeroed(SlotIndices.Num());
+		TArray<FGenerationGatePtr> Gates;
+		TArray<FContinuationTicketPtr> Tickets; // 1.1: one per member of a continuation, else empty
+		Gates.Reserve(SlotIndices.Num());
+		for (int32 Idx : SlotIndices)
+		{
+			Gates.Add(GenerationGateFor(S.Slots[Idx]));
+			if (bContinuation)
+			{
+				Tickets.Add(MakeShared<FContinuationTicket, ESPMode::ThreadSafe>());
+			}
+		}
 
 		// Plan §2.5 row 20 rule 4, per member: a Generate's first job carries every held entry
 		// below its op's ordinal; each later job carries adapter entries only (the mid-generation
@@ -4225,16 +5950,38 @@ namespace
 			const bool bFirstJob = !Member.bGenerateFirstJobPosted;
 			CarriedPerSlot.Add(CarryHeldRequests(Member, bFirstJob ? Member.ActiveGenerateOrdinal : TNumericLimits<int64>::Max(), /*bAdaptersOnly*/ !bFirstJob));
 			Member.bGenerateFirstJobPosted = true;
+			ensure(!bContinuation || CarriedPerSlot.Last().IsEmpty()); // see DispatchSequencePrefill
 		}
 
 		// D-SLM7528 (plan §5 item 3): the lane is resolved by PostLedgerJob; the workspace it
 		// requires is read from BuildExecute's own resolved-lane parameter.
-		auto BuildExecute = [&S, Model, Seqs, LayerBudget, bAllFinishOnly, CarriedPerSlot, Out](int32 LaneIndex) -> TFunction<void()>
+		auto BuildExecute = [&S, Model, Seqs, LayerBudget, bAllFinishOnly, CarriedPerSlot, Out, Gates, Tickets, bContinuation](int32 LaneIndex) -> TFunction<void()>
 		{
 			const sslm_workspace Workspace = S.Lanes[LaneIndex].Workspace;
-			return [Model, Seqs, LayerBudget, Workspace, bAllFinishOnly, CarriedPerSlot, Out]()
+			return [Model, Seqs, LayerBudget, Workspace, bAllFinishOnly, CarriedPerSlot, Out, Gates, Tickets, bContinuation]()
 			{
+				// 1.1 (plan §5 item 1a): a continuation leaves out every member whose generation
+				// ended in the job ahead of it (or was ended from the game thread), and every member
+				// a later request cancelled; with none left it makes no Layer-1 call at all. Layer 1's results do not depend on which sequences
+				// share a call, so the members that stay produce the tokens they would have anyway.
+				TArray<int32, TInlineAllocator<16>> Live;
 				for (int32 I = 0; I < Seqs.Num(); ++I)
+				{
+					if (bContinuation && (Gates[I]->IsStopped() || Tickets[I]->bCancelled.load(std::memory_order_acquire)))
+					{
+						Out->MemberSkipped[I] = true;
+					}
+					else
+					{
+						Live.Add(I);
+					}
+				}
+				if (Live.Num() == 0)
+				{
+					Out->bSkipped = true;
+					return;
+				}
+				for (int32 I : Live)
 				{
 					ApplyCarriedOnWorker(Model, Seqs[I], CarriedPerSlot[I], Out->PerSequence[I].CarriedStatuses); // rule 4: at the job's head
 				}
@@ -4249,10 +5996,40 @@ namespace
 				Out->Status = sslm_decode_params_init(Model, SSLM_DECODE_MODE_GREEDY, LayerBudget, &Params);
 				if (Out->Status == SSLM_OK)
 				{
-					Out->DecodeTokens.SetNumUninitialized(Seqs.Num(), EAllowShrinking::No);
-					Out->Status = sslm_decode_step_v2(Model, const_cast<sslm_seq*>(Seqs.GetData()), Seqs.Num(), &Params, Workspace, Out->DecodeTokens.GetData());
+					Out->DecodeTokens.SetNumZeroed(Seqs.Num(), EAllowShrinking::No);
+					if (Live.Num() == Seqs.Num())
+					{
+						Out->Status = sslm_decode_step_v2(Model, const_cast<sslm_seq*>(Seqs.GetData()), Seqs.Num(), &Params, Workspace, Out->DecodeTokens.GetData());
+					}
+					else
+					{
+						TArray<sslm_seq, TInlineAllocator<16>> LiveSeqs;
+						TArray<int32, TInlineAllocator<16>> LiveTokens;
+						for (int32 I : Live)
+						{
+							LiveSeqs.Add(Seqs[I]);
+						}
+						LiveTokens.SetNumZeroed(Live.Num());
+						Out->Status = sslm_decode_step_v2(Model, LiveSeqs.GetData(), LiveSeqs.Num(), &Params, Workspace, LiveTokens.GetData());
+						for (int32 J = 0; J < Live.Num(); ++J)
+						{
+							Out->DecodeTokens[Live[J]] = LiveTokens[J];
+						}
+					}
 				}
-				for (int32 I = 0; I < Seqs.Num(); ++I)
+				// 1.1: every member that ran updates its gate, by Deliver()'s own terminal rule.
+				for (int32 I : Live)
+				{
+					if (Out->Status != SSLM_OK)
+					{
+						Gates[I]->Stop();
+					}
+					else
+					{
+						Gates[I]->NoteDecodeToken(Out->DecodeTokens[I]);
+					}
+				}
+				for (int32 I : Live)
 				{
 					ReadStatsOnWorker(Model, Seqs[I], Out->PerSequence[I]); // row 22: at the job's tail
 				}
@@ -4273,13 +6050,16 @@ namespace
 		                                 // SpeculativeFinishesQueued for -- Deliver decrements
 		                                 // exactly those, unconditionally, mirroring
 		                                 // OutstandingJobCount's own unconditional-decrement rule.
+		TArray<int32> PreLayersDoneCopy; // 1.1: restored with WasReadyForLogitsCopy if a member is skipped
 		WasReadyForLogitsCopy.Reserve(SlotIndices.Num());
 		WasFinishingCopy.Reserve(SlotIndices.Num());
+		PreLayersDoneCopy.Reserve(SlotIndices.Num());
 		for (int32 Idx : SlotIndices)
 		{
 			FSlot& Slot2 = S.Slots[Idx];
 			SlotVendedIdsCopy.Add(Slot2.VendedId);
 			WasReadyForLogitsCopy.Add(Slot2.bReadyForLogits);
+			PreLayersDoneCopy.Add(Slot2.LayersDoneInToken);
 			const int32 Left2 = Slot2.bReadyForLogits ? 0 : NumHiddenLayers - Slot2.LayersDoneInToken;
 			const int32 Layers2 = FMath::Min(LayerBudget, Left2);
 			const bool bFinishing = Layers2 >= Left2;
@@ -4296,8 +6076,52 @@ namespace
 			}
 		}
 
-		auto Deliver = [&S, SlotIndicesCopy, SlotVendedIdsCopy, WasReadyForLogitsCopy, WasFinishingCopy, CarriedPerSlot, Out, bAllFinishOnly](double WorkerCallMs) // LayerBudget/NumHiddenLayers no longer needed here: Left/Layers/the finishing decision are already resolved above, at POST time
+		const int64 LedgerRowCap = S.JobLedger.AppendedCount(); // the row PostLedgerJob appends
+		auto Deliver = [&S, SlotIndicesCopy, SlotVendedIdsCopy, WasReadyForLogitsCopy, WasFinishingCopy, PreLayersDoneCopy, CarriedPerSlot, Out, bAllFinishOnly, LedgerRowCap, Tickets](double WorkerCallMs) // LayerBudget/NumHiddenLayers no longer needed here: Left/Layers/the finishing decision are already resolved above, at POST time
 		{
+			for (int32 I = 0; I < Tickets.Num(); ++I)
+			{
+				FSlot& Member = S.Slots[SlotIndicesCopy[I]];
+				if (Member.QueuedContinuation == Tickets[I])
+				{
+					Member.QueuedContinuation.Reset();
+				}
+			}
+			if (Out->bSkipped)
+			{
+				if (FSuperSLMWorkerJobReport* Row = S.JobLedger.Find(LedgerRowCap))
+				{
+					Row->bSkippedContinuation = true;
+				}
+			}
+			// 1.1 (plan §5 item 1a): a member a continuation left out ran nothing. The continuation
+			// is its last posted job (nothing is admitted behind it: its generation has ended, or a
+			// queued request blocks further continuations and ordinary admission waits for it),
+			// so the planning mirrors this job advanced for it at post go back to what Layer 1 holds.
+			// Returns true when member I was skipped and is fully handled.
+			auto DeliverSkippedMember = [&](int32 I) -> bool
+			{
+				if (!Out->MemberSkipped[I])
+				{
+					return false;
+				}
+				if (FSuperSLMWorkerJobReport* Row = S.JobLedger.Find(LedgerRowCap))
+				{
+					++Row->SkippedMembers;
+				}
+				FSlot& Slot = S.Slots[SlotIndicesCopy[I]];
+				--Slot.OutstandingJobCount;
+				if (WasFinishingCopy[I])
+				{
+					--Slot.SpeculativeFinishesQueued;
+				}
+				if (Slot.VendedId == SlotVendedIdsCopy[I])
+				{
+					Slot.LayersDoneInToken = PreLayersDoneCopy[I];
+					Slot.bReadyForLogits = WasReadyForLogitsCopy[I];
+				}
+				return true;
+			};
 			// Rule 4 and row 22, per member, before its content: every job pin is released, and
 			// the carried entries and the stats copy are confirmed only for a member whose owner
 			// (the holder at post) still holds the slot (rule 2).
@@ -4312,6 +6136,10 @@ namespace
 			{
 				for (int32 I = 0; I < SlotIndicesCopy.Num(); ++I)
 				{
+					if (DeliverSkippedMember(I))
+					{
+						continue;
+					}
 					FSlot& Slot = S.Slots[SlotIndicesCopy[I]];
 					// Decrement unconditionally -- see DispatchSequencePrefill's own Deliver note.
 					--Slot.OutstandingJobCount;
@@ -4341,6 +6169,11 @@ namespace
 					{
 						continue; // an earlier-committed, later-delivered job already made this slot terminal
 					}
+					if (Out->Status == SSLM_KV_BUDGET_EXCEEDED)
+					{
+						FaultAtEngineLimit(S, Slot, TEXT("sslm_decode_step_v2"));
+						continue;
+					}
 					S.Fault(Slot, ESuperSLMDecodeOutcome::Generating, FString::Printf(TEXT("sslm_decode_step_v2 failed (%s)"), *StatusText(Out->Status)));
 				}
 				return;
@@ -4348,6 +6181,10 @@ namespace
 			int32 Finishes = 0;
 			for (int32 I = 0; I < SlotIndicesCopy.Num(); ++I)
 			{
+				if (DeliverSkippedMember(I))
+				{
+					continue;
+				}
 				FSlot& Slot = S.Slots[SlotIndicesCopy[I]];
 				--Slot.OutstandingJobCount;
 				if (WasFinishingCopy[I])
@@ -4419,7 +6256,8 @@ namespace
 		// SAME resolved value below -- one chooser, one write-back, not N independent choices.
 		int32 GroupPinnedLane = SlotIndices.Num() > 0 ? S.Slots[SlotIndices[0]].PinnedLane : INDEX_NONE;
 		const int32 CommittedDeliveryTick = PostLedgerJob(S, GroupPinnedLane, CandidateLanes, ESuperSLMWorkerJobKind::DecodeOrPrefill, Composition.TotalLayers, 0, Composition.TotalFinishes, Composition.PlannedMs,
-			FSuperSLMSequence{}, FSuperSLMLifecycleOpHandle{}, TickIndex, BuildExecute, MoveTemp(Deliver));
+			FSuperSLMSequence{}, FSuperSLMLifecycleOpHandle{}, TickIndex, BuildExecute, MoveTemp(Deliver), ChainBaseTick);
+		const int64 PostedJobId = S.JobLedger.Last()->JobId;
 		// Diagnostic only (R-S1d): the ledger row PostLedgerJob just appended names every member.
 		for (const int64 MemberId : SlotVendedIdsCopy)
 		{
@@ -4429,10 +6267,16 @@ namespace
 		// count per slot and depth -- not from its planned cost.
 		S.JobLedger.Last()->DecodeLayerDepthSum = Composition.DecodeLayerDepthSum;
 
-		for (int32 Idx : SlotIndices)
+		for (int32 I = 0; I < SlotIndices.Num(); ++I)
 		{
-			S.Slots[Idx].NextAvailableTick = CommittedDeliveryTick;
-			S.Slots[Idx].PinnedLane = GroupPinnedLane;
+			FSlot& Member = S.Slots[SlotIndices[I]];
+			Member.NextAvailableTick = CommittedDeliveryTick;
+			Member.PinnedLane = GroupPinnedLane;
+			Member.ContinuableJobId = PostedJobId;
+			if (bContinuation)
+			{
+				Member.QueuedContinuation = Tickets[I];
+			}
 		}
 	}
 
@@ -4464,6 +6308,19 @@ namespace
 				TEXT("the prompt's %d tokens after a %lld-token prefix exceed the model's context_cap of %lld (SSLM_CONTEXT_CAP_EXCEEDED)"),
 				Request.PromptTokens.Num(), PrefixContext, S.Shape.ContextCap));
 			return;
+		}
+		// Plugin paging plan §3.3 "Generation limit", §3.4 "Activation pre-check": in budget mode the
+		// prompt after the holder's origin must fit its limit, min(origin + SequenceBudget, cap).
+		if (S.IsBudgetMode())
+		{
+			const int32 SlotIndex = static_cast<int32>(&Slot - S.Slots.GetData());
+			const int64 Limit = S.Ledger.SlotLimit(SlotIndex);
+			const SuperSLMPaging::ELimitVerdict Verdict = SuperSLMPaging::CheckActivation(PrefixContext, Request.PromptTokens.Num(), Limit, S.Shape.ContextCap);
+			if (Verdict != SuperSLMPaging::ELimitVerdict::Allowed)
+			{
+				FaultAtLimit(S, Slot, Verdict, Limit, *FString::Printf(TEXT("the prompt's %d tokens after a %lld-token prefix"), Request.PromptTokens.Num(), PrefixContext));
+				return;
+			}
 		}
 		// Rule 4 (T-2989 F21): the value of the holder's last held schema entry counts when one
 		// exists, so a held bind counts as bound and a held unbind after it as unbound. Under the
@@ -4575,6 +6432,12 @@ namespace
 						continue;
 					}
 				}
+				// Plugin paging plan §3.9: an admitted op parked at its HoldStart() hold waits there.
+				// §3.5 (K3): so does a restore waiting on H, until the ledger admits it.
+				if (Front.bWaiting || IsParkedAtStartHold(S, Front))
+				{
+					continue;
+				}
 				if (Front.Ordinal < BestOrdinal)
 				{
 					BestOrdinal = Front.Ordinal;
@@ -4589,6 +6452,21 @@ namespace
 				{
 					const FPrefixEntry* Prefix = S.Prefixes.Find(Op.PrefixId);
 					if (Prefix == nullptr || Prefix->bAdminJobInFlight || !IsLanePinFree(Prefix->PinnedLane, S.Lanes, TickIndex))
+					{
+						continue;
+					}
+					// 1.1 (RetiringPrefixes): a released prefix keeps its place until its release has
+					// delivered. K2 review F2: this gate holds in both modes. In budget mode the page
+					// ledger admitted the build's pages at CreatePrefix() (region P) and freed the
+					// released prefix's count slot at its release admission, but this gate bounds the
+					// prefix jobs in flight, which is what keeps the §5.3 per-lane pending-job bound
+					// (BlockCount + PrefixBlockCount + 1).
+					int32 Occupied = S.RetiringPrefixes.Num();
+					for (const TPair<int64, FPrefixEntry>& Pair : S.Prefixes)
+					{
+						Occupied += (Pair.Value.Handle != nullptr || Pair.Value.bAdminJobInFlight) ? 1 : 0;
+					}
+					if (Occupied >= S.Config.PrefixBlockCount)
 					{
 						continue;
 					}
@@ -4610,10 +6488,22 @@ namespace
 					// Release for the same id, so there is no admin job for this same prefix that
 					// could still be in flight. Op.PinnedLane, captured at ReleasePrefix() call
 					// time, stands in for the vanished entry's own field.
-					if (!IsLanePinFree(Op.PinnedLane, S.Lanes, TickIndex))
+					// 1.1 (plan §5 item 1a, "Lane depth"): the comment above held for the Begin, but
+					// a prefill job can still be in flight when its prefix is released. The release
+					// waits for it, so a prefix never has two jobs posted and undelivered.
+					const FSuperSLMSubsystemState::FRetiringPrefix* Retiring = S.RetiringPrefixes.Find(Op.PrefixId);
+					if ((Retiring != nullptr && Retiring->bJobInFlight) || !IsLanePinFree(Op.PinnedLane, S.Lanes, TickIndex))
 					{
 						continue;
 					}
+				}
+				// Plugin paging plan §3.9: an op parked at its HoldStart() hold waits there. K2 review
+				// F9: checked after the op's other gates, so the hold is marked reached only where it
+				// is what actually parks the op (the job would otherwise be posted).
+				if (S.IsHoldBlocking(Op.StartHoldId))
+				{
+					S.MarkHoldReached(Op.StartHoldId);
+					continue;
 				}
 				if (Op.Ordinal < BestOrdinal)
 				{
@@ -4715,6 +6605,12 @@ namespace
 					&& CandidateSlot.SpeculativeFinishesQueued < CandidateSlot.MaxNewTokens - CandidateSlot.Generated.Num()
 					&& IsLanePinFree(CandidateSlot.PinnedLane, S.Lanes, TickIndex))
 				{
+					// Plugin paging plan §3.4: the per-step limit pre-check, before the step is
+					// grouped. A due sequence has no job in flight, so ContextUsed is exact here.
+					if (!PreCheckDecodeStep(S, I, CandidateSlot.ContextUsed, /*bFaultOnRefusal*/ true))
+					{
+						continue;
+					}
 					const int64 GroupKey = (static_cast<int64>(CandidateSlot.PinnedLayerBudget) << 32) | static_cast<uint32>(CandidateSlot.PinnedLane);
 					Groups.FindOrAdd(GroupKey).Add(I);
 				}
@@ -4736,6 +6632,129 @@ namespace
 				DispatchDecodeBatch(S, FreeLanes, Pair.Value, GroupBudget, TickIndex);
 				Report.JobsPlannedThisTick += static_cast<int32>(S.NextJobId - JobIdBeforeDispatch); // O1: posted jobs only
 			}
+		}
+	}
+
+	// 1.1 worker continuation (plan §5 item 1a, ruled 2026-09-29). Runs after
+	// PlanNextJobs. For each lane whose one pending job is a generation's prefill or decode job, and
+	// on which nothing else is waiting, it posts that generation's next job now, queued behind the
+	// running one, so the worker starts it the moment the running job finishes rather than idling
+	// until the next Tick() delivers it and posts the next. The next job is composed exactly as the
+	// next tick would compose it: from the planning mirrors, which every dispatcher already advances
+	// at post (§14.8 item 2). It is the one exception to D-SLM7515's one job in flight per sequence:
+	// at most two, the second a continuation on the same pinned lane, where the lane's single thread
+	// runs them in order, so two Layer-1 calls for one sequence never overlap. Whether the
+	// generation is still running when the continuation reaches the worker is content-dependent,
+	// and the generation's gate (FGenerationGate) answers it there, so a continuation never runs a
+	// sequence past its end.
+	//
+	// Anything else that wants the lane blocks the continuation, and the lane goes back to 1.0's
+	// hand-off at the next free tick: another sequence's work (pinned to the lane or not yet pinned),
+	// a member's queued lifecycle op or held request, or any prefix work. So a continuation never
+	// delays other work by more than the one job it adds, and never reorders anything queued.
+	void PlanContinuations(FSuperSLMSubsystemState& S, FSuperSLMTickReport& Report, int32 TickIndex)
+	{
+		if (!S.Config.bWorkerContinuation)
+		{
+			return;
+		}
+		// Prefix work is rare and administrative; it keeps 1.0's hand-off on every lane.
+		if (!S.PrefixAdminQueue.IsEmpty())
+		{
+			return;
+		}
+		for (const TPair<int64, FPrefixEntry>& Pair : S.Prefixes)
+		{
+			if (Pair.Value.Phase == ESuperSLMPrefixPhase::Prefilling || Pair.Value.bAdminJobInFlight)
+			{
+				return;
+			}
+		}
+		for (int32 L = 0; L < S.Lanes.Num(); ++L)
+		{
+			const FLane& Lane = S.Lanes[L];
+			if (Lane.Pending.Num() != 1 || Lane.Pending[0].Kind != ESuperSLMWorkerJobKind::DecodeOrPrefill)
+			{
+				continue;
+			}
+			const int64 RunningJobId = Lane.Pending[0].JobId;
+			const int32 ChainBaseTick = Lane.Pending[0].CommittedDeliveryTick;
+			TArray<int32> Members;
+			bool bBlocked = false;
+			for (int32 I = 0; I < S.Slots.Num() && !bBlocked; ++I)
+			{
+				const FSlot& Slot = S.Slots[I];
+				const bool bInRunningJob = Slot.PinnedLane == L && Slot.OutstandingJobCount == 1 && Slot.ContinuableJobId == RunningJobId;
+				if (bInRunningJob)
+				{
+					// A member with anything queued, held or returned keeps 1.0's order.
+					if (Slot.VendedId == 0 || Slot.bAwaitingRestore || !Slot.OpQueue.IsEmpty() || !Slot.Held.IsEmpty())
+					{
+						bBlocked = true;
+						continue;
+					}
+					// A member whose generation has ended, or whose last token is already in flight
+					// (§17's cap), has nothing to continue; it neither joins nor blocks.
+					if (!Slot.IsGenerating() || !Slot.bGenerateFirstJobPosted)
+					{
+						continue;
+					}
+					if (Slot.Phase == ESuperSLMSequencePhase::Decoding && Slot.SpeculativeFinishesQueued >= Slot.MaxNewTokens - Slot.Generated.Num())
+					{
+						continue;
+					}
+					// Plugin paging plan §3.4, budget mode: the running job's own embed lands in
+					// ContextUsed only at its delivery, so the continuation's step is checked as if
+					// it had (one position more). A member that could reach its limit neither joins
+					// nor blocks; the next ordinary planning pass checks it exactly.
+					if (Slot.Phase == ESuperSLMSequencePhase::Decoding && !PreCheckDecodeStep(S, I, Slot.ContextUsed + 1, /*bFaultOnRefusal*/ false))
+					{
+						continue;
+					}
+					Members.Add(I);
+					continue;
+				}
+				const bool bMayUseLane = Slot.PinnedLane == L || Slot.PinnedLane == INDEX_NONE;
+				if (bMayUseLane && (!Slot.OpQueue.IsEmpty() || Slot.IsGenerating() || Slot.bAwaitingRestore || Slot.HasUndeliveredJob()))
+				{
+					bBlocked = true;
+				}
+			}
+			if (bBlocked || Members.IsEmpty())
+			{
+				continue;
+			}
+
+			TArray<int32> CandidateLanes;
+			CandidateLanes.Add(L);
+			const int64 JobIdBeforeDispatch = S.NextJobId;
+			const FSlot& First = S.Slots[Members[0]];
+			if (First.Phase == ESuperSLMSequencePhase::Prefilling)
+			{
+				// A prefill job serves one sequence, so its continuation does too.
+				if (Members.Num() != 1)
+				{
+					continue;
+				}
+				DispatchSequencePrefill(S, CandidateLanes, Members[0], TickIndex, ChainBaseTick);
+			}
+			else
+			{
+				// A decode continuation keeps the running job's group: every member decoding, one
+				// shared layer-budget pin (the group key PlanNextJobs batches by).
+				bool bOneGroup = true;
+				for (int32 Idx : Members)
+				{
+					const FSlot& M = S.Slots[Idx];
+					bOneGroup &= M.Phase == ESuperSLMSequencePhase::Decoding && M.PinnedLayerBudget == First.PinnedLayerBudget;
+				}
+				if (!bOneGroup)
+				{
+					continue;
+				}
+				DispatchDecodeBatch(S, CandidateLanes, Members, First.PinnedLayerBudget, TickIndex, ChainBaseTick);
+			}
+			Report.JobsPlannedThisTick += static_cast<int32>(S.NextJobId - JobIdBeforeDispatch); // O1: posted jobs only
 		}
 	}
 }
@@ -4794,16 +6813,32 @@ void USuperSLMSubsystem::Tick(float DeltaSeconds)
 			// tick after the worker finishes it; it is no longer held back to its planned tick.
 			// The planned tick (CommittedDeliveryTick = PlannedAtTick + K) stays a planning figure,
 			// and a result delivered after it is a hitch. PlanNextJobs' own free-lane/free-slot
-			// checks (IsFreeForPlanning/IsDue) are unchanged. Drained strictly front-to-back, so
-			// per lane deliveries keep their FIFO order and one entity's results never reorder.
-			while (Lane.Pending.Num() > 0)
+			// checks (IsFreeForPlanning/IsDue) are unchanged. Drained front-to-back, stopping at the
+			// first unfinished job. Per-entity order is always preserved, because each sequence or
+			// prefix has at most one undelivered job; entries for different entities apply out of lane
+			// order only past an entry a test seam's HoldApply() hold keeps (K3).
+			int32 Index = 0;
+			while (Index < Lane.Pending.Num())
 			{
-				FLanePendingDelivery& Front = Lane.Pending[0];
+				FLanePendingDelivery& Front = Lane.Pending[Index];
 				checkf(Front.WorkerJob.IsValid(), TEXT("SuperSLM CPU lane holds a null pending job -- Post() never stores a null Ptr, so this is an internal invariant violation, not a runtime condition to degrade past."));
 				const bool bWorkerDone = Front.WorkerJob->bDone.load(std::memory_order_acquire);
 				if (!bWorkerDone)
 				{
 					break;
+				}
+				// Plugin paging plan §3.9: a job held at its HoldApply() hold stays undelivered until
+				// ReleaseHold(). It holds only its own delivery (step K3): every later result on its
+				// lane belongs to another entity, because a sequence or a prefix never has a second
+				// job posted while one is undelivered (and holds attach to no continuation), so they
+				// deliver past it and their entities' order is kept. A lane shared by a held restore
+				// and a sequence pinned to it (cell 1.8 (b)) needs this: FIFO would park the
+				// sequence's reset behind the hold.
+				if (S.IsHoldBlocking(Front.ApplyHoldId))
+				{
+					S.MarkHoldReached(Front.ApplyHoldId);
+					++Index;
+					continue;
 				}
 				const double WorkerCallMs = Front.WorkerJob->WorkerCallMs;
 				const uint32 WorkerThreadId = Front.WorkerJob->WorkerThreadId;
@@ -4811,7 +6846,11 @@ void USuperSLMSubsystem::Tick(float DeltaSeconds)
 				// The hitch rule and the counters read the job's own figures, copied at post, so they
 				// hold even when the ring has overwritten the job's ledger row; the row, while
 				// retained, records the same figures.
-				const bool bWorkerOverran = WorkerCallMs > S.Config.TickBudgetMs;
+				// Slice 1P (tiled-matmul plan §4A.1 item 4, rev 11.1 audit F8): a worker overrun is a
+				// job whose own Layer-1 time exceeded its own planned K ticks -- the job's own K, never
+				// ChainedWaitTicks + K (a continuation's queue wait is not worker time, and WorkerCallMs
+				// excludes it). At K = 1 this is 1.0's rule. One predicate, behind the scheduling seam.
+				const bool bWorkerOverran = SuperSLMPrefillPlanning::IsWorkerOverrun(WorkerCallMs, Front.K, S.Config.TickBudgetMs);
 				// D-SLM7407, plan §5 ("What counts as a hitch"): a result is a hitch when it is
 				// delivered after its committed tick AND the worker was left at least K ticks'
 				// worth of real wall time (K x TickBudgetMs, posted to finished) and still needed
@@ -4820,7 +6859,10 @@ void USuperSLMSubsystem::Tick(float DeltaSeconds)
 				// loop against an 8 ms budget) counted its own pace as worker lateness (T-2818 box
 				// follow-up). WorkerSpanMs is published on the ledger so tests apply this rule.
 				const bool bLateByTicks = Report.TickIndex > Front.CommittedDeliveryTick;
-				const bool bHitch = bLateByTicks && WorkerSpanMs > double(Front.K) * S.Config.TickBudgetMs;
+				// 1.1 (plan §5 item 1a): a continuation is posted behind the job it follows, so its
+				// span includes that wait; ChainedWaitTicks (0 for every other job) is the part of the
+				// committed tick the wait accounts for, and the wall-time half allows for it the same way.
+				const bool bHitch = bLateByTicks && WorkerSpanMs > double(Front.ChainedWaitTicks + Front.K) * S.Config.TickBudgetMs;
 				if (FSuperSLMWorkerJobReport* LedgerEntry = S.JobLedger.Find(Front.LedgerRow))
 				{
 					LedgerEntry->WorkerCallMs = WorkerCallMs;
@@ -4851,9 +6893,11 @@ void USuperSLMSubsystem::Tick(float DeltaSeconds)
 					Front.Deliver(WorkerCallMs);
 				}
 				++Report.JobsDeliveredThisTick;
-				Lane.Pending.RemoveAt(0, EAllowShrinking::No);
+				Lane.Pending.RemoveAt(Index, EAllowShrinking::No);
 			}
 		}
+		// Plugin paging plan §3.5 (K3): the applies above may have admitted waiting restores.
+		ResolveWaitingRestores(S);
 	}
 	Report.ApplyMs = (FPlatformTime::Seconds() - ApplyStart) * 1000.0;
 
@@ -4864,6 +6908,7 @@ void USuperSLMSubsystem::Tick(float DeltaSeconds)
 		if (!S.bTickHorizonReached)
 		{
 			PlanNextJobs(S, Report, Report.TickIndex);
+			PlanContinuations(S, Report, Report.TickIndex); // 1.1, plan §5 item 1a
 		}
 	}
 	Report.PlanMs = (FPlatformTime::Seconds() - PlanStart) * 1000.0;
@@ -4910,6 +6955,7 @@ ESuperSLMRestoreResult USuperSLMSubsystem::SaveSequence(const FSuperSLMSequence&
 	Op.HandleId = State->MintHandle();
 	Op.Owner = Slot->VendedId;
 	Slot->OpQueue.Add(Op);
+	Slot->CancelQueuedContinuation(); // 1.1: a queued op precedes the generation's next job
 	OutHandle.Id = Op.HandleId;
 	return ESuperSLMRestoreResult::Success;
 }
@@ -4927,8 +6973,116 @@ namespace
 	// Plan §2.5 row 19: validation reads the caller's array in place; only an accepted request
 	// creates the shared immutable buffer every later holder uses -- by one copy, or by taking
 	// the caller's array when MovableBlob is given, so no copy is ever taken after acceptance.
+	// Plugin paging plan §3.5 (step K3): the Layer-1 payload header, read by the plugin at the call
+	// (plugin code parsing bytes, never a Layer-1 call), at the offsets K0 fixed from the engine's
+	// writers. The CPU reads the magic, context_length, and for 'SSB6' kv_mode, budget and origin.
+	namespace PayloadHeader
+	{
+		constexpr int64 ContextLength = 60;   // LE64, 'SSB5' and 'SSB6'
+		constexpr int64 Ssb5HeaderEnd = 124;  // through ready_for_logits (LE32 at 120)
+		constexpr int64 KvMode = 156;         // LE32, 'SSB6' (0 whole_reserve, 1 budget)
+		constexpr int64 Budget = 160;         // i32, 'SSB6'
+		constexpr int64 Origin = 164;         // i64, 'SSB6'
+		constexpr int64 Ssb6HeaderEnd = 172;
+
+		uint64 ReadLE(const uint8* P, int32 Bytes)
+		{
+			uint64 Value = 0;
+			for (int32 I = Bytes - 1; I >= 0; --I)
+			{
+				Value = (Value << 8) | uint64(P[I]);
+			}
+			return Value;
+		}
+
+		bool MagicIs(const uint8* Payload, int64 PayloadBytes, const char (&Magic)[5])
+		{
+			return PayloadBytes >= 4 && FMemory::Memcmp(Payload, Magic, 4) == 0;
+		}
+	}
+
+	struct FRestoreHeader
+	{
+		SuperSLMPaging::ERestorePayload Payload = SuperSLMPaging::ERestorePayload::Budget;
+		int64 Budget = 0;
+		int64 Origin = 0;
+		int64 ContextLength = 0;
+	};
+
+	// §3.5 "Malformed input": any of these is Malformed before any job, with nothing drawn. A header
+	// the parser cannot read (shorter than its fixed fields); a magic other than 'SSB5' or 'SSB6';
+	// an 'SSB6' kv_mode other than 0 or 1; a budget outside [1, cap], an origin or context_length
+	// outside [0, cap]; or the wrapper's ContextUsed differing from the payload's context_length.
+	// Cap is the model's (on the CPU the plugin's cap is the model's).
+	bool ReadRestoreHeader(const uint8* Payload, int64 PayloadBytes, int64 Cap, int64 WrapperContextUsed, FRestoreHeader& Out, FString& OutError)
+	{
+		const bool bSsb6 = PayloadHeader::MagicIs(Payload, PayloadBytes, "SSB6");
+		if (!bSsb6 && !PayloadHeader::MagicIs(Payload, PayloadBytes, "SSB5"))
+		{
+			OutError = TEXT("Malformed: the payload's magic is neither 'SSB5' nor 'SSB6' (or the payload is shorter than its magic)");
+			return false;
+		}
+		const int64 HeaderEnd = bSsb6 ? PayloadHeader::Ssb6HeaderEnd : PayloadHeader::Ssb5HeaderEnd;
+		if (PayloadBytes < HeaderEnd)
+		{
+			OutError = FString::Printf(TEXT("Malformed: the payload's %lld bytes end inside its %lld-byte header"), PayloadBytes, HeaderEnd);
+			return false;
+		}
+		Out.ContextLength = static_cast<int64>(PayloadHeader::ReadLE(Payload + PayloadHeader::ContextLength, 8));
+		if (Out.ContextLength < 0 || Out.ContextLength > Cap)
+		{
+			OutError = FString::Printf(TEXT("Malformed: the payload's context_length %lld is outside [0, %lld]"), Out.ContextLength, Cap);
+			return false;
+		}
+		if (bSsb6)
+		{
+			const uint64 KvMode = PayloadHeader::ReadLE(Payload + PayloadHeader::KvMode, 4);
+			Out.Budget = static_cast<int64>(static_cast<int32>(static_cast<uint32>(PayloadHeader::ReadLE(Payload + PayloadHeader::Budget, 4))));
+			Out.Origin = static_cast<int64>(PayloadHeader::ReadLE(Payload + PayloadHeader::Origin, 8));
+			if (KvMode > 1)
+			{
+				OutError = FString::Printf(TEXT("Malformed: the payload's kv_mode %llu is neither whole_reserve (0) nor budget (1)"), KvMode);
+				return false;
+			}
+			if (Out.Budget < 1 || Out.Budget > Cap)
+			{
+				OutError = FString::Printf(TEXT("Malformed: the payload's budget %lld is outside [1, %lld]"), Out.Budget, Cap);
+				return false;
+			}
+			if (Out.Origin < 0 || Out.Origin > Cap)
+			{
+				OutError = FString::Printf(TEXT("Malformed: the payload's origin %lld is outside [0, %lld]"), Out.Origin, Cap);
+				return false;
+			}
+			// K3 review N5: the engine's own ordering, 0 <= origin <= context_length <= min(origin +
+			// budget, cap), checked here at the call so a payload the engine must refuse never queues.
+			if (Out.Origin > Out.ContextLength)
+			{
+				OutError = FString::Printf(TEXT("Malformed: the payload's origin %lld is above its context_length %lld"), Out.Origin, Out.ContextLength);
+				return false;
+			}
+			const int64 Limit = FMath::Min<int64>(Out.Origin + Out.Budget, Cap);
+			if (Out.ContextLength > Limit)
+			{
+				OutError = FString::Printf(TEXT("Malformed: the payload's context_length %lld is above its limit %lld, min(origin + budget, cap)"), Out.ContextLength, Limit);
+				return false;
+			}
+			Out.Payload = KvMode == 1 ? SuperSLMPaging::ERestorePayload::Budget : SuperSLMPaging::ERestorePayload::WholeReserve;
+		}
+		else
+		{
+			Out.Payload = SuperSLMPaging::ERestorePayload::WholeReserve;
+		}
+		if (WrapperContextUsed != Out.ContextLength)
+		{
+			OutError = FString::Printf(TEXT("Malformed: the wrapper's ContextUsed %lld differs from the payload's context_length %lld"), WrapperContextUsed, Out.ContextLength);
+			return false;
+		}
+		return true;
+	}
+
 	ESuperSLMRestoreResult QueueRestore(FSuperSLMSubsystemState* State, const TArray<uint8>& Blob, TArray<uint8>* MovableBlob,
-		USuperSLMModel* ExpectedModel, FSuperSLMSequence& OutSequence, FSuperSLMLifecycleOpHandle& OutHandle, FString& OutError)
+		USuperSLMModel* ExpectedModel, const FSuperSLMPrefix* Hint, FSuperSLMSequence& OutSequence, FSuperSLMLifecycleOpHandle& OutHandle, FString& OutError)
 	{
 		OutSequence = FSuperSLMSequence();
 		OutHandle = FSuperSLMLifecycleOpHandle();
@@ -4964,6 +7118,24 @@ namespace
 		{
 			OutError = State->TickHorizonMessage; // D-SLM7799
 			return ESuperSLMRestoreResult::NotConfigured;
+		}
+		// Plugin paging plan §3.5 (step K3): admission reads the payload header, before anything is
+		// reserved or queued. The mode check reads the magic, never a wrapper field: an 'SSB6' (a
+		// budget holder's save) into legacy mode is KvModeMismatch, since a budget holder in a legacy
+		// pool breaks E4; legacy mode is otherwise unchanged. Budget mode refuses a malformed header
+		// by name, and takes the charge's fields from it.
+		FRestoreHeader Header;
+		if (!State->IsBudgetMode())
+		{
+			if (PayloadHeader::MagicIs(Payload, PayloadBytes, "SSB6"))
+			{
+				OutError = TEXT("KvModeMismatch: the save is a budget-mode holder's ('SSB6'), and this subsystem is in legacy mode (SequenceBudget 0); configure SequenceBudget > 0 to restore it");
+				return ESuperSLMRestoreResult::KvModeMismatch;
+			}
+		}
+		else if (!ReadRestoreHeader(Payload, PayloadBytes, State->Ledger.GetConfig().ContextCap, Contents.ContextUsed, Header, OutError))
+		{
+			return ESuperSLMRestoreResult::Malformed;
 		}
 		if (ExpectedModel == nullptr)
 		{
@@ -5043,7 +7215,30 @@ namespace
 			ProjectedPhase = ESuperSLMSequencePhase::Complete;
 		}
 		Op.RestoreProjectedPhase = ProjectedPhase;
+		if (S.IsBudgetMode())
+		{
+			Op.RestorePayload = Header.Payload;
+			Op.RestoreBudget = Header.Budget;
+			Op.RestoreOrigin = Header.Origin;
+			Op.RestoreContextLength = Header.ContextLength;
+			// §3.5 "Restore hint" (UP-10): never a requirement. A hint that is not a built, live
+			// prefix of this subsystem is ignored (the restore is private), and a whole-reserve
+			// payload ignores its hint, as the engine does: it pins nothing and reaches the engine
+			// as null. A usable hint is pinned from here until the job delivers or is refused.
+			if (Hint != nullptr && Header.Payload == SuperSLMPaging::ERestorePayload::Budget)
+			{
+				if (FPrefixEntry* HintEntry = S.Prefixes.Find(Hint->Id))
+				{
+					if (HintEntry->bLedgerBuilt && HintEntry->Handle != nullptr && HintEntry->Phase == ESuperSLMPrefixPhase::Ready)
+					{
+						++HintEntry->PendingHintedRestores;
+						Op.RestoreHintPrefixId = Hint->Id;
+					}
+				}
+			}
+		}
 		Slot.OpQueue.Add(MoveTemp(Op));
+		Slot.CancelQueuedContinuation(); // 1.1: a queued op precedes the generation's next job
 		OutHandle.Id = Slot.OpQueue.Last().HandleId;
 		return ESuperSLMRestoreResult::Success;
 	}
@@ -5056,7 +7251,7 @@ ESuperSLMRestoreResult USuperSLMSubsystem::RestoreSequence(
 	FSuperSLMLifecycleOpHandle& OutHandle,
 	FString& OutError)
 {
-	return QueueRestore(State, Blob, /*MovableBlob*/ nullptr, ExpectedModel, OutSequence, OutHandle, OutError);
+	return QueueRestore(State, Blob, /*MovableBlob*/ nullptr, ExpectedModel, /*Hint*/ nullptr, OutSequence, OutHandle, OutError);
 }
 
 ESuperSLMRestoreResult USuperSLMSubsystem::RestoreSequence(
@@ -5068,7 +7263,33 @@ ESuperSLMRestoreResult USuperSLMSubsystem::RestoreSequence(
 {
 	// Blob is validated in place and moved into the shared buffer only once accepted; a refused
 	// request leaves the caller's array untouched.
-	return QueueRestore(State, Blob, &Blob, ExpectedModel, OutSequence, OutHandle, OutError);
+	return QueueRestore(State, Blob, &Blob, ExpectedModel, /*Hint*/ nullptr, OutSequence, OutHandle, OutError);
+}
+
+// Plugin paging plan §3.5 (UP-10): the hinted forms. In budget mode the hint reaches
+// sslm_seq_restore_shared, which shares the prefix's full pages when the engine's identity check
+// passes; the hint is pinned while the restore is queued or waiting (QueueRestore()). A hint is
+// never a requirement: legacy mode restores privately exactly as the unhinted forms do.
+ESuperSLMRestoreResult USuperSLMSubsystem::RestoreSequence(
+	const TArray<uint8>& Blob,
+	USuperSLMModel* ExpectedModel,
+	const FSuperSLMPrefix& Hint,
+	FSuperSLMSequence& OutSequence,
+	FSuperSLMLifecycleOpHandle& OutHandle,
+	FString& OutError)
+{
+	return QueueRestore(State, Blob, /*MovableBlob*/ nullptr, ExpectedModel, &Hint, OutSequence, OutHandle, OutError);
+}
+
+ESuperSLMRestoreResult USuperSLMSubsystem::RestoreSequence(
+	TArray<uint8>&& Blob,
+	USuperSLMModel* ExpectedModel,
+	const FSuperSLMPrefix& Hint,
+	FSuperSLMSequence& OutSequence,
+	FSuperSLMLifecycleOpHandle& OutHandle,
+	FString& OutError)
+{
+	return QueueRestore(State, Blob, &Blob, ExpectedModel, &Hint, OutSequence, OutHandle, OutError);
 }
 
 ESuperSLMRestoreResult USuperSLMSubsystem::GetLifecycleOpResult(const FSuperSLMLifecycleOpHandle& Handle) const
@@ -5080,12 +7301,23 @@ ESuperSLMRestoreResult USuperSLMSubsystem::GetLifecycleOpResult(const FSuperSLML
 			return Entry->Result;
 		}
 	}
+	// Plugin paging plan §3.5 (K3): a handle a budget-mode teardown left Pending. Its id is never
+	// minted again while the tombstone stands (FirstHandleIdAfterTombstones()).
+	if (LifecycleTombstones.Contains(Handle.Id))
+	{
+		return ESuperSLMRestoreResult::NotConfigured;
+	}
 	return ESuperSLMRestoreResult::Pending;
 }
 
 ESuperSLMRestoreResult USuperSLMSubsystem::GetSaveResult(const FSuperSLMLifecycleOpHandle& Handle, TArray<uint8>& OutBlob)
 {
 	OutBlob.Reset();
+	// Plugin paging plan §3.5 (K3): a tombstone reads NotConfigured, with no blob.
+	if (LifecycleTombstones.Contains(Handle.Id))
+	{
+		return ESuperSLMRestoreResult::NotConfigured;
+	}
 	if (State != nullptr)
 	{
 		if (FSuperSLMSubsystemState::FHandleResult* Entry = State->HandleResults.Find(Handle.Id))
@@ -5112,6 +7344,11 @@ ESuperSLMRestoreResult USuperSLMSubsystem::GetSaveResult(const FSuperSLMLifecycl
 
 bool USuperSLMSubsystem::ReleaseLifecycleOpHandle(const FSuperSLMLifecycleOpHandle& Handle)
 {
+	// Plugin paging plan §3.5 (K3): releasing a tombstone erases it; the handle then reads Pending.
+	if (LifecycleTombstones.Remove(Handle.Id) > 0)
+	{
+		return true;
+	}
 	if (State == nullptr)
 	{
 		return false;
@@ -5133,9 +7370,23 @@ int64 USuperSLMSubsystem::GetRetainedResultBytes() const
 
 int32 USuperSLMSubsystem::GetLifecycleHandleEntryCount() const
 {
-	return State != nullptr ? State->HandleResults.Num() : 0;
+	// Plugin paging plan §3.5 (K3): tombstones count, since the game still owes their release.
+	return (State != nullptr ? State->HandleResults.Num() : 0) + LifecycleTombstones.Num();
 }
 #endif // SUPERSLM_WITH_L2S1_ASYNC
+
+// Plugin paging plan §3.5 "Handle ids stay unique" (K3): the handle counter lives in the
+// per-Configure state and restarts with it, so a new state starts above the highest tombstoned id,
+// and a fresh operation can never take a tombstone's id. With no tombstones it starts at 1.
+int64 USuperSLMSubsystem::FirstHandleIdAfterTombstones() const
+{
+	int64 Highest = 0;
+	for (const int64 Id : LifecycleTombstones)
+	{
+		Highest = FMath::Max(Highest, Id);
+	}
+	return Highest + 1;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Diagnostics
@@ -5194,6 +7445,50 @@ int32 USuperSLMSubsystem::GetPoolFreeCount() const { return State ? State->FreeS
 int32 USuperSLMSubsystem::GetPoolOccupiedCount() const { return State ? State->IdToSlot.Num() : 0; }
 int32 USuperSLMSubsystem::GetLivePrefixCount() const { return State ? State->Prefixes.Num() : 0; }
 int64 USuperSLMSubsystem::GetKvPoolReservedBytes() const { return State ? State->KvBytes : 0; }
+
+// Plugin paging plan §3.2: the ledger's regions and counters and the last applied job's pool
+// snapshot, all game-thread data. LedgerFaults is this subsystem's own count, kept across
+// re-Configure() (PriorLedgerFaults holds the ended states' counts).
+FSuperSLMKvPageStats USuperSLMSubsystem::GetKvPageStats() const
+{
+	FSuperSLMKvPageStats Stats;
+	Stats.LedgerFaults = PriorLedgerFaults + (State != nullptr ? static_cast<uint64>(State->Ledger.LedgerFaults()) : 0);
+	if (State == nullptr || !State->IsBudgetMode())
+	{
+		return Stats;
+	}
+	const FSuperSLMSubsystemState& S = *State;
+	const SuperSLMPaging::FPageLedgerStats L = S.Ledger.GetStats();
+	auto Region = [&L](SuperSLMPaging::ERegion R)
+	{
+		FSuperSLMKvRegionStats Out;
+		Out.CapacityPages = L.Regions[static_cast<int32>(R)].Capacity;
+		Out.ChargedPages = L.Regions[static_cast<int32>(R)].Charged;
+		return Out;
+	};
+	Stats.bPagedMode = true;
+	Stats.PagePositions = S.PagePositions;
+	Stats.PageBytes = static_cast<int64>(S.PageBytes);
+	Stats.PoolPages = L.PoolPages;
+	Stats.Sequences = Region(SuperSLMPaging::ERegion::S);
+	Stats.Prefixes = Region(SuperSLMPaging::ERegion::P);
+	Stats.RestoreHeadroom = Region(SuperSLMPaging::ERegion::H);
+	Stats.CacheSharing = Region(SuperSLMPaging::ERegion::A);
+	Stats.Cache = Region(SuperSLMPaging::ERegion::C);
+	Stats.LivePrefixCount = static_cast<int32>(L.LivePrefixCount);
+	Stats.GhostCount = static_cast<int32>(L.GhostCount);
+	Stats.InFlightRestores = static_cast<int32>(L.InFlightRestores);
+	Stats.WaitingRestores = static_cast<int32>(L.WaitingRestores);
+	Stats.FreeHeadroomPages = L.FreeHeadroomPages;
+	Stats.bHasPoolSnapshot = S.bHasPoolSnapshot;
+	if (S.bHasPoolSnapshot)
+	{
+		Stats.SnapshotPageCount = S.LastPoolStats.page_count;
+		Stats.SnapshotFreePages = S.LastPoolStats.free_pages;
+		Stats.SnapshotSharedPages = S.LastPoolStats.shared_pages;
+	}
+	return Stats;
+}
 int64 USuperSLMSubsystem::GetWorkspaceReservedBytes() const { return State ? State->WorkspaceBytesEach * State->Lanes.Num() : 0; }
 
 double USuperSLMSubsystem::GetTimeToFirstTokenMs(const FSuperSLMSequence& Sequence) const
@@ -5220,6 +7515,28 @@ int32 FSuperSLMSchedulingTestAccess::TickHorizon() { return kTickHorizon; }
 bool FSuperSLMSchedulingTestAccess::TryComputeK(double PlannedJobMs, double TickBudgetMs, int32& OutK)
 {
 	return ::TryComputeK(PlannedJobMs, TickBudgetMs, OutK);
+}
+
+// Both seams price Config as a configuration with no model would resolve it (decode-threading D4):
+// its set cost fields, and the effective mode's one-time profile for the rest.
+int32 FSuperSLMSchedulingTestAccess::PlanPrefillChunk(int32 MaxChunk, int64 StartDepth, double ShareMs, const FSuperSLMRuntimeConfig& Config)
+{
+	return ::PlanPrefillChunk(MaxChunk, StartDepth, ShareMs, Config.MinPrefillChunk, SuperSLMRuntimeResolve::Resolve(Config, nullptr));
+}
+
+double FSuperSLMSchedulingTestAccess::PrefillChunkCostMs(int32 Chunk, int64 StartDepth, const FSuperSLMRuntimeConfig& Config)
+{
+	return ::PrefillChunkCostMs(Chunk, StartDepth, SuperSLMRuntimeResolve::Resolve(Config, nullptr));
+}
+
+bool FSuperSLMSchedulingTestAccess::IsWorkerOverrun(double WorkerCallMs, int32 K, double TickBudgetMs)
+{
+	return SuperSLMPrefillPlanning::IsWorkerOverrun(WorkerCallMs, K, TickBudgetMs);
+}
+
+int32 FSuperSLMSchedulingTestAccess::TiledMinTokens()
+{
+	return SuperSLMPrefillPlanning::kTiledMinTokens;
 }
 
 bool FSuperSLMSchedulingTestAccess::TryCommitTick(int32 TickIndex, int32 K, int32& OutTick)
@@ -5258,5 +7575,388 @@ void FSuperSLMSchedulingTestAccess::SetNextResetStatusOverride(USuperSLMSubsyste
 int32 FSuperSLMSchedulingTestAccess::GetReportHistoryCapacity()
 {
 	return ReportHistoryRows();
+}
+#endif // WITH_DEV_AUTOMATION_TESTS
+
+// ---------------------------------------------------------------------------------------------
+// The paged-KV test seams (plugin paging plan §3.9, SuperSLMPagedTestSeam.h)
+// ---------------------------------------------------------------------------------------------
+
+#if WITH_DEV_AUTOMATION_TESTS
+namespace
+{
+	// The seam's request kinds onto this file's job kinds, one to one.
+	EPagedJobKind ToPagedJobKind(ESuperSLMPagedRequestKind Kind)
+	{
+		switch (Kind)
+		{
+		case ESuperSLMPagedRequestKind::Reset:         return EPagedJobKind::Reset;
+		case ESuperSLMPagedRequestKind::Return:        return EPagedJobKind::Return;
+		case ESuperSLMPagedRequestKind::Adopt:         return EPagedJobKind::Adopt;
+		case ESuperSLMPagedRequestKind::Restore:       return EPagedJobKind::Restore;
+		case ESuperSLMPagedRequestKind::PrefixBuild:   return EPagedJobKind::PrefixBuild;
+		case ESuperSLMPagedRequestKind::NestedBuild:   return EPagedJobKind::NestedBuild;
+		case ESuperSLMPagedRequestKind::PrefixRelease: return EPagedJobKind::PrefixRelease;
+		default:                                       break;
+		}
+		return EPagedJobKind::Count;
+	}
+
+	// RunOnPoolThread()'s access object: the engine verbs on the subsystem's own model and pool,
+	// called on the lane thread the callback runs on.
+	class FCpuPoolThreadAccess final : public FSuperSLMPoolThreadAccess
+	{
+	public:
+		FCpuPoolThreadAccess(sslm_model InModel, sslm_kv_pool* InPool) : Model(InModel), Pool(InPool) {}
+		virtual ~FCpuPoolThreadAccess() override { ReleaseAll(); }
+
+		virtual int64 PagePositions() const override { return sslm_kv_page_positions(Model); }
+		virtual int64 PageBytes() const override { return static_cast<int64>(sslm_kv_page_size(Model)); }
+		virtual int64 PagesForBudget(int32 Budget) const override { return static_cast<int64>(sslm_kv_pages_for_budget(Model, Budget)); }
+
+		virtual sslm_status CreateBudgeted(int32 Budget) override
+		{
+			sslm_seq Seq = nullptr;
+			const sslm_status Status = sslm_seq_create_budgeted(Model, Pool, Budget, &Seq);
+			if (Status == SSLM_OK && Seq != nullptr)
+			{
+				Held.Add(Seq);
+			}
+			return Status;
+		}
+		virtual sslm_status CreateWholeReserve() override
+		{
+			sslm_seq Seq = nullptr;
+			const sslm_status Status = sslm_seq_create(Model, Pool, &Seq);
+			if (Status == SSLM_OK && Seq != nullptr)
+			{
+				Held.Add(Seq);
+			}
+			return Status;
+		}
+		virtual int32 HeldCount() const override { return Held.Num(); }
+		virtual void ReleaseAll() override
+		{
+			for (int32 I = Held.Num() - 1; I >= 0; --I)
+			{
+				sslm_seq_release(Held[I]);
+			}
+			Held.Reset();
+		}
+
+	private:
+		sslm_model Model = nullptr;
+		sslm_kv_pool* Pool = nullptr;
+		TArray<sslm_seq> Held;
+	};
+
+	int32 SlotIndexOfState(const FSuperSLMSubsystemState* State, const FSuperSLMSequence& Sequence)
+	{
+		if (State == nullptr)
+		{
+			return INDEX_NONE;
+		}
+		const int32* Index = State->IdToSlot.Find(Sequence.Id);
+		return Index != nullptr ? *Index : INDEX_NONE;
+	}
+
+	const SuperSLMPaging::FNodeId* NodeOf(const FSuperSLMSubsystemState* State, const FSuperSLMPrefix& Prefix)
+	{
+		return (State != nullptr && State->IsBudgetMode()) ? State->PrefixIdToNode.Find(Prefix.Id) : nullptr;
+	}
+}
+
+bool FSuperSLMPagedTestSeam::RunOnPoolThread(USuperSLMSubsystem& Subsystem, TFunction<void(FSuperSLMPoolThreadAccess&)> Fn)
+{
+	FSuperSLMSubsystemState* State = Subsystem.State;
+	if (State == nullptr || State->Lanes.Num() == 0 || State->Lanes[0].Runnable == nullptr || !Fn)
+	{
+		return false;
+	}
+	// Quiesce: every posted job's Layer-1 work is finished (a HoldStart() job was never posted; a
+	// HoldApply() job has finished its work and waits only for its apply). Nothing is delivered
+	// here, so the job ledger and every result stay as they were.
+	for (;;)
+	{
+		bool bAllDone = true;
+		for (const FLane& Lane : State->Lanes)
+		{
+			for (const FLanePendingDelivery& Pending : Lane.Pending)
+			{
+				bAllDone &= Pending.WorkerJob.IsValid() && Pending.WorkerJob->bDone.load(std::memory_order_acquire);
+			}
+		}
+		if (bAllDone)
+		{
+			break;
+		}
+		FPlatformProcess::Sleep(0.0005f);
+	}
+	// Lane 0's queue is empty now, so this job runs next on its thread. It is enqueued directly,
+	// not posted: it has no ledger row and no delivery.
+	const sslm_model Model = State->Model;
+	sslm_kv_pool* Pool = &State->Pool;
+	FQueuedWorkerJobRef Job = MakeShared<FQueuedWorkerJob, ESPMode::ThreadSafe>();
+	Job->Execute = [Model, Pool, &Fn]()
+	{
+		FCpuPoolThreadAccess Access(Model, Pool);
+		Fn(Access);
+		Access.ReleaseAll();
+	};
+	State->Lanes[0].Runnable->Enqueue(Job);
+	while (!Job->bDone.load(std::memory_order_acquire))
+	{
+		FPlatformProcess::Sleep(0.0005f);
+	}
+	return true;
+}
+
+FSuperSLMPagedHold FSuperSLMPagedTestSeam::HoldStart(USuperSLMSubsystem& Subsystem, ESuperSLMPagedRequestKind Kind)
+{
+	FSuperSLMPagedHold Hold;
+	const EPagedJobKind JobKind = ToPagedJobKind(Kind);
+	if (Subsystem.State == nullptr || JobKind == EPagedJobKind::Count)
+	{
+		return Hold;
+	}
+	FSuperSLMSubsystemState::FPagedHold& Armed = Subsystem.State->PagedHolds.AddDefaulted_GetRef();
+	Armed.Id = GNextPagedHoldId++;
+	Armed.Kind = JobKind;
+	Armed.bApply = false;
+	Hold.Id = Armed.Id;
+	return Hold;
+}
+
+FSuperSLMPagedHold FSuperSLMPagedTestSeam::HoldApply(USuperSLMSubsystem& Subsystem, ESuperSLMPagedRequestKind Kind)
+{
+	FSuperSLMPagedHold Hold;
+	const EPagedJobKind JobKind = ToPagedJobKind(Kind);
+	if (Subsystem.State == nullptr || JobKind == EPagedJobKind::Count)
+	{
+		return Hold;
+	}
+	FSuperSLMSubsystemState::FPagedHold& Armed = Subsystem.State->PagedHolds.AddDefaulted_GetRef();
+	Armed.Id = GNextPagedHoldId++;
+	Armed.Kind = JobKind;
+	Armed.bApply = true;
+	Hold.Id = Armed.Id;
+	return Hold;
+}
+
+bool FSuperSLMPagedTestSeam::IsHoldReached(const USuperSLMSubsystem& Subsystem, const FSuperSLMPagedHold& Hold)
+{
+	if (Subsystem.State == nullptr || !Hold.IsValid())
+	{
+		return false;
+	}
+	const FSuperSLMSubsystemState::FPagedHold* Found = Subsystem.State->PagedHolds.FindByPredicate(
+		[&Hold](const FSuperSLMSubsystemState::FPagedHold& H) { return H.Id == Hold.Id; });
+	return Found != nullptr && Found->bReached && !Found->bReleased;
+}
+
+bool FSuperSLMPagedTestSeam::ReleaseHold(USuperSLMSubsystem& Subsystem, const FSuperSLMPagedHold& Hold)
+{
+	FSuperSLMSubsystemState::FPagedHold* Found = Subsystem.State != nullptr ? Subsystem.State->FindPagedHold(Hold.Id) : nullptr;
+	if (Found == nullptr || Found->bReleased)
+	{
+		return false;
+	}
+	Found->bReleased = true;
+	return true;
+}
+
+FSuperSLMPagedLedgerView FSuperSLMPagedTestSeam::Ledger(const USuperSLMSubsystem& Subsystem)
+{
+	FSuperSLMPagedLedgerView View;
+	const FSuperSLMSubsystemState* State = Subsystem.State;
+	View.LedgerFaults = Subsystem.PriorLedgerFaults + (State != nullptr ? static_cast<uint64>(State->Ledger.LedgerFaults()) : 0);
+	if (State == nullptr || !State->IsBudgetMode())
+	{
+		return View;
+	}
+	const SuperSLMPaging::FPageLedgerStats L = State->Ledger.GetStats();
+	View.bConfigured = L.bConfigured;
+	View.PoolPages = L.PoolPages;
+	for (int32 Region = 0; Region < static_cast<int32>(ESuperSLMPagedRegion::Count); ++Region)
+	{
+		View.Capacity[Region] = L.Regions[Region].Capacity;
+		View.Charged[Region] = L.Regions[Region].Charged;
+	}
+	View.TotalCharged = State->Ledger.TotalCharged();
+	View.LivePrefixCount = static_cast<int32>(L.LivePrefixCount);
+	View.GhostCount = static_cast<int32>(L.GhostCount);
+	View.InFlightRestores = static_cast<int32>(L.InFlightRestores);
+	View.WaitingRestores = static_cast<int32>(L.WaitingRestores);
+	return View;
+}
+
+int64 FSuperSLMPagedTestSeam::PrefixChargedPages(const USuperSLMSubsystem& Subsystem, const FSuperSLMPrefix& Prefix)
+{
+	const SuperSLMPaging::FNodeId* Node = NodeOf(Subsystem.State, Prefix);
+	if (Node == nullptr || !(Subsystem.State->Ledger.IsPrefixLive(*Node) || Subsystem.State->Ledger.IsGhost(*Node)))
+	{
+		return -1;
+	}
+	return Subsystem.State->Ledger.NodeChargedPages(*Node);
+}
+
+int32 FSuperSLMPagedTestSeam::PrefixDependentCount(const USuperSLMSubsystem& Subsystem, const FSuperSLMPrefix& Prefix)
+{
+	const SuperSLMPaging::FNodeId* Node = NodeOf(Subsystem.State, Prefix);
+	if (Node == nullptr || !(Subsystem.State->Ledger.IsPrefixLive(*Node) || Subsystem.State->Ledger.IsGhost(*Node)))
+	{
+		return -1;
+	}
+	return static_cast<int32>(Subsystem.State->Ledger.DependentCount(*Node));
+}
+
+bool FSuperSLMPagedTestSeam::IsPrefixGhost(const USuperSLMSubsystem& Subsystem, const FSuperSLMPrefix& Prefix)
+{
+	const SuperSLMPaging::FNodeId* Node = NodeOf(Subsystem.State, Prefix);
+	return Node != nullptr && Subsystem.State->Ledger.IsGhost(*Node);
+}
+
+int64 FSuperSLMPagedTestSeam::SequenceHeadroomHold(const USuperSLMSubsystem& Subsystem, const FSuperSLMSequence& Sequence)
+{
+	const int32 Index = SlotIndexOfState(Subsystem.State, Sequence);
+	if (Index == INDEX_NONE || !Subsystem.State->IsBudgetMode())
+	{
+		return -1;
+	}
+	return Subsystem.State->Ledger.SlotHeadroomHold(Index);
+}
+
+bool FSuperSLMPagedTestSeam::SequenceHasOpenJob(const USuperSLMSubsystem& Subsystem, const FSuperSLMSequence& Sequence)
+{
+	const int32 Index = SlotIndexOfState(Subsystem.State, Sequence);
+	return Index != INDEX_NONE && Subsystem.State->IsBudgetMode() && Subsystem.State->Ledger.SlotHasJob(Index);
+}
+
+int32 FSuperSLMPagedTestSeam::SlotIndexOf(const USuperSLMSubsystem& Subsystem, const FSuperSLMSequence& Sequence)
+{
+	return SlotIndexOfState(Subsystem.State, Sequence);
+}
+
+int64 FSuperSLMPagedTestSeam::SlotHolderGeneration(const USuperSLMSubsystem& Subsystem, int32 SlotIndex)
+{
+	const FSuperSLMSubsystemState* State = Subsystem.State;
+	if (State == nullptr || !State->Slots.IsValidIndex(SlotIndex))
+	{
+		return -1;
+	}
+	return State->Slots[SlotIndex].HolderGeneration;
+}
+
+bool FSuperSLMPagedTestSeam::ForceUnderCharge(USuperSLMSubsystem& Subsystem, ESuperSLMPagedChargeKind Kind, uint32 Pages)
+{
+	if (Subsystem.State == nullptr || !Subsystem.State->IsBudgetMode())
+	{
+		return false;
+	}
+#if SUPERSLM_PAGE_LEDGER_TEST_HOOKS
+	SuperSLMPaging::EChargeKind Charge = SuperSLMPaging::EChargeKind::Count;
+	switch (Kind)
+	{
+	case ESuperSLMPagedChargeKind::PrefixBuild:         Charge = SuperSLMPaging::EChargeKind::PrefixBuild; break;
+	case ESuperSLMPagedChargeKind::NestedBuild:         Charge = SuperSLMPaging::EChargeKind::NestedBuild; break;
+	case ESuperSLMPagedChargeKind::BudgetRestore:       Charge = SuperSLMPaging::EChargeKind::BudgetRestore; break;
+	case ESuperSLMPagedChargeKind::WholeReserveRestore: Charge = SuperSLMPaging::EChargeKind::WholeReserveRestore; break;
+	default:                                            break;
+	}
+	if (Charge == SuperSLMPaging::EChargeKind::Count)
+	{
+		return false;
+	}
+	Subsystem.State->Ledger.SetForceUnderChargeForTest(Charge, Pages);
+	return true;
+#else
+	(void)Kind;
+	(void)Pages;
+	return false;
+#endif
+}
+
+bool FSuperSLMPagedTestSeam::SetNextLayer1StatusOverride(USuperSLMSubsystem& Subsystem, ESuperSLMPagedRequestKind Kind, sslm_status Status)
+{
+	const EPagedJobKind JobKind = ToPagedJobKind(Kind);
+	if (Subsystem.State == nullptr || JobKind == EPagedJobKind::Count)
+	{
+		return false;
+	}
+	Subsystem.State->Layer1Overrides[static_cast<int32>(JobKind)] = Status;
+	return true;
+}
+
+bool FSuperSLMPagedTestSeam::EditPayload(TArray<uint8>& WrappedBlob, TFunctionRef<void(TArray<uint8>& Payload)> Edit)
+{
+	SuperSLMSaveBlob::FContents Contents;
+	const uint8* Payload = nullptr;
+	int64 PayloadBytes = 0;
+	FString Error;
+	if (!SuperSLMSaveBlob::Read(WrappedBlob, Contents, Payload, PayloadBytes, Error) || Payload == nullptr)
+	{
+		return false;
+	}
+	// The payload is the wrapper's last field, preceded by its u64 size: everything before that
+	// size is kept byte for byte.
+	const int64 PayloadOffset = static_cast<int64>(Payload - WrappedBlob.GetData());
+	// Plugin paging plan §3.9 (K7): a GPU blob's payload is the GPU subsystem's own section ('SLUG'
+	// v1: a 24-byte head, 12 bytes per carried event, the u64 Layer-1 length) followed by the Layer-1
+	// bytes, so the edit sees the Layer-1 payload alone, as on the CPU, and the section's recorded
+	// Layer-1 length is rewritten with the wrapper's payload size. Its layout is
+	// SuperSLMGpuSubsystem.cpp's (FinalizeSaveOp()); a GPU payload without the section is edited whole.
+	int64 Layer1Offset = 0;
+	if (Contents.Backend == ESuperSLMBackend::GPU && PayloadBytes >= 32 && Payload[0] == 'S' && Payload[1] == 'L' && Payload[2] == 'U' && Payload[3] == 'G')
+	{
+		uint32 CarriedCount = 0;
+		for (int32 B = 0; B < 4; ++B)
+		{
+			CarriedCount |= static_cast<uint32>(Payload[20 + B]) << (8 * B);
+		}
+		const int64 SectionBytes = 24 + 12 * static_cast<int64>(CarriedCount) + 8;
+		if (SectionBytes > PayloadBytes)
+		{
+			return false;
+		}
+		Layer1Offset = SectionBytes;
+	}
+	TArray<uint8> Edited;
+	Edited.Append(Payload + Layer1Offset, static_cast<int32>(PayloadBytes - Layer1Offset));
+	Edit(Edited);
+	TArray<uint8> NewPayload;
+	if (Layer1Offset > 0)
+	{
+		NewPayload.Append(Payload, static_cast<int32>(Layer1Offset - 8));
+		const uint64 Layer1Length = static_cast<uint64>(Edited.Num());
+		for (int32 B = 0; B < 8; ++B)
+		{
+			NewPayload.Add(static_cast<uint8>(Layer1Length >> (8 * B)));
+		}
+	}
+	NewPayload.Append(Edited);
+	WrappedBlob.SetNum(static_cast<int32>(PayloadOffset), EAllowShrinking::No);
+	WrappedBlob.Append(NewPayload);
+	SuperSLMSaveBlob::FinalizePayload(WrappedBlob, PayloadOffset, NewPayload.Num());
+	return true;
+}
+
+bool FSuperSLMPagedTestSeam::SetWrapperContextUsed(TArray<uint8>& WrappedBlob, int64 ContextUsed)
+{
+	SuperSLMSaveBlob::FContents Contents;
+	const uint8* Payload = nullptr;
+	int64 PayloadBytes = 0;
+	FString Error;
+	if (!SuperSLMSaveBlob::Read(WrappedBlob, Contents, Payload, PayloadBytes, Error))
+	{
+		return false;
+	}
+	// The wrapper's "context positions used" field, little-endian at offset 112
+	// (SuperSLMSaveBlob.h's layout).
+	constexpr int32 kContextUsedOffset = 112;
+	for (int32 I = 0; I < 8; ++I)
+	{
+		WrappedBlob[kContextUsedOffset + I] = static_cast<uint8>(static_cast<uint64>(ContextUsed) >> (8 * I));
+	}
+	return true;
 }
 #endif // WITH_DEV_AUTOMATION_TESTS

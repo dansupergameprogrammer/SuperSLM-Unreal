@@ -1,0 +1,17 @@
+{
+	"artifact_path": "qwen2.5-0.5b-instruct-cap4096-aex-pr.sslm",
+	"artifact_hash": "83e96aa46e1404c824e2bfea22e1511a528298a2edd32299e69a77f414e2007a",
+	"cap": 4096,
+	"tasks": 4,
+	"blocks_per_mode": 3,
+	"block_scope": "Three sequential measurement blocks per mode in one process; actual full-context setup is prepared once per mode. No independence or accuracy bound is claimed.",
+	"warmup_per_arm_mode": 50,
+	"timed_per_arm_mode": 50,
+	"timer_ms_per_cycle": 9.9999999999999991e-05,
+	"elapsed_s": 204.06668099761009,
+	"whole_run_box_busy_pct": 12.121197619691383,
+	"whole_run_own_pct": 3.1811623505427957,
+	"whole_run_foreign_pct": 8.9400352691485878,
+	"load_scope": "Whole-run interval averages including actual full-context preparation; not per-call load, not an idle-box verdict or an accuracy bound.",
+	"observations": "observed_* are actual ABI sequence stats: the adopter, restored sequence, or an adopter of the newly frozen empty Begin prefix. call_budget is the target's pre-existing adopt budget or the restore/Begin budget."
+}

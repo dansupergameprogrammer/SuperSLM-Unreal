@@ -37,10 +37,15 @@
 // Build (see run_axes.sh / run_axes.ps1):
 //   <cxx> -std=c++20 -I<repo>/include <repo>/src/*.cpp sslm_axis_digest.cpp -o sslm_axis_digest
 
+#include "superslm/forward_sites.h"  // QkQ31ScoreRow (section 11, slice S5)
 #include "superslm/intmath.h"
 #include "superslm/matmul.h"
 #include "superslm/sha256.h"
 #include "superslm/silu_lut.h"
+// Attention and per-row sites plan, section 10's fixed input set (header-only, shared with the golden
+// generator and the suite; included by path so this tool keeps its one-line build recipe).
+#include "../../tests/support/attention_cases.h"
+#include "../../tests/support/rowsite_cases.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -627,6 +632,97 @@ void SectionMatmul() {
 	}
 }
 
+// --- 9. C17 matmul, tiled shapes: stacking cases at M >= 8 --------------------------
+//
+// Tiled-matmul plan slice 1, cell 6.2. On the AVX2 and AVX-512 tiers a GEMM call of 8 or more tokens
+// runs the register-tiled kernel, which section 8 reaches only by chance (its random batches stop at 9
+// tokens). These cases pin it on every digest leg: M in {8, 32} x N in {32, 48}, at K values that cross
+// the packer's 16-wide transpose, its scalar tail and the odd-K pad. Each batched call is checked
+// against the single-row form (the stacking property) and the scalar reference, and digested. A new
+// section, so sections 1-8 keep their previous values exactly.
+void SectionMatmulTiled() {
+	Section& sec = NewSection("c17_matmul_tiled");
+
+	Rng rng(0x7A1ED7A1ED7A1EDULL);
+	static const size_t kTokens[] = {8, 32};
+	static const size_t kOut[] = {32, 48};
+	static const size_t kIn[] = {17, 64, 1023};
+	for (size_t toks : kTokens) {
+		for (size_t out_c : kOut) {
+			for (size_t in_c : kIn) {
+				std::vector<int8_t> act(toks * in_c), wgt(out_c * in_c);
+				for (size_t i = 0; i < act.size(); ++i) act[i] = static_cast<int8_t>(rng.InRange(-127, 127));
+				for (size_t i = 0; i < wgt.size(); ++i) wgt[i] = static_cast<int8_t>(rng.InRange(-128, 127));
+
+				std::vector<int64_t> batched(toks * out_c, 0);
+				superslm::GemmInt8Accumulate(act.data(), wgt.data(), toks, in_c, out_c, batched.data());
+
+				std::vector<int64_t> single(out_c, 0);
+				for (size_t t = 0; t < toks; ++t) {
+					superslm::GemmInt8AccumulateRow(act.data() + t * in_c, wgt.data(), in_c, out_c,
+					                                single.data());
+					for (size_t j = 0; j < out_c; ++j) {
+						if (single[j] != batched[t * out_c + j]) {
+							sec.ok = false;
+							sec.note = "stacking equivalence broken at M >= 8";
+						}
+						const int64_t ref = superslm::DotRowScalarRef(act.data() + t * in_c,
+						                                              wgt.data() + j * in_c, in_c);
+						if (ref != batched[t * out_c + j]) {
+							sec.ok = false;
+							sec.note = "scalar reference != batched gemm at M >= 8";
+						}
+						sec.sink.I64(batched[t * out_c + j]);
+					}
+				}
+			}
+		}
+	}
+}
+
+// --- 10. The per-row sites: tables and element loops ------------------------------
+//
+// Attention and per-row sites plan (rev 3.1), §3.3 evidence 2, cell 6.2. RmsNormSite, MlpActSite and
+// ResidualReconcileSite over tests/support/rowsite_cases.h's fixed set, which sits on both sides of the
+// per-row table threshold (widths 1 to 4,864 around 512), carries -128 codes, uniform rows, a small
+// gate scale and landing-flag rows (slice S1's entries), then slice S3's requant rows through
+// RequantChainChecked (every width around the 4- and 8-lane SIMD bodies, +-d' in every lane position,
+// every s the funnel's preflight can produce, the P = 2^63 corner). Every call's status, output scale
+// and whole output row are digested. The forced-scalar leg runs the v1.9.0
+// per-element loops (tables off), so it is the reference axis this section is compared against; the
+// suite pins the same stream to a hash from the v1.9.0 tag. A new section, so sections 1-9 keep their
+// previous values exactly.
+void SectionRowsites() {
+	Section& sec = NewSection("c_rowsites");
+	auto emit = [&](int64_t v) { sec.sink.I64(v); };
+	superslm_rowsite_cases::RunRowTableCases(emit);
+	superslm_rowsite_cases::RunRequantRowCases(emit);
+}
+
+// --- 11. The attention kernels ------------------------------------------------------
+//
+// Attention and per-row sites plan (rev 3.1), §3.3 evidence 2, cell 6.2. GemmProbQ15Accumulate over
+// tests/support/attention_cases.h's fixed set (slice S2's entries: plan §8 4.S2's head_dim x width grid,
+// the int16 condition's corners, width 0 and 2.S2's hostile rows; slices S4-S6 append theirs). Every
+// call's width, head_dim and whole output row are digested. The forced-scalar and forced-SSE2 legs run
+// the v1.9.0 loop, so they are the reference axes; the suite pins the same stream to a hash from the
+// v1.9.0 tag. A new section, so sections 1-10 keep their previous values exactly.
+//
+// Slice S4 appends SoftmaxRowQ15 over the same header's S4 set (§8 4.S4's grid, inside corners and
+// correction rows, 2.S4's hostile rows; per call its width, bool and output row), as §3.3 evidence 2 has
+// c32_attention carry the S2, S4, S5 and S6 entries. The suite pins the S4 stream to its own hash.
+//
+// Slice S5 appends QkQ31ScoreRow over the same header's S5 set (§8 4.S5's head_dim x width grid in three
+// operand kinds, 7.S5b's margin corners, 7.S5c's rounding ties; per call its width, head_dim and scores). Every
+// ratio is in [1, 2^31] (§3.3). The suite pins the S5 stream to its own hash, from the v1.9.0 per-key loop.
+void SectionAttention() {
+	Section& sec = NewSection("c32_attention");
+	auto emit = [&](int64_t v) { sec.sink.I64(v); };
+	superslm_attention_cases::RunProbVCases(emit);
+	superslm_attention_cases::RunSoftmaxCases(emit);
+	superslm_attention_cases::RunQ31Cases(emit, superslm::QkQ31ScoreRow);
+}
+
 // --- driver ---------------------------------------------------------------------
 
 void PrintBuildIdentity() {
@@ -665,6 +761,13 @@ void PrintBuildIdentity() {
 	std::printf("# arch: other (matmul scalar fallback active)\n");
 #endif
 	std::printf("# int64_digits: %d\n", static_cast<int>(sizeof(long long) * 8));
+	// Tiled-matmul plan slice 1 (§11, the dispatched-tier line): which GEMM tier this binary dispatches
+	// on this runner, and whether a call of 8 tokens takes the tiled kernel. Printed, never digested:
+	// it is the evidence of which kernel an auto leg's digest actually exercised.
+	static const char* const kTierNames[] = {"scalar", "SSE2", "AVX2", "AVX-512"};
+	const superslm::detail::GemmTier tier = superslm::detail::ActiveGemmTier();
+	std::printf("# gemm tier: %s; tiled at M >= 8: %s\n", kTierNames[static_cast<int>(tier)],
+	            superslm::detail::DispatchGemmPath(tier, 8) == superslm::detail::GemmPath::kTiled ? "yes" : "no");
 }
 
 }  // namespace
@@ -680,6 +783,9 @@ int main() {
 	SectionRope();
 	SectionSiluLut();
 	SectionMatmul();
+	SectionMatmulTiled();
+	SectionRowsites();
+	SectionAttention();
 
 	Sha256 global;
 	int failures = 0;

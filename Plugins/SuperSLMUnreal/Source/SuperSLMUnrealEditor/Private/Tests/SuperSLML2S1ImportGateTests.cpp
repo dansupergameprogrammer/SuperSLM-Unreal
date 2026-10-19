@@ -330,6 +330,7 @@ bool FSuperSLML2S1HitchCounterFidelityTest::RunTest(const FString& Parameters)
 		OutWorkerOverruns = 0;
 		OutLateByTicksOnly = 0;
 		int32 HitchFlagMismatches = 0;
+		int32 OverrunFlagMismatches = 0;
 		int32 SpansMissing = 0;
 		for (const FSuperSLMWorkerJobReport& Job : Ledger)
 		{
@@ -340,15 +341,21 @@ bool FSuperSLML2S1HitchCounterFidelityTest::RunTest(const FString& Parameters)
 			++OutDeliveredJobs;
 			SpansMissing += Job.WorkerSpanMs < 0.0 ? 1 : 0;
 			const bool bLateByTicks = Job.DeliveredAtTick > Job.CommittedDeliveryTick;
-			const bool bLate = bLateByTicks && Job.WorkerSpanMs > double(Job.K) * TickBudgetMs;
+			const bool bLate = bLateByTicks && Job.WorkerSpanMs > double(Job.ChainedWaitTicks + Job.K) * TickBudgetMs; // 1.1: plan §5 item 1a
 			OutLateJobs += bLate ? 1 : 0;
 			OutLateByTicksOnly += (bLateByTicks && !bLate) ? 1 : 0;
-			OutWorkerOverruns += Job.WorkerCallMs > TickBudgetMs ? 1 : 0;
+			// Slice 1P item 4: an overrun is the job's own Layer-1 time over its own K ticks (never
+			// ChainedWaitTicks + K); at K = 1 this is 1.0's rule.
+			const bool bOverran = Job.WorkerCallMs > double(Job.K) * TickBudgetMs;
+			OutWorkerOverruns += bOverran ? 1 : 0;
 			HitchFlagMismatches += Job.bHitch != bLate ? 1 : 0;
+			OverrunFlagMismatches += Job.bWorkerOverran != bOverran ? 1 : 0;
 		}
 		bOk &= TestEqual(TEXT("every delivered job carries its worker span (WorkerSpanMs >= 0)"), SpansMissing, 0);
 		bOk &= TestEqual(TEXT("every delivered job's bHitch equals (late by ticks AND WorkerSpanMs > K x TickBudgetMs)"),
 			HitchFlagMismatches, 0);
+		bOk &= TestEqual(TEXT("every delivered job's bWorkerOverran equals (WorkerCallMs > K x TickBudgetMs)"),
+			OverrunFlagMismatches, 0);
 		return OutLateJobs + OutWorkerOverruns;
 	};
 
@@ -396,7 +403,12 @@ bool FSuperSLML2S1HitchCounterFidelityTest::RunTest(const FString& Parameters)
 	// is measured against for bWorkerOverran (SuperSLMSequenceTypes.h: "a Layer-1 call inside this
 	// job measured over TickBudgetMs, reported on this job regardless of K's own headroom"), a
 	// property that holds by construction and needs no scheduling race, no contention, and no
-	// assumption about K/delivery timing at all. Pacing: see the drain below (review round 4, R4-S1). ---
+	// assumption about K/delivery timing at all. Pacing: see the drain below (review round 4, R4-S1).
+	// Slice 1P item 4 (plan of record rev 11.1) retires the by-construction half of that: an
+	// overrun is now a call over its own K x TickBudgetMs, and K here is sized from the planned
+	// cost, so a call overruns only when it runs longer than it was priced. This arm now checks
+	// each job's flag against that rule (in CountExpectedHitches) and the counter against the
+	// ledger; Arm 3 (K = 1) carries the overrun's vitality. ---
 	{
 		FSuperSLMRuntimeConfig Config;
 		Config.MaxSequencesPerDecodeCall = 1;
@@ -440,7 +452,21 @@ bool FSuperSLML2S1HitchCounterFidelityTest::RunTest(const FString& Parameters)
 		AddInfo(FString::Printf(TEXT("hitch fidelity: %d jobs delivered, %d late (by ticks and real time), %d late by ticks only (not hitches), %d worker overruns, hitch count %d"),
 			DeliveredJobs, LateJobs, LateByTicksOnly, WorkerOverruns, Subsystem->GetHitchCount()));
 		bOk &= TestTrue(TEXT("small-budget arm must deliver jobs"), DeliveredJobs > 0);
-		bOk &= TestEqual(TEXT("every delivered job must overrun the small per-call budget"), WorkerOverruns, DeliveredJobs);
+		// 1.1 (plan §5 item 1a): a continuation that reached the worker after its generation ended
+		// made no Layer-1 call (bSkippedContinuation), so it has no call to overrun.
+		int32 SkippedContinuations = 0;
+		for (const FSuperSLMWorkerJobReport& Job : Subsystem->GetJobLedger())
+		{
+			SkippedContinuations += (Job.DeliveredAtTick >= 0 && Job.bSkippedContinuation) ? 1 : 0;
+		}
+		// Slice 1P item 4: a job that made no Layer-1 call has no call to overrun, whatever its K.
+		int32 SkippedOverruns = 0;
+		for (const FSuperSLMWorkerJobReport& Job : Subsystem->GetJobLedger())
+		{
+			SkippedOverruns += (Job.DeliveredAtTick >= 0 && Job.bSkippedContinuation && Job.bWorkerOverran) ? 1 : 0;
+		}
+		bOk &= TestEqual(*FString::Printf(TEXT("no skipped continuation reports an overrun (%d skipped continuations made no call)"), SkippedContinuations),
+			SkippedOverruns, 0);
 		bOk &= TestEqual(*FString::Printf(TEXT("small-budget hitch count must equal late deliveries (%d) plus worker overruns (%d)"),
 			LateJobs, WorkerOverruns), Subsystem->GetHitchCount(), ExpectedHitches);
 #else
@@ -483,11 +509,15 @@ bool FSuperSLML2S1HitchCounterFidelityTest::RunTest(const FString& Parameters)
 		Config.BlockCount = 1;
 		Config.SequenceLifecycleBudgetMs = 100000.0;
 		Config.TickBudgetMs = 2.0;
-		Config.LayerCostMs = 0.001;
-		Config.LayerCostPerPositionMs = 0.0;
-		Config.PromptTokenCostMs = 0.001;
-		Config.PromptTokenCostPerPositionMs = 0.0;
-		Config.FinishCostMs = 0.001;
+		SuperSLMConfigAccess::SetCost(Config, TEXT("LayerCostMs"), 0.001);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("LayerCostPerPositionMs"), 0.0);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("PromptTokenCostMs"), 0.001);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("PromptTokenCostPerPositionMs"), 0.0);
+		// Slice 1P item 2: prefill chunks of 8 or more are priced with the batched pair, whose 36 ms
+		// default would plan them at K > 1. Priced near zero with the rest.
+		SuperSLMConfigAccess::SetCost(Config, TEXT("BatchedPromptTokenCostMs"), 0.001);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("BatchedPromptTokenCostPerPositionMs"), 0.0);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("FinishCostMs"), 0.001);
 		if (!TestEqual(TEXT("Configure() result (under-priced)"), (uint8)Subsystem->Configure(Model, Config).Result, (uint8)ESuperSLMConfigureResult::Success))
 		{
 			return false;
@@ -527,6 +557,10 @@ bool FSuperSLML2S1HitchCounterFidelityTest::RunTest(const FString& Parameters)
 			DeliveredJobs, LateJobs, LateByTicksOnly, WorkerOverruns, Subsystem->GetHitchCount()));
 		bOk &= TestTrue(TEXT("under-priced arm must deliver jobs"), DeliveredJobs > 0);
 		bOk &= TestTrue(TEXT("under-priced arm: at least one job is late on both halves (LateJobs > 0)"), LateJobs > 0);
+		// Slice 1P item 4 (M11-4d): at K = 1 the own-K rule is 1.0's rule, and every real A-EX job
+		// runs tens of ms against a 2 ms budget, so overruns must still be reported.
+		bOk &= TestTrue(*FString::Printf(TEXT("under-priced arm: at K = 1 at least one worker overrun is reported (got %d)"), WorkerOverruns),
+			WorkerOverruns >= 1);
 		bOk &= TestTrue(*FString::Printf(TEXT("under-priced arm: hitch count (%d) >= late jobs (%d)"), Subsystem->GetHitchCount(), LateJobs),
 			Subsystem->GetHitchCount() >= LateJobs);
 		bOk &= TestEqual(*FString::Printf(TEXT("under-priced hitch count must equal late deliveries (%d) plus worker overruns (%d)"),

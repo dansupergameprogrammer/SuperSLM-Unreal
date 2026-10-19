@@ -477,11 +477,14 @@ bool FSuperSLMU1CpuHitchCountedAfterLedgerRowEvictedTest::RunTest(const FString&
 	// Every real Layer-1 call takes far longer than 0.1 ms, so every delivered job overruns. The
 	// static costs are priced near zero so that K is 1 and a whole token or prompt is one job.
 	Config.TickBudgetMs = 0.1;
-	Config.LayerCostMs = 0.001;
-	Config.LayerCostPerPositionMs = 0.0;
-	Config.PromptTokenCostMs = 0.001;
-	Config.PromptTokenCostPerPositionMs = 0.0;
-	Config.FinishCostMs = 0.001;
+	SuperSLMConfigAccess::SetCost(Config, TEXT("LayerCostMs"), 0.001);
+	SuperSLMConfigAccess::SetCost(Config, TEXT("LayerCostPerPositionMs"), 0.0);
+	SuperSLMConfigAccess::SetCost(Config, TEXT("PromptTokenCostMs"), 0.001);
+	SuperSLMConfigAccess::SetCost(Config, TEXT("PromptTokenCostPerPositionMs"), 0.0);
+	// Slice 1P item 2: chunks of 8 or more are priced with the batched pair; priced near zero too.
+	SuperSLMConfigAccess::SetCost(Config, TEXT("BatchedPromptTokenCostMs"), 0.001);
+	SuperSLMConfigAccess::SetCost(Config, TEXT("BatchedPromptTokenCostPerPositionMs"), 0.0);
+	SuperSLMConfigAccess::SetCost(Config, TEXT("FinishCostMs"), 0.001);
 	{
 		// One row per ring, applied at this Configure() and then restored to the default.
 		FSuperSLMSchedulingTestAccess::FScopedReportHistoryCapacity OneRow(1);

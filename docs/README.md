@@ -22,7 +22,8 @@ Start with the repository [README](../README.md) for what the plugin does, and
 | [ASSETS_AND_IMPORT.md](ASSETS_AND_IMPORT.md) | The `.sslm` model asset, import validation, cooking, schemas, adapters, the GPU head option. |
 | [DETERMINISM.md](DETERMINISM.md) | What is guaranteed, the per-device GPU question, and the self-check with its limits. |
 | [PROFILING.md](PROFILING.md) | Trace channels, timing scopes, counters, stats, CSV categories and bookmarks. |
-| [TOOLING.md](TOOLING.md) | The editor tools, the calibration command, and the optional MCP toolset. |
+| [PAGING.md](PAGING.md) | 1.2.0's budget mode, shared/nested prefixes, generation limits, restore bursts and compatibility, saves across releases, page statistics and the GPU pool cap. |
+| [TOOLING.md](TOOLING.md) | The editor tools, the cost estimate and decode-settings commands, and the optional MCP toolset. |
 
 ## SuperSLM
 

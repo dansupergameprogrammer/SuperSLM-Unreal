@@ -87,6 +87,11 @@ enum class ESuperSLMGpuFaultReason : uint8
 	// to CPU (plan §5); "no cause is reported to gameplay, because the ABI carries
 	// none" -- this enum is a PLUGIN-INTERNAL diagnostic, not a gameplay-facing result.
 	TerminalDeviceLost,
+	// Plugin paging plan §3.4 (F3): a pooled sequence reached its own limit,
+	// min(origin + budget, ContextCap), below ContextCap -- at activation (context used + prompt >
+	// limit) or at the token boundary after the limit's ready token (E7). At ContextCap the existing
+	// cap outcome fires instead. Appended last so every earlier value keeps its number.
+	KvBudgetExceeded,
 };
 
 // GPU-side adapter handle -- distinct from the CPU backend's FSuperSLMAdapterHandle

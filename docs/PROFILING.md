@@ -36,8 +36,9 @@ thread (the blocking calls outside the frame are listed in
 worker is a named thread (`SuperSLM CPU Worker N`) with its own track in the Timing view. On the
 worker, `SuperSLM.WorkerJob` wraps each job, and inside it scopes name the prefill (per prompt
 token), the decode layers, the token finish, and each lifecycle and pool operation. When
-`FinishParallelTasks` is above 1, `SuperSLM.FinishTask` scopes show where the finish's pieces ran on
-the engine's task workers.
+`FinishParallelTasks` is above 1, `SuperSLM.ParallelTask` scopes show where the finish's pieces ran on
+the engine's task workers. With `bParallelDecode` enabled, the same scope also covers decode
+projection work dispatched through the hook.
 
 **GPU backend.** The game thread shows `SuperSLM.Gpu.Tick`, with `SuperSLM.Gpu.Tick.Plan` and
 `SuperSLM.Gpu.Tick.Apply`. The submission thread shows `SuperSLM.Gpu.SubmissionJob`, and inside it

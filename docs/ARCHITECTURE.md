@@ -1,7 +1,7 @@
 # Architecture
 
-> **Status:** everything in this document is built and tested on Windows x64. See also
-> [BLUEPRINT_API.md](BLUEPRINT_API.md) and [TOOLING.md](TOOLING.md).
+> **Status:** the implemented Windows x64 architecture as of 1.2.0. See [PAGING.md](PAGING.md) for
+> the paging API, and [BLUEPRINT_API.md](BLUEPRINT_API.md) and [TOOLING.md](TOOLING.md).
 
 ---
 
@@ -50,9 +50,11 @@ upstream on its own merits, never made as a convenience for the plugin.
 The plugin compiles SuperSLM's sources with the engine's toolchain. It never links a prebuilt
 SuperSLM library.
 
-- The sources of one SuperSLM release tag are vendored, unmodified, under
-  `Plugins/SuperSLMUnreal/Source/ThirdParty/SuperSLM/`. `VENDORED_VERSION.txt` names the tag and commit,
-  and `VENDORED_MANIFEST.sha256` records each file's hash. The build reads the tag and commit from
+- The library sources of one exact SuperSLM commit are vendored under
+  `Plugins/SuperSLMUnreal/Source/ThirdParty/SuperSLM/`; 1.2.0 vendors SuperSLM v1.13.1
+  (d697927f6d5ce5fa73ecbb8660020a425518b923). `VENDORED_VERSION.txt` names the tag and its commit,
+  and `VENDORED_MANIFEST.sha256` records each file's hash. Five route-P witness tool files carry
+  a tracked hook-API adaptation described in `VENDORED_VERSION.txt`. The build reads the tag and commit from
   `VENDORED_VERSION.txt` and compiles them into the plugin, so every report and save blob can name
   the exact SuperSLM it came from.
 - At 1.0, the runtime module compiles SuperSLM's CPU library and, on Windows, its D3D12 GPU
@@ -70,7 +72,7 @@ SuperSLM library.
 
 | Module | Type | Contents |
 |---|---|---|
-| `SuperSLMUnreal` | Runtime | The model asset, both subsystems and their schedulers, save and restore, the self-check, the calibration command, instrumentation, the model inspector, the Blueprint surface (the function library, the **Load SuperSLM Model** and **Run Determinism Self-Check** nodes, and `USuperSLMQuery`), and the compiled SuperSLM sources. |
+| `SuperSLMUnreal` | Runtime | The model asset, both subsystems and their schedulers, save and restore, the self-check, the cost estimate and decode-settings commands, instrumentation, the model inspector, the Blueprint surface (the function library, the **Load SuperSLM Model** and **Run Determinism Self-Check** nodes, and `USuperSLMQuery`), and the compiled SuperSLM sources. |
 | `SuperSLMUnrealEditor` | Editor | The `.sslm` import factory and asset actions, the model's asset editor, the SuperSLM Query Window, the schema dry-run, the conversion pre-check, and the automation tests. |
 | `SuperSLMUnrealTests` | DeveloperTool | Tests that must run in a packaged build. |
 
@@ -186,33 +188,60 @@ configuration joins the worker threads); they are listed under *Blocking calls* 
   (`BudgetHeadroom` defaults to 0.7). `TickBudgetMs` bounds the worker's CPU time per job, not the
   game's frame. The planned cost comes from **fixed per-unit costs in the configuration**:
 
-  | Field | Default (ms) | Priced unit |
+  | Field | Mode 0 / mode 1 default (ms) | Priced unit |
   |---|---|---|
-  | `LayerCostMs` + `LayerCostPerPositionMs` × depth | 2.0 + 0.001 × depth | one decode layer at a given context depth |
-  | `PromptTokenCostMs` + `PromptTokenCostPerPositionMs` × depth | 36.0 + 0.021 × depth | one prompt token |
-  | `FinishCostMs` | 5.3 | one token finish |
-  | `ResetCostMs`, `AdoptCostMs`, `SaveCostMs`, `RestoreCostMs` | 2.1, 2.5, 2.5, 4.2 | one lifecycle operation |
-  | `PrefixBeginCostMs`, `PrefixReleaseCostMs` | 2.0, 2.0 | one shared-prefix operation |
+  | `LayerCostMs` + `LayerCostPerPositionMs` × depth | 1.397 + 0.000186 × depth / 0.906 + 0.000254 × depth | one decode layer at a given context depth |
+  | `PromptTokenCostMs` + `PromptTokenCostPerPositionMs` × depth | 33.583 + 0.004547 × depth / 22.108 + 0.005209 × depth | one prompt token, in a prefill call of fewer than 8 tokens |
+  | `BatchedPromptTokenCostMs` + `BatchedPromptTokenCostPerPositionMs` × depth | 15.023 + 0.004791 × depth / 15.682 + 0.004437 × depth | one prompt token, in a prefill call of 8 tokens or more |
+  | `FinishCostMs` | 5.836 / 5.929 | one token finish |
+  | `ResetCostMs`, `AdoptCostMs`, `SaveCostMs`, `RestoreCostMs` | 2.369, 2.648, 2.691, 4.644 / 2.397, 2.731, 2.744, 4.766 | one lifecycle operation |
+  | `PrefixBeginCostMs`, `PrefixReleaseCostMs` | 2.261, 2.247 / 2.425, 2.440 | one shared-prefix operation |
 
-  The defaults are rounded-up medians measured on one machine (AMD Ryzen 9 3950X, 0.5B example
-  model), except `LayerCostMs` and `LayerCostPerPositionMs`, which were **set by hand** above the
-  measured values: the calibration command's layer measurement under-prices layers run inside a
-  real job.
-- **Calibrating for your hardware.** `SuperSLM.CalibrateCosts <path-to-model.sslm>` measures these
-  costs on the machine it runs on and writes them to `Saved/SuperSLM/CalibratedCosts.ini`, which the
-  plugin does not read back (see [TOOLING.md](TOOLING.md)). It needs an otherwise idle machine and refuses to report while
-  other processes are loading the CPU. Because its layer figure runs low, keep `LayerCostMs` at or
-  above the shipped default unless you have measured jobs directly. An under-priced cost lets a job
-  run past its CPU share; an over-priced one only lowers throughput.
+  Mode 0 is decode threading off and mode 1 is `bParallelDecode` on (below). The two profiles are
+  rounded-up medians from six per-call capture blocks on one machine (an AMD Ryzen 9 3950X, Zen 2,
+  with the 0.5B example model, `FinishParallelTasks` 4): reasonable measured starting costs, not
+  certified ones. An under-priced cost lets a job run past its CPU share; an over-priced one only
+  lowers throughput. Layers timed inside a real job have read higher than layers timed alone, and
+  the job's planned and measured times are both reported, so a project can check its own.
+  In budget mode, the three adopt/restore/prefix-Begin defaults come from the separate
+  full-cap measurements in [PAGING.md](PAGING.md#7-cpu-scheduling-costs). Legacy mode and
+  the other ten default fields retain the table above; caller and saved values keep priority.
+- **How each field resolves.** The decode mode, `FinishParallelTasks` and the thirteen cost fields
+  are optional (`TOptional`). An assignment sets a field whatever its value. At `Configure()` (or
+  `BeginConfigure()`, on the calling thread) each field resolves on its own: the caller's value if
+  set; else, for the mode and task count, the running editor's `SuperSLM.SetDecodeMode` /
+  `SuperSLM.SetFinishParallelTasks` choice, then the value saved in `Saved/SuperSLM/RuntimeSettings.ini`,
+  then off and 4; for a cost field, a saved estimate in `Saved/SuperSLM/CalibratedCosts.ini` for the
+  same artifact, effective mode and task count, then the effective mode's profile above. The
+  effective mode is `bParallelDecode` with `FinishParallelTasks` above 1, because the decode
+  projections ride on the finish hook. `FSuperSLMConfigureReport::Resolved` and
+  `USuperSLMSubsystem::GetResolvedConfig()` carry what was resolved, and `Configure()` logs
+  `SuperSLM: CPU Configure: bParallelDecode=<0|1> FinishParallelTasks=<n> cost profile=<caller|saved-estimate|mode-default> caller_cost_fields=<0..13>`.
+  A saved estimate with a missing, non-finite or out-of-range value, or one that would put a job
+  past the scheduler's tick limit where the mode profile would not, is skipped with one warning.
+- **Decode threading.** `bParallelDecode` (off by default) splits each CPU one-row decode
+  projection across the finish hook's tasks. Tokens are identical either way.
+  `SuperSLM.SetDecodeMode 0|1 [--save]` and `SuperSLM.SetFinishParallelTasks <0..256> [--save]`
+  choose the mode and task count for the next configuration that leaves them unset; a
+  configuration already made keeps its settings. `--save` keeps the choice in
+  `Saved/SuperSLM/RuntimeSettings.ini`, which later sessions, packaged games included, load.
+- **Estimating costs on your hardware.** `SuperSLM.EstimateCosts "<path-to-model.sslm>" [--write-ini]`
+  measures both decode modes on the machine it runs on, at the task count the next configuration
+  would resolve, and prints a `CALIBRATION ESTIMATE — not verified`: per-arm medians and spread,
+  thirteen suggested costs per mode, and the CPU load other processes put on the machine while it
+  ran. Desktop load is reported, never a reason to stop. With `--write-ini` it saves both modes'
+  suggestions to `Saved/SuperSLM/CalibratedCosts.ini`, which the next `Configure()` reads for a
+  matching artifact, mode and task count; without it nothing is written. See
+  [TOOLING.md](TOOLING.md).
 
-  **Known limitation in 1.0:** the calibration command's layer measurement is not fixed. It read
-  about 25 % low at depth 1 against layers timed inside a real job (the 0.5B example model, on the
-  maintainer's machine, an AMD Ryzen 9 3950X with an NVIDIA RTX 2080 SUPER), which is why the two layer
-  defaults were raised by hand.
-
-- One whole prompt token is the smallest unit of prefill, and at 0.5B it costs more than a
-  typical `TickBudgetMs`. Such a job still runs, on the worker, and simply takes more ticks to
-  deliver. Time to first token is reported.
+- **Prefill chunks.** A prefill job carries at least `MinPrefillChunk` prompt tokens (default 8)
+  while the prompt has that many left and `MaxPrefillChunkBudget` allows it, and more when their
+  price still fits the share. Eight is where SuperSLM's prefill matrix multiply switches to its
+  tiled kernel. A chunk costs more than a typical `TickBudgetMs`; the job still runs, on the
+  worker, and simply takes more ticks to deliver. Set `MinPrefillChunk` to 1 for one-token prefill
+  jobs, as in 1.0. Tokens are identical at every setting. Time to first token is reported.
+- **Overruns.** A job is a worker overrun when its worker time exceeds its own planned ticks,
+  K × `TickBudgetMs`. A job planned for K ticks is not an overrun at tick 2.
 
 ## The GPU backend
 

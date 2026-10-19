@@ -33,6 +33,7 @@
 
 #include "Fixtures/SuperSLML2S2Fixtures.h"
 #include "SuperSLMGpuTestAccess.h"
+#include "SuperSLMPagedGpuTestSeam.h"
 #include "SuperSLMModel.h"
 #include "SuperSLMModelImport.h"
 #include "SuperSLMSaveRestoreTypes.h"
@@ -106,6 +107,16 @@ bool FSuperSLMU1GpuRestoreOutOfMemoryReadsOutOfMemoryTest::RunTest(const FString
 		{SslmGpuStatus::SSLM_GPU_PARALLEL_FOR_INVALID,    TEXT("SSLM_GPU_PARALLEL_FOR_INVALID"),    ESuperSLMRestoreResult::Malformed},
 		{SslmGpuStatus::SSLM_GPU_PARALLEL_FOR_INCOMPLETE, TEXT("SSLM_GPU_PARALLEL_FOR_INCOMPLETE"), ESuperSLMRestoreResult::Malformed},
 		{SslmGpuStatus::SSLM_GPU_RESIDENCY_FLAGS_INVALID, TEXT("SSLM_GPU_RESIDENCY_FLAGS_INVALID"), ESuperSLMRestoreResult::Malformed},
+		// Paged K/V, ordinals 24-29 (1.13.0). An 'SLM6' blob given to sslm_gpu_seq_restore keeps the
+		// KvMismatch it read at 1.12.0 and earlier (SSLM_SEQUENCE_KV_BUFFER_MISMATCH then); a page pool
+		// too short for a restore reads OutOfMemory like an allocation failure; the four non-restore
+		// statuses read Malformed through the default arm.
+		{SslmGpuStatus::SSLM_GPU_KV_BUDGET_EXCEEDED,      TEXT("SSLM_GPU_KV_BUDGET_EXCEEDED"),      ESuperSLMRestoreResult::Malformed},
+		{SslmGpuStatus::SSLM_GPU_KV_POOL_EXHAUSTED,       TEXT("SSLM_GPU_KV_POOL_EXHAUSTED"),       ESuperSLMRestoreResult::OutOfMemory},
+		{SslmGpuStatus::SSLM_GPU_KV_POOL_TOO_LARGE,       TEXT("SSLM_GPU_KV_POOL_TOO_LARGE"),       ESuperSLMRestoreResult::Malformed},
+		{SslmGpuStatus::SSLM_GPU_HOLDER_MODE_MISMATCH,    TEXT("SSLM_GPU_HOLDER_MODE_MISMATCH"),    ESuperSLMRestoreResult::KvMismatch},
+		{SslmGpuStatus::SSLM_GPU_PREFIX_REJECTED,         TEXT("SSLM_GPU_PREFIX_REJECTED"),         ESuperSLMRestoreResult::Malformed},
+		{SslmGpuStatus::SSLM_GPU_PREFIX_SCHEMA_MISMATCH,  TEXT("SSLM_GPU_PREFIX_SCHEMA_MISMATCH"),  ESuperSLMRestoreResult::Malformed},
 	};
 	for (const FRestoreStatusRow& Row : ExistingRows)
 	{
@@ -314,6 +325,57 @@ bool FSuperSLMU1GpuRestoreAllocationFailureReadsOutOfMemoryTest::RunTest(const F
 	{
 		Gpu->ReturnSequence(Restored);
 	}
+	return bOk;
+}
+
+// Plugin paging plan §3.7 (step K5; coverage re-audit N-d): the GPU restore mapping by mode. In
+// dedicated mode the two paged arms keep K0R's values (KV_POOL_EXHAUSTED -> OutOfMemory,
+// HOLDER_MODE_MISMATCH -> KvMismatch: cell 8.1's legacy identity); in pooled mode they read §3.7's
+// (KvPagesExhausted, KvModeMismatch: cells 1.6 and 11.2's GPU twin), and SEQUENCE_KV_BUFFER_MISMATCH
+// reads Malformed (§5). The ordinals the rows name are pinned first, so a renumbered enum cannot move a
+// row onto another status. The rows go through FSuperSLMPagedGpuTestSeam::RestoreFailureResult(), the
+// mode-aware twin of the seam above; every other status reads as the dedicated mapping in both modes.
+// Mutant: K0R's arms kept in pooled mode (the pooled rows); the mode applied to dedicated (the
+// dedicated rows).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FSuperSLMU1GpuRestoreStatusMappingByModeTest,
+	"SuperSLM.U1.Gpu.RestoreStatusMappingByMode",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FSuperSLMU1GpuRestoreStatusMappingByModeTest::RunTest(const FString& Parameters)
+{
+	bool bOk = TestEqual(TEXT("SSLM_GPU_KV_POOL_EXHAUSTED is ordinal 25"), (int64)(uint32)SslmGpuStatus::SSLM_GPU_KV_POOL_EXHAUSTED, (int64)25);
+	bOk &= TestEqual(TEXT("SSLM_GPU_HOLDER_MODE_MISMATCH is ordinal 27"), (int64)(uint32)SslmGpuStatus::SSLM_GPU_HOLDER_MODE_MISMATCH, (int64)27);
+
+	struct FModeRow
+	{
+		SslmGpuStatus Status;
+		const TCHAR* StatusName;
+		ESuperSLMRestoreResult Dedicated;
+		ESuperSLMRestoreResult Pooled;
+	};
+	static const FModeRow Rows[] = {
+		{SslmGpuStatus::SSLM_GPU_KV_POOL_EXHAUSTED,       TEXT("SSLM_GPU_KV_POOL_EXHAUSTED (25)"),    ESuperSLMRestoreResult::OutOfMemory, ESuperSLMRestoreResult::KvPagesExhausted},
+		{SslmGpuStatus::SSLM_GPU_HOLDER_MODE_MISMATCH,    TEXT("SSLM_GPU_HOLDER_MODE_MISMATCH (27)"), ESuperSLMRestoreResult::KvMismatch,  ESuperSLMRestoreResult::KvModeMismatch},
+		{SslmGpuStatus::SSLM_SEQUENCE_KV_BUFFER_MISMATCH, TEXT("SSLM_SEQUENCE_KV_BUFFER_MISMATCH"),   ESuperSLMRestoreResult::KvMismatch,  ESuperSLMRestoreResult::Malformed},
+		{SslmGpuStatus::SSLM_GPU_ALLOCATION_FAILED,       TEXT("SSLM_GPU_ALLOCATION_FAILED"),         ESuperSLMRestoreResult::OutOfMemory, ESuperSLMRestoreResult::OutOfMemory},
+		{SslmGpuStatus::SSLM_RESTORE_MODEL_MISMATCH,      TEXT("SSLM_RESTORE_MODEL_MISMATCH"),        ESuperSLMRestoreResult::ModelMismatch, ESuperSLMRestoreResult::ModelMismatch},
+		{SslmGpuStatus::SSLM_GPU_PREFIX_SCHEMA_MISMATCH,  TEXT("SSLM_GPU_PREFIX_SCHEMA_MISMATCH"),    ESuperSLMRestoreResult::Malformed,   ESuperSLMRestoreResult::Malformed},
+	};
+	for (const FModeRow& Row : Rows)
+	{
+		const ESuperSLMRestoreResult Dedicated = FSuperSLMPagedGpuTestSeam::RestoreFailureResult(Row.Status, /*bPooled*/ false, /*bSchemaCrossCheckFailed*/ false);
+		const ESuperSLMRestoreResult Pooled = FSuperSLMPagedGpuTestSeam::RestoreFailureResult(Row.Status, /*bPooled*/ true, /*bSchemaCrossCheckFailed*/ false);
+		bOk &= TestEqual(*FString::Printf(TEXT("dedicated: %s reads result %d"), Row.StatusName, (int32)(uint8)Row.Dedicated), (int32)(uint8)Dedicated, (int32)(uint8)Row.Dedicated);
+		bOk &= TestEqual(*FString::Printf(TEXT("pooled: %s reads result %d"), Row.StatusName, (int32)(uint8)Row.Pooled), (int32)(uint8)Pooled, (int32)(uint8)Row.Pooled);
+		bOk &= TestEqual(*FString::Printf(TEXT("dedicated: %s reads as the existing seam does"), Row.StatusName),
+			(int32)(uint8)Dedicated, (int32)(uint8)FSuperSLMGpuTestAccess::RestoreFailureResult(Row.Status, false));
+	}
+	// A failed schema cross-check reads Malformed in both modes, whatever the status.
+	bOk &= TestEqual(TEXT("pooled: a failed schema cross-check reads Malformed (KV_POOL_EXHAUSTED)"),
+		(int32)(uint8)FSuperSLMPagedGpuTestSeam::RestoreFailureResult(SslmGpuStatus::SSLM_GPU_KV_POOL_EXHAUSTED, true, true), (int32)(uint8)ESuperSLMRestoreResult::Malformed);
+	bOk &= TestEqual(TEXT("dedicated: a failed schema cross-check reads Malformed (KV_POOL_EXHAUSTED)"),
+		(int32)(uint8)FSuperSLMPagedGpuTestSeam::RestoreFailureResult(SslmGpuStatus::SSLM_GPU_KV_POOL_EXHAUSTED, false, true), (int32)(uint8)ESuperSLMRestoreResult::Malformed);
 	return bOk;
 }
 

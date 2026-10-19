@@ -47,6 +47,7 @@ namespace
 			case ESuperSLMDecodeOutcome::Generating: return TEXT("Generating");
 			case ESuperSLMDecodeOutcome::SchemaDeadEnd: return TEXT("SchemaDeadEnd");
 			case ESuperSLMDecodeOutcome::SequenceNoLongerValid: return TEXT("SequenceNoLongerValid");
+			case ESuperSLMDecodeOutcome::KvBudgetExceeded: return TEXT("KvBudgetExceeded");
 		}
 		return TEXT("Unknown");
 	}
@@ -89,21 +90,25 @@ namespace
 	}
 
 	// Fixed costs keep the boundary cells independent of calibration defaults. The prompt
-	// intercept also makes an uncapped twice-cap chunk exceed the capped prefill bound.
+	// intercept also makes an uncapped twice-cap chunk exceed the capped prefill bound. Slice 1P:
+	// the two prompt pairs differ, so a bound that priced P tokens with the chunk-1 pair (or 7 with
+	// the batched one) lands on a different floor and fails the boundary.
 	FSuperSLMRuntimeConfig CostBoundaryConfig()
 	{
 		FSuperSLMRuntimeConfig Config = SchedulingConfig();
-		Config.LayerCostMs = 2.0;
-		Config.LayerCostPerPositionMs = 0.001;
-		Config.PromptTokenCostMs = 36.0;
-		Config.PromptTokenCostPerPositionMs = 0.001;
-		Config.FinishCostMs = 5.0;
-		Config.ResetCostMs = 1.0;
-		Config.AdoptCostMs = 1.0;
-		Config.SaveCostMs = 1.0;
-		Config.RestoreCostMs = 1.0;
-		Config.PrefixBeginCostMs = 1.0;
-		Config.PrefixReleaseCostMs = 1.0;
+		SuperSLMConfigAccess::SetCost(Config, TEXT("LayerCostMs"), 2.0);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("LayerCostPerPositionMs"), 0.001);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("PromptTokenCostMs"), 36.0);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("PromptTokenCostPerPositionMs"), 0.001);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("BatchedPromptTokenCostMs"), 20.0);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("BatchedPromptTokenCostPerPositionMs"), 0.001);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("FinishCostMs"), 5.0);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("ResetCostMs"), 1.0);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("AdoptCostMs"), 1.0);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("SaveCostMs"), 1.0);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("RestoreCostMs"), 1.0);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("PrefixBeginCostMs"), 1.0);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("PrefixReleaseCostMs"), 1.0);
 		return Config;
 	}
 
@@ -121,19 +126,28 @@ namespace
 		return Test.TestNotNull(TEXT("CPU subsystem"), Cpu);
 	}
 
+	// n prompt tokens ending at position D, priced with one pair.
+	double PrefillEndingAt(double N, double D, double TokenMs, double PerPositionMs)
+	{
+		return N * TokenMs + PerPositionMs * (N * (D - N + 1) + N * (N - 1) / 2);
+	}
+
 	// The three plan §5 bounds are calculated from fixture inputs, never from the production seam.
-	struct FPlanBounds { double Decode; double Prefill; double Lifecycle; };
+	// Slice 1P item 5 (plan of record rev 11.1, one definition): the prefill bound is the larger of
+	// the chunk-1 pair at min(P, 7) tokens and the batched pair at P tokens, both ending at D.
+	struct FPlanBounds { double Decode; double Prefill; double Lifecycle; double Chunk1Prefill; double BatchedPrefill; };
 	FPlanBounds PlanBounds(const FSuperSLMRuntimeConfig& C)
 	{
 		const double B = C.BlockCount, M = C.MaxLayerBudget;
 		const double P = FMath::Min(C.MaxPrefillChunkBudget, kAExContextCap);
 		const double D = kAExContextCap - 1;
-		const double Decode = B * (M * (C.LayerCostMs + C.LayerCostPerPositionMs * kAExContextCap) + C.FinishCostMs);
-		const double Prefill = P * C.PromptTokenCostMs + C.PromptTokenCostPerPositionMs *
-			(P * (D - P + 1) + P * (P - 1) / 2);
-		const double Lifecycle = FMath::Max(FMath::Max(FMath::Max(C.ResetCostMs, C.AdoptCostMs),
-			FMath::Max(C.SaveCostMs, C.RestoreCostMs)), FMath::Max(C.PrefixBeginCostMs, C.PrefixReleaseCostMs));
-		return { Decode, Prefill, Lifecycle };
+		const double Decode = B * (M * (SuperSLMConfigAccess::GetCost(C, TEXT("LayerCostMs")) + SuperSLMConfigAccess::GetCost(C, TEXT("LayerCostPerPositionMs")) * kAExContextCap) + SuperSLMConfigAccess::GetCost(C, TEXT("FinishCostMs")));
+		const double Chunk1Prefill = PrefillEndingAt(FMath::Min(P, 7.0), D, SuperSLMConfigAccess::GetCost(C, TEXT("PromptTokenCostMs")), SuperSLMConfigAccess::GetCost(C, TEXT("PromptTokenCostPerPositionMs")));
+		const double BatchedPrefill = PrefillEndingAt(P, D, SuperSLMConfigAccess::GetCost(C, TEXT("BatchedPromptTokenCostMs")), SuperSLMConfigAccess::GetCost(C, TEXT("BatchedPromptTokenCostPerPositionMs")));
+		const double Prefill = FMath::Max(Chunk1Prefill, BatchedPrefill);
+		const double Lifecycle = FMath::Max(FMath::Max(FMath::Max(SuperSLMConfigAccess::GetCost(C, TEXT("ResetCostMs")), SuperSLMConfigAccess::GetCost(C, TEXT("AdoptCostMs"))),
+			FMath::Max(SuperSLMConfigAccess::GetCost(C, TEXT("SaveCostMs")), SuperSLMConfigAccess::GetCost(C, TEXT("RestoreCostMs")))), FMath::Max(SuperSLMConfigAccess::GetCost(C, TEXT("PrefixBeginCostMs")), SuperSLMConfigAccess::GetCost(C, TEXT("PrefixReleaseCostMs"))));
+		return { Decode, Prefill, Lifecycle, Chunk1Prefill, BatchedPrefill };
 	}
 
 	double LargestPlanBound(const FSuperSLMRuntimeConfig& C)
@@ -142,7 +156,7 @@ namespace
 		return FMath::Max(FMath::Max(Bounds.Decode, Bounds.Prefill), Bounds.Lifecycle);
 	}
 
-	bool CheckCostField(FAutomationTestBase& Test, double FSuperSLMRuntimeConfig::* Field,
+	bool CheckCostField(FAutomationTestBase& Test,
 		const TCHAR* Name, bool bAllowsZero)
 	{
 		FString Path, Reason;
@@ -165,7 +179,7 @@ namespace
 			Config.MaxSequencesPerDecodeCall = 1;
 			Config.SequenceLifecycleBudgetMs = 1000.0;
 			Config.TickBudgetMs = 16.6;
-			Config.*Field = Values[I];
+			SuperSLMConfigAccess::SetCost(Config, Name, Values[I]);
 			const FSuperSLMConfigureReport Report = Cpu->Configure(Model, Config);
 			const bool bAccepted = I == 0 && bAllowsZero;
 			bOk &= Test.TestEqual(*FString::Printf(TEXT("%s case %d result"), Name, I), (uint8)Report.Result,
@@ -185,12 +199,14 @@ namespace
 		"SuperSLM.U1.Cpu.ConfigureCost." #Suffix, \
 		EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter) \
 	bool FSuperSLMU1Cost##Suffix##Test::RunTest(const FString& Parameters) \
-	{ return CheckCostField(*this, &FSuperSLMRuntimeConfig::Member, TEXT(#Member), AllowsZero); }
+	{ return CheckCostField(*this, TEXT(#Member), AllowsZero); }
 
 SSU_COST_FIELD_CELL(LayerCostMs, LayerCostMs, false)
 SSU_COST_FIELD_CELL(LayerCostPerPositionMs, LayerCostPerPositionMs, true)
 SSU_COST_FIELD_CELL(PromptTokenCostMs, PromptTokenCostMs, false)
 SSU_COST_FIELD_CELL(PromptTokenCostPerPositionMs, PromptTokenCostPerPositionMs, true)
+SSU_COST_FIELD_CELL(BatchedPromptTokenCostMs, BatchedPromptTokenCostMs, false)
+SSU_COST_FIELD_CELL(BatchedPromptTokenCostPerPositionMs, BatchedPromptTokenCostPerPositionMs, true)
 SSU_COST_FIELD_CELL(FinishCostMs, FinishCostMs, false)
 SSU_COST_FIELD_CELL(ResetCostMs, ResetCostMs, false)
 SSU_COST_FIELD_CELL(AdoptCostMs, AdoptCostMs, false)
@@ -248,25 +264,27 @@ bool FSuperSLMU1CostDomainRefusalsTest::RunTest(const FString& Parameters)
 	USuperSLMSubsystem* Cpu = nullptr;
 	USuperSLMModel* Model = nullptr;
 	if (!SchedulingFixture(*this, World, Cpu, Model)) { return false; }
-	struct FCase { const TCHAR* Name; double FSuperSLMRuntimeConfig::* Field; const TCHAR* Kind; };
+	struct FCase { const TCHAR* Name; const TCHAR* Kind; };
 	const FCase Cases[] = {
-		{ TEXT("LayerCostMs"), &FSuperSLMRuntimeConfig::LayerCostMs, TEXT("decode") },
-		{ TEXT("FinishCostMs"), &FSuperSLMRuntimeConfig::FinishCostMs, TEXT("decode") },
-		{ TEXT("PromptTokenCostMs"), &FSuperSLMRuntimeConfig::PromptTokenCostMs, TEXT("prefill") },
-		{ TEXT("ResetCostMs"), &FSuperSLMRuntimeConfig::ResetCostMs, TEXT("lifecycle") },
-		{ TEXT("AdoptCostMs"), &FSuperSLMRuntimeConfig::AdoptCostMs, TEXT("lifecycle") },
-		{ TEXT("SaveCostMs"), &FSuperSLMRuntimeConfig::SaveCostMs, TEXT("lifecycle") },
-		{ TEXT("RestoreCostMs"), &FSuperSLMRuntimeConfig::RestoreCostMs, TEXT("lifecycle") },
-		{ TEXT("PrefixBeginCostMs"), &FSuperSLMRuntimeConfig::PrefixBeginCostMs, TEXT("lifecycle") },
-		{ TEXT("PrefixReleaseCostMs"), &FSuperSLMRuntimeConfig::PrefixReleaseCostMs, TEXT("lifecycle") },
-		{ TEXT("LayerCostPerPositionMs"), &FSuperSLMRuntimeConfig::LayerCostPerPositionMs, TEXT("decode") },
-		{ TEXT("PromptTokenCostPerPositionMs"), &FSuperSLMRuntimeConfig::PromptTokenCostPerPositionMs, TEXT("prefill") },
+		{ TEXT("LayerCostMs"), TEXT("decode") },
+		{ TEXT("FinishCostMs"), TEXT("decode") },
+		{ TEXT("PromptTokenCostMs"), TEXT("prefill") },
+		{ TEXT("ResetCostMs"), TEXT("lifecycle") },
+		{ TEXT("AdoptCostMs"), TEXT("lifecycle") },
+		{ TEXT("SaveCostMs"), TEXT("lifecycle") },
+		{ TEXT("RestoreCostMs"), TEXT("lifecycle") },
+		{ TEXT("PrefixBeginCostMs"), TEXT("lifecycle") },
+		{ TEXT("PrefixReleaseCostMs"), TEXT("lifecycle") },
+		{ TEXT("LayerCostPerPositionMs"), TEXT("decode") },
+		{ TEXT("PromptTokenCostPerPositionMs"), TEXT("prefill") },
+		{ TEXT("BatchedPromptTokenCostMs"), TEXT("prefill") },
+		{ TEXT("BatchedPromptTokenCostPerPositionMs"), TEXT("prefill") },
 	};
 	bool bOk = true;
 	for (const FCase& Case : Cases)
 	{
 		FSuperSLMRuntimeConfig C = SchedulingConfig();
-		C.*Case.Field = DBL_MAX;
+		SuperSLMConfigAccess::SetCost(C, Case.Name, DBL_MAX);
 		const FPlanBounds Bounds = PlanBounds(C);
 		const double Target = FCString::Strcmp(Case.Kind, TEXT("decode")) == 0 ? Bounds.Decode :
 			(FCString::Strcmp(Case.Kind, TEXT("prefill")) == 0 ? Bounds.Prefill : Bounds.Lifecycle);
@@ -279,7 +297,7 @@ bool FSuperSLMU1CostDomainRefusalsTest::RunTest(const FString& Parameters)
 			R.Message.Contains(Case.Kind) && R.Message.Contains(TEXT("K =")));
 	}
 	FSuperSLMRuntimeConfig Overflow = SchedulingConfig();
-	Overflow.LayerCostPerPositionMs = 1e305;
+	SuperSLMConfigAccess::SetCost(Overflow, TEXT("LayerCostPerPositionMs"), 1e305);
 	bOk &= TestFalse(TEXT("finite slope overflows independent decode bound"),
 		FMath::IsFinite(PlanBounds(Overflow).Decode));
 	const FSuperSLMConfigureReport OR = Cpu->Configure(Model, Overflow);
@@ -339,34 +357,51 @@ bool FSuperSLMU1CostDomainBoundaryTest::RunTest(const FString& Parameters)
 		return bCaseOk;
 	};
 	bool bOk = CheckBoundary(TEXT("baseline prefill"), CostBoundaryConfig(), TEXT("prefill"));
+	{
+		// Slice 1P item 5: the baseline's prefill bound is the batched pair's (P = 64 tokens).
+		const FPlanBounds Baseline = PlanBounds(CostBoundaryConfig());
+		bOk &= TestTrue(TEXT("baseline prefill bound is the batched pair at P"),
+			Baseline.BatchedPrefill > Baseline.Chunk1Prefill);
+	}
+	{
+		// Slice 1P item 5: the chunk-1 pair's bound is 7 tokens ending at D, not P. With the batched
+		// pair cheap, the chunk-1 pair at 7 tokens is the dominant bound; a bound that priced P tokens
+		// with it would sit about nine times higher and refuse the above-floor budget.
+		FSuperSLMRuntimeConfig Chunk1Dominant = CostBoundaryConfig();
+		SuperSLMConfigAccess::SetCost(Chunk1Dominant, TEXT("BatchedPromptTokenCostMs"), 1.0);
+		SuperSLMConfigAccess::SetCost(Chunk1Dominant, TEXT("BatchedPromptTokenCostPerPositionMs"), 0.0);
+		const FPlanBounds Bounds = PlanBounds(Chunk1Dominant);
+		bOk &= TestTrue(TEXT("chunk-1-dominant fixture: the chunk-1 pair at 7 tokens is the prefill bound"),
+			Bounds.Chunk1Prefill > Bounds.BatchedPrefill);
+		bOk &= CheckBoundary(TEXT("chunk-1 pair at seven tokens"), Chunk1Dominant, TEXT("prefill"));
+	}
 	FSuperSLMRuntimeConfig Decode = CostBoundaryConfig();
 	Decode.BlockCount = 4;
 	Decode.MaxLayerBudget = 24;
 	Decode.MaxPrefillChunkBudget = 1;
 	bOk &= CheckBoundary(TEXT("four-sequence depth-cap decode"), Decode, TEXT("decode"));
-	struct FOpCost { const TCHAR* Name; double FSuperSLMRuntimeConfig::* Field; };
+	struct FOpCost { const TCHAR* Name; };
 	const FOpCost OpCosts[] = {
-		{ TEXT("ResetCostMs"), &FSuperSLMRuntimeConfig::ResetCostMs },
-		{ TEXT("AdoptCostMs"), &FSuperSLMRuntimeConfig::AdoptCostMs },
-		{ TEXT("SaveCostMs"), &FSuperSLMRuntimeConfig::SaveCostMs },
-		{ TEXT("RestoreCostMs"), &FSuperSLMRuntimeConfig::RestoreCostMs },
-		{ TEXT("PrefixBeginCostMs"), &FSuperSLMRuntimeConfig::PrefixBeginCostMs },
-		{ TEXT("PrefixReleaseCostMs"), &FSuperSLMRuntimeConfig::PrefixReleaseCostMs },
+		{ TEXT("ResetCostMs") },
+		{ TEXT("AdoptCostMs") },
+		{ TEXT("SaveCostMs") },
+		{ TEXT("RestoreCostMs") },
+		{ TEXT("PrefixBeginCostMs") },
+		{ TEXT("PrefixReleaseCostMs") },
 	};
 	for (const FOpCost& Op : OpCosts)
 	{
 		FSuperSLMRuntimeConfig Lifecycle = CostBoundaryConfig();
 		const FPlanBounds OtherBounds = PlanBounds(Lifecycle);
-		Lifecycle.*Op.Field = 2.0 * FMath::Max(OtherBounds.Decode, OtherBounds.Prefill);
+		SuperSLMConfigAccess::SetCost(Lifecycle, Op.Name, 2.0 * FMath::Max(OtherBounds.Decode, OtherBounds.Prefill));
 		bOk &= CheckBoundary(Op.Name, Lifecycle, TEXT("lifecycle"));
 	}
 	FSuperSLMRuntimeConfig PrefillCap = CostBoundaryConfig();
 	PrefillCap.MaxPrefillChunkBudget = 2 * kAExContextCap;
 	const double UncappedP = PrefillCap.MaxPrefillChunkBudget;
 	const double D = kAExContextCap - 1;
-	const double UncappedPrefill = UncappedP * PrefillCap.PromptTokenCostMs +
-		PrefillCap.PromptTokenCostPerPositionMs *
-		(UncappedP * (D - UncappedP + 1) + UncappedP * (UncappedP - 1) / 2);
+	const double UncappedPrefill = PrefillEndingAt(UncappedP, D,
+		SuperSLMConfigAccess::GetCost(PrefillCap, TEXT("BatchedPromptTokenCostMs")), SuperSLMConfigAccess::GetCost(PrefillCap, TEXT("BatchedPromptTokenCostPerPositionMs")));
 	bOk &= TestTrue(TEXT("twice-cap fixture distinguishes uncapped prefill"),
 		UncappedPrefill > PlanBounds(PrefillCap).Prefill * (1.0 + 1e-9));
 	bOk &= CheckBoundary(TEXT("prefill chunk twice context cap"), PrefillCap, TEXT("prefill"));

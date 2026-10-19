@@ -19,6 +19,7 @@ public class SuperSLMUnrealEditor : ModuleRules
 	public SuperSLMUnrealEditor(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+		bWarningsAsErrors = true;
 		bUseUnity = false;
 
 		// Layer 1 forbids implicit FP contraction: Layer 1's own scalar/kernel-tier
@@ -44,6 +45,7 @@ public class SuperSLMUnrealEditor : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
+			"AssetRegistry", // Paging certification commandlet registers the two real imported assets.
 			"Projects", // IPluginManager, to resolve Tests/Fixtures/SSLM/*.sslm by plugin-relative path
 			"Json",     // T-2805 (L2-S1 red suite): SuperSLML2S1Fixtures.h parses the committed
 			            // Tests/Fixtures/L2S1/l2s1_r_s1a_reference.json extract of T-2783's own

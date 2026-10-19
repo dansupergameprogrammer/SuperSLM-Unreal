@@ -88,6 +88,27 @@ struct SUPERSLMUNREAL_API FSuperSLMGpuRuntimeConfig
 	// Default 4, Layer 1's measured best on the reference box; valid 0-256, anything else is
 	// refused at Configure() (InvalidFinishParallelTasks).
 	int32 FinishParallelTasks = 4;
+
+	// --- Paged KV, pooled mode (plugin paging plan §3.1, UP-4, UP-15; declared at step K5, read
+	// from step K6). Appended, so every earlier field keeps its place. ---
+
+	// 0 (the default) is dedicated mode: every warm sequence owns a ContextCap-sized K/V buffer,
+	// exactly as before. Above 0 is pooled mode: one sslm_gpu_kv_pool_create per subsystem, sized
+	// by the page ledger's regions (§3.2), and warm sequences are
+	// sslm_gpu_seq_create_budgeted(..., SequenceBudget). Configure() refuses a value below 0 or
+	// above ContextCap (ESuperSLMGpuConfigureResult::InvalidSequenceBudget).
+	int32 SequenceBudget = 0;
+
+	// Pooled: the maximum number of live GPU prefixes (and nested children); region P is
+	// PrefixBlockCount blocks of P_blk pages. Ignored, with a logged warning, when dedicated.
+	int32 PrefixBlockCount = 0;
+
+	// Pooled: restore headroom, region H, in blocks of H_blk pages (§3.5).
+	int32 RestoreHeadroomBlocks = 1;
+
+	// Pooled with a GPU cache: region A, in blocks of P_blk. No GPU cache exists in the paging
+	// release, so it is accepted and ignored there.
+	int32 CacheGhostBlocks = 1;
 };
 
 enum class ESuperSLMGpuConfigureResult : uint8
@@ -106,6 +127,8 @@ enum class ESuperSLMGpuConfigureResult : uint8
 	InvalidMaxQueuedOperationsPerSequence, // MaxQueuedOperationsPerSequence < 1: a bound of 0 refuses every queued op
 	InvalidFinishParallelTasks, // FinishParallelTasks outside [0, 256], or Layer 1 refused the hook (named)
 	KAboveMaximum,           // K above kMaxJobTicks (2^20), plan §5 (D-SLM7803); appended last so earlier values keep their numbers
+	InvalidSequenceBudget,   // plugin paging plan §3.1: SequenceBudget < 0 or > ContextCap; appended
+	KvPoolRefused,           // plugin paging plan §3.1, §3.4: the pool create returned KV_POOL_TOO_LARGE or ALLOCATION_FAILED, or its stats disagree with the computed geometry; the message names the pages, the bytes and the status
 };
 
 struct SUPERSLMUNREAL_API FSuperSLMGpuConfigureReport

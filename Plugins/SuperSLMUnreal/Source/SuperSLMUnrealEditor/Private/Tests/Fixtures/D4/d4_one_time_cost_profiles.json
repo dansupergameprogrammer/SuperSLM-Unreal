@@ -1,0 +1,38 @@
+{
+  "format": "d4-one-time-cost-profiles-v1",
+  "source": "Six alternating T-3050d per-call capture blocks (m0a, m1a, m0b, m1b, m0c, m1c) on the A-EX artifact at cap 4096, FinishParallelTasks 4, Zen 2 dev box; 1,524 timed calls per block.",
+  "rule": "Per mode and arm/depth: the median of the calls in each block, then the median of the three block medians. LayerCostMs/LayerCostPerPositionMs and PromptTokenCostMs/PromptTokenCostPerPositionMs: the chunk-1 upper envelope over depths 1, 1024, 2048, 3072, 4095 (slope = (last - first) / span floored at 0; intercept from the depth-1 median, raised by the largest residual). Batched pair: per-token medians (call / 8) at positions depth + 3.5 over depths 1, 1024, 2048, 3072, 4088, the chord extended to position 0 and raised by the largest residual. Every value rounded upward by ceil(x * 10^d - 1e-9) / 10^d, d = 3 for millisecond fields and 6 for per-position fields (D-SLM8113). Mode-0 BatchedPromptTokenCostMs is 15.022198 exact, so 15.023 (D-SLM8108).",
+  "status": "Reasonable measured starting defaults, not certified costs or accuracy bounds.",
+  "profiles": {
+    "0": {
+      "LayerCostMs": 1.397,
+      "LayerCostPerPositionMs": 0.000186,
+      "PromptTokenCostMs": 33.583,
+      "PromptTokenCostPerPositionMs": 0.004547,
+      "BatchedPromptTokenCostMs": 15.023,
+      "BatchedPromptTokenCostPerPositionMs": 0.004791,
+      "FinishCostMs": 5.836,
+      "ResetCostMs": 2.369,
+      "AdoptCostMs": 2.648,
+      "SaveCostMs": 2.691,
+      "RestoreCostMs": 4.644,
+      "PrefixBeginCostMs": 2.261,
+      "PrefixReleaseCostMs": 2.247
+    },
+    "1": {
+      "LayerCostMs": 0.906,
+      "LayerCostPerPositionMs": 0.000254,
+      "PromptTokenCostMs": 22.108,
+      "PromptTokenCostPerPositionMs": 0.005209,
+      "BatchedPromptTokenCostMs": 15.682,
+      "BatchedPromptTokenCostPerPositionMs": 0.004437,
+      "FinishCostMs": 5.929,
+      "ResetCostMs": 2.397,
+      "AdoptCostMs": 2.731,
+      "SaveCostMs": 2.744,
+      "RestoreCostMs": 4.766,
+      "PrefixBeginCostMs": 2.425,
+      "PrefixReleaseCostMs": 2.440
+    }
+  }
+}

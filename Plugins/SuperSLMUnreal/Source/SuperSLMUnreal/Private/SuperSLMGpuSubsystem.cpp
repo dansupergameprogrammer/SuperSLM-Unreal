@@ -5,6 +5,7 @@
 #include "SuperSLMGpuTestAccess.h"
 #include "SuperSLMLog.h"
 #include "SuperSLMModel.h"
+#include "SuperSLMPagedGpuTestSeam.h" // the paged-KV test seams (plugin paging plan §3.9; declared under WITH_DEV_AUTOMATION_TESTS)
 #include "SuperSLMSubsystem.h" // SuperSLMChannel (§5.1's shared trace channel, extern'd there)
 
 #include "ProfilingDebugging/CpuProfilerTrace.h"
@@ -84,6 +85,7 @@
 
 #if SUPERSLMUNREAL_WITH_GPU
 
+#include "Core/SuperSLMPageLedgerCore.h" // the page ledger (plugin paging plan §3.2-§3.5), pooled mode only
 #include "SuperSLMFinishHook.h"
 #include "SuperSLMGpuStatusMapping.h"
 #include "SuperSLMRuntimeRegistry.h"
@@ -127,6 +129,29 @@
 #include <new>
 #include <string>
 #include <vector>
+
+// Plugin paging plan §3.4 (K6): the engine's own page geometry, R(budget) and the pool-size refusal,
+// header-only and D3D12-free (src/gpu, on this module's Win64 private include path). Included after
+// the Windows headers so <limits> is read with NOMINMAX in force.
+#include "gpu_kv_pool_geometry.h"
+
+// The engine's context_length for a sequence (include/superslm/gpu_1p0_bench_bridge.h, defined in
+// gpu_1p0.cpp, which this module compiles). Declared here rather than by including that header,
+// which pulls the forward-pass headers in; the declaration is the header's own, verbatim. Read by
+// the RunOnPoolThread() seam's ContextLength() (plan §3.9) and by the pooled adopt's job, which tells
+// the engine's reset-on-fault after the share from a refusal before it (K7 review N3). The public
+// ABI has no other query that tells the two apart: both arms return the same status, and a save's
+// size query would report a size failure as SSLM_DEVICE_LOST. The dependency is safe to carry:
+// gpu_1p0.cpp defines this accessor unconditionally (under no build flag) and this module compiles
+// that file, and because the symbol is declared here, a vendored update that drops it fails this
+// module's link loudly rather than changing the adopt path silently. The K7 build record carries
+// it as a decision (D6) for the planner to rule on.
+int64_t* SslmGpuSeqHandleContextLengthForBench(SslmGpuSequenceHandle* seq);
+
+// Plugin paging plan §3.4 "Prefixes" (K7): GPU prefix ids come from the CPU subsystem's shared
+// counter (SuperSLMSubsystem.cpp, GNextPrefixId), so a handle of one backend is unknown to the other.
+// Game thread.
+int64 SuperSLMMintPrefixId();
 
 // §5.1 (plan §5.1, "GPU backend"; D-SLM7411; R-S2h; T-2826 round 5, 2026-09-19). A dedicated
 // SuperSLMGpuChannel, sibling to SuperSLMSubsystem.h's own SuperSLMChannel, with the identical
@@ -245,6 +270,10 @@ namespace
 		OneCallToken,
 		ComposedSlice,      // Layers > 0; embeds first when bEmbed; finishes when bFinish
 		ComposedFinishOnly, // the primed first step: no embed, no layers (D-SLM7256 rule 1)
+		// Plugin paging plan §3.4 "Build pace" (K7, UP-11): one build-seat turn, one whole prefix token
+		// (sslm_gpu_prefix_prefill, count 1, a whole token's dispatches). Slot is INDEX_NONE: the
+		// action names its prefix by PrefixId, and no sequence's generation filter applies to it.
+		PrefixBuildTurn,
 	};
 
 	enum class EResultKind : uint8
@@ -279,6 +308,19 @@ namespace
 		int32 PromptToken = -1;
 		int32 MaxNewTokens = 0;
 		TArray<int32> StopTokenIds;
+		// Plugin paging plan §3.4 "An empty prompt after adopt" (K7): the first step of an armed
+		// sequence's empty-prompt generation carries the generation's limits (MaxNewTokens,
+		// StopTokenIds), which a prompt's first token carries otherwise (bFirstPrompt).
+		bool bBeginLimits = false;
+		// K7 review S1, pooled mode: with bFirstPrompt or bBeginLimits, the generation's limit as the
+		// page ledger had applied it when the generation was admitted (FGameSlotUser::PlanBeginLimit),
+		// which the thread slot takes (FThreadSlot::Limit): the ledger's applied value wins. 0: keep
+		// (dedicated mode, where the limit is not used).
+		int64 BeginLimit = 0;
+		// PrefixBuildTurn only (K7): the prefix whose token this turn feeds (PromptToken), its prefill
+		// kind (0 prompt, 1 schema content) and, with bLastPrompt, that the turn freezes it.
+		int64 PrefixId = 0;
+		int32 PrefixKind = 0;
 	};
 
 	struct FActionResult
@@ -301,6 +343,13 @@ namespace
 		// DeadEnd); a restore's carried results have none and leave the game-side record as it is.
 		bool bHasWalkState = false;
 		uint32 WalkState = kSslmGpuDfaWalkStateUnused;
+		// Plugin paging plan §3.4 (K6): the thread slot's ContextUsed after this action ran, carried
+		// back so the game side keeps the slot's mirror (the activation pre-check and the seam's
+		// SequenceContextUsed() read it). -1 on a result whose action did not run (not live).
+		int64 ContextUsed = -1;
+		// Plugin paging plan §3.4 "The armed flag" (K7): the thread slot's bArmed after this action ran,
+		// 1 or 0, carried back for the slot's armed mirror. -1 on a result whose action did not run.
+		int32 Armed = -1;
 	};
 
 	struct FJob
@@ -357,6 +406,29 @@ namespace
 		std::atomic<bool> bDone{false};
 	};
 
+	// Plugin paging plan §3.9 (K6): the job kinds the paged-KV seams count and hold, one per
+	// ESuperSLMPagedRequestKind value in the same order (that enum is declared only with the test
+	// seams). Always compiled, so the counters cost the same in every build.
+	enum class EGpuPagedJobKind : uint8 { Reset, Return, Adopt, Restore, PrefixBuild, NestedBuild, PrefixRelease, Count };
+
+	// One FSuperSLMPagedGpuTestSeam::HoldApply() hold, in arming order: attached to the next admitted
+	// job of its kind, reached when that job's Layer-1 work is done and its apply would run, released
+	// by ReleaseHold(). They live and die with the state, so Configure() and teardown release them.
+	struct FGpuPagedHold
+	{
+		int64 Id = 0;
+		EGpuPagedJobKind Kind = EGpuPagedJobKind::Reset;
+		bool bAttached = false;
+		bool bReached = false;
+		bool bReleased = false;
+	};
+
+#if WITH_DEV_AUTOMATION_TESTS
+	// Hold ids are unique across states, so a hold from an ended state never names a new one.
+	// Game thread (HoldApply()).
+	int64 GNextGpuPagedHoldId = 1;
+#endif
+
 	// --- Per-slot state ---
 
 	// Owned by the submission thread (and by the game thread only while the thread is drained).
@@ -374,6 +446,22 @@ namespace
 		FActionResult StopFault;
 		int32 LastToken = -1;       // the most recent produced token: the next token's embed
 		int64 ContextUsed = 0;
+		// Plugin paging plan §3.4 (K6): a pooled holder's generation limit, min(origin + budget,
+		// ContextCap). K6 review N1: its one source is the page ledger's holder shape for the slot,
+		// through FSuperSLMGpuSubsystemState::LedgerHolderLimit(), the ledger's own SlotLimit()
+		// formula; the job that gives the slot its holder shape (Configure's budgeted create, a reset,
+		// an adopt, a pooled restore) writes it here, because the submission thread cannot read the
+		// ledger. K7 review S1: a generation's first step then overwrites it with the ledger's applied
+		// SlotLimit() as of the generation's admission (FAction::BeginLimit), so where the two ever
+		// disagree the ledger's value wins. Never 0 on a live pooled holder (ContextHasRoom() checks);
+		// 0 in dedicated mode, where ContextHasRoom() checks Cap alone, exactly as before.
+		int64 Limit = 0;
+		// Plugin paging plan §3.4 "The armed flag" (K7): the exact mirror of the engine's
+		// ready_for_logits for this pooled holder. Set by an adopt (the prefix's last write) and by a
+		// restore (the payload's ready word); cleared by a reset and by the first finish-only step
+		// while armed, which runs SslmGpuSeqDecodeStepForG5Bridge's ready shortcut instead of the
+		// finish bridge (ArmedFinish()). Never set in dedicated mode.
+		bool bArmed = false;
 		int32 Produced = 0;
 		int32 MaxNewTokens = 0;
 		TArray<int32> StopTokenIds;
@@ -468,6 +556,20 @@ namespace
 		SslmGpuSequenceHandle* FreshHandle = nullptr;
 		bool bAdapterBound = false; // rule 4 (T-2987 F4): the restore job bound the saved adapter
 		bool bSchemaCrossCheckFailed = false; // row 5: the restored binding disagrees with the wrapper
+		// Plugin paging plan §3.5 (K7): a pooled restore's out_shared_pages, for the ledger's apply.
+		uint32 SharedPages = 0;
+
+		// Plugin paging plan §3.5 "Normalization" (K7): the reset job replaced the holder create-first
+		// (a budgeted SequenceBudget holder created, then the old one released). False for a reset in
+		// place, including a normalization whose create was refused.
+		bool bNormalized = false;
+
+		// Plugin paging plan §3.4 "Adopt" (K7): sslm_gpu_seq_adopt_prefix's status (or the reported
+		// fault after the share), and the thread slot's ContextUsed and armed flag after the job.
+		FGpuStatus AdoptStatus = FGpuStatus::SSLM_OK;
+		bool bAdoptResetByFault = false; // the engine left the sequence reset (§3.4 "A fault after the share")
+		int64 ContextUsedAfter = 0;
+		bool bArmedAfter = false;
 	};
 
 	// One requested-and-queued lifecycle operation. Lives in FGameSlot::OpLog (Reset/Save/
@@ -538,6 +640,31 @@ namespace
 		// T-2885 review) -- FinalizeRestoreOp() uses this directly instead of re-deriving the
 		// slot by matching the restored Layer-1 handle against every ThreadSlot.
 		int32 RestoreSlotIndex = INDEX_NONE;
+
+		// Plugin paging plan §3.2-§3.5 (K6), pooled mode only: the page ledger's ticket for this op's
+		// admission (a reset's; K7 adds adopt and restore), applied when the op finalizes. 0 when the
+		// op takes no ledger admission (dedicated mode, and saves, generations and binds).
+		SuperSLMPaging::FTicket LedgerTicket = SuperSLMPaging::InvalidTicket;
+		// Plan rev 1.9 ruling 2: RequestAdoptPrefix(Sequence, Prefix) in dedicated mode. Admission
+		// resolves it UnsupportedOnGpu with the dedicated-mode reason, not the no-prefix overload's.
+		bool bPrefixOverload = false;
+		// FSuperSLMPagedGpuTestSeam::HoldApply() (§3.9): the hold this op's job carries; 0 for none.
+		int64 HoldId = 0;
+
+		// Plugin paging plan §3.4 "Adopt" (K7), pooled mode: the prefix RequestAdoptPrefix(Sequence,
+		// Prefix) names. 0 for the no-prefix overload and in dedicated mode.
+		int64 AdoptPrefixId = 0;
+
+		// Plugin paging plan §3.5 (K7), a pooled restore: the 'SLM6' header's budget, origin and ready
+		// word as the call checked them (the ledger's charge and the holder's shape and armed flag
+		// read these, never the wrapper), the sharing hint's prefix id (0: none), and whether the
+		// ledger holds the restore waiting on H (bSubmitted with no job yet).
+		bool bRestorePooled = false;
+		int64 RestoreBudget = 0;
+		int64 RestoreOrigin = 0;
+		bool bRestoreReady = false;
+		int64 RestoreHintPrefixId = 0;
+		bool bRestoreWaiting = false;
 
 		TSharedPtr<FLifecycleAsyncState> Async;
 	};
@@ -615,6 +742,24 @@ namespace
 		// thread, ApplyDue() applies nothing to this slot, so the tokens a caller reads at the save's
 		// resolution are exactly the ones the blob counts as applied.
 		bool bSaveAssembling = false;
+
+		// Plugin paging plan §3.4 (K6): the slot's mirror of the thread slot's ContextUsed, as of the
+		// last applied result (FActionResult::ContextUsed) or finalized reset. 0 at vend: a vended
+		// holder is fresh or reset. The pooled activation pre-check reads it.
+		int64 ContextUsedMirror = 0;
+		// Plugin paging plan §3.4 "The armed flag" (K7): the slot's bL1ReadyArmed, the mirror of the
+		// thread slot's bArmed as of the last applied result (FActionResult::Armed) or finalized adopt,
+		// reset or restore. False at vend: a vended holder is fresh or reset. The empty-prompt check at
+		// a generation's admission and the seam's SequenceArmed() read it.
+		bool bArmedMirror = false;
+		// K7: the generation now planned is an armed sequence's empty-prompt one, whose first
+		// (finish-only) step still has to carry the generation's limits (FAction::bBeginLimits).
+		bool bPlanBeginLimits = false;
+		// K7 review S1, pooled mode: the generation's limit, read from the page ledger's applied shape
+		// when its BeginGeneration was admitted (it waits at the slot front while the slot has a ledger
+		// job open, so no job is in flight then), carried to the thread by its first step
+		// (FAction::BeginLimit). 0 in dedicated mode and outside a generation.
+		int64 PlanBeginLimit = 0;
 	};
 
 	struct FGameSlot : FGameSlotUser
@@ -628,6 +773,10 @@ namespace
 		bool bHeldThisTick = false;
 		int64 Id = 0;     // the hand-off key
 		uint32 Gen = 0;   // the stale-result filter (slot-owned, K11)
+		// Plugin paging plan §3.9 (FSuperSLMPagedGpuTestSeam::SlotHolderGeneration()): rises each
+		// time the slot's Layer-1 handle is replaced (a restore's finalize). Slot-owned, so it
+		// survives a holder's return.
+		int64 HolderGeneration = 0;
 
 		// Plan §2.5 row 4 (D-SLM7665): the bind eligibility the Layer-1 sequence will have once
 		// everything already queued for it has run -- true at the vend of a fresh or reset
@@ -657,6 +806,10 @@ namespace
 		// mapping, bVended stays true) until the admission step observes the log fully drained,
 		// at which point it performs the deferred free.
 		bool bReturnPending = false;
+		// Plugin paging plan §3.5 (K7): a pooled restore holds this free slot (bVended is set with it)
+		// from its arrival until it resolves -- in flight, or waiting on H. A later arrival that finds
+		// no free slot waits for such a slot instead of reading PoolExhausted.
+		bool bRestoreReserved = false;
 	};
 
 	struct FAdapterEntry
@@ -715,6 +868,237 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	// review: reading ThreadSlots[0].KvBytes zeroed itself when SlotIndex == 0, since TS IS
 	// ThreadSlots[0]).
 	int64 KvBytesPerSequence = 0;
+
+	// --- Plugin paging plan, pooled mode (K6; §3.1-§3.5, UP-15) ---
+	// SequenceBudget > 0. Set at Configure and never changed.
+	bool bPooled = false;
+	// The engine's page geometry, computed at the model's cap (Ce) exactly as
+	// sslm_gpu_kv_pool_create computes it, and cross-checked against the pool's stats at Configure.
+	superslm_gpu::kv_pool::GpuPageGeometry PageGeometry;
+	// The pool: S + P + H + CacheRegionPages() pages, and its bytes (the device buffer; the host
+	// mirror is the same size again, in system RAM, and is not declared GPU residency).
+	uint32 PoolPageCount = 0;
+	int64 PoolBytes = 0;
+	// Created and destroyed on the submission thread (Configure's job 3, ReleaseLayer1()).
+	SslmGpuKvPoolHandle* Pool = nullptr;
+	// The page ledger. Game thread only, once the state is published (Configure() fills it on the
+	// thread that prepares the state, before any other thread can see it).
+	SuperSLMPaging::FPageLedger Ledger;
+	// The pool's stats as Configure's cross-check read them (GetKvPageStats()' snapshot).
+	bool bHasPoolSnapshot = false;
+	SslmGpuKvPoolStats LastPoolStats = {};
+
+	// Region C: the GPU has no prefix cache in the paging release, so it is 0 (plan §3.2).
+	static constexpr uint32 CacheRegionPages() { return 0u; }
+
+	bool IsPooled() const { return bPooled; }
+
+	// §3.7: the engine returned KV_POOL_EXHAUSTED to one of this plan's own (admitted) requests,
+	// which a correct ledger never lets happen. Counted, and logged by name as a ledger fault.
+	// Game thread.
+	void NoteLedgerFault(const TCHAR* Verb)
+	{
+		Ledger.NoteEngineExhaustion();
+		UE_LOG(LogSuperSLM, Warning, TEXT("SuperSLM ledger fault: %s returned SSLM_GPU_KV_POOL_EXHAUSTED to a request the page ledger admitted (%llu so far); the ledger under-charged it."),
+			Verb, static_cast<uint64>(Ledger.LedgerFaults()));
+	}
+
+	// K2 review F3's twin: the ledger refused, at the head of a slot's queue, an op it should always
+	// admit (a plugin defect). The op is refused by name and never runs untracked; the refusal is
+	// counted with the ledger faults and logged as one. Game thread.
+	void NoteLedgerRefusal(int32 SlotIndex, const FString& Reason)
+	{
+		Ledger.NoteEngineExhaustion();
+		UE_LOG(LogSuperSLM, Error, TEXT("SuperSLM ledger fault: GPU slot %d: %s; the op was refused, nothing was posted (%llu so far; plugin defect)."),
+			SlotIndex, *Reason, static_cast<uint64>(Ledger.LedgerFaults()));
+	}
+
+	// §3.9 seams: the submission-thread jobs of each paged kind posted since this Configure(), and
+	// every SSLM_BUSY a Layer-1 call of this state returned (cell 3.3: never, when the jobs are
+	// Busy-safe). JobsPostedByKind is game thread; Layer1BusyCount is written on the submission
+	// thread.
+	int64 JobsPostedByKind[static_cast<int32>(EGpuPagedJobKind::Count)] = {};
+	std::atomic<int64> Layer1BusyCount{0};
+
+	// Counts a Layer-1 status: SSLM_BUSY is what Layer1BusyCount measures. Any thread.
+	void NoteLayer1Status(FGpuStatus Status)
+	{
+		if (Status == FGpuStatus::SSLM_BUSY)
+		{
+			Layer1BusyCount.fetch_add(1);
+		}
+	}
+
+	// HoldApply()'s holds (§3.9). Game thread.
+	TArray<FGpuPagedHold> PagedHolds;
+
+	// The next armed hold of Kind, attached to the job being admitted now; 0 when none is armed.
+	int64 AttachPagedHold(EGpuPagedJobKind Kind)
+	{
+		// K6 review N4: an armed hold released before any job took it is disarmed for good; it goes.
+		PagedHolds.RemoveAll([](const FGpuPagedHold& Hold) { return Hold.bReleased && !Hold.bAttached; });
+		for (FGpuPagedHold& Hold : PagedHolds)
+		{
+			if (Hold.Kind == Kind && !Hold.bAttached && !Hold.bReleased)
+			{
+				Hold.bAttached = true;
+				return Hold.Id;
+			}
+		}
+		return 0;
+	}
+
+	// True while HoldId's job must not be applied: its Layer-1 work is done (the caller checked) and
+	// the hold is not released. Marks the hold reached.
+	bool PagedHoldBlocks(int64 HoldId)
+	{
+		if (HoldId == 0)
+		{
+			return false;
+		}
+		for (int32 Index = 0; Index < PagedHolds.Num(); ++Index)
+		{
+			FGpuPagedHold& Hold = PagedHolds[Index];
+			if (Hold.Id == HoldId)
+			{
+				if (Hold.bReleased)
+				{
+					// K6 review N4: the held apply goes ahead now, so the hold is done with. A later
+					// IsHoldReached() or ReleaseHold() of it reads false, as for any released hold.
+					PagedHolds.RemoveAt(Index, 1, EAllowShrinking::No);
+					return false;
+				}
+				Hold.bReached = true;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Configure() and teardown: every hold released and every armed one disarmed (cell 1.11).
+	void ReleaseAllPagedHolds()
+	{
+		for (FGpuPagedHold& Hold : PagedHolds)
+		{
+			Hold.bReleased = true;
+		}
+	}
+
+	// --- GPU prefixes (plugin paging plan §3.3, §3.4; K7), pooled mode only ---
+
+	// The submission thread's prefix handles, by prefix id. Written and read on the submission thread
+	// only (the begin, build-turn, adopt, restore and release jobs, and ReleaseLayer1()).
+	struct FThreadPrefix
+	{
+		SslmGpuPrefixHandle* Handle = nullptr;
+	};
+	TMap<int64, FThreadPrefix> ThreadPrefixes;
+
+	// A prefix job's output, written by its job before bDone and read on the game thread after.
+	struct FPrefixJobState
+	{
+		FGpuStatus Status = FGpuStatus::SSLM_OK;
+		const TCHAR* Where = TEXT("");
+	};
+
+	// One planned build turn: the tick job that carries it and its action's index there.
+	struct FPrefixTurn
+	{
+		TSharedPtr<FJob> Job;
+		int32 ActionIndex = INDEX_NONE;
+	};
+
+	// A prefix, game-side. Its Phase is Pending until its begin job has run (sslm_gpu_prefix_begin or
+	// begin_from, and set_schema), Prefilling while the build seat feeds it, then Ready once the build's
+	// apply has run (ApplyPrefixBuild), or Faulted. A released prefix reads Invalid; its entry is
+	// kept only until release apply and its last ghost dependent drain. Game thread.
+	struct FGpuPrefixEntry
+	{
+		int64 Id = 0;
+		SuperSLMPaging::FNodeId Node = SuperSLMPaging::InvalidNode;
+		ESuperSLMPrefixPhase Phase = ESuperSLMPrefixPhase::Pending;
+		TArray<int32> Tokens;      // this prefix's own tokens (a nested child's: the child's alone)
+		int32 Kind = 0;            // sslm_gpu_prefix_prefill's kind: 0 prompt, 1 schema content
+		int64 ParentId = 0;        // a nested child's parent; 0 for a root
+		int64 Length = 0;          // the engine's length once built: the parent's length + Tokens.Num()
+		bool bReady = false;       // the engine's ready_for_logits after the build (§3.4 "The armed flag")
+		SuperSLMPaging::FTicket BuildTicket = SuperSLMPaging::InvalidTicket;
+		int64 HoldId = 0;          // HoldApply(PrefixBuild or NestedBuild): holds the build's apply
+		TSharedPtr<FJob> BeginJob;
+		TSharedPtr<FPrefixJobState> BeginState;
+		int32 TurnsPlanned = 0;
+		int32 BuiltTokens = 0;     // turns applied (§3.9 PrefixBuiltTokens())
+		#if WITH_DEV_AUTOMATION_TESTS
+		TArray<int64> TurnTicks;   // dev observation; no per-turn history in Shipping
+		#endif
+		TArray<FPrefixTurn> TurnsInFlight;
+		bool bBuildFaulted = false;
+		FString FaultMessage;
+		bool bReleased = false;
+		bool bReleaseApplied = false;
+		SuperSLMPaging::FTicket ReleaseTicket = SuperSLMPaging::InvalidTicket;
+		TSharedPtr<FJob> ReleaseJob;
+		int64 ReleaseHoldId = 0;
+	};
+	TMap<int64, FGpuPrefixEntry> Prefixes;
+	// The build seat's queue, in arrival order (§3.4: "one build seat per subsystem; further builds
+	// queue in arrival order"). Its head is the prefix the seat feeds.
+	TArray<int64> BuildQueue;
+
+	// Plan §3.2 N2 of the K6 review (K7): GetKvPageStats()' snapshot is the last applied paged job's
+	// sslm_gpu_kv_pool_stats. The jobs write the shadow under its lock on the submission thread; each
+	// tick's admission pass copies it to LastPoolStats on the game thread.
+	FCriticalSection PoolStatsLock;
+	SslmGpuKvPoolStats PoolStatsShadow = {};
+	bool bPoolStatsShadowFresh = false;
+
+	// Submission thread: reads the pool's stats into the shadow (a diagnostic; no verdict reads it).
+	void SnapshotPoolStatsOnThread()
+	{
+		if (Pool == nullptr)
+		{
+			return;
+		}
+		SslmGpuKvPoolStats Stats = {};
+		Stats.struct_size = static_cast<uint32_t>(sizeof(Stats));
+		const FGpuStatus St = sslm_gpu_kv_pool_stats(Pool, &Stats);
+		NoteLayer1Status(St);
+		if (St == FGpuStatus::SSLM_OK)
+		{
+			FScopeLock Lock(&PoolStatsLock);
+			PoolStatsShadow = Stats;
+			bPoolStatsShadowFresh = true;
+		}
+	}
+
+	// Game thread: the latest shadow becomes GetKvPageStats()' snapshot.
+	void TakePoolStatsSnapshot()
+	{
+		FScopeLock Lock(&PoolStatsLock);
+		if (bPoolStatsShadowFresh)
+		{
+			LastPoolStats = PoolStatsShadow;
+			bHasPoolSnapshot = true;
+			bPoolStatsShadowFresh = false;
+		}
+	}
+
+#if WITH_DEV_AUTOMATION_TESTS
+	// §3.9 SetNextLayer1StatusOverride() for the K7 kinds and ArmAdoptFaultAfterShare(): one-shot
+	// statuses written on the game thread and taken once on the submission thread with an exchange
+	// back to SSLM_OK (0), the unset value, as TestNextResetStatus is.
+	std::atomic<uint32> TestNextAdoptStatus{0};
+	std::atomic<uint32> TestNextPrefixBuildStatus{0};
+	std::atomic<uint32> TestNextNestedBuildStatus{0};
+	std::atomic<uint32> TestAdoptFaultAfterShare{0};
+#endif
+
+	// Test overrides read on the submission thread: the armed one-shot status, or SSLM_OK when unset
+	// (and in every build without the seams).
+	static FGpuStatus TakeTestStatus(std::atomic<uint32>* Slot)
+	{
+		return Slot != nullptr ? static_cast<FGpuStatus>(Slot->exchange(0u, std::memory_order_acq_rel)) : FGpuStatus::SSLM_OK;
+	}
 
 	// Plan §2.5 row 1 (D-SLM7662): the absolute shader directory Configure() passed to Layer 1 as
 	// GpuContextConfig::shader_dir, the same directory the staging check read.
@@ -879,6 +1263,14 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	{
 		int32 SlotIndex = INDEX_NONE;
 		TSharedPtr<FLifecycleAsyncState> Async;
+		// Pooled mode (K6): the recycle's page-ledger reset ticket, applied when its statuses are
+		// read, and the HoldApply(Return) hold its apply carries.
+		SuperSLMPaging::FTicket LedgerTicket = SuperSLMPaging::InvalidTicket;
+		int64 HoldId = 0;
+		// K6 review C1, fix (b): false while the page ledger has not yet admitted this recycle's reset,
+		// because the slot's previous ledger job (an earlier recycle) was still open when it was
+		// queued. PollRecycles() admits it, in queue order, once that job has applied.
+		bool bLedgerAdmitted = true;
 	};
 	TArray<FPendingRecycle> PendingRecycles;
 
@@ -905,6 +1297,9 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	std::atomic<int32> OutstandingTickJobs{0};
 	std::atomic<int32> OutstandingOtherJobs{0};
 	std::atomic<double> LastGpuBusyMs{0.0};
+	FCriticalSection TimingLock;
+	FSuperSLMGpuTimingSnapshot CompletedTiming; // TimingLock protects worker publication
+	FSuperSLMGpuTimingSnapshot GameTiming;      // game thread only, published once per Tick
 	std::atomic<double> LastHostFinishMs{0.0};
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -1336,6 +1731,10 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	{
 		const double Busy = superslm_gpu::LastCallTiming().gpu_busy_ms;
 		LastGpuBusyMs.store(Busy);
+		{
+			FScopeLock Guard(&TimingLock);
+			CompletedTiming = { DispatchCount.load(), Busy };
+		}
 		TRACE_COUNTER_SET(SuperSLMGpuBusyMs, Busy);
 		if (Busy > Config.TickBudgetMs)
 		{
@@ -1376,22 +1775,27 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		}
 		SslmGpuSequenceHandle* Probe = nullptr;
 		FGpuStatus St = sslm_gpu_seq_create(Ctx, Model, 2, &Probe);
+		NoteLayer1Status(St);
 		if (St != FGpuStatus::SSLM_OK || Probe == nullptr)
 		{
 			return St == FGpuStatus::SSLM_GPU_ALLOCATION_FAILED && (!Dev.dev || SUCCEEDED(Dev.dev->GetDeviceRemovedReason()));
 		}
 		bool bOk = false;
 		St = sslm_gpu_seq_embed_token(Ctx, Probe, 0);
+		NoteLayer1Status(St);
 		if (St == FGpuStatus::SSLM_OK)
 		{
 			CountSubmission();
 			St = sslm_decode_step_gpu(Ctx, Probe, nullptr, DispatchesPerLayer);
+			NoteLayer1Status(St);
 		}
 		if (St == FGpuStatus::SSLM_OK)
 		{
 			int32_t Ready = 0;
 			FGpuStatus Drained = FGpuStatus::SSLM_OK;
 			St = sslm_gpu_ready(Ctx, Probe, 1, &Ready, &Drained);
+			NoteLayer1Status(St);
+			NoteLayer1Status(Drained);
 			if (St == FGpuStatus::SSLM_OK)
 			{
 				bOk = Ready == 1 && (Drained == FGpuStatus::SSLM_OK || Drained == FGpuStatus::SSLM_GPU_ALLOCATION_FAILED);
@@ -1401,7 +1805,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		{
 			bOk = St == FGpuStatus::SSLM_GPU_ALLOCATION_FAILED;
 		}
-		sslm_gpu_seq_release(Ctx, Probe);
+		NoteLayer1Status(sslm_gpu_seq_release(Ctx, Probe));
 		return bOk && (!Dev.dev || SUCCEEDED(Dev.dev->GetDeviceRemovedReason()));
 	}
 
@@ -1425,9 +1829,22 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 
 	void FaultResult(FThreadSlot& TS, FActionResult& R, FGpuStatus Status, const TCHAR* Where)
 	{
+		NoteLayer1Status(Status);
 		R.Kind = EResultKind::Fault;
-		R.Fault = Classify(Status);
 		R.Message = FString::Printf(TEXT("%s returned %s"), Where, *GpuStatusText(Status));
+		if (Status == FGpuStatus::SSLM_GPU_KV_BUDGET_EXCEEDED)
+		{
+			// Plugin paging plan §3.4, §3.7 (K6): the engine's own budget enforcement stopped a pooled
+			// holder. The plugin's per-step pre-check (ContextHasRoom()) stops every holder at its
+			// limit first, so reaching this is a defect of that check: named, and logged as a limit
+			// fault. Never probed: the device is not in question.
+			R.Fault = ESuperSLMGpuFaultReason::KvBudgetExceeded;
+			UE_LOG(LogSuperSLM, Warning, TEXT("SuperSLM limit fault: %s on GPU slot generation %u (context used %lld, limit %lld); the plugin's per-step pre-check let the step past the holder's limit."),
+				*R.Message, TS.Gen, TS.ContextUsed, TS.Limit);
+			StopWith(TS, R);
+			return;
+		}
+		R.Fault = Classify(Status);
 		StopWith(TS, R);
 	}
 
@@ -1466,6 +1883,10 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	// The first prompt token of a generation sets the limits the thread stops on.
 	void BeginPrompt(FThreadSlot& TS, const FAction& A)
 	{
+		if (A.BeginLimit > 0)
+		{
+			TS.Limit = A.BeginLimit; // K7 review S1: the ledger's applied limit wins over the thread's
+		}
 		TS.MaxNewTokens = A.MaxNewTokens;
 		TS.StopTokenIds = A.StopTokenIds;
 		TS.Produced = 0;
@@ -1526,7 +1947,9 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			// does not answer SSLM_BUSY; a dead end leaves the walk where it was, so its reading
 			// is the last produced token's. Any other status reads as not accepting.
 			int32_t Accepting = 0;
-			R.bSchemaAccepting = SslmGpuSeqSchemaAcceptingForG5Bridge(Ctx, TS.Handle, &Accepting) == FGpuStatus::SSLM_OK && Accepting != 0;
+			const FGpuStatus AcceptingSt = SslmGpuSeqSchemaAcceptingForG5Bridge(Ctx, TS.Handle, &Accepting);
+			NoteLayer1Status(AcceptingSt); // K6 review S2: every submission-thread status is counted
+			R.bSchemaAccepting = AcceptingSt == FGpuStatus::SSLM_OK && Accepting != 0;
 		}
 		// Ruling 2026-09-26: the walk as of this finish, beside the accepting read, carried back for
 		// GetSchemaWalkState() (Unused when no schema is bound, which the bridge itself reports).
@@ -1551,6 +1974,30 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 
 	bool ContextHasRoom(FThreadSlot& TS, FActionResult& R)
 	{
+		// Plugin paging plan §3.4 "Generation limit" (K6): a pooled holder's per-step pre-check
+		// (engine token law E7). An embed needs ContextUsed < limit; finish-only steps never come
+		// here. Below the cap the stop is KvBudgetExceeded, by name; at limit == ContextCap the
+		// existing cap outcome below fires instead. Dedicated slots (Limit 0) skip it.
+		// K6 review N1: a pooled holder with no limit is a plugin defect (a shape-changing job that
+		// did not write it), which would silently turn the pre-check off; it fails loudly.
+		ensureMsgf(!bPooled || TS.Limit > 0, TEXT("SuperSLM GPU: a pooled holder has no generation limit (FThreadSlot::Limit 0); the job that gave it its shape did not write it"));
+		if (TS.Limit > 0)
+		{
+			const SuperSLMPaging::ELimitVerdict Verdict = SuperSLMPaging::CheckStep(TS.ContextUsed, /*bFinishOnly*/ false, TS.Limit, TS.Cap);
+			if (Verdict == SuperSLMPaging::ELimitVerdict::Allowed)
+			{
+				return true;
+			}
+			if (Verdict == SuperSLMPaging::ELimitVerdict::KvBudgetExceeded)
+			{
+				R.Kind = EResultKind::Fault;
+				R.Fault = ESuperSLMGpuFaultReason::KvBudgetExceeded;
+				R.Message = FString::Printf(TEXT("the sequence has reached its own generation limit (%lld = min(origin + SequenceBudget, ContextCap)); no budgeted position is left to embed the next token"),
+					TS.Limit);
+				StopWith(TS, R);
+				return false;
+			}
+		}
 		if (TS.ContextUsed < TS.Cap)
 		{
 			return true;
@@ -1581,6 +2028,93 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		RecordToken(TS, R, Token);
 	}
 
+	// Plugin paging plan §3.4 "The armed flag" (K7): the first finish-only step of an armed holder (an
+	// adopt of a non-empty prefix, or a restore of a ready payload; a suffix's embeds leave the flag
+	// set). SslmGpuSeqDecodeStepForG5Bridge takes its ready shortcut: it finishes the resident state,
+	// embeds nothing and clears ready_for_logits, so ContextUsed does not advance and no room check
+	// applies (a finish-only step). The finish bridge here would leave the engine's flag set, and the
+	// next embed would be one token short. On both paths (RunOneCallToken(), ComposedFinishOnly).
+	void ArmedFinish(FThreadSlot& TS, FActionResult& R)
+	{
+		int32_t Token = -1;
+		FGpuStatus St;
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Finish", SuperSLMGpuChannel);
+			const double Start = FPlatformTime::Seconds();
+			St = SslmGpuSeqDecodeStepForG5Bridge(Ctx, TS.Handle, FMath::Max(TS.LastToken, 0), FullTokenBudget(), &Token);
+			const double FinishMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+			LastHostFinishMs.store(FinishMs);
+			TRACE_COUNTER_SET(SuperSLMGpuHostFinishMs, FinishMs);
+		}
+		TS.bArmed = false;
+		TS.bPrimed = false;
+		if (St != FGpuStatus::SSLM_OK)
+		{
+			FaultResult(TS, R, St, TEXT("SslmGpuSeqDecodeStepForG5Bridge (the armed step)"));
+			return;
+		}
+		RecordToken(TS, R, Token);
+	}
+
+	// Plugin paging plan §3.4 "Build pace" (K7, UP-11): one build-seat turn. One prefix token, through
+	// sslm_gpu_prefix_prefill with count 1 at a whole token's dispatches (never DispatchBudget, which
+	// may be one layer, below the verb's unit), and on the prefix's last token its freeze. A refusal,
+	// or a turn that consumed other than one token, faults the build: its handle is released here and
+	// every later turn of it reads the fault. Submission thread.
+	void RunPrefixBuildTurn(const FAction& A, FActionResult& R)
+	{
+		FThreadPrefix* Prefix = ThreadPrefixes.Find(A.PrefixId);
+		if (Prefix == nullptr || Prefix->Handle == nullptr)
+		{
+			R.Kind = EResultKind::Fault;
+			R.Message = TEXT("the prefix's build had already failed");
+			return;
+		}
+		const int32_t Token = static_cast<int32_t>(A.PromptToken);
+		int32_t Consumed = 0;
+		FGpuStatus St;
+		const TCHAR* Where = TEXT("sslm_gpu_prefix_prefill");
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.PrefixBuild", SuperSLMGpuChannel);
+			CountSubmission();
+			St = sslm_gpu_prefix_prefill(Ctx, Prefix->Handle, &Token, 1, static_cast<int32_t>(A.PrefixKind), FullTokenBudget(), &Consumed);
+		}
+		NoteLayer1Status(St);
+		if (St == FGpuStatus::SSLM_OK && Consumed == 1) { RecordGpuBusy(); }
+		if (St == FGpuStatus::SSLM_OK && Consumed != 1)
+		{
+			R.Kind = EResultKind::Fault;
+			R.Message = FString::Printf(TEXT("sslm_gpu_prefix_prefill consumed %d of 1 token"), static_cast<int32>(Consumed));
+		}
+		else if (St == FGpuStatus::SSLM_OK && A.bLastPrompt)
+		{
+			Where = TEXT("sslm_gpu_prefix_freeze");
+			St = sslm_gpu_prefix_freeze(Ctx, Prefix->Handle);
+			NoteLayer1Status(St);
+		}
+		if (St != FGpuStatus::SSLM_OK)
+		{
+			R.Kind = EResultKind::Fault;
+			R.Message = FString::Printf(TEXT("%s returned %s"), Where, *GpuStatusText(St));
+			R.Fault = Classify(St); // a confirmed device loss stops the job here, as on every other call
+		}
+		if (R.Kind == EResultKind::Fault)
+		{
+			const FGpuStatus ReleaseSt = sslm_gpu_prefix_release(Ctx, Prefix->Handle);
+			NoteLayer1Status(ReleaseSt);
+			// K7 review N2: the faulted build's thread entry goes with its handle (a later turn of the
+			// same build finds none and reports the build failed; ReleaseGpuPrefix() of a Faulted prefix
+			// posts no job). Prefix is not read after this.
+			ThreadPrefixes.Remove(A.PrefixId);
+			return;
+		}
+		R.Kind = A.bLastPrompt ? EResultKind::PrefillOk : EResultKind::Progress;
+		if (A.bLastPrompt)
+		{
+			SnapshotPoolStatsOnThread();
+		}
+	}
+
 	// One whole layer loop for the token just embedded: one call at a full-token budget, drained.
 	FGpuStatus RunFullDepth(FThreadSlot& TS)
 	{
@@ -1597,6 +2131,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			{
 				TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Drain", SuperSLMGpuChannel);
 				St = sslm_gpu_ready(Ctx, TS.Handle, 1, &Ready, &Drained);
+				NoteLayer1Status(St);
 			}
 			if (St == FGpuStatus::SSLM_OK)
 			{
@@ -1642,6 +2177,11 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		FThreadSlot& TS = ThreadSlots[A.Slot];
 		if (!BindAdapterIfRequested(TS, A, R))
 		{
+			return;
+		}
+		if (TS.bArmed)
+		{
+			ArmedFinish(TS, R); // plugin paging plan §3.4 (K7): the first finish-only step while armed
 			return;
 		}
 		int32_t Token = -1;
@@ -1708,11 +2248,16 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				break;
 			}
 			const FAction& A = Job.Actions[I];
+			if (A.Kind == EActionKind::PrefixBuildTurn)
+			{
+				RunPrefixBuildTurn(A, Job.Results[I]); // the build seat's place in the one-call rotation (K7)
+				continue;
+			}
 			if ((A.Kind != EActionKind::OneCallPromptToken && A.Kind != EActionKind::OneCallToken) || !ActionIsLive(A))
 			{
 				continue;
 			}
-			if (A.bFirstPrompt)
+			if (A.bFirstPrompt || A.bBeginLimits)
 			{
 				BeginPrompt(ThreadSlots[A.Slot], A);
 			}
@@ -1743,7 +2288,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			{
 				continue;
 			}
-			if (A.bFirstPrompt)
+			if (A.bFirstPrompt || A.bBeginLimits)
 			{
 				BeginPrompt(ThreadSlots[A.Slot], A);
 			}
@@ -1755,6 +2300,11 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			FActionResult& R = Job.Results[I];
 			if (A.Kind == EActionKind::ComposedFinishOnly)
 			{
+				if (TS.bArmed)
+				{
+					ArmedFinish(TS, R); // plugin paging plan §3.4 (K7): replaces the one primed finish-bridge call
+					continue;
+				}
 				TS.bPrimed = false;
 				FinishToken(TS, R);
 				continue;
@@ -1804,6 +2354,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				{
 					TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Drain", SuperSLMGpuChannel);
 					St = sslm_gpu_ready(Ctx, TS.Handle, 1, &Ready, &Drained);
+					NoteLayer1Status(St);
 				}
 				if (St == FGpuStatus::SSLM_OK)
 				{
@@ -1898,9 +2449,11 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		for (int32 I = 0; I < Job.Actions.Num(); ++I)
 		{
 			const FAction& A = Job.Actions[I];
-			if (ActionIsLive(A))
+			if (A.Kind != EActionKind::PrefixBuildTurn && ActionIsLive(A))
 			{
 				Job.Results[I].BindTag = ThreadSlots[A.Slot].AppliedBindTag;
+				Job.Results[I].ContextUsed = ThreadSlots[A.Slot].ContextUsed; // plugin paging plan §3.4 (K6): the mirror
+				Job.Results[I].Armed = ThreadSlots[A.Slot].bArmed ? 1 : 0;    // and the armed mirror (K7)
 			}
 		}
 	}
@@ -1924,7 +2477,9 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			if (TS.Handle != nullptr)
 			{
 				const FGpuStatus UnbindSt = sslm_gpu_seq_bind_adapter(Ctx, TS.Handle, nullptr);
+				NoteLayer1Status(UnbindSt);
 				const FGpuStatus St = sslm_gpu_seq_release(Ctx, TS.Handle);
+				NoteLayer1Status(St);
 				TeardownRecord.SequenceSlots.Add(SlotIndex);
 				TeardownRecord.SequenceUnbindStatuses.Add(GpuStatusText(UnbindSt));
 				TeardownRecord.SequenceReleaseStatuses.Add(GpuStatusText(St));
@@ -1937,11 +2492,41 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				TS.PinnedAdapter = nullptr;
 			}
 		}
+		// Plugin paging plan §3.4 "Pool and sequences" (K7): every prefix, after the sequences and
+		// before the pool, which refuses its destroy while a prefix drawn from it is live.
+		for (TPair<int64, FThreadPrefix>& Pair : ThreadPrefixes)
+		{
+			if (Pair.Value.Handle != nullptr)
+			{
+				const FGpuStatus St = sslm_gpu_prefix_release(Ctx, Pair.Value.Handle);
+				NoteLayer1Status(St);
+				if (St != FGpuStatus::SSLM_OK)
+				{
+					UE_LOG(LogSuperSLM, Error, TEXT("GPU teardown: sslm_gpu_prefix_release refused (%s)."), *GpuStatusText(St));
+				}
+				Pair.Value.Handle = nullptr;
+			}
+		}
+		ThreadPrefixes.Reset();
+		// Plugin paging plan §3.5 (K6): the pool, after every sequence drawn from it (and, at K7,
+		// every prefix) is released, and before the adapters, the model and the context.
+		if (Pool != nullptr)
+		{
+			const FGpuStatus St = sslm_gpu_kv_pool_destroy(Ctx, Pool);
+			NoteLayer1Status(St);
+			TeardownRecord.KvPoolDestroyStatus = GpuStatusText(St);
+			if (St != FGpuStatus::SSLM_OK)
+			{
+				UE_LOG(LogSuperSLM, Error, TEXT("GPU teardown: sslm_gpu_kv_pool_destroy refused (%s)."), *GpuStatusText(St));
+			}
+			Pool = nullptr;
+		}
 		for (TPair<int64, FAdapterEntry>& Pair : Adapters)
 		{
 			if (Pair.Value.Handle != nullptr)
 			{
 				const FGpuStatus St = sslm_gpu_adapter_unmap(Ctx, Pair.Value.Handle);
+				NoteLayer1Status(St);
 				TeardownRecord.AdapterIds.Add(Pair.Key);
 				TeardownRecord.AdapterUnmapStatuses.Add(GpuStatusText(St));
 				if (St != FGpuStatus::SSLM_OK)
@@ -1954,6 +2539,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		if (Model != nullptr)
 		{
 			const FGpuStatus St = sslm_gpu_model_unmap(Ctx, Model);
+			NoteLayer1Status(St);
 			TeardownRecord.ModelUnmapStatus = GpuStatusText(St);
 			if (St != FGpuStatus::SSLM_OK)
 			{
@@ -1964,6 +2550,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		if (Ctx != nullptr)
 		{
 			const FGpuStatus St = sslm_gpu_context_destroy(Ctx);
+			NoteLayer1Status(St);
 			TeardownRecord.ContextDestroyStatus = GpuStatusText(St);
 			if (St != FGpuStatus::SSLM_OK)
 			{
@@ -2104,6 +2691,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			if (Entry.bSubmitted && Slots.IsValidIndex(Entry.RestoreSlotIndex))
 			{
 				Slots[Entry.RestoreSlotIndex].bVended = false; // the reservation, as Refuse() releases it
+				Slots[Entry.RestoreSlotIndex].bRestoreReserved = false;
 			}
 			ResolveEntry(Entry, ESuperSLMRestoreResult::NotConfigured);
 			LastLifecycleRequestError = LostBeforeRanText();
@@ -2215,6 +2803,8 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		S.BeginWallSeconds = 0.0;
 		S.FirstTokenMs = -1.0;
 		S.bPlanPrimed = false;
+		S.bPlanBeginLimits = false;
+		S.PlanBeginLimit = 0;
 		S.TokensIssued = 0;
 		S.PlanLayerPos = 0;
 		S.bSchemaAccepting = false;
@@ -2230,12 +2820,75 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	// ineligible sequence anyway) and does not clear the thread slot's generation fields as if
 	// reset; it still re-syncs the stale-result generation, so the filter stays consistent with
 	// the game side. Returns the queued job so a caller can poll it without blocking.
-	TSharedPtr<FJob> QueueReset(int32 SlotIndex, bool bUnbind, const TSharedPtr<FLifecycleAsyncState>& Async)
+	// Plugin paging plan §3.5 "Normalization" (K7): the create-first replacement of TS's holder by a
+	// budgeted SequenceBudget one, on the submission thread. True when the new holder took the slot
+	// (the old one released); false, with the old holder untouched, when the create, a re-bind of a
+	// kept binding, or the old holder's release was refused -- the caller then resets in place.
+	bool NormalizeHolderOnThread(FThreadSlot& TS, int32 SlotIndex, bool bUnbind)
 	{
+		SslmGpuSequenceHandle* Fresh = nullptr;
+		FGpuStatus St = sslm_gpu_seq_create_budgeted(Ctx, Model, Pool, Config.SequenceBudget, &Fresh);
+		NoteLayer1Status(St);
+		const TCHAR* Where = TEXT("sslm_gpu_seq_create_budgeted");
+		if (St == FGpuStatus::SSLM_OK && Fresh != nullptr && !bUnbind)
+		{
+			// A reset keeps the schema binding (rewound) and the adapter: the new holder takes both.
+			if (TS.SchemaIndex >= 0)
+			{
+				Where = TEXT("SslmGpuSeqSetSchemaForG5Bridge (the normalized holder)");
+				St = SslmGpuSeqSetSchemaForG5Bridge(Ctx, Fresh, TS.SchemaIndex);
+				NoteLayer1Status(St);
+			}
+			if (St == FGpuStatus::SSLM_OK && TS.BoundAdapter != nullptr)
+			{
+				Where = TEXT("sslm_gpu_seq_bind_adapter (the normalized holder)");
+				St = sslm_gpu_seq_bind_adapter(Ctx, Fresh, TS.BoundAdapter);
+				NoteLayer1Status(St);
+			}
+		}
+		if (St == FGpuStatus::SSLM_OK && Fresh != nullptr)
+		{
+			Where = TEXT("sslm_gpu_seq_release (the holder being normalized)");
+			St = sslm_gpu_seq_release(Ctx, TS.Handle);
+			NoteLayer1Status(St);
+		}
+		if (St != FGpuStatus::SSLM_OK || Fresh == nullptr)
+		{
+			if (Fresh != nullptr)
+			{
+				NoteLayer1Status(sslm_gpu_seq_release(Ctx, Fresh));
+			}
+			UE_LOG(LogSuperSLM, Display, TEXT("GPU slot %d: the create-first normalization was not made (%s returned %s); the holder is reset in place and normalized at a later reset."),
+				SlotIndex, Where, *GpuStatusText(St));
+			return false;
+		}
+		TS.Handle = Fresh;
+		if (bUnbind)
+		{
+			TS.SchemaIndex = -1;
+			TS.BoundAdapter = nullptr;
+			TS.AppliedBindTag = 0;
+		}
+		return true;
+	}
+
+	// Plugin paging plan §3.5 "Normalization" (K7), pooled mode: bNormalize is the page ledger's
+	// create-first normalization (FAdmission::bNormalizes). The job first creates a budgeted
+	// SequenceBudget holder, then releases the old one, and the new holder takes the slot (a reset
+	// that keeps its bindings re-binds the schema and adapter on it first). If the create (or a
+	// re-bind) is refused, the old holder is reset in place, as an ordinary reset, and the ledger's
+	// apply reads ResetInPlace (normalization is retried at the next reset). LimitInPlace and
+	// LimitNormalized are the holder's limit after each outcome (FThreadSlot::Limit; 0 in dedicated
+	// mode, where the limit is not used).
+	TSharedPtr<FJob> QueueReset(int32 SlotIndex, bool bUnbind, const TSharedPtr<FLifecycleAsyncState>& Async, bool bNormalize = false,
+		int64 LimitInPlace = 0, int64 LimitNormalized = 0)
+	{
+		// Plan §3.9 (K6): JobsPosted() counts the reset jobs posted, by kind.
+		JobsPostedByKind[static_cast<int32>(bUnbind ? EGpuPagedJobKind::Return : EGpuPagedJobKind::Reset)] += 1;
 		BumpGeneration(SlotIndex);
 		const uint32 Gen = Slots[SlotIndex].Gen;
 		TSharedPtr<FJob> Job = MakeShared<FJob>();
-		Job->Custom = [this, SlotIndex, Gen, bUnbind, Async]()
+		Job->Custom = [this, SlotIndex, Gen, bUnbind, Async, bNormalize, LimitInPlace, LimitNormalized]()
 		{
 			FThreadSlot& TS = ThreadSlots[SlotIndex];
 			TS.Gen = Gen;
@@ -2245,10 +2898,33 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			}
 #if WITH_DEV_AUTOMATION_TESTS
 			const FGpuStatus ForcedResetSt = static_cast<FGpuStatus>(TestNextResetStatus.exchange(0u, std::memory_order_acq_rel));
-			const FGpuStatus St = ForcedResetSt != FGpuStatus::SSLM_OK ? ForcedResetSt : sslm_gpu_seq_reset(Ctx, TS.Handle);
 #else
-			const FGpuStatus St = sslm_gpu_seq_reset(Ctx, TS.Handle);
+			const FGpuStatus ForcedResetSt = FGpuStatus::SSLM_OK;
 #endif
+			bool bNormalized = false;
+			if (bNormalize && ForcedResetSt == FGpuStatus::SSLM_OK)
+			{
+				bNormalized = NormalizeHolderOnThread(TS, SlotIndex, bUnbind);
+			}
+			const FGpuStatus St = bNormalized ? FGpuStatus::SSLM_OK
+				: (ForcedResetSt != FGpuStatus::SSLM_OK ? ForcedResetSt : sslm_gpu_seq_reset(Ctx, TS.Handle));
+			NoteLayer1Status(St);
+			if (Async.IsValid())
+			{
+				Async->bNormalized = bNormalized;
+			}
+			if (St == FGpuStatus::SSLM_OK && bPooled)
+			{
+				// Plugin paging plan §3.4, §3.5 (K7): the holder rests at origin 0 with its own budget (or,
+				// normalized, SequenceBudget), and a reset clears the engine's ready flag. A negative
+				// in-place limit keeps the holder's limit as it stands (a deferred recycle, K6 review C1).
+				const int64 LimitAfter = bNormalized ? LimitNormalized : LimitInPlace;
+				if (LimitAfter >= 0)
+				{
+					TS.Limit = LimitAfter;
+				}
+				TS.bArmed = false;
+			}
 			if (Async.IsValid())
 			{
 				Async->bResetRan = true;
@@ -2266,7 +2942,9 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			if (bUnbind)
 			{
 				const FGpuStatus SchemaSt = SslmGpuSeqSetSchemaForG5Bridge(Ctx, TS.Handle, -1);
+				NoteLayer1Status(SchemaSt); // K6 review S2
 				const FGpuStatus AdapterSt = sslm_gpu_seq_bind_adapter(Ctx, TS.Handle, nullptr);
+				NoteLayer1Status(AdapterSt);
 				if (Async.IsValid())
 				{
 					Async->UnbindSchemaStatus = SchemaSt;
@@ -2309,28 +2987,151 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	{
 		FPendingRecycle Recycle;
 		Recycle.SlotIndex = SlotIndex;
+		bool bNormalize = false;
+		int64 LimitInPlace = 0;
+		int64 LimitNormalized = 0;
+		// Plugin paging plan §3.5 (K6): in pooled mode the recycle is a reset the page ledger admits
+		// (it returns whatever the holder drew above its warm reservation, at its apply), and is
+		// applied when PollRecycles() reads its statuses. A refusal is a plugin defect: the recycle
+		// is not posted and the slot is withheld, so no holder runs untracked.
+		//
+		// K6 review C1, fix (b): a slot may be vended and returned again before its previous recycle
+		// has applied (a Vend right after a Return gets the slot at once; FIFO orders every job of the
+		// new holder after that recycle). The ledger admits one job per slot, so this recycle's
+		// admission is deferred to PollRecycles(), which admits it in queue order once the earlier job
+		// has applied. Its job is posted now, in FIFO order, as a reset in place: it draws nothing,
+		// and it keeps the holder's limit, which is the one the earlier recycle left (origin 0, and no
+		// shape-changing job can run on the slot between the two -- an adopt or a reset of the holder
+		// in between waits for the earlier recycle, and its return waits for it). A normalization the
+		// ledger would ask for at the deferred admission is applied as ResetInPlace, and retried at
+		// the slot's next reset.
+		if (IsPooled() && (Ledger.SlotHasJob(SlotIndex) || HasUnadmittedRecycle(SlotIndex)))
+		{
+			Recycle.bLedgerAdmitted = false;
+			Recycle.HoldId = AttachPagedHold(EGpuPagedJobKind::Return);
+			Recycle.Async = MakeShared<FLifecycleAsyncState>();
+			Recycle.Async->Job = QueueReset(SlotIndex, /*bUnbind*/ true, Recycle.Async, /*bNormalize*/ false, /*LimitInPlace: keep*/ -1, 0);
+			PendingRecycles.Add(MoveTemp(Recycle));
+			return;
+		}
+		if (IsPooled())
+		{
+			const SuperSLMPaging::FAdmission Admission = Ledger.AdmitReset(SlotIndex);
+			if (Admission.Outcome != SuperSLMPaging::EPageAdmit::Admitted)
+			{
+				NoteLedgerRefusal(SlotIndex, FString::Printf(TEXT("the page ledger did not admit the recycle's reset (outcome %d)"), static_cast<int32>(Admission.Outcome)));
+				Slots[SlotIndex].bWithheld = true;
+				return;
+			}
+			Recycle.LedgerTicket = Admission.Ticket;
+			Recycle.HoldId = AttachPagedHold(EGpuPagedJobKind::Return);
+			bNormalize = Admission.bNormalizes; // K7: a restored holder of another budget is replaced create-first
+			ResetLimits(SlotIndex, LimitInPlace, LimitNormalized);
+		}
 		Recycle.Async = MakeShared<FLifecycleAsyncState>();
-		Recycle.Async->Job = QueueReset(SlotIndex, /*bUnbind*/ true, Recycle.Async);
+		Recycle.Async->Job = QueueReset(SlotIndex, /*bUnbind*/ true, Recycle.Async, bNormalize, LimitInPlace, LimitNormalized);
 		PendingRecycles.Add(MoveTemp(Recycle));
 	}
 
+	// K6 review N1: the one formula for a pooled holder's generation limit, the page ledger's own
+	// (FPageLedger::SlotLimit(): HolderLimit at the ledger's Cp). Every FThreadSlot::Limit a job
+	// writes, and the activation pre-check's SlotLimit(), come from a ledger shape through it.
+	int64 LedgerHolderLimit(const SuperSLMPaging::FHolderShape& Shape) const
+	{
+		return SuperSLMPaging::HolderLimit(Ledger.GetConfig().ContextCap, Shape);
+	}
+
+	// Plugin paging plan §3.4, §3.5 (K7): the slot holder's generation limit after a reset in place
+	// (its own budget, origin 0) and after a create-first normalization (SequenceBudget, origin 0),
+	// read from the ledger's shape for the slot before the reset applies. Pooled mode.
+	void ResetLimits(int32 SlotIndex, int64& OutInPlace, int64& OutNormalized) const
+	{
+		SuperSLMPaging::FHolderShape Shape = Ledger.SlotShape(SlotIndex);
+		Shape.Origin = 0;
+		OutInPlace = LedgerHolderLimit(Shape);
+		SuperSLMPaging::FHolderShape Normalized;
+		Normalized.Mode = SuperSLMPaging::EHolderMode::Budget;
+		Normalized.Budget = Config.SequenceBudget;
+		Normalized.Origin = 0;
+		OutNormalized = LedgerHolderLimit(Normalized);
+	}
+
+	// Plugin paging plan §3.5 (K6, K7): a reset's page-ledger apply, with what its job did: Normalized
+	// when the job replaced the holder create-first (K7), ResetInPlace when it reset the holder as it
+	// is (a reset in place, or a normalization whose create was refused), Refused when Layer 1
+	// refused the reset or the job never ran. A stale ticket (an ended epoch) changes nothing. A
+	// normalization replaced the slot's Layer-1 handle, so the slot's handle generation rises.
+	void ApplyLedgerReset(int32 SlotIndex, SuperSLMPaging::FTicket& Ticket, bool bRan, bool bNormalized)
+	{
+		if (Ticket == SuperSLMPaging::InvalidTicket)
+		{
+			return;
+		}
+		const SuperSLMPaging::EResetResult Result = !bRan ? SuperSLMPaging::EResetResult::Refused
+			: (bNormalized ? SuperSLMPaging::EResetResult::Normalized : SuperSLMPaging::EResetResult::ResetInPlace);
+		Ledger.ApplyReset(Ticket, Result);
+		Ticket = SuperSLMPaging::InvalidTicket;
+		if (bRan && bNormalized && Slots.IsValidIndex(SlotIndex))
+		{
+			Slots[SlotIndex].HolderGeneration += 1;
+		}
+	}
+
+	// The recycles' polls, in queue order (K6 review C1, fix (b)): a recycle whose ledger admission
+	// was deferred is admitted once its slot's earlier job has applied -- in this same pass, when the
+	// earlier recycle of the slot applies just ahead of it -- and every recycle whose job is done and
+	// whose apply HoldApply(Return) does not hold is applied, its statuses read.
 	void PollRecycles()
 	{
-		for (int32 I = PendingRecycles.Num() - 1; I >= 0; --I)
+		int32 I = 0;
+		while (I < PendingRecycles.Num())
 		{
-			const FPendingRecycle& Recycle = PendingRecycles[I];
+			FPendingRecycle& Recycle = PendingRecycles[I];
+			if (!Recycle.bLedgerAdmitted)
+			{
+				if (!IsPooled() || Ledger.SlotHasJob(Recycle.SlotIndex) || HasEarlierUnadmittedRecycle(I))
+				{
+					++I; // still behind its slot's earlier job
+					continue;
+				}
+				Recycle.bLedgerAdmitted = true;
+				const SuperSLMPaging::FAdmission Admission = Ledger.AdmitReset(Recycle.SlotIndex);
+				if (Admission.Outcome == SuperSLMPaging::EPageAdmit::Admitted)
+				{
+					Recycle.LedgerTicket = Admission.Ticket; // its job ran (or runs) in place: see QueueRecycle()
+				}
+				else
+				{
+					// A plugin defect, as at QueueRecycle(): the reset runs untracked by the ledger, so the
+					// slot is withheld once its statuses are read.
+					NoteLedgerRefusal(Recycle.SlotIndex, FString::Printf(TEXT("the page ledger did not admit a deferred recycle's reset (outcome %d)"),
+						static_cast<int32>(Admission.Outcome)));
+					Slots[Recycle.SlotIndex].bWithheld = true;
+				}
+			}
 			const FLifecycleAsyncState& Async = *Recycle.Async;
 			if (!Async.Job.IsValid() || !Async.Job->bDone.load(std::memory_order_acquire))
 			{
+				++I;
 				continue;
 			}
+			// Plan §3.9 (K6): HoldApply(Return) holds this recycle's apply once its job is done.
+			if (PagedHoldBlocks(Recycle.HoldId))
+			{
+				++I;
+				continue;
+			}
+			// Plugin paging plan §3.5 (K6): the recycle's ledger apply, before the slot can admit
+			// its next holder's reset (one job per slot).
+			ApplyLedgerReset(Recycle.SlotIndex, Recycle.LedgerTicket, !JobWasSkipped(Async.Job) && Async.bResetRan && Async.ResetStatus == FGpuStatus::SSLM_OK,
+				Async.bNormalized);
 			if (JobWasSkipped(Async.Job))
 			{
 				// Round 4 (finding 1): a recycle that never ran re-synced nothing, so the slot stays
 				// out of the pool.
 				Slots[Recycle.SlotIndex].bWithheld = true;
 				UE_LOG(LogSuperSLM, Warning, TEXT("GPU slot %d withheld from vending: %s (its recycle did not run)."), Recycle.SlotIndex, LostBeforeRanText());
-				PendingRecycles.RemoveAtSwap(I);
+				PendingRecycles.RemoveAt(I, 1, EAllowShrinking::No);
 				continue;
 			}
 			if (Async.bResetRan && (Async.ResetStatus != FGpuStatus::SSLM_OK || Async.UnbindSchemaStatus != FGpuStatus::SSLM_OK ||
@@ -2342,8 +3143,23 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 					Recycle.SlotIndex, *GpuStatusText(Async.ResetStatus), *GpuStatusText(Async.UnbindSchemaStatus), *GpuStatusText(Async.UnbindAdapterStatus),
 					S.bVended ? TEXT(" (it was already vended again; it is withheld once that holder returns it)") : TEXT(""));
 			}
-			PendingRecycles.RemoveAtSwap(I);
+			PendingRecycles.RemoveAt(I, 1, EAllowShrinking::No);
 		}
+	}
+
+	// True when a recycle of the same slot queued before index Index is still unadmitted: recycles of
+	// one slot are admitted in the order they were queued.
+	bool HasEarlierUnadmittedRecycle(int32 Index) const
+	{
+		const int32 SlotIndex = PendingRecycles[Index].SlotIndex;
+		for (int32 Earlier = 0; Earlier < Index; ++Earlier)
+		{
+			if (PendingRecycles[Earlier].SlotIndex == SlotIndex && !PendingRecycles[Earlier].bLedgerAdmitted)
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 
 	// Plan §2.5 row 20 rule 1 (H6, H7): the only code that ends a hold on a GPU slot. The
@@ -2580,20 +3396,1108 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	{
 		FGameSlot& S = Slots[SlotIndex];
 		Entry.bSubmitted = true;
+		bool bNormalize = false;
+		int64 LimitInPlace = 0;
+		int64 LimitNormalized = 0;
+		// Plugin paging plan §3.5 (K6): in pooled mode the page ledger admits every reset at the head
+		// of its queue (AdmitSlotFront() waits while the slot still has a ledger job, so one job per
+		// slot holds). A refusal here is a plugin defect: the reset is refused by name, nothing is
+		// posted, and the holder is faulted, so it never runs untracked.
+		if (IsPooled())
+		{
+			const SuperSLMPaging::FAdmission Admission = Ledger.AdmitReset(SlotIndex);
+			if (Admission.Outcome != SuperSLMPaging::EPageAdmit::Admitted)
+			{
+				const FString Reason = FString::Printf(TEXT("the page ledger did not admit a reset at the head of the sequence's queue (outcome %d)"),
+					static_cast<int32>(Admission.Outcome));
+				NoteLedgerRefusal(SlotIndex, Reason);
+				if (S.Id == Entry.Owner)
+				{
+					FaultSlot(S, ESuperSLMDecodeOutcome::Generating, ESuperSLMGpuFaultReason::RecoverablePerSequenceRejection, Reason);
+				}
+				ResolveEntry(Entry, ESuperSLMRestoreResult::NotConfigured);
+				LastLifecycleRequestError = Reason;
+				return;
+			}
+			Entry.LedgerTicket = Admission.Ticket;
+			Entry.HoldId = AttachPagedHold(EGpuPagedJobKind::Reset);
+			bNormalize = Admission.bNormalizes; // K7: create-first, charged R(SequenceBudget) on H at this admission
+			ResetLimits(SlotIndex, LimitInPlace, LimitNormalized);
+		}
 		DropPendingEvents(S);
 		S.ActiveGenerationOpLogIndex = INDEX_NONE;
 		Entry.Async = MakeShared<FLifecycleAsyncState>();
-		Entry.Async->Job = QueueReset(SlotIndex, /*bUnbind*/ false, Entry.Async);
+		Entry.Async->Job = QueueReset(SlotIndex, /*bUnbind*/ false, Entry.Async, bNormalize, LimitInPlace, LimitNormalized);
 	}
 
 	void AdmitAdoptPrefixOp(FLifecycleOpEntry& Entry)
 	{
-		// D-SLM7457 ruling (1): no GPU prefix-adopt verb exists at v1.5.0 or at the 1.7.0 and 1.9.0 pins
+		// D-SLM7457 ruling (1): no GPU prefix-adopt verb exists at v1.5.0 or at the 1.7.0, 1.9.0 and 1.11.0 pins
 		// (gpu_1p0.h and gpu_port.h name no adopt verb). Admits and resolves
 		// directly, without ever forwarding to the submission thread.
 		Entry.bSubmitted = true;
 		ResolveEntry(Entry, ESuperSLMRestoreResult::UnsupportedOnGpu);
-		LastLifecycleRequestError = TEXT("AdoptPrefix has no GPU counterpart in 1.0: shared prefixes are CPU-only; refused by name");
+		// Plan rev 1.9 ruling 2 (K6): the prefix overload in dedicated mode names the mode and the
+		// field that selects it, as the dedicated prefix verbs do.
+		LastLifecycleRequestError = Entry.bPrefixOverload
+			? TEXT("RequestAdoptPrefix(Sequence, Prefix) is unsupported on a dedicated GPU subsystem: GPU prefixes need pooled mode (SequenceBudget > 0); refused by name")
+			: TEXT("AdoptPrefix has no GPU counterpart in 1.0: shared prefixes are CPU-only; refused by name");
+	}
+
+	// Plugin paging plan §3.4 "Adopt" (K7), pooled mode: RequestAdoptPrefix(Sequence, Prefix) at the
+	// head of its sequence's queue (AdmitSlotFront() waits while the slot has a ledger job open). The
+	// page ledger admits it (it draws nothing, so it charges nothing, and pins the prefix until its
+	// apply), and the job runs sslm_gpu_seq_adopt_prefix on the submission thread. On success the
+	// thread slot takes the prefix's length as its ContextUsed and origin, its limit min(L + budget,
+	// ContextCap), and the prefix's ready flag as armed (§3.4 "The armed flag"). A prefix released or
+	// faulted after the call is refused here by name, with nothing posted.
+	void AdmitPooledAdoptOp(int32 SlotIndex, FLifecycleOpEntry& Entry)
+	{
+		Entry.bSubmitted = true;
+		const FGpuPrefixEntry* Prefix = Prefixes.Find(Entry.AdoptPrefixId);
+		if (Prefix == nullptr || Prefix->bReleased || Prefix->Phase != ESuperSLMPrefixPhase::Ready)
+		{
+			LastLifecycleRequestError = TEXT("Malformed: the prefix was released, or its build failed, before the adopt reached the head of the sequence's queue; nothing was posted");
+			ResolveEntry(Entry, ESuperSLMRestoreResult::Malformed);
+			return;
+		}
+		const SuperSLMPaging::FAdmission Admission = Ledger.AdmitAdoptPrefix(SlotIndex, Prefix->Node);
+		if (Admission.Outcome == SuperSLMPaging::EPageAdmit::KvModeMismatch)
+		{
+			LastLifecycleRequestError = TEXT("KvModeMismatch: the holder is a whole-reserve sequence, which cannot adopt until a reset has normalized it");
+			ResolveEntry(Entry, ESuperSLMRestoreResult::KvModeMismatch);
+			return;
+		}
+		if (Admission.Outcome != SuperSLMPaging::EPageAdmit::Admitted)
+		{
+			const FString Reason = FString::Printf(TEXT("the page ledger did not admit an adopt at the head of the sequence's queue (outcome %d)"),
+				static_cast<int32>(Admission.Outcome));
+			NoteLedgerRefusal(SlotIndex, Reason);
+			LastLifecycleRequestError = Reason;
+			ResolveEntry(Entry, ESuperSLMRestoreResult::NotConfigured);
+			return;
+		}
+		Entry.LedgerTicket = Admission.Ticket;
+		Entry.HoldId = AttachPagedHold(EGpuPagedJobKind::Adopt);
+		JobsPostedByKind[static_cast<int32>(EGpuPagedJobKind::Adopt)] += 1;
+		// The holder keeps its own budget; its origin becomes the prefix's length (an adopt that faults
+		// after the share leaves it reset: origin 0, the shape FinalizeAdoptOp() then applies to the
+		// ledger, so the two limits agree; K7 review S1).
+		SuperSLMPaging::FHolderShape Shape = Ledger.SlotShape(SlotIndex);
+		Shape.Origin = Prefix->Length;
+		const int64 LimitAfter = LedgerHolderLimit(Shape);
+		Shape.Origin = 0;
+		const int64 LimitReset = LedgerHolderLimit(Shape);
+		const int64 PrefixId = Prefix->Id;
+		const int64 Length = Prefix->Length;
+		const bool bReady = Prefix->bReady;
+		Entry.Async = MakeShared<FLifecycleAsyncState>();
+		TSharedPtr<FLifecycleAsyncState> Async = Entry.Async;
+		TSharedPtr<FJob> Job = MakeShared<FJob>();
+		Job->Custom = [this, SlotIndex, PrefixId, Length, bReady, LimitAfter, LimitReset, Async]()
+		{
+			FThreadSlot& TS = ThreadSlots[SlotIndex];
+#if WITH_DEV_AUTOMATION_TESTS
+			const FGpuStatus Forced = TakeTestStatus(&TestNextAdoptStatus);
+			const FGpuStatus FaultAfterShare = TakeTestStatus(&TestAdoptFaultAfterShare);
+#else
+			const FGpuStatus Forced = FGpuStatus::SSLM_OK;
+			const FGpuStatus FaultAfterShare = FGpuStatus::SSLM_OK;
+#endif
+			const FThreadPrefix* ThreadPrefix = ThreadPrefixes.Find(PrefixId);
+			FGpuStatus St;
+			if (Forced != FGpuStatus::SSLM_OK)
+			{
+				St = Forced; // §3.9: the engine is left as the refusal would leave it (unchanged)
+			}
+			else if (TS.Handle == nullptr || ThreadPrefix == nullptr || ThreadPrefix->Handle == nullptr)
+			{
+				St = FGpuStatus::SSLM_GPU_PREFIX_REJECTED;
+			}
+			else
+			{
+				superslm_gpu::harness::Device& Device = superslm_gpu::harness::GetDevice();
+				const uint64 Before = Device.submission_counter();
+				St = sslm_gpu_seq_adopt_prefix(Ctx, TS.Handle, ThreadPrefix->Handle);
+				// The singleton advances this counter after ExecuteCommandLists, including an
+				// upload whose later Signal/wait fails. Empty/aligned adopts issue no submission.
+				// The worker holds the process-wide Layer-1 lock across both observations.
+				CountSubmission(static_cast<int64>(Device.submission_counter() - Before));
+			}
+			NoteLayer1Status(St);
+			if (St == FGpuStatus::SSLM_OK && FaultAfterShare != FGpuStatus::SSLM_OK)
+			{
+				// §3.4 "A fault after the share": the seam reproduces the documented post-state -- the
+				// real adopt ran; the engine sequence is reset, and the fault is the adopt's result.
+				const FGpuStatus ResetSt = sslm_gpu_seq_reset(Ctx, TS.Handle);
+				NoteLayer1Status(ResetSt);
+				St = FaultAfterShare;
+				Async->bAdoptResetByFault = true;
+			}
+			else if ((St == FGpuStatus::SSLM_GPU_ALLOCATION_FAILED || St == FGpuStatus::SSLM_DEVICE_LOST) && TS.Handle != nullptr)
+			{
+				// The engine's own fault after the share leaves the sequence reset (gpu_1p0.h); a fault
+				// before it changes nothing. The engine's context_length tells the two apart (the
+				// accessor's use here is justified at its declaration; K7 review N3).
+				const int64_t* EngineLength = SslmGpuSeqHandleContextLengthForBench(TS.Handle);
+				Async->bAdoptResetByFault = EngineLength != nullptr && *EngineLength == 0 && TS.ContextUsed != 0;
+			}
+			Async->AdoptStatus = St;
+			if (St == FGpuStatus::SSLM_OK || Async->bAdoptResetByFault)
+			{
+				const bool bAdopted = St == FGpuStatus::SSLM_OK;
+				TS.ContextUsed = bAdopted ? Length : 0;
+				TS.bArmed = bAdopted && bReady;
+				TS.Limit = bAdopted ? LimitAfter : LimitReset;
+				TS.bPrimed = false;
+				TS.bStopped = false;
+				TS.bHasStopFault = false;
+				TS.StopFault = FActionResult();
+				TS.LastToken = -1;
+				TS.Produced = 0;
+				TS.MaxNewTokens = 0;
+				TS.StopTokenIds.Reset();
+				TS.PinnedAdapter = nullptr;
+			}
+			Async->ContextUsedAfter = TS.ContextUsed;
+			Async->bArmedAfter = TS.bArmed;
+			Async->WalkState = TS.Handle != nullptr ? SslmGpuSeqWalkStateForG5Bridge(TS.Handle) : kSslmGpuDfaWalkStateUnused;
+			SnapshotPoolStatsOnThread();
+		};
+		Async->Job = Enqueue(Job);
+	}
+
+	// K7: the pooled adopt's completion. The ledger's apply runs with what the job did (a refusal
+	// leaves the slot's ledger shape and dependency as they were), then the slot's mirrors take the
+	// thread slot's figures. A successful adopt clears the generation (the sequence now holds the
+	// prefix and nothing else) and the bind eligibility (a successful GPU adopt revokes the bind,
+	// §3.4); a refused one changes neither. A fault after the share left the engine sequence reset,
+	// so the ledger then applies the reset shape (plan §3.4 rev 1.10, K7 review S1: origin 0, the
+	// holder's own budget, its dependency dropped -- the shape a reset in place leaves), the
+	// generation is cleared, and the bind permission the engine granted again is mirrored (K7 review
+	// N1).
+	void FinalizeAdoptOp(int32 SlotIndex, FLifecycleOpEntry& Entry)
+	{
+		FGameSlot& S = Slots[SlotIndex];
+		const FLifecycleAsyncState& Async = *Entry.Async;
+		const bool bSkipped = JobWasSkipped(Async.Job);
+		const bool bOk = !bSkipped && Async.AdoptStatus == FGpuStatus::SSLM_OK;
+		if (Entry.LedgerTicket != SuperSLMPaging::InvalidTicket)
+		{
+			Ledger.ApplyAdopt(Entry.LedgerTicket, bOk);
+			Entry.LedgerTicket = SuperSLMPaging::InvalidTicket;
+			if (!bSkipped && Async.bAdoptResetByFault)
+			{
+				ApplyLedgerResetShape(SlotIndex);
+			}
+		}
+		if (bSkipped)
+		{
+			ResolveEntry(Entry, ESuperSLMRestoreResult::NotConfigured);
+			LastLifecycleRequestError = LostBeforeRanText();
+			return;
+		}
+		if (S.Id == Entry.Owner)
+		{
+			S.ContextUsedMirror = Async.ContextUsedAfter;
+			S.bArmedMirror = Async.bArmedAfter;
+			S.WalkState = Async.WalkState;
+			if (bOk || Async.bAdoptResetByFault)
+			{
+				ClearGeneration(S);
+			}
+			if (bOk)
+			{
+				S.bBindEligibleAfterQueue = false;
+			}
+			else if (Async.bAdoptResetByFault)
+			{
+				S.bBindEligibleAfterQueue = true; // K7 review N1: the engine's reset granted the bind again (gpu_1p0.h, adopt)
+			}
+		}
+		if (bOk)
+		{
+			ResolveEntry(Entry, ESuperSLMRestoreResult::Success);
+			return;
+		}
+		// The mapping: a schema mismatch is Malformed by name (the CPU twin's outcome, cell 8.2); every
+		// other status reads as a pooled restore's would (§3.7).
+		const ESuperSLMRestoreResult Result = Async.AdoptStatus == FGpuStatus::SSLM_GPU_PREFIX_SCHEMA_MISMATCH
+			? ESuperSLMRestoreResult::Malformed
+			: SuperSLMGpuStatusMapping::ToRestoreFailureResult(Async.AdoptStatus, /*bPooled*/ true, /*bSchemaCrossCheckFailed*/ false);
+		LastLifecycleRequestError = FString::Printf(TEXT("sslm_gpu_seq_adopt_prefix returned %s%s"), *GpuStatusText(Async.AdoptStatus),
+			Async.bAdoptResetByFault ? TEXT(" after the share; the sequence was left reset (ContextUsed 0, unarmed)") : TEXT(""));
+		ResolveEntry(Entry, Result);
+	}
+
+	// Plan §3.4 rev 1.10 (K7 review S1): the engine reset the sequence inside a pooled adopt that
+	// faulted after the share, so the slot's ledger shape follows it to the reset shape, through the
+	// core's own reset verbs: a reset admitted and applied in place at once (the engine's reset has
+	// already run). A normalization the admission would ask for is applied as ResetInPlace, as at a
+	// deferred recycle, and retried at the slot's next reset. The thread slot took the same limit in
+	// the adopt's job (FThreadSlot::Limit, LimitReset). Game thread, right after ApplyAdopt().
+	void ApplyLedgerResetShape(int32 SlotIndex)
+	{
+		const SuperSLMPaging::FAdmission Admission = Ledger.AdmitReset(SlotIndex);
+		if (Admission.Outcome != SuperSLMPaging::EPageAdmit::Admitted)
+		{
+			NoteLedgerRefusal(SlotIndex, FString::Printf(TEXT("the page ledger did not admit the reset shape after an adopt that faulted after the share (outcome %d)"),
+				static_cast<int32>(Admission.Outcome)));
+			return;
+		}
+		SuperSLMPaging::FTicket Ticket = Admission.Ticket;
+		ApplyLedgerReset(SlotIndex, Ticket, /*bRan*/ true, /*bNormalized*/ false);
+	}
+
+	// ------------------------------------------------------------------ GPU prefixes (K7)
+
+	// Plugin paging plan §3.3, §3.4 "Prefixes" (K7), pooled mode: CreatePrefix(), its schema-bound
+	// overload (SchemaIndex >= 0, Kind 1 for SchemaContent) and CreatePrefixFrom() (ParentId != 0).
+	// Every refusal is decided here, on the game thread, before anything is charged or posted: the
+	// parent first (a nested build), then the plugin's cap, then the vocabulary, then the page
+	// ledger's count and page rules. An admitted build charges R(max(L, 1)) on P, mints its id from
+	// the shared counter, and posts its begin job (sslm_gpu_prefix_begin or begin_from, then
+	// set_schema, then, for an empty prefix, freeze); its tokens are then fed by the build seat, one
+	// whole token per turn (PlanAndIssue()). Game thread.
+	ESuperSLMPrefixResult CreateGpuPrefix(const TArray<int32>& Tokens, int64 ParentId, int32 SchemaIndex, int32 Kind, FSuperSLMPrefix& OutPrefix, FString& OutError)
+	{
+		OutPrefix = FSuperSLMPrefix();
+		const bool bNested = ParentId != 0;
+		SuperSLMPaging::FNodeId ParentNode = SuperSLMPaging::InvalidNode;
+		int64 ParentLength = 0;
+		bool bParentReady = false;
+		if (bNested)
+		{
+			const FGpuPrefixEntry* Parent = Prefixes.Find(ParentId);
+			if (Parent == nullptr || Parent->bReleased || Parent->Phase != ESuperSLMPrefixPhase::Ready)
+			{
+				OutError = Parent == nullptr
+					? FString(TEXT("ParentNotUsable: the parent is not a GPU prefix of this subsystem (unknown, or another backend's)"))
+					: FString(TEXT("ParentNotUsable: the parent is released, faulted or not yet frozen; a nested prefix continues a Ready parent"));
+				return ESuperSLMPrefixResult::ParentNotUsable;
+			}
+			ParentNode = Parent->Node;
+			ParentLength = Parent->Length;
+			bParentReady = Parent->bReady;
+		}
+		const int64 Length = ParentLength + Tokens.Num();
+		if (Length > Config.ContextCap)
+		{
+			OutError = FString::Printf(TEXT("Malformed: the prefix would hold %lld positions (parent %lld + %d tokens), above this subsystem's ContextCap (%lld)"),
+				Length, ParentLength, Tokens.Num(), Config.ContextCap);
+			return ESuperSLMPrefixResult::Malformed;
+		}
+		for (const int32 Token : Tokens)
+		{
+			if (Token < 0 || Token >= VocabSize)
+			{
+				OutError = FString::Printf(TEXT("Malformed: prefix token %d is outside the vocabulary [0, %d)"), Token, VocabSize);
+				return ESuperSLMPrefixResult::Malformed;
+			}
+		}
+		const SuperSLMPaging::FAdmission Admission = bNested ? Ledger.AdmitNestedPrefixBuild(ParentNode, Tokens.Num()) : Ledger.AdmitPrefixBuild(Tokens.Num());
+		switch (Admission.Outcome)
+		{
+			case SuperSLMPaging::EPageAdmit::Admitted:
+				break;
+			case SuperSLMPaging::EPageAdmit::PrefixLimit:
+				OutError = FString::Printf(TEXT("PrefixLimit: PrefixBlockCount (%d) prefixes and nested children are already live"), Config.PrefixBlockCount);
+				return ESuperSLMPrefixResult::PrefixLimit;
+			case SuperSLMPaging::EPageAdmit::KvPagesExhausted:
+				OutError = FString::Printf(TEXT("KvPagesExhausted: region P has %u pages free and the build is charged R(max(%d, 1)); released prefixes still shared by a sequence hold their pages until it lets go"),
+					Ledger.RegionFree(SuperSLMPaging::ERegion::P), Tokens.Num());
+				return ESuperSLMPrefixResult::KvPagesExhausted;
+			case SuperSLMPaging::EPageAdmit::ParentNotUsable:
+				OutError = TEXT("ParentNotUsable: the page ledger does not hold the parent as a live, frozen prefix");
+				return ESuperSLMPrefixResult::ParentNotUsable;
+			case SuperSLMPaging::EPageAdmit::NotConfigured:
+				OutError = TEXT("NotConfigured: the page ledger is not configured");
+				return ESuperSLMPrefixResult::NotConfigured;
+			case SuperSLMPaging::EPageAdmit::InvalidRequest:
+			case SuperSLMPaging::EPageAdmit::Waiting:
+			case SuperSLMPaging::EPageAdmit::KvModeMismatch:
+			case SuperSLMPaging::EPageAdmit::PrefixPinned:
+			case SuperSLMPaging::EPageAdmit::ContextCapMismatch:
+				// The checks above make these unreachable for a build: a plugin defect, refused by name.
+				OutError = FString::Printf(TEXT("Malformed: the page ledger refused the build (outcome %d)"), static_cast<int32>(Admission.Outcome));
+				UE_LOG(LogSuperSLM, Error, TEXT("GPU CreatePrefix: %s (plugin defect)."), *OutError);
+				return ESuperSLMPrefixResult::Malformed;
+		}
+
+		const int64 Id = SuperSLMMintPrefixId();
+		FGpuPrefixEntry& Entry = Prefixes.Add(Id);
+		Entry.Id = Id;
+		Entry.Node = Admission.Node;
+		Entry.Phase = ESuperSLMPrefixPhase::Pending;
+		Entry.Tokens = Tokens;
+		Entry.Kind = Kind;
+		Entry.ParentId = ParentId;
+		Entry.Length = Length;
+		// §3.4 "The armed flag": a prefix's last write is its prefill arc when it fed a token; an empty
+		// nested child keeps its parent's; an empty root has none.
+		Entry.bReady = Tokens.Num() > 0 ? true : (bNested && bParentReady);
+		Entry.BuildTicket = Admission.Ticket;
+		const EGpuPagedJobKind JobKind = bNested ? EGpuPagedJobKind::NestedBuild : EGpuPagedJobKind::PrefixBuild;
+		Entry.HoldId = AttachPagedHold(JobKind);
+		JobsPostedByKind[static_cast<int32>(JobKind)] += 1;
+		Entry.BeginState = MakeShared<FPrefixJobState>();
+		TSharedPtr<FPrefixJobState> JobState = Entry.BeginState;
+		const int32 Budget = FMath::Max(Tokens.Num(), 1); // §3.3 "Empty prefixes": the budget domain starts at 1
+		const bool bFreezeNow = Tokens.Num() == 0;
+		TSharedPtr<FJob> Job = MakeShared<FJob>();
+		Job->Custom = [this, Id, ParentId, bNested, Budget, SchemaIndex, bFreezeNow, JobState]()
+		{
+#if WITH_DEV_AUTOMATION_TESTS
+			const FGpuStatus Forced = TakeTestStatus(bNested ? &TestNextNestedBuildStatus : &TestNextPrefixBuildStatus);
+#else
+			const FGpuStatus Forced = FGpuStatus::SSLM_OK;
+#endif
+			SslmGpuPrefixHandle* Handle = nullptr;
+			FGpuStatus St = FGpuStatus::SSLM_OK;
+			const TCHAR* Where = bNested ? TEXT("sslm_gpu_prefix_begin_from") : TEXT("sslm_gpu_prefix_begin");
+			if (Forced != FGpuStatus::SSLM_OK)
+			{
+				St = Forced; // §3.9: the refusal is the engine's, which draws nothing
+			}
+			else if (bNested)
+			{
+				const FThreadPrefix* ParentPrefix = ThreadPrefixes.Find(ParentId);
+				St = (ParentPrefix != nullptr && ParentPrefix->Handle != nullptr)
+					? sslm_gpu_prefix_begin_from(Ctx, ParentPrefix->Handle, static_cast<int32_t>(Budget), &Handle)
+					: FGpuStatus::SSLM_GPU_PREFIX_REJECTED;
+			}
+			else
+			{
+				St = sslm_gpu_prefix_begin(Ctx, Model, Pool, static_cast<int32_t>(Budget), &Handle);
+			}
+			NoteLayer1Status(St);
+			if (St == FGpuStatus::SSLM_OK && Handle != nullptr && SchemaIndex >= 0)
+			{
+				Where = TEXT("sslm_gpu_prefix_set_schema");
+				St = sslm_gpu_prefix_set_schema(Ctx, Handle, static_cast<int32_t>(SchemaIndex));
+				NoteLayer1Status(St);
+			}
+			if (St == FGpuStatus::SSLM_OK && Handle != nullptr && bFreezeNow)
+			{
+				Where = TEXT("sslm_gpu_prefix_freeze");
+				St = sslm_gpu_prefix_freeze(Ctx, Handle);
+				NoteLayer1Status(St);
+			}
+			if (St != FGpuStatus::SSLM_OK || Handle == nullptr)
+			{
+				if (Handle != nullptr)
+				{
+					NoteLayer1Status(sslm_gpu_prefix_release(Ctx, Handle));
+				}
+				JobState->Status = St != FGpuStatus::SSLM_OK ? St : FGpuStatus::SSLM_GPU_PREFIX_REJECTED;
+				JobState->Where = Where;
+				SnapshotPoolStatsOnThread();
+				return;
+			}
+			FThreadPrefix& Added = ThreadPrefixes.Add(Id);
+			Added.Handle = Handle;
+			SnapshotPoolStatsOnThread();
+		};
+		Entry.BeginJob = Enqueue(Job);
+		if (Tokens.Num() > 0)
+		{
+			BuildQueue.Add(Id);
+		}
+		OutPrefix.Id = Id;
+		return ESuperSLMPrefixResult::Success;
+	}
+
+	// A build's end: its page-ledger apply (success settles its P charge to its own pages; failure
+	// refunds it all and forgets the node), unless HoldApply holds it. The phase follows the apply,
+	// so a Ready prefix is always one the ledger counts as built. Game thread.
+	bool ApplyPrefixBuildEnd(FGpuPrefixEntry& Entry, bool bSucceeded, const FString& FaultMessage)
+	{
+		if (PagedHoldBlocks(Entry.HoldId))
+		{
+			return false;
+		}
+		if (Entry.BuildTicket != SuperSLMPaging::InvalidTicket)
+		{
+			Ledger.ApplyPrefixBuild(Entry.BuildTicket, bSucceeded);
+			Entry.BuildTicket = SuperSLMPaging::InvalidTicket;
+		}
+		BuildQueue.Remove(Entry.Id);
+		if (bSucceeded)
+		{
+			Entry.Phase = ESuperSLMPrefixPhase::Ready;
+			return true;
+		}
+		Entry.Phase = ESuperSLMPrefixPhase::Faulted;
+		Entry.bBuildFaulted = true;
+		Entry.FaultMessage = FaultMessage;
+		UE_LOG(LogSuperSLM, Warning, TEXT("GPU prefix %lld faulted: %s; release it."), Entry.Id, *FaultMessage);
+		return true;
+	}
+
+	// Plugin paging plan §3.4 (K7): each tick's poll of the prefix jobs, before admission. A begin job
+	// done moves its prefix to Prefilling (or, empty and frozen in the job, to its build's apply); the
+	// build turns done are read in order, the last one applying the build; a release job done applies
+	// the release (its pages stay charged as a ghost while a sequence still shares them). Game thread.
+	void PollPrefixBuilds()
+	{
+		for (auto It = Prefixes.CreateIterator(); It; ++It)
+		{
+			FGpuPrefixEntry& Entry = It.Value();
+			if (Entry.bReleased)
+			{
+				if (Entry.ReleaseTicket != SuperSLMPaging::InvalidTicket && Entry.ReleaseJob.IsValid() && Entry.ReleaseJob->bDone.load(std::memory_order_acquire)
+					&& !PagedHoldBlocks(Entry.ReleaseHoldId))
+				{
+					const FGpuStatus St = Entry.ReleaseJob->bSkipped ? FGpuStatus::SSLM_DEVICE_LOST : Entry.BeginState.IsValid() ? Entry.BeginState->Status : FGpuStatus::SSLM_OK;
+					if (St == FGpuStatus::SSLM_OK)
+					{
+						Entry.bReleaseApplied = Ledger.ApplyPrefixRelease(Entry.ReleaseTicket);
+					}
+					else
+					{
+						// The engine did not release the pages (or the job never ran): they stay charged.
+						UE_LOG(LogSuperSLM, Warning, TEXT("GPU prefix %lld: its release did not run to completion (%s); its pages stay charged until teardown."), Entry.Id, *GpuStatusText(St));
+					}
+					Entry.ReleaseTicket = SuperSLMPaging::InvalidTicket;
+					Entry.ReleaseJob.Reset();
+					Entry.BeginState.Reset();
+				}
+				if (Entry.bReleaseApplied && !Ledger.IsGhost(Entry.Node)) { It.RemoveCurrent(); }
+				continue;
+			}
+			if (Entry.Phase == ESuperSLMPrefixPhase::Pending)
+			{
+				if (!Entry.BeginJob.IsValid() || !Entry.BeginJob->bDone.load(std::memory_order_acquire))
+				{
+					continue;
+				}
+				const bool bSkipped = JobWasSkipped(Entry.BeginJob);
+				const FGpuStatus St = Entry.BeginState->Status;
+				if (bSkipped || St != FGpuStatus::SSLM_OK)
+				{
+					const bool bApplied = ApplyPrefixBuildEnd(Entry, false, bSkipped ? FString(LostBeforeRanText()) : FString::Printf(TEXT("%s returned %s"), Entry.BeginState->Where, *GpuStatusText(St)));
+					if (bApplied && !bSkipped && St == FGpuStatus::SSLM_GPU_KV_POOL_EXHAUSTED)
+					{
+						NoteLedgerFault(Entry.ParentId != 0 ? TEXT("sslm_gpu_prefix_begin_from") : TEXT("sslm_gpu_prefix_begin")); // §3.7: the ledger admitted it
+					}
+					continue;
+				}
+				if (Entry.Tokens.Num() == 0)
+				{
+					ApplyPrefixBuildEnd(Entry, true, FString());
+					continue;
+				}
+				Entry.Phase = ESuperSLMPrefixPhase::Prefilling;
+				Entry.BeginJob.Reset();
+				continue;
+			}
+			if (Entry.Phase != ESuperSLMPrefixPhase::Prefilling)
+			{
+				continue;
+			}
+			while (Entry.TurnsInFlight.Num() > 0 && !Entry.bBuildFaulted)
+			{
+				const FPrefixTurn& Turn = Entry.TurnsInFlight[0];
+				if (!Turn.Job.IsValid() || !Turn.Job->bDone.load(std::memory_order_acquire))
+				{
+					break;
+				}
+				const bool bSkipped = Turn.Job->bSkipped || !Turn.Job->Results.IsValidIndex(Turn.ActionIndex);
+				const FActionResult* R = bSkipped ? nullptr : &Turn.Job->Results[Turn.ActionIndex];
+				if (bSkipped || R->Kind == EResultKind::Fault || R->Kind == EResultKind::Skipped)
+				{
+					Entry.bBuildFaulted = true;
+					Entry.FaultMessage = bSkipped || R->Kind == EResultKind::Skipped ? FString(LostBeforeRanText()) : R->Message;
+					break;
+				}
+				Entry.BuiltTokens += 1;
+				Entry.TurnsInFlight.RemoveAt(0, 1, EAllowShrinking::No);
+			}
+			if (Entry.bBuildFaulted)
+			{
+				// Every later turn of a faulted build reads the fault on the thread; none is planned now.
+				if (ApplyPrefixBuildEnd(Entry, false, Entry.FaultMessage))
+				{
+					Entry.TurnsInFlight.Reset();
+				}
+				continue;
+			}
+			if (Entry.BuiltTokens == Entry.Tokens.Num())
+			{
+				ApplyPrefixBuildEnd(Entry, true, FString());
+			}
+		}
+	}
+
+	// The build seat's head (§3.4: one seat, further builds in arrival order): the prefix whose next
+	// token a turn would feed, or nullptr when the seat has nothing to plan. Game thread.
+	FGpuPrefixEntry* BuildSeatHead()
+	{
+		for (const int64 Id : BuildQueue)
+		{
+			FGpuPrefixEntry* Entry = Prefixes.Find(Id);
+			if (Entry == nullptr || Entry->bReleased || Entry->bBuildFaulted)
+			{
+				continue;
+			}
+			if (Entry->Phase != ESuperSLMPrefixPhase::Prefilling || Entry->TurnsPlanned >= Entry->Tokens.Num())
+			{
+				return nullptr; // the head is still beginning, or its last turns are in flight
+			}
+			return Entry;
+		}
+		return nullptr;
+	}
+
+	// One build turn, planned into this tick's job at the seat's place in the one-call rotation.
+	void PlanBuildTurn(FGpuPrefixEntry& Entry, const TSharedPtr<FJob>& Job)
+	{
+		FAction A;
+		A.Kind = EActionKind::PrefixBuildTurn;
+		A.Slot = INDEX_NONE;
+		A.PrefixId = Entry.Id;
+		A.PrefixKind = Entry.Kind;
+		A.PromptToken = Entry.Tokens[Entry.TurnsPlanned];
+		Entry.TurnsPlanned += 1;
+		A.bLastPrompt = Entry.TurnsPlanned == Entry.Tokens.Num();
+		FPrefixTurn Turn;
+		Turn.Job = Job;
+		Turn.ActionIndex = Job->Actions.Add(MoveTemp(A));
+		Entry.TurnsInFlight.Add(MoveTemp(Turn));
+		#if WITH_DEV_AUTOMATION_TESTS
+		Entry.TurnTicks.Add(TickIndex);
+		#endif
+	}
+
+	// ReleasePrefix(), pooled mode (§3.3 "Concurrency", §3.4). Refused by name, with nothing changed,
+	// for an unknown or already released prefix, a prefix still building, or one an adopt, a nested
+	// build or a hinted restore names (queued or admitted). A faulted prefix (its charge already
+	// refunded) is forgotten at once. Otherwise the ledger frees its count slot now, and the release
+	// job runs sslm_gpu_prefix_release on the submission thread; its pages are refunded at the job's
+	// apply, or kept as a ghost while a sequence still shares them. Game thread.
+	bool ReleaseGpuPrefix(const FSuperSLMPrefix& Prefix, FString& OutError)
+	{
+		FGpuPrefixEntry* Entry = Prefix.IsValid() ? Prefixes.Find(Prefix.Id) : nullptr;
+		if (Entry == nullptr || Entry->bReleased)
+		{
+			OutError = TEXT("not a live GPU prefix of this subsystem (unknown, released, or another backend's)");
+			return false;
+		}
+		if (Entry->Phase == ESuperSLMPrefixPhase::Faulted)
+		{
+			BuildQueue.Remove(Entry->Id);
+			Prefixes.Remove(Prefix.Id);
+			return true;
+		}
+		if (Entry->Phase != ESuperSLMPrefixPhase::Ready)
+		{
+			OutError = TEXT("the prefix is still building; release it once GetPrefixPhase() reads Ready or Faulted");
+			return false;
+		}
+		for (const FGameSlot& S : Slots)
+		{
+			for (int32 Index = S.OpFront; Index < S.OpLog.Num(); ++Index)
+			{
+				const FLifecycleOpEntry& Op = S.OpLog[Index];
+				if (Op.Kind == ELifecycleOpKind::AdoptPrefix && Op.AdoptPrefixId == Prefix.Id && Op.Result == ESuperSLMRestoreResult::Pending)
+				{
+					OutError = TEXT("PrefixPinned: an adopt of this prefix is queued; release it once the adopt has resolved");
+					return false;
+				}
+			}
+		}
+		for (const FLifecycleOpEntry& Op : RestoreOps)
+		{
+			if (Op.RestoreHintPrefixId == Prefix.Id && Op.Result == ESuperSLMRestoreResult::Pending)
+			{
+				OutError = TEXT("PrefixPinned: a restore hinted with this prefix is queued; release it once the restore has resolved");
+				return false;
+			}
+		}
+		const SuperSLMPaging::FAdmission Admission = Ledger.AdmitPrefixRelease(Entry->Node);
+		if (Admission.Outcome != SuperSLMPaging::EPageAdmit::Admitted)
+		{
+			OutError = Admission.Outcome == SuperSLMPaging::EPageAdmit::PrefixPinned
+				? FString(TEXT("PrefixPinned: an adopt, a nested build or a hinted restore of this prefix is in flight; release it once it has resolved"))
+				: FString::Printf(TEXT("the page ledger did not admit the release (outcome %d)"), static_cast<int32>(Admission.Outcome));
+			return false;
+		}
+		Entry->bReleased = true;
+		Entry->Tokens.Empty();
+		Entry->TurnsInFlight.Empty();
+		Entry->FaultMessage.Empty();
+		Entry->BeginJob.Reset();
+		#if WITH_DEV_AUTOMATION_TESTS
+		Entry->TurnTicks.Empty();
+		#endif
+		Entry->Phase = ESuperSLMPrefixPhase::Invalid;
+		Entry->ReleaseTicket = Admission.Ticket;
+		Entry->ReleaseHoldId = AttachPagedHold(EGpuPagedJobKind::PrefixRelease);
+		JobsPostedByKind[static_cast<int32>(EGpuPagedJobKind::PrefixRelease)] += 1;
+		// The release job's status rides in the begin state (the begin job is long done).
+		Entry->BeginState = MakeShared<FPrefixJobState>();
+		TSharedPtr<FPrefixJobState> JobState = Entry->BeginState;
+		const int64 Id = Prefix.Id;
+		TSharedPtr<FJob> Job = MakeShared<FJob>();
+		Job->Custom = [this, Id, JobState]()
+		{
+			FThreadPrefix* ThreadPrefix = ThreadPrefixes.Find(Id);
+			if (ThreadPrefix == nullptr || ThreadPrefix->Handle == nullptr)
+			{
+				ThreadPrefixes.Remove(Id);
+				SnapshotPoolStatsOnThread();
+				return;
+			}
+			const FGpuStatus St = sslm_gpu_prefix_release(Ctx, ThreadPrefix->Handle);
+			NoteLayer1Status(St);
+			JobState->Status = St;
+			JobState->Where = TEXT("sslm_gpu_prefix_release");
+			if (St == FGpuStatus::SSLM_OK)
+			{
+				ThreadPrefixes.Remove(Id);
+			}
+			else
+			{
+				UE_LOG(LogSuperSLM, Error, TEXT("sslm_gpu_prefix_release returned %s for GPU prefix %lld; the handle is kept and released at teardown."), *GpuStatusText(St), Id);
+			}
+			SnapshotPoolStatsOnThread();
+		};
+		Entry->ReleaseJob = Enqueue(Job);
+		return true;
+	}
+
+	// The prefix an adopt, a nested build or a hint may use: Ready and not released.
+	const FGpuPrefixEntry* FindReadyPrefix(int64 Id) const
+	{
+		const FGpuPrefixEntry* Entry = Id != 0 ? Prefixes.Find(Id) : nullptr;
+		return Entry != nullptr && !Entry->bReleased && Entry->Phase == ESuperSLMPrefixPhase::Ready ? Entry : nullptr;
+	}
+
+	// ------------------------------------------------------------------ pooled restores (K7)
+
+	// Plugin paging plan §3.5 (K7): the call-time header checks of a pooled restore's Layer-1 payload,
+	// and, in dedicated mode, the mode crossing by magic. Every refusal the header alone decides is
+	// made here, with no handle minted and nothing queued, its error beginning with the result's
+	// name and a colon (rev 1.9 ruling 1). Fields are read at the fixed 'SLM6' offsets K0 fixed (§13
+	// item 1). True when the restore may be queued; Out* carry the header's budget, origin and ready
+	// word for the ledger's charge and the holder's shape.
+	bool CheckRestorePayloadHeader(const uint8* L1, int64 L1Size, int64 WrapperContextUsed, int64& OutBudget, int64& OutOrigin, bool& OutReady)
+	{
+		OutBudget = 0;
+		OutOrigin = 0;
+		OutReady = false;
+		auto HasMagic = [L1, L1Size](const char* FourCC)
+		{
+			return L1Size >= 4 && FMemory::Memcmp(L1, FourCC, 4) == 0;
+		};
+		auto ReadLE = [L1](int32 Offset, int32 Bytes)
+		{
+			uint64 V = 0;
+			for (int32 B = 0; B < Bytes; ++B)
+			{
+				V |= static_cast<uint64>(L1[Offset + B]) << (8 * B);
+			}
+			return V;
+		};
+		const bool bSlm6 = HasMagic("SLM6");
+		if (!IsPooled())
+		{
+			if (bSlm6)
+			{
+				LastLifecycleRequestError = TEXT("KvModeMismatch: the payload is 'SLM6', saved by a pooled GPU subsystem (SequenceBudget > 0); this subsystem is dedicated (SequenceBudget 0) and restores 'SLM5' only");
+				return false;
+			}
+			return true;
+		}
+		if (HasMagic("SLM5"))
+		{
+			LastLifecycleRequestError = TEXT("KvModeMismatch: the payload is 'SLM5', saved by a dedicated GPU subsystem (SequenceBudget 0); this subsystem is pooled and restores 'SLM6' only");
+			return false;
+		}
+		if (!bSlm6)
+		{
+			LastLifecycleRequestError = TEXT("Malformed: the payload's magic is not one of the GPU's ('SLM5', 'SLM6')");
+			return false;
+		}
+		constexpr int32 Slm6HeaderEnd = 148;
+		if (L1Size < Slm6HeaderEnd)
+		{
+			LastLifecycleRequestError = FString::Printf(TEXT("Malformed: the 'SLM6' payload is %lld bytes, shorter than its %d-byte header"), L1Size, Slm6HeaderEnd);
+			return false;
+		}
+		const int64 ContextLength = static_cast<int64>(ReadLE(32, 8));
+		const uint32 ReadyWord = static_cast<uint32>(ReadLE(128, 4));
+		const uint32 KvMode = static_cast<uint32>(ReadLE(132, 4));
+		const int64 Budget = static_cast<int64>(static_cast<int32>(static_cast<uint32>(ReadLE(136, 4))));
+		const int64 Origin = static_cast<int64>(ReadLE(140, 8));
+		const int64 Ce = Ledger.GetConfig().EngineContextCap > 0 ? Ledger.GetConfig().EngineContextCap : static_cast<int64>(Config.ContextCap);
+		const int64 Cp = Config.ContextCap;
+		constexpr uint32 KvModeBudget = 1;
+		if (KvMode != KvModeBudget)
+		{
+			LastLifecycleRequestError = FString::Printf(TEXT("Malformed: the 'SLM6' payload's kv_mode is %u, not budget (%u)"), KvMode, KvModeBudget);
+			return false;
+		}
+		if (Budget < 1 || Budget > Ce)
+		{
+			LastLifecycleRequestError = FString::Printf(TEXT("Malformed: the payload's budget (%lld) is outside [1, %lld], the model's cap"), Budget, Ce);
+			return false;
+		}
+		if (Origin < 0 || Origin > Ce)
+		{
+			LastLifecycleRequestError = FString::Printf(TEXT("Malformed: the payload's origin (%lld) is outside [0, %lld], the model's cap"), Origin, Ce);
+			return false;
+		}
+		if (ContextLength < 0 || ContextLength > Ce)
+		{
+			LastLifecycleRequestError = FString::Printf(TEXT("Malformed: the payload's context_length (%lld) is outside [0, %lld], the model's cap"), ContextLength, Ce);
+			return false;
+		}
+		if (WrapperContextUsed != ContextLength)
+		{
+			LastLifecycleRequestError = FString::Printf(TEXT("Malformed: the wrapper's ContextUsed (%lld) differs from the payload's context_length (%lld)"), WrapperContextUsed, ContextLength);
+			return false;
+		}
+		const TCHAR* Field = Budget > Cp ? TEXT("budget") : (Origin > Cp ? TEXT("origin") : (ContextLength > Cp ? TEXT("context_length") : nullptr));
+		if (Field != nullptr)
+		{
+			const int64 Figure = Budget > Cp ? Budget : (Origin > Cp ? Origin : ContextLength);
+			LastLifecycleRequestError = FString::Printf(TEXT("ContextCapMismatch: the payload's %s (%lld) is above this subsystem's ContextCap (%lld); it was saved under a larger ContextCap and restores after ContextCap is raised"),
+				Field, Figure, Cp);
+			return false;
+		}
+		OutBudget = Budget;
+		OutOrigin = Origin;
+		OutReady = ReadyWord != 0; // the engine reads any non-zero word as ready (round-2 note 10)
+		return true;
+	}
+
+	// K6 review C1, fix (b): a recycle QueueRecycle() recorded on SlotIndex whose reset the page
+	// ledger has not yet admitted (PollRecycles() admits it). A ledger op of the slot's new holder,
+	// and a restore's choice of slot, wait behind it, as they wait behind an open ledger job.
+	bool HasUnadmittedRecycle(int32 SlotIndex) const
+	{
+		for (const FPendingRecycle& Recycle : PendingRecycles)
+		{
+			if (Recycle.SlotIndex == SlotIndex && !Recycle.bLedgerAdmitted)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// A slot a pooled restore may take now: free, not withheld, with no open ledger job.
+	int32 FindPooledRestoreSlot() const
+	{
+		for (int32 I = 0; I < Slots.Num(); ++I)
+		{
+			if (!Slots[I].bVended && !Slots[I].bWithheld && !Ledger.SlotHasJob(I) && !HasUnadmittedRecycle(I))
+			{
+				return I;
+			}
+		}
+		return INDEX_NONE;
+	}
+
+	// True while a slot will come free without any caller acting: a restore's reservation (its job may
+	// fail) or a recycle not yet applied.
+	bool AnySlotWillFree() const
+	{
+		for (int32 I = 0; I < Slots.Num(); ++I)
+		{
+			if (Slots[I].bRestoreReserved || (!Slots[I].bVended && !Slots[I].bWithheld && (Ledger.SlotHasJob(I) || HasUnadmittedRecycle(I))))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Plugin paging plan §3.5 "Fit and wait" (K7): every queued pooled restore not yet arrived, in
+	// arrival order. Each takes a free slot and the ledger's admission there: admitted (its job is
+	// posted), waiting on H (the slot is held for it), or refused KvPagesExhausted on arrival. A
+	// restore with no slot free waits, and every restore behind it waits too, while a slot will come
+	// free; with none it is refused PoolExhausted, as in dedicated mode. Game thread.
+	void ArrivePooledRestores()
+	{
+		for (int32 Index = 0; Index < RestoreOps.Num(); ++Index)
+		{
+			FLifecycleOpEntry& Entry = RestoreOps[Index];
+			if (Entry.bSubmitted || Entry.Result != ESuperSLMRestoreResult::Pending)
+			{
+				continue;
+			}
+			if (!ArrivePooledRestore(Entry))
+			{
+				break;
+			}
+		}
+	}
+
+	// One arrival. False when the restore must wait for a slot (it stays queued, not arrived).
+	bool ArrivePooledRestore(FLifecycleOpEntry& Entry)
+	{
+		const SslmGpuAdapterHandle* RestoreAdapterHandle = ResolveRestoreAdapterHandle(Entry.RestoreAdapterId);
+		if (Entry.RestoreAdapterId != 0 && RestoreAdapterHandle == nullptr)
+		{
+			Entry.bSubmitted = true;
+			ReleaseRestorePin(Entry);
+			ResolveEntry(Entry, ESuperSLMRestoreResult::AdapterUnavailable);
+			LastLifecycleRequestError = FString::Printf(TEXT("the blob was saved with adapter %s bound, and that adapter is no longer mapped on this GPU subsystem"),
+				*SuperSLMRuntime::HashToHex(Entry.RestoreContents.AdapterHash));
+			return true;
+		}
+		const int32 SlotIndex = FindPooledRestoreSlot();
+		if (SlotIndex == INDEX_NONE)
+		{
+			if (AnySlotWillFree())
+			{
+				return false;
+			}
+			Entry.bSubmitted = true;
+			ReleaseRestorePin(Entry);
+			ResolveEntry(Entry, ESuperSLMRestoreResult::PoolExhausted);
+			LastLifecycleRequestError = TEXT("every pooled GPU sequence is vended; a restore needs a free one");
+			return true;
+		}
+		SuperSLMPaging::FRestoreRequest Request;
+		Request.Slot = SlotIndex;
+		Request.Payload = SuperSLMPaging::ERestorePayload::Budget;
+		Request.Budget = Entry.RestoreBudget;
+		Request.Origin = Entry.RestoreOrigin;
+		if (const FGpuPrefixEntry* Hint = FindReadyPrefix(Entry.RestoreHintPrefixId))
+		{
+			Request.Hint = SuperSLMPaging::EHintKind::Prefix;
+			Request.HintNode = Hint->Node;
+		}
+		else if (Entry.RestoreHintPrefixId != 0)
+		{
+			// A hint is never a requirement (gpu_1p0.h): one that names no Ready prefix of this
+			// subsystem is dropped and the restore runs unhinted.
+			UE_LOG(LogSuperSLM, Display, TEXT("GPU restore: the hint (prefix %lld) is not a Ready prefix of this subsystem; the restore runs unhinted."), Entry.RestoreHintPrefixId);
+			Entry.RestoreHintPrefixId = 0;
+		}
+		const SuperSLMPaging::FAdmission Admission = Ledger.AdmitRestore(Request);
+		Entry.bSubmitted = true;
+		switch (Admission.Outcome)
+		{
+			case SuperSLMPaging::EPageAdmit::Admitted:
+			case SuperSLMPaging::EPageAdmit::Waiting:
+				Slots[SlotIndex].bVended = true; // reserved: see AdmitRestoreFront()
+				Slots[SlotIndex].bRestoreReserved = true;
+				Entry.RestoreSlotIndex = SlotIndex;
+				Entry.LedgerTicket = Admission.Ticket;
+				if (Admission.Outcome == SuperSLMPaging::EPageAdmit::Waiting)
+				{
+					Entry.bRestoreWaiting = true; // admitted at the apply that makes it fit (DrainRestoreResolutions())
+				}
+				else
+				{
+					StartPooledRestoreJob(Entry);
+				}
+				return true;
+			case SuperSLMPaging::EPageAdmit::KvPagesExhausted:
+				ReleaseRestorePin(Entry);
+				LastLifecycleRequestError = FString::Printf(TEXT("KvPagesExhausted: the restore's charge does not fit the restore headroom (%u pages free) and the restores ahead of it do not guarantee it; re-issue it after an apply, or raise RestoreHeadroomBlocks"),
+					Ledger.RegionFree(SuperSLMPaging::ERegion::H));
+				ResolveEntry(Entry, ESuperSLMRestoreResult::KvPagesExhausted);
+				return true;
+			case SuperSLMPaging::EPageAdmit::ContextCapMismatch:
+				ReleaseRestorePin(Entry);
+				LastLifecycleRequestError = TEXT("ContextCapMismatch: the payload's budget or origin is above this subsystem's ContextCap");
+				ResolveEntry(Entry, ESuperSLMRestoreResult::ContextCapMismatch);
+				return true;
+			case SuperSLMPaging::EPageAdmit::InvalidRequest:
+				ReleaseRestorePin(Entry);
+				LastLifecycleRequestError = TEXT("Malformed: the page ledger refused the payload's budget or origin");
+				ResolveEntry(Entry, ESuperSLMRestoreResult::Malformed);
+				return true;
+			case SuperSLMPaging::EPageAdmit::NotConfigured:
+			case SuperSLMPaging::EPageAdmit::PrefixLimit:
+			case SuperSLMPaging::EPageAdmit::ParentNotUsable:
+			case SuperSLMPaging::EPageAdmit::KvModeMismatch:
+			case SuperSLMPaging::EPageAdmit::PrefixPinned:
+				break;
+		}
+		ReleaseRestorePin(Entry);
+		const FString Reason = FString::Printf(TEXT("the page ledger did not admit the restore (outcome %d)"), static_cast<int32>(Admission.Outcome));
+		NoteLedgerRefusal(SlotIndex, Reason);
+		LastLifecycleRequestError = Reason;
+		ResolveEntry(Entry, ESuperSLMRestoreResult::NotConfigured);
+		return true;
+	}
+
+	// The admitted pooled restore's job: sslm_gpu_seq_restore_into_pool (restore-first: the slot's
+	// warm holder is released only once the new one is restored, bound and checked), with the hint's
+	// handle. The thread slot takes the payload's shape: its limit from the header's budget and
+	// origin, its armed flag from the header's ready word (§3.4 "The armed flag"). Game thread.
+	void StartPooledRestoreJob(FLifecycleOpEntry& Entry)
+	{
+		const int32 SlotIndex = Entry.RestoreSlotIndex;
+		Entry.HoldId = AttachPagedHold(EGpuPagedJobKind::Restore);
+		JobsPostedByKind[static_cast<int32>(EGpuPagedJobKind::Restore)] += 1;
+		Entry.Async = MakeShared<FLifecycleAsyncState>();
+		TSharedPtr<FLifecycleAsyncState> Async = Entry.Async;
+		BumpGeneration(SlotIndex);
+		const uint32 Gen = Slots[SlotIndex].Gen;
+		const int32 SchemaIndex = Entry.RestoreSchemaIndex;
+		const SslmGpuAdapterHandle* RestoreAdapterHandle = ResolveRestoreAdapterHandle(Entry.RestoreAdapterId);
+		TSharedPtr<const TArray<uint8>, ESPMode::ThreadSafe> Blob = MoveTemp(Entry.RestoreBlob);
+		const int64 Layer1Offset = Entry.RestoreLayer1Offset;
+		const int64 Layer1Size = Entry.RestoreLayer1Size;
+		const int32 RestoreLastToken = Entry.RestoreLastToken;
+		const bool bRestoreStopped = Entry.bRestoreStopped;
+		const bool bRestorePrimed = Entry.bRestorePrimed;
+		const int64 RestoreContextUsed = Entry.RestoreContents.ContextUsed;
+		const int32 RestoreMaxNewTokens = Entry.RestoreContents.MaxNewTokensRemaining;
+		const TArray<int32> RestoreStopTokenIds = Entry.RestoreContents.StopTokenIds;
+		const int64 HintId = Entry.RestoreHintPrefixId;
+		const bool bReady = Entry.bRestoreReady;
+		SuperSLMPaging::FHolderShape Shape;
+		Shape.Mode = SuperSLMPaging::EHolderMode::Budget;
+		Shape.Budget = Entry.RestoreBudget;
+		Shape.Origin = Entry.RestoreOrigin;
+		const int64 LimitAfter = LedgerHolderLimit(Shape);
+		TSharedPtr<FJob> Job = MakeShared<FJob>();
+		Job->Custom = [this, SlotIndex, Gen, SchemaIndex, RestoreAdapterHandle, Blob = MoveTemp(Blob), Layer1Offset, Layer1Size, Async, RestoreLastToken, bRestoreStopped,
+			bRestorePrimed, RestoreContextUsed, RestoreMaxNewTokens, RestoreStopTokenIds, HintId, bReady, LimitAfter]()
+		{
+			SslmGpuSequenceHandle* Fresh = nullptr;
+			uint32_t SharedPages = 0;
+			const FThreadPrefix* HintPrefix = HintId != 0 ? ThreadPrefixes.Find(HintId) : nullptr;
+#if WITH_DEV_AUTOMATION_TESTS
+			const FGpuStatus Forced = TakeTestStatus(&TestNextRestoreStatus);
+#else
+			const FGpuStatus Forced = FGpuStatus::SSLM_OK;
+#endif
+			Async->RestoreStatus = Forced != FGpuStatus::SSLM_OK ? Forced
+				: sslm_gpu_seq_restore_into_pool(Ctx, Model, Pool, Blob->GetData() + Layer1Offset, static_cast<size_t>(Layer1Size),
+					HintPrefix != nullptr ? HintPrefix->Handle : nullptr, &Fresh, &SharedPages);
+			NoteLayer1Status(Async->RestoreStatus);
+			if (Async->RestoreStatus != FGpuStatus::SSLM_OK || Fresh == nullptr)
+			{
+				Async->RestoreWhere = TEXT("sslm_gpu_seq_restore_into_pool");
+				SnapshotPoolStatsOnThread();
+				return;
+			}
+			// Plan §2.5 row 5, as the dedicated restore: the restored binding must agree with the wrapper.
+			int32_t SchemaBound = 0;
+			const FGpuStatus BoundSt = SslmGpuSeqSchemaBoundForG5Bridge(Ctx, Fresh, &SchemaBound);
+			NoteLayer1Status(BoundSt);
+			if (BoundSt != FGpuStatus::SSLM_OK || (SchemaBound != 0) != (SchemaIndex >= 0))
+			{
+				Async->bSchemaCrossCheckFailed = true;
+				Async->RestoreStatus = BoundSt != FGpuStatus::SSLM_OK ? BoundSt : FGpuStatus::SSLM_SEQUENCE_REJECTED;
+				Async->RestoreWhere = BoundSt != FGpuStatus::SSLM_OK
+					? FString(TEXT("SslmGpuSeqSchemaBoundForG5Bridge (restore cross-check)"))
+					: FString::Printf(TEXT("the restore cross-check: the wrapper %s a schema, but the restored sequence %s one"),
+						SchemaIndex >= 0 ? TEXT("names") : TEXT("names no"), SchemaBound != 0 ? TEXT("has") : TEXT("has no"));
+				NoteLayer1Status(sslm_gpu_seq_release(Ctx, Fresh));
+				SnapshotPoolStatsOnThread();
+				return;
+			}
+			if (RestoreAdapterHandle != nullptr)
+			{
+				Async->RestoreStatus = sslm_gpu_seq_bind_adapter(Ctx, Fresh, RestoreAdapterHandle);
+				NoteLayer1Status(Async->RestoreStatus);
+				if (Async->RestoreStatus != FGpuStatus::SSLM_OK)
+				{
+					Async->RestoreWhere = TEXT("sslm_gpu_seq_bind_adapter (re-bind after restore)");
+					NoteLayer1Status(sslm_gpu_seq_release(Ctx, Fresh));
+					SnapshotPoolStatsOnThread();
+					return;
+				}
+				Async->bAdapterBound = true;
+			}
+			FThreadSlot& TS = ThreadSlots[SlotIndex];
+			if (TS.Handle != nullptr)
+			{
+				NoteLayer1Status(sslm_gpu_seq_release(Ctx, TS.Handle)); // restore-first: the warm holder goes last
+			}
+			TS = FThreadSlot();
+			TS.Handle = Fresh;
+			TS.Cap = Config.ContextCap;
+			TS.KvBytes = 0; // a pooled holder's K/V is the pool's
+			TS.Gen = Gen;
+			TS.bPrimed = bRestorePrimed;
+			TS.SchemaIndex = SchemaIndex;
+			TS.BoundAdapter = RestoreAdapterHandle;
+			TS.LastToken = RestoreLastToken;
+			TS.bStopped = bRestoreStopped;
+			TS.ContextUsed = RestoreContextUsed;
+			TS.MaxNewTokens = RestoreMaxNewTokens;
+			TS.StopTokenIds = RestoreStopTokenIds;
+			TS.Limit = LimitAfter;
+			TS.bArmed = bReady;
+			Async->SharedPages = SharedPages;
+			Async->WalkState = SslmGpuSeqWalkStateForG5Bridge(Fresh);
+			Async->FreshHandle = Fresh;
+			SnapshotPoolStatsOnThread();
+		};
+		Async->bPrimed = bRestorePrimed;
+		Async->Job = Enqueue(Job);
+	}
+
+	// Each tick (pooled): every pooled restore whose job is done and whose apply HoldApply does not
+	// hold is finalized, in arrival order; then the waiters the ledger admitted at those applies (or
+	// at any other H refund) post their jobs; then the resolved entries leave the queue (their results
+	// live in HandleResults). Game thread.
+	void PollPooledRestores()
+	{
+		for (FLifecycleOpEntry& Entry : RestoreOps)
+		{
+			if (!Entry.bSubmitted || Entry.bRestoreWaiting || Entry.Result != ESuperSLMRestoreResult::Pending || !Entry.Async.IsValid() || !Entry.Async->Job.IsValid()
+				|| !Entry.Async->Job->bDone.load(std::memory_order_acquire))
+			{
+				continue;
+			}
+			if (PagedHoldBlocks(Entry.HoldId))
+			{
+				continue;
+			}
+			FinalizeRestoreOp(Entry);
+		}
+		DrainRestoreResolutions();
+		RestoreOps.RemoveAll([](const FLifecycleOpEntry& Entry) { return Entry.Result != ESuperSLMRestoreResult::Pending; });
+		RestoreOpsFront = 0;
+	}
+
+	// The ledger's wait resolutions (§3.5 "Fit and wait"): an admitted waiter posts its job now; a
+	// waiter the epoch's end resolved is refused NotConfigured, its slot reservation released (no job
+	// ran on it). Game thread.
+	void DrainRestoreResolutions()
+	{
+		if (!IsPooled())
+		{
+			return;
+		}
+		for (const SuperSLMPaging::FWaitResolution& Resolution : Ledger.DrainResolutions())
+		{
+			FLifecycleOpEntry* Waiter = RestoreOps.FindByPredicate([&Resolution](const FLifecycleOpEntry& Entry)
+			{
+				return Entry.bRestoreWaiting && Entry.LedgerTicket == Resolution.Ticket && Entry.Result == ESuperSLMRestoreResult::Pending;
+			});
+			if (Waiter == nullptr)
+			{
+				continue;
+			}
+			Waiter->bRestoreWaiting = false;
+			if (Resolution.Outcome == SuperSLMPaging::EPageAdmit::Admitted)
+			{
+				StartPooledRestoreJob(*Waiter);
+				continue;
+			}
+			Waiter->LedgerTicket = SuperSLMPaging::InvalidTicket;
+			ReleaseRestorePin(*Waiter);
+			if (Slots.IsValidIndex(Waiter->RestoreSlotIndex))
+			{
+				Slots[Waiter->RestoreSlotIndex].bVended = false;
+				Slots[Waiter->RestoreSlotIndex].bRestoreReserved = false;
+			}
+			LastLifecycleRequestError = TEXT("NotConfigured: the restore was waiting on the restore headroom when the pooled epoch ended");
+			ResolveEntry(*Waiter, ESuperSLMRestoreResult::NotConfigured);
+		}
 	}
 
 	// D-SLM7758: a held schema bind reaches Layer 1 here, on the one FIFO, after every op ahead of
@@ -2610,6 +4514,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		{
 			FThreadSlot& TS = St8->ThreadSlots[SlotIndex];
 			Async->BindStatus = SslmGpuSeqSetSchemaForG5Bridge(St8->Ctx, TS.Handle, Index);
+			St8->NoteLayer1Status(Async->BindStatus); // K6 review S2
 			if (Async->BindStatus == FGpuStatus::SSLM_OK)
 			{
 				TS.SchemaIndex = Index;
@@ -2689,6 +4594,44 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			ResolveEntry(Entry, ESuperSLMRestoreResult::Success); // admitted; the generation itself faulted
 			return;
 		}
+		// Plugin paging plan §3.4 "An empty prompt after adopt", rev 1.9 ruling 6 (K7): in pooled mode
+		// the call accepted an empty prompt; here, at its queue head, it runs only on an armed
+		// sequence (an adopter of a prefix that fed a token, or a restore of a ready payload), whose
+		// first step is the finish of its already-embedded arc. An unarmed sequence faults by name,
+		// before any Layer-1 call.
+		const bool bEmptyPrompt = Entry.Request.PromptTokens.Num() == 0;
+		if (IsPooled() && bEmptyPrompt && !S.bArmedMirror)
+		{
+			S.Request = Entry.Request;
+			S.Generated.Reset();
+			FaultSlot(S, ESuperSLMDecodeOutcome::Generating, ESuperSLMGpuFaultReason::RecoverablePerSequenceRejection,
+				TEXT("the prompt is empty; a GPU sequence is primed by prefilling at least one prompt token (this sequence is not armed: no adopted prefix or restored payload left it ready)"));
+			ResolveEntry(Entry, ESuperSLMRestoreResult::Success); // admitted; the generation itself faulted
+			return;
+		}
+		// Plugin paging plan §3.4 "Activation pre-check", rev 1.9 ruling 6 (K6, a plain holder; K7
+		// adds the adopter, whose mirror counts the adopted prefix's positions): in pooled mode a prompt that would run past the holder's limit is
+		// refused here, at its queue head, not at the call. The handle is valid and resolves
+		// Success (admitted); the sequence faults by name before any token, as the CPU's activation
+		// does. KvBudgetExceeded below ContextCap; at a limit equal to ContextCap the cap outcome.
+		if (IsPooled())
+		{
+			const int64 Limit = Ledger.SlotLimit(SlotIndex);
+			const int64 PromptTokens = Entry.Request.PromptTokens.Num();
+			const SuperSLMPaging::ELimitVerdict Verdict = SuperSLMPaging::CheckActivation(S.ContextUsedMirror, PromptTokens, Limit, Config.ContextCap);
+			if (Verdict != SuperSLMPaging::ELimitVerdict::Allowed)
+			{
+				const bool bBudget = Verdict == SuperSLMPaging::ELimitVerdict::KvBudgetExceeded;
+				const FString Refusal = FString::Printf(TEXT("the prompt (%lld tokens, with %lld positions already used) would run past the sequence's %s (%lld); refused at activation, before any token"),
+					PromptTokens, S.ContextUsedMirror, bBudget ? TEXT("own generation limit, min(origin + SequenceBudget, ContextCap)") : TEXT("ContextCap"), Limit);
+				S.Request = Entry.Request;
+				S.Generated.Reset();
+				FaultSlot(S, ESuperSLMDecodeOutcome::Generating,
+					bBudget ? ESuperSLMGpuFaultReason::KvBudgetExceeded : ESuperSLMGpuFaultReason::RecoverablePerSequenceRejection, Refusal);
+				ResolveEntry(Entry, ESuperSLMRestoreResult::Success); // admitted; the generation itself faulted
+				return;
+			}
+		}
 		// The sequence is Idle here: the call refuses every request whose turn would not find it
 		// Idle (EnqueueSlotOp()), and the check above refuses the rest. The request-shape checks
 		// already ran at the call (RequestBeginGeneration()).
@@ -2696,9 +4639,17 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		S.Generated.Reset();
 		S.Generated.Reserve(Entry.Request.MaxNewTokens);
 		S.Phase = ESuperSLMSequencePhase::Prefilling;
+		// K7 review S1: the limit the check above read is the one the generation's steps check.
+		S.PlanBeginLimit = IsPooled() ? Ledger.SlotLimit(SlotIndex) : 0;
 		S.PromptPlanned = 0;
 		S.BeginWallSeconds = FPlatformTime::Seconds();
 		S.FirstTokenMs = -1.0;
+		if (bEmptyPrompt)
+		{
+			// The armed sequence's first step is finish-only, and carries the generation's limits.
+			S.bPlanPrimed = true;
+			S.bPlanBeginLimits = true;
+		}
 		// ActiveGenerationOpLogIndex is set by the caller (AdmitSlotFront), which knows this
 		// entry's own OpLog index; this function only knows the entry by reference.
 		ResolveEntry(Entry, ESuperSLMRestoreResult::Success); // "delivered" means admitted (header doc)
@@ -2759,7 +4710,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			// on the same Queue) -- Layer 1's state is final by the time this runs.
 			FThreadSlot& TS = St8->ThreadSlots[SlotIndex];
 			size_t Size = 0;
-			sslm_gpu_seq_save(St8->Ctx, TS.Handle, nullptr, &Size);
+			St8->NoteLayer1Status(sslm_gpu_seq_save(St8->Ctx, TS.Handle, nullptr, &Size)); // K6 review S2: the size query
 			if (Size == 0)
 			{
 				Async->SaveStatus = FGpuStatus::SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
@@ -2767,6 +4718,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			}
 			Async->Layer1Bytes.SetNumUninitialized(static_cast<int64>(Size));
 			Async->SaveStatus = sslm_gpu_seq_save(St8->Ctx, TS.Handle, Async->Layer1Bytes.GetData(), &Size);
+			St8->NoteLayer1Status(Async->SaveStatus);
 			Async->Layer1Bytes.SetNum(static_cast<int64>(Size));
 			Async->bPrimed = TS.bPrimed;
 			Async->bStopped = TS.bStopped;
@@ -2967,6 +4919,18 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	{
 		FGameSlot& S = Slots[SlotIndex];
 		FLifecycleOpEntry& Entry = S.OpLog[S.OpFront];
+		// Plugin paging plan §3.2 "One job per slot" (K6, K7): a ledger op (a reset, or a pooled adopt)
+		// waits at the head of its queue while the slot still has a ledger job open -- the previous
+		// holder's recycle, until PollRecycles() applies it. It is admitted at a later pass.
+		// Plan §3.4 "Activation reads the applied shape" (rev 1.10; K7 review S1): in pooled mode a
+		// BeginGeneration waits the same way, so its empty-prompt and activation checks read the shape
+		// the slot's last applied job left, never a previous holder's or a job's still in flight.
+		const bool bLedgerOp = Entry.Kind == ELifecycleOpKind::Reset || (Entry.Kind == ELifecycleOpKind::AdoptPrefix && Entry.AdoptPrefixId != 0);
+		const bool bWaitsForSlotJob = bLedgerOp || Entry.Kind == ELifecycleOpKind::BeginGeneration;
+		if (IsPooled() && bWaitsForSlotJob && (Ledger.SlotHasJob(SlotIndex) || HasUnadmittedRecycle(SlotIndex))) // K6 review C1: and a deferred recycle
+		{
+			return;
+		}
 		switch (Entry.Kind)
 		{
 			case ELifecycleOpKind::Reset: AdmitResetOp(SlotIndex, Entry); break;
@@ -2978,7 +4942,16 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 					S.ActiveGenerationOpLogIndex = S.OpFront;
 				}
 				break;
-			case ELifecycleOpKind::AdoptPrefix: AdmitAdoptPrefixOp(Entry); break;
+			case ELifecycleOpKind::AdoptPrefix:
+				if (IsPooled() && Entry.AdoptPrefixId != 0)
+				{
+					AdmitPooledAdoptOp(SlotIndex, Entry); // K7
+				}
+				else
+				{
+					AdmitAdoptPrefixOp(Entry);
+				}
+				break;
 			case ELifecycleOpKind::SchemaBind: AdmitSchemaBindOp(SlotIndex, Entry); break;
 			case ELifecycleOpKind::Restore: break; // subsystem-level; never reached here
 		}
@@ -3017,12 +4990,20 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		else if (Entry.Result == ESuperSLMRestoreResult::Pending && Entry.Async.IsValid() && Entry.Async->Job.IsValid() &&
 			Entry.Async->Job->bDone.load(std::memory_order_acquire))
 		{
+			// Plan §3.9 (K6): HoldApply() holds this op's apply once its job is done; the entry stays
+			// at the front, unresolved, until the hold is released.
+			if (PagedHoldBlocks(Entry.HoldId))
+			{
+				return;
+			}
 			if (Entry.Kind == ELifecycleOpKind::Reset)
 			{
 				// Plan §2.5 row 16: a refused reset resolves Malformed with the status named, as the
 				// CPU backend's failed reset does.
 				const FLifecycleAsyncState& Async = *Entry.Async;
 				const bool bSkipped = JobWasSkipped(Async.Job);
+				// Plugin paging plan §3.5 (K6): the reset's page-ledger apply, with what its job did.
+				ApplyLedgerReset(SlotIndex, Entry.LedgerTicket, !bSkipped && Async.bResetRan && Async.ResetStatus == FGpuStatus::SSLM_OK, Async.bNormalized);
 				if (!bSkipped && Async.bResetRan && S.Id == Entry.Owner)
 				{
 					S.WalkState = Async.WalkState; // ruling 2026-09-26: the game-side walk record
@@ -3056,6 +5037,8 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 					{
 						ClearGeneration(S);
 						S.Path = Entry.NewDecodePath;
+						S.ContextUsedMirror = 0; // plugin paging plan §3.4 (K6): reset to origin 0
+						S.bArmedMirror = false;  // K7: a reset clears the engine's ready flag
 					}
 					ResolveEntry(Entry, ESuperSLMRestoreResult::Success);
 				}
@@ -3067,6 +5050,10 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			else if (Entry.Kind == ELifecycleOpKind::SchemaBind)
 			{
 				FinalizeSchemaBindOp(SlotIndex, Entry);
+			}
+			else if (Entry.Kind == ELifecycleOpKind::AdoptPrefix)
+			{
+				FinalizeAdoptOp(SlotIndex, Entry); // K7: only a pooled adopt posts a job
 			}
 		}
 		if (Entry.Result != ESuperSLMRestoreResult::Pending)
@@ -3193,6 +5180,15 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			LastLifecycleRequestError = TEXT("the blob's GPU section is truncated or its Layer-1 length is inconsistent");
 			return FSuperSLMLifecycleOpHandle();
 		}
+		// Plugin paging plan §3.5 (K7): the Layer-1 payload's header, checked at the call -- the mode
+		// crossing by magic in both modes, and a pooled payload's 'SLM6' fields.
+		int64 HeaderBudget = 0;
+		int64 HeaderOrigin = 0;
+		bool bHeaderReady = false;
+		if (!CheckRestorePayloadHeader(Payload + Cursor, static_cast<int64>(Layer1Bytes), Contents.ContextUsed, HeaderBudget, HeaderOrigin, bHeaderReady))
+		{
+			return FSuperSLMLifecycleOpHandle();
+		}
 
 		int32 RestoreSchemaIndex = -1;
 		if (!Contents.SchemaName.IsEmpty())
@@ -3222,6 +5218,10 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		Entry.RestoreLastToken = LastToken;
 		Entry.RestoreInFlightIssued = InFlightIssued;
 		Entry.RestoreCarried = MoveTemp(Carried);
+		Entry.bRestorePooled = IsPooled();
+		Entry.RestoreBudget = HeaderBudget;
+		Entry.RestoreOrigin = HeaderOrigin;
+		Entry.bRestoreReady = bHeaderReady;
 		if (Contents.bHasAdapter)
 		{
 			for (const TPair<int64, FAdapterEntry>& Pair : Adapters)
@@ -3257,6 +5257,11 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	// restore now if nothing else in the subsystem-level restore queue is ahead of it.
 	void TryAdmitRestoreImmediately()
 	{
+		if (IsPooled())
+		{
+			ArrivePooledRestores(); // §3.5 (K7): every restore not yet arrived, in arrival order
+			return;
+		}
 		if (RestoreOps.IsValidIndex(RestoreOpsFront) && !RestoreOps[RestoreOpsFront].bSubmitted)
 		{
 			AdmitRestoreFront();
@@ -3359,6 +5364,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 #else
 			Async->RestoreStatus = sslm_gpu_seq_restore(St8->Ctx, St8->Model, Blob->GetData() + Layer1Offset, static_cast<size_t>(Layer1Size), &Fresh);
 #endif
+			St8->NoteLayer1Status(Async->RestoreStatus); // plugin paging plan §3.9 (K6): Layer1BusyCount()
 			if (Async->RestoreStatus != FGpuStatus::SSLM_OK || Fresh == nullptr)
 			{
 				Async->RestoreWhere = TEXT("sslm_gpu_seq_restore");
@@ -3371,6 +5377,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			// plugin, which restores unbound.
 			int32_t SchemaBound = 0;
 			const FGpuStatus BoundSt = SslmGpuSeqSchemaBoundForG5Bridge(St8->Ctx, Fresh, &SchemaBound);
+			St8->NoteLayer1Status(BoundSt); // K6 review S2
 			if (BoundSt != FGpuStatus::SSLM_OK || (SchemaBound != 0) != (SchemaIndex >= 0))
 			{
 				Async->bSchemaCrossCheckFailed = true;
@@ -3379,7 +5386,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 					? FString(TEXT("SslmGpuSeqSchemaBoundForG5Bridge (restore cross-check)"))
 					: FString::Printf(TEXT("the restore cross-check: the wrapper %s a schema, but the restored sequence %s one"),
 						SchemaIndex >= 0 ? TEXT("names") : TEXT("names no"), SchemaBound != 0 ? TEXT("has") : TEXT("has no"));
-				sslm_gpu_seq_release(St8->Ctx, Fresh);
+				St8->NoteLayer1Status(sslm_gpu_seq_release(St8->Ctx, Fresh));
 				return;
 			}
 			if (RestoreAdapterHandle != nullptr)
@@ -3387,10 +5394,11 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				// The adapter binding is not carried by the blob; bind_adapter is not subject to
 				// bind eligibility, so it stays legal on a restored sequence.
 				Async->RestoreStatus = sslm_gpu_seq_bind_adapter(St8->Ctx, Fresh, RestoreAdapterHandle);
+				St8->NoteLayer1Status(Async->RestoreStatus);
 				if (Async->RestoreStatus != FGpuStatus::SSLM_OK)
 				{
 					Async->RestoreWhere = TEXT("sslm_gpu_seq_bind_adapter (re-bind after restore)");
-					sslm_gpu_seq_release(St8->Ctx, Fresh);
+					St8->NoteLayer1Status(sslm_gpu_seq_release(St8->Ctx, Fresh));
 					return;
 				}
 				Async->bAdapterBound = true;
@@ -3398,12 +5406,12 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			FThreadSlot& TS = St8->ThreadSlots[SlotIndex];
 			if (TS.Handle != nullptr)
 			{
-				sslm_gpu_seq_release(St8->Ctx, TS.Handle);
+				St8->NoteLayer1Status(sslm_gpu_seq_release(St8->Ctx, TS.Handle));
 			}
 			TS = FThreadSlot();
 			TS.Handle = Fresh;
 			TS.Cap = St8->Config.ContextCap;
-			TS.KvBytes = St8->KvBytesPerSequence;
+			TS.KvBytes = St8->bPooled ? 0 : St8->KvBytesPerSequence; // a pooled holder's K/V is the pool's (K6)
 			TS.Gen = Gen;
 			TS.bPrimed = Async->bPrimed; // set below from Entry's own parsed fields before Enqueue
 			TS.SchemaIndex = SchemaIndex;
@@ -3427,6 +5435,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		// not the original one.
 		Async->bPrimed = Entry.bRestorePrimed;
 		Async->Job = Enqueue(Job);
+		JobsPostedByKind[static_cast<int32>(EGpuPagedJobKind::Restore)] += 1; // plugin paging plan §3.9 (K6)
 	}
 
 	// Rule 4 (T-2987 L1): releases the adapter pin a restore took at request time, once the
@@ -3461,8 +5470,17 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			// next holder (every action dropped by ActionIsLive()). Every failure path therefore
 			// queues the unbinding reset on the pooled handle the failure left untouched -- which
 			// re-syncs the generation -- before it releases the reservation.
+			// Plugin paging plan §3.5 (K7), my K6 note 2: a pooled restore's own ledger job is applied
+			// (as failed: its H charge refunded, its holder's shape kept) before the recycle, whose
+			// reset the ledger admits only on a slot with no open job.
+			if (Entry.LedgerTicket != SuperSLMPaging::InvalidTicket)
+			{
+				Ledger.ApplyRestore(Entry.LedgerTicket, false, 0u);
+				Entry.LedgerTicket = SuperSLMPaging::InvalidTicket;
+			}
 			if (Slots.IsValidIndex(SlotIndex))
 			{
+				Slots[SlotIndex].bRestoreReserved = false;
 				if (Thread != nullptr)
 				{
 					QueueRecycle(SlotIndex);
@@ -3487,7 +5505,13 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			// Row 5: a failed schema cross-check is refused Malformed by name. Out of GPU memory
 			// (SSLM_GPU_ALLOCATION_FAILED) reads OutOfMemory; the mapping is one function
 			// (SuperSLMGpuStatusMapping::ToRestoreFailureResult).
-			Refuse(SuperSLMGpuStatusMapping::ToRestoreFailureResult(Async.RestoreStatus, Async.bSchemaCrossCheckFailed), Why);
+			// Plugin paging plan §3.7 (K6): the mapping takes the subsystem's mode. In pooled mode a
+			// KV_POOL_EXHAUSTED on a restore the ledger admitted is a ledger fault too.
+			if (IsPooled() && !Async.bSchemaCrossCheckFailed && Async.RestoreStatus == FGpuStatus::SSLM_GPU_KV_POOL_EXHAUSTED)
+			{
+				NoteLedgerFault(TEXT("the restore into the pool"));
+			}
+			Refuse(SuperSLMGpuStatusMapping::ToRestoreFailureResult(Async.RestoreStatus, IsPooled(), Async.bSchemaCrossCheckFailed), Why);
 			return;
 		}
 		// SlotIndex is the slot admission already chose and reserved, not re-derived by matching
@@ -3499,10 +5523,21 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			return;
 		}
 		FGameSlot& S = Slots[SlotIndex];
+		// Plugin paging plan §3.5 (K7): the pooled restore's ledger job applies with the pages the
+		// hint let it share; the slot's holder takes the payload's shape (the ledger sets it here).
+		if (Entry.LedgerTicket != SuperSLMPaging::InvalidTicket)
+		{
+			Ledger.ApplyRestore(Entry.LedgerTicket, true, Async.SharedPages);
+			Entry.LedgerTicket = SuperSLMPaging::InvalidTicket;
+		}
+		S.bRestoreReserved = false;
 		// Rule 1 (H8): the restore's holder starts from a value-reset per-user struct --
 		// LayersPerSliceOverride included -- before the blob's own fields apply.
 		DropPendingEvents(S); // empty on a free slot; any event is logged as dropped (ruling 2026-09-26)
 		static_cast<FGameSlotUser&>(S) = FGameSlotUser();
+		// §3.4 "The armed flag": the restored holder is armed exactly when the payload's ready word
+		// says its last write was a prefill arc (pooled); a dedicated restore's mirror stays false.
+		S.bArmedMirror = Entry.bRestorePooled && Entry.bRestoreReady;
 		S.OpLog.Reset();
 		S.OpFront = 0;
 		S.bVended = true;
@@ -3523,6 +5558,10 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		S.Schema.Index = Entry.RestoreSchemaIndex;
 		S.SchemaName = Entry.RestoreContents.SchemaName;
 		S.WalkState = Async.WalkState; // ruling 2026-09-26: the game-side walk record, as restored
+		// Plugin paging plan §3.4, §3.9 (K6): the restored holder's ContextUsed mirror, and the slot's
+		// handle generation (its Layer-1 handle was replaced).
+		S.ContextUsedMirror = Entry.RestoreContents.ContextUsed;
+		S.HolderGeneration += 1;
 		// Rule 4 (T-2987 F4): the adapter is recorded only when the restore job bound it.
 		S.ActiveAdapterId = Async.bAdapterBound ? Entry.RestoreAdapterId : 0;
 		S.RequestedAdapterId = S.ActiveAdapterId;
@@ -3602,11 +5641,20 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	void AdmitQueuedOps()
 	{
 		PollRecycles(); // plan §2.5 row 16: a refused recycle withholds its slot
+		PollPrefixBuilds(); // plugin paging plan §3.4 (K7): begins, build turns and releases
 		for (int32 SlotIndex = 0; SlotIndex < Slots.Num(); ++SlotIndex)
 		{
 			PollSlotFront(SlotIndex);
 		}
-		PollRestoreFront();
+		if (IsPooled())
+		{
+			PollPooledRestores(); // §3.5 (K7): several restores may be in flight, each on its own slot
+		}
+		else
+		{
+			PollRestoreFront();
+		}
+		TakePoolStatsSnapshot(); // K6 review N2: the last applied paged job's pool stats
 
 		struct FCandidate { bool bIsRestore; int32 SlotIndex; int64 Ordinal; };
 		TArray<FCandidate> Candidates;
@@ -3618,7 +5666,19 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				Candidates.Add({false, SlotIndex, S.OpLog[S.OpFront].GlobalOrdinal});
 			}
 		}
-		if (RestoreOps.IsValidIndex(RestoreOpsFront) && !RestoreOps[RestoreOpsFront].bSubmitted)
+		if (IsPooled())
+		{
+			// §3.5 (K7): the first restore not yet arrived takes the restore queue's place in the order.
+			for (const FLifecycleOpEntry& Op : RestoreOps)
+			{
+				if (!Op.bSubmitted && Op.Result == ESuperSLMRestoreResult::Pending)
+				{
+					Candidates.Add({true, INDEX_NONE, Op.GlobalOrdinal});
+					break;
+				}
+			}
+		}
+		else if (RestoreOps.IsValidIndex(RestoreOpsFront) && !RestoreOps[RestoreOpsFront].bSubmitted)
 		{
 			Candidates.Add({true, INDEX_NONE, RestoreOps[RestoreOpsFront].GlobalOrdinal});
 		}
@@ -3627,7 +5687,14 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		{
 			if (C.bIsRestore)
 			{
-				AdmitRestoreFront();
+				if (IsPooled())
+				{
+					ArrivePooledRestores();
+				}
+				else
+				{
+					AdmitRestoreFront();
+				}
 			}
 			else
 			{
@@ -3680,6 +5747,16 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	// Applies one result to its sequence. Results arrive in order per sequence.
 	void ApplyResult(FGameSlot& S, const FPendingEvent& E, const FActionResult& R)
 	{
+		// Plugin paging plan §3.4 (K6): the slot's ContextUsed mirror, from every result whose
+		// action ran (the stale-result filter already dropped the others).
+		if (R.ContextUsed >= 0)
+		{
+			S.ContextUsedMirror = R.ContextUsed;
+		}
+		if (R.Armed >= 0)
+		{
+			S.bArmedMirror = R.Armed != 0; // K7: the armed mirror, from the same results
+		}
 		switch (R.Kind)
 		{
 			case EResultKind::Skipped:
@@ -4073,6 +6150,22 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			A.bFirstPrompt = true;
 			A.MaxNewTokens = S.Request.MaxNewTokens;
 			A.StopTokenIds = S.Request.StopTokenIds;
+			A.BeginLimit = S.PlanBeginLimit;
+		}
+	}
+
+	// Plugin paging plan §3.4 "An empty prompt after adopt" (K7): an armed sequence's empty-prompt
+	// generation has no first prompt token to carry its limits, so its first (finish-only) step
+	// carries them (FAction::bBeginLimits).
+	static void TakeBeginLimits(FGameSlot& S, FAction& A)
+	{
+		if (S.bPlanBeginLimits)
+		{
+			A.bBeginLimits = true;
+			A.MaxNewTokens = S.Request.MaxNewTokens;
+			A.StopTokenIds = S.Request.StopTokenIds;
+			A.BeginLimit = S.PlanBeginLimit;
+			S.bPlanBeginLimits = false;
 		}
 	}
 
@@ -4152,6 +6245,12 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		// that stays due is therefore served within BlockCount ticks, a hard bound (ruling
 		// 2026-09-26, finding 14), whatever other sequences enter or leave the due set. Every
 		// one-call step starts a new token, so back-pressure and the cap apply to all of them.
+		//
+		// Plugin paging plan §3.4 "Prefixes" (K7, UP-11): the build seat takes one more place in this
+		// rotation, after every slot (index Slots.Num()). A turn there feeds one whole token of the
+		// build seat's head prefix, so a build turn and a one-call token cost the same, the seat is
+		// served within BlockCount + 1 ticks, and MinimumK counts it (PrepareGpuState()). The cap
+		// holds the seat back like any new token.
 		TArray<int32, TInlineAllocator<16>> OneCallDue;
 		for (int32 SlotIndex = 0; SlotIndex < Slots.Num(); ++SlotIndex)
 		{
@@ -4160,18 +6259,33 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				OneCallDue.Add(SlotIndex);
 			}
 		}
+		const int32 BuildSeatIndex = Slots.Num();
+		FGpuPrefixEntry* BuildHead = bCapBinding ? nullptr : BuildSeatHead();
+		if (BuildHead != nullptr)
+		{
+			OneCallDue.Add(BuildSeatIndex);
+		}
+		int32 OneCallChosen = INDEX_NONE;
 		if (OneCallDue.Num() > 0)
 		{
-			int32 SlotIndex = OneCallDue[0];
+			OneCallChosen = OneCallDue[0];
 			for (const int32 Candidate : OneCallDue)
 			{
 				if (Candidate > OneCallCursor)
 				{
-					SlotIndex = Candidate;
+					OneCallChosen = Candidate;
 					break;
 				}
 			}
-			OneCallCursor = SlotIndex;
+			OneCallCursor = OneCallChosen;
+		}
+		if (OneCallChosen == BuildSeatIndex && BuildHead != nullptr)
+		{
+			PlanBuildTurn(*BuildHead, Job);
+		}
+		else if (OneCallChosen != INDEX_NONE)
+		{
+			const int32 SlotIndex = OneCallChosen;
 			FGameSlot& S = Slots[SlotIndex];
 			LogStarted(S.Id);
 			FAction A;
@@ -4193,6 +6307,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			else
 			{
 				A.Kind = EActionKind::OneCallToken;
+				TakeBeginLimits(S, A);
 				const int32 Index = Job->Actions.Add(MoveTemp(A));
 				S.bPlanPrimed = false;
 				S.TokensIssued += 1;
@@ -4244,6 +6359,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				}
 				LogStarted(S.Id);
 				A.Kind = EActionKind::ComposedFinishOnly;
+				TakeBeginLimits(S, A);
 				const int32 Index = Job->Actions.Add(MoveTemp(A));
 				S.bPlanPrimed = false;
 				S.TokensIssued += 1;
@@ -4318,7 +6434,10 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			// Test access only (GetPlanLog()): the sequences this tick's Plan issued any action for.
 			for (const FAction& Issued : Job->Actions)
 			{
-				PlanLog->IssuedSequenceIds.AddUnique(Slots[Issued.Slot].Id);
+				if (Slots.IsValidIndex(Issued.Slot)) // a build turn has no slot (K7)
+				{
+					PlanLog->IssuedSequenceIds.AddUnique(Slots[Issued.Slot].Id);
+				}
 			}
 		}
 #endif
@@ -4524,6 +6643,8 @@ void USuperSLMGpuSubsystem::Deinitialize()
 		DiscardGpuState(Flight->Claim());
 	}
 	InFlightConfigures.Empty();
+	// Plugin paging plan §3.5 (K6): the subsystem is going away, so its tombstones go with it.
+	LifecycleTombstones.Empty();
 	Super::Deinitialize();
 }
 
@@ -4541,6 +6662,47 @@ void USuperSLMGpuSubsystem::TearDown()
 	UnregisterConfigured(this);
 	if (State != nullptr)
 	{
+		// Plugin paging plan §3.5 "When a lifecycle exit ends a wait" (K6), pooled mode only: every
+		// lifecycle-op handle still Pending (queued, admitted, or held by HoldApply()) is tombstoned,
+		// and reads NotConfigured until the game releases it, rather than Pending for ever. So is a
+		// handle a terminal loss already resolved NotConfigured, whose entry goes below. The ledger's
+		// epoch ends with the state (every waiter NotConfigured), its fault count is carried over,
+		// and every test hold is released. Dedicated mode is unchanged.
+		if (State->IsPooled())
+		{
+			FSuperSLMGpuSubsystemState& S = *State;
+			S.ReleaseAllPagedHolds();
+			auto Tombstone = [this](const FLifecycleOpEntry& Entry)
+			{
+				if (Entry.Result == ESuperSLMRestoreResult::Pending && Entry.Kind != ELifecycleOpKind::SchemaBind && Entry.HandleId != 0)
+				{
+					LifecycleTombstones.Add(Entry.HandleId);
+				}
+			};
+			for (const FGameSlot& Slot : S.Slots)
+			{
+				for (const FLifecycleOpEntry& Entry : Slot.OpLog)
+				{
+					Tombstone(Entry);
+				}
+			}
+			for (const FLifecycleOpEntry& Entry : S.RestoreOps)
+			{
+				Tombstone(Entry);
+			}
+			for (const TPair<int64, FSuperSLMGpuSubsystemState::FGpuHandleResult>& Pair : S.HandleResults)
+			{
+				if (Pair.Value.Result == ESuperSLMRestoreResult::NotConfigured)
+				{
+					LifecycleTombstones.Add(Pair.Key);
+				}
+			}
+			if (S.Ledger.IsConfigured())
+			{
+				S.Ledger.EndEpoch(SuperSLMPaging::EEpochEnd::Teardown);
+			}
+			PriorLedgerFaults += static_cast<uint64>(S.Ledger.LedgerFaults());
+		}
 		// Plan §2.5 row 19 (D-SLM7763): TearDown() releases every lifecycle-op handle entry, and with
 		// them every save blob nobody took -- also when the state itself must be leaked (row 21),
 		// since the submission thread never reads these game-thread entries.
@@ -4598,8 +6760,13 @@ namespace
 // thread; the three device jobs (context, model map, pool and warm-up) run on the submission
 // thread, and the calling thread waits for them within the load-time bound. ShaderDirectory is
 // resolved by the caller on the game thread (the plugin manager). OutState is set only on Success.
+// Plugin paging plan §3.9 (K6): PageCountPerturbation and PoolCreateStatusOverride are the Configure
+// seams the caller spent for this Configure (0 when unarmed): the first is added to the plugin's
+// computed page count before the post-create cross-check, the second is returned in place of the
+// sslm_gpu_kv_pool_create call. Both are read in pooled mode only.
 static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModelBytes* Model, const FSuperSLMGpuRuntimeConfig& Config,
-	const FString& ResolvedShaderDirectory, FGpuConfigureDiagnostics& OutDiag, FSuperSLMGpuSubsystemState*& OutState)
+	const FString& ResolvedShaderDirectory, int32 PageCountPerturbation, uint32 PoolCreateStatusOverride,
+	FGpuConfigureDiagnostics& OutDiag, FSuperSLMGpuSubsystemState*& OutState)
 {
 	OutState = nullptr;
 
@@ -4631,6 +6798,23 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 	{
 		return Fail(ESuperSLMGpuConfigureResult::InvalidBlockCount, FString::Printf(
 			TEXT("BlockCount %d must be positive: it is the number of GPU sequences the pool backs"), Config.BlockCount));
+	}
+	// Plugin paging plan §3.1, UP-15 (K6): SequenceBudget selects the mode and is bounded by the
+	// plugin's own cap, ContextCap (Cp), never the model's (Ce): a budget above Cp would admit a holder
+	// past every bound the plugin enforces. 0 is dedicated mode, unchanged.
+	if (Config.SequenceBudget < 0 || static_cast<int64>(Config.SequenceBudget) > Config.ContextCap)
+	{
+		return Fail(ESuperSLMGpuConfigureResult::InvalidSequenceBudget, FString::Printf(
+			TEXT("SequenceBudget %d must lie in [0, ContextCap %lld]: 0 is dedicated mode, and a pooled holder's budget is bounded by the plugin's ContextCap"),
+			Config.SequenceBudget, Config.ContextCap));
+	}
+	const bool bPooled = Config.SequenceBudget > 0;
+	// UP-4: prefixes need pooled mode, so a dedicated configuration's PrefixBlockCount is ignored,
+	// with a warning that names the field (plan §11).
+	if (!bPooled && Config.PrefixBlockCount > 0)
+	{
+		UE_LOG(LogSuperSLM, Warning, TEXT("GPU Configure(): PrefixBlockCount %d is ignored in dedicated mode (SequenceBudget 0): GPU prefixes need pooled mode."),
+			Config.PrefixBlockCount);
 	}
 	// D-SLM7799 (plan §5 rule 1): +inf is refused as NaN already was; the negated comparison
 	// refuses NaN, zero and negatives, and the finiteness clause refuses +inf. The reason
@@ -4713,8 +6897,11 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 	// ticks; one-call sequences are served one whole token per tick in rotation, so BlockCount
 	// ticks. A sequence chooses its path at vend, so the floor is the larger of the two, which is
 	// always the composed one (L >= LayersPerTick).
+	// Plugin paging plan §3.4 "Build pace" (K7, UP-11): in pooled mode with PrefixBlockCount > 0 the
+	// build seat is one more member of the one-call rotation, so the one-call term is BlockCount + 1.
 	const int64 ComposedMinimumK = (static_cast<int64>(Config.BlockCount) * NumLayers + LayersPerSlice - 1) / LayersPerSlice;
-	Report.MinimumK = static_cast<int32>(FMath::Max<int64>(ComposedMinimumK, Config.BlockCount));
+	const int64 OneCallMinimumK = static_cast<int64>(Config.BlockCount) + (bPooled && Config.PrefixBlockCount > 0 ? 1 : 0);
+	Report.MinimumK = static_cast<int32>(FMath::Max<int64>(ComposedMinimumK, OneCallMinimumK));
 	if (Config.K < Report.MinimumK)
 	{
 		Report.Result = ESuperSLMGpuConfigureResult::KBelowMinimum;
@@ -4801,6 +6988,68 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 		+ static_cast<int64>(Cfg.hidden_size) * 4 + static_cast<int64>(Cfg.vocab_size) * 8;
 	S->ShaderDirectory = ShaderDirectory;
 
+	// Plugin paging plan §3.1-§3.4, UP-15 (K6): pooled mode's page geometry, ledger and pool size,
+	// all host arithmetic, decided before any device work. The geometry is the engine's own
+	// (ComputeGpuPageGeometry over the model's fields at the model's cap Ce, exactly as
+	// sslm_gpu_kv_pool_create computes it), so B and the page bytes are never a plugin constant; the
+	// pool's stats cross-check it after the create (job 3). The ledger prices every charge at Ce and
+	// bounds every admission at the plugin's ContextCap (Cp), and sizes the regions with the two
+	// block sizes P_blk and H_blk. The pool is S + P + H + CacheRegionPages() (0: no GPU cache).
+	S->bPooled = bPooled;
+	int64 WarmLimit = 0;
+	if (bPooled)
+	{
+		const int64 EngineCap = static_cast<int64>(Cfg.context_cap);
+		S->PageGeometry = superslm_gpu::kv_pool::ComputeGpuPageGeometry(Cfg.num_hidden_layers, Cfg.num_key_value_heads, Cfg.head_dim,
+			static_cast<int64_t>(EngineCap), Cfg.kv_block_size);
+		if (!S->PageGeometry.ok)
+		{
+			delete S;
+			return Fail(ESuperSLMGpuConfigureResult::KvPoolRefused, FString::Printf(
+				TEXT("the model's page geometry is not computable (%u layers, %u K/V heads, head_dim %u, context_cap %lld, kv_block_size %u): no pool of 0 pages (0 bytes) can be made"),
+				Cfg.num_hidden_layers, Cfg.num_key_value_heads, Cfg.head_dim, EngineCap, Cfg.kv_block_size));
+		}
+		SuperSLMPaging::FPageLedgerConfig LedgerConfig;
+		LedgerConfig.PagePositions = S->PageGeometry.page_positions;
+		LedgerConfig.PageBytes = static_cast<uint64_t>(S->PageGeometry.page_bytes);
+		LedgerConfig.ContextCap = Config.ContextCap;
+		LedgerConfig.EngineContextCap = EngineCap;
+		LedgerConfig.SequenceBudget = Config.SequenceBudget;
+		LedgerConfig.BlockCount = Config.BlockCount;
+		LedgerConfig.PrefixBlockCount = Config.PrefixBlockCount;
+		LedgerConfig.RestoreHeadroomBlocks = Config.RestoreHeadroomBlocks;
+		LedgerConfig.CacheGhostBlocks = Config.CacheGhostBlocks;
+		LedgerConfig.bCacheConfigured = false;
+		LedgerConfig.CacheRegionPages = FSuperSLMGpuSubsystemState::CacheRegionPages();
+		const SuperSLMPaging::ELedgerConfigure LedgerResult = S->Ledger.Configure(LedgerConfig);
+		FString LedgerRefusal;
+		ESuperSLMGpuConfigureResult LedgerRefusalResult = ESuperSLMGpuConfigureResult::KvPoolRefused;
+		switch (LedgerResult)
+		{
+			case SuperSLMPaging::ELedgerConfigure::Ok:
+				break;
+			case SuperSLMPaging::ELedgerConfigure::LegacyMode:
+			case SuperSLMPaging::ELedgerConfigure::InvalidSequenceBudget:
+				LedgerRefusalResult = ESuperSLMGpuConfigureResult::InvalidSequenceBudget;
+				LedgerRefusal = FString::Printf(TEXT("the page ledger refused SequenceBudget %d against ContextCap %lld"), Config.SequenceBudget, Config.ContextCap);
+				break;
+			case SuperSLMPaging::ELedgerConfigure::InvalidGeometry:
+				LedgerRefusal = FString::Printf(TEXT("the page ledger refused the pool's geometry: BlockCount %d, PrefixBlockCount %d, RestoreHeadroomBlocks %d and CacheGhostBlocks %d "
+					"at %lld positions per page (%llu bytes) must be non-negative and size a pool of at most 4,294,967,295 pages"),
+					Config.BlockCount, Config.PrefixBlockCount, Config.RestoreHeadroomBlocks, Config.CacheGhostBlocks,
+					static_cast<int64>(S->PageGeometry.page_positions), static_cast<uint64>(S->PageGeometry.page_bytes));
+				break;
+		}
+		if (!LedgerRefusal.IsEmpty())
+		{
+			delete S;
+			return Fail(LedgerRefusalResult, LedgerRefusal);
+		}
+		S->PoolPageCount = S->Ledger.PoolPages();
+		S->PoolBytes = static_cast<int64>(S->PoolPageCount) * static_cast<int64>(S->PageGeometry.page_bytes);
+		WarmLimit = S->Ledger.SlotLimit(0);
+	}
+
 	S->Slots.SetNum(Config.BlockCount);
 	// Each sequence's op log, sized for its queued window plus a running generation's kept entry
 	// (CompactSlotOpLog()), so between generations a request does not grow it. A long generation
@@ -4849,6 +7098,7 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 		ContextConfig.reserved = 0;
 		ContextConfig.shader_dir = ShaderDirUtf8.c_str();
 		FGpuStatus St = sslm_gpu_context_create(ContextConfig, &S->Ctx);
+		S->NoteLayer1Status(St); // K6 review S2: every submission-thread status is counted
 		if (St != FGpuStatus::SSLM_OK || S->Ctx == nullptr)
 		{
 			Outcome->Result = ESuperSLMGpuConfigureResult::DeviceUnavailable;
@@ -4861,8 +7111,9 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 		}
 		if (SuperSLMFinishHook::ShouldInstall(FinishParallelTasks))
 		{
-			const sslm_parallel_for Hook = SuperSLMFinishHook::Make(FinishParallelTasks);
+			const sslm_parallel_for Hook = SuperSLMFinishHook::Make(FinishParallelTasks, 0);
 			St = sslm_gpu_context_set_host_parallel_for(S->Ctx, &Hook);
+			S->NoteLayer1Status(St);
 			if (St != FGpuStatus::SSLM_OK)
 			{
 				Outcome->Result = ESuperSLMGpuConfigureResult::InvalidFinishParallelTasks;
@@ -4894,6 +7145,7 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 			// between them by this subsystem.
 			Outcome->PreMapLocalVideoMemoryBytes = QueryLayer1LocalVideoMemoryBytes();
 			FGpuStatus St = sslm_gpu_model_map(S->Ctx, ViewPtr, Residency, &S->Model);
+			S->NoteLayer1Status(St);
 			if (bHeadRequested && St == FGpuStatus::SSLM_OK)
 			{
 				Outcome->bHeadActive = true;
@@ -4904,6 +7156,7 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 				Residency.flags = 0u;
 				Outcome->PreMapLocalVideoMemoryBytes = QueryLayer1LocalVideoMemoryBytes(); // before the map that succeeds
 				St = sslm_gpu_model_map(S->Ctx, ViewPtr, Residency, &S->Model);
+				S->NoteLayer1Status(St);
 				Outcome->HeadStatus = TEXT("on the host: the model map with the device-resident head ran out of memory (SSLM_GPU_ALLOCATION_FAILED), so the model was mapped once more without it");
 			}
 			else if (!bHeadRequested)
@@ -4922,56 +7175,158 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 	}
 
 	// 3. The sequence pool, the warm-up token, and the adapter for the live video-memory reading.
+	//    Pooled mode (plugin paging plan §3.4, K6): the warm-up's dedicated scratch sequence is made
+	//    and released first, then the page pool is created and cross-checked against the computed
+	//    geometry, then the warm sequences are drawn from it with sslm_gpu_seq_create_budgeted.
+	//    Dedicated mode is unchanged: its warm sequences, then the warm-up.
 	if (bJobsFinished && Outcome->Result == ESuperSLMGpuConfigureResult::Success)
 	{
-		bJobsFinished = S->RunSync([S, Outcome, KvBytesPerSequence]()
+		bJobsFinished = S->RunSync([S, Outcome, KvBytesPerSequence, PageCountPerturbation, PoolCreateStatusOverride, WarmLimit]()
 		{
-			FGpuStatus St = FGpuStatus::SSLM_OK;
-			for (int32 I = 0; I < S->ThreadSlots.Num(); ++I)
-			{
-				FThreadSlot& TS = S->ThreadSlots[I];
-				St = sslm_gpu_seq_create(S->Ctx, S->Model, S->Config.ContextCap, &TS.Handle);
-				if (St != FGpuStatus::SSLM_OK || TS.Handle == nullptr)
-				{
-					Outcome->Result = ESuperSLMGpuConfigureResult::DeviceUnavailable;
-					Outcome->Message = FString::Printf(TEXT("sslm_gpu_seq_create (pool sequence %d of %d, context_cap %lld) returned %s"),
-						I + 1, S->ThreadSlots.Num(), S->Config.ContextCap, *GpuStatusText(St));
-					return;
-				}
-				TS.Cap = S->Config.ContextCap;
-				TS.KvBytes = KvBytesPerSequence;
-			}
-
 			// Warm-up: one token embedded and driven to full depth on a scratch sequence builds
 			// every pipeline state object the decode path uses, so the first gameplay tick does not
 			// pay for shader loading. It is also the configure-time proof that the staged shaders
 			// load from the directory Layer 1 was given.
-			SslmGpuSequenceHandle* Scratch = nullptr;
-			St = sslm_gpu_seq_create(S->Ctx, S->Model, 2, &Scratch);
-			if (St == FGpuStatus::SSLM_OK && Scratch != nullptr)
+			auto RunWarmUp = [S]() -> FGpuStatus
 			{
-				St = sslm_gpu_seq_embed_token(S->Ctx, Scratch, 0);
-				if (St == FGpuStatus::SSLM_OK)
+				SslmGpuSequenceHandle* Scratch = nullptr;
+				FGpuStatus WarmSt = sslm_gpu_seq_create(S->Ctx, S->Model, 2, &Scratch);
+				S->NoteLayer1Status(WarmSt);
+				if (WarmSt == FGpuStatus::SSLM_OK && Scratch != nullptr)
 				{
-					St = sslm_decode_step_gpu(S->Ctx, Scratch, nullptr, S->FullTokenBudget());
-				}
-				if (St == FGpuStatus::SSLM_OK)
-				{
-					int32_t Ready = 0;
-					FGpuStatus Drained = FGpuStatus::SSLM_OK;
-					St = sslm_gpu_ready(S->Ctx, Scratch, 1, &Ready, &Drained);
-					if (St == FGpuStatus::SSLM_OK)
+					WarmSt = sslm_gpu_seq_embed_token(S->Ctx, Scratch, 0);
+					S->NoteLayer1Status(WarmSt);
+					if (WarmSt == FGpuStatus::SSLM_OK)
 					{
-						St = Drained;
+						WarmSt = sslm_decode_step_gpu(S->Ctx, Scratch, nullptr, S->FullTokenBudget());
+						S->NoteLayer1Status(WarmSt);
 					}
+					if (WarmSt == FGpuStatus::SSLM_OK)
+					{
+						int32_t Ready = 0;
+						FGpuStatus Drained = FGpuStatus::SSLM_OK;
+						WarmSt = sslm_gpu_ready(S->Ctx, Scratch, 1, &Ready, &Drained);
+						S->NoteLayer1Status(WarmSt);
+						if (WarmSt == FGpuStatus::SSLM_OK)
+						{
+							WarmSt = Drained;
+							S->NoteLayer1Status(WarmSt);
+						}
+					}
+					S->NoteLayer1Status(sslm_gpu_seq_release(S->Ctx, Scratch));
 				}
-				sslm_gpu_seq_release(S->Ctx, Scratch);
-			}
-			if (St != FGpuStatus::SSLM_OK)
+				return WarmSt;
+			};
+
+			FGpuStatus St = FGpuStatus::SSLM_OK;
+			if (!S->bPooled)
 			{
-				Outcome->Result = ESuperSLMGpuConfigureResult::DeviceUnavailable;
-				Outcome->Message = FString::Printf(TEXT("the warm-up token returned %s"), *GpuStatusText(St));
-				return;
+				for (int32 I = 0; I < S->ThreadSlots.Num(); ++I)
+				{
+					FThreadSlot& TS = S->ThreadSlots[I];
+					St = sslm_gpu_seq_create(S->Ctx, S->Model, S->Config.ContextCap, &TS.Handle);
+					S->NoteLayer1Status(St);
+					if (St != FGpuStatus::SSLM_OK || TS.Handle == nullptr)
+					{
+						Outcome->Result = ESuperSLMGpuConfigureResult::DeviceUnavailable;
+						Outcome->Message = FString::Printf(TEXT("sslm_gpu_seq_create (pool sequence %d of %d, context_cap %lld) returned %s"),
+							I + 1, S->ThreadSlots.Num(), S->Config.ContextCap, *GpuStatusText(St));
+						return;
+					}
+					TS.Cap = S->Config.ContextCap;
+					TS.KvBytes = KvBytesPerSequence;
+				}
+				St = RunWarmUp();
+				if (St != FGpuStatus::SSLM_OK)
+				{
+					Outcome->Result = ESuperSLMGpuConfigureResult::DeviceUnavailable;
+					Outcome->Message = FString::Printf(TEXT("the warm-up token returned %s"), *GpuStatusText(St));
+					return;
+				}
+			}
+			else
+			{
+				St = RunWarmUp();
+				if (St != FGpuStatus::SSLM_OK)
+				{
+					Outcome->Result = ESuperSLMGpuConfigureResult::DeviceUnavailable;
+					Outcome->Message = FString::Printf(TEXT("the warm-up token returned %s"), *GpuStatusText(St));
+					return;
+				}
+
+				// The pool (§3.4, cell 5). KV_POOL_TOO_LARGE and ALLOCATION_FAILED are KvPoolRefused,
+				// naming the pages, the bytes and the status; a smaller pool may be tried at once.
+				const uint32 Pages = S->PoolPageCount;
+				const uint64 PageBytes = static_cast<uint64>(S->PageGeometry.page_bytes);
+				const uint64 Bytes = static_cast<uint64>(Pages) * PageBytes;
+				St = PoolCreateStatusOverride != 0u
+					? static_cast<FGpuStatus>(PoolCreateStatusOverride) // the §3.9 seam, in place of the call
+					: sslm_gpu_kv_pool_create(S->Ctx, S->Model, Pages, &S->Pool);
+				S->NoteLayer1Status(St);
+				if (St != FGpuStatus::SSLM_OK || S->Pool == nullptr)
+				{
+					const bool bPoolRefusal = St == FGpuStatus::SSLM_GPU_KV_POOL_TOO_LARGE || St == FGpuStatus::SSLM_GPU_ALLOCATION_FAILED;
+					Outcome->Result = bPoolRefusal ? ESuperSLMGpuConfigureResult::KvPoolRefused : ESuperSLMGpuConfigureResult::DeviceUnavailable;
+					Outcome->Message = FString::Printf(TEXT("sslm_gpu_kv_pool_create refused a pool of %u pages (%llu bytes: %llu bytes per page, %lld positions per page; "
+						"S %u + P %u + H %u + C %u pages), returning %s%s"),
+						Pages, Bytes, PageBytes, static_cast<int64>(S->PageGeometry.page_positions),
+						S->Ledger.RegionCapacity(SuperSLMPaging::ERegion::S), S->Ledger.RegionCapacity(SuperSLMPaging::ERegion::P),
+						S->Ledger.RegionCapacity(SuperSLMPaging::ERegion::H), FSuperSLMGpuSubsystemState::CacheRegionPages(),
+						*GpuStatusText(St),
+						bPoolRefusal ? TEXT("; reduce BlockCount, SequenceBudget, PrefixBlockCount or RestoreHeadroomBlocks") : TEXT(""));
+					if (S->Pool != nullptr)
+					{
+						S->NoteLayer1Status(sslm_gpu_kv_pool_destroy(S->Ctx, S->Pool));
+						S->Pool = nullptr;
+					}
+					return;
+				}
+
+				// The post-create cross-check (§3.4, cell 5; coverage audit G6): the pool's own page
+				// size and page count must be the ones the plugin computed (with the §3.9 seam's
+				// perturbation applied to the computed count). Otherwise the pool is destroyed and
+				// Configure is refused, naming both figures.
+				SslmGpuKvPoolStats PoolStats = {};
+				PoolStats.struct_size = static_cast<uint32_t>(sizeof(PoolStats));
+				St = sslm_gpu_kv_pool_stats(S->Pool, &PoolStats);
+				S->NoteLayer1Status(St); // K6 review S2
+				const int64 ComputedPages = static_cast<int64>(Pages) + static_cast<int64>(PageCountPerturbation);
+				const int64 ComputedPositions = static_cast<int64>(S->PageGeometry.page_positions);
+				if (St != FGpuStatus::SSLM_OK || static_cast<int64>(PoolStats.page_count) != ComputedPages ||
+					static_cast<int64>(PoolStats.page_positions) != ComputedPositions)
+				{
+					const FGpuStatus DestroySt = sslm_gpu_kv_pool_destroy(S->Ctx, S->Pool);
+					S->NoteLayer1Status(DestroySt);
+					S->Pool = nullptr;
+					Outcome->Result = ESuperSLMGpuConfigureResult::KvPoolRefused;
+					Outcome->Message = FString::Printf(TEXT("the page pool disagrees with the plugin's geometry: sslm_gpu_kv_pool_stats returned %s with %u pages of %lld positions, "
+						"and the plugin computed %lld pages of %lld positions (%llu bytes per page, %llu bytes) from the model's geometry; the pool was destroyed (%s)"),
+						*GpuStatusText(St), PoolStats.page_count, static_cast<int64>(PoolStats.page_positions), ComputedPages, ComputedPositions,
+						PageBytes, Bytes, *GpuStatusText(DestroySt));
+					return;
+				}
+				S->LastPoolStats = PoolStats;
+				S->bHasPoolSnapshot = true;
+
+				// The warm sequences: budgeted holders, R(SequenceBudget) pages each, drawn from the
+				// pool (region S). Each is the plugin's {Budget, SequenceBudget, 0} holder, whose limit
+				// is min(SequenceBudget, ContextCap); the engine's own cap is the model's.
+				for (int32 I = 0; I < S->ThreadSlots.Num(); ++I)
+				{
+					FThreadSlot& TS = S->ThreadSlots[I];
+					St = sslm_gpu_seq_create_budgeted(S->Ctx, S->Model, S->Pool, S->Config.SequenceBudget, &TS.Handle);
+					S->NoteLayer1Status(St);
+					if (St != FGpuStatus::SSLM_OK || TS.Handle == nullptr)
+					{
+						Outcome->Result = ESuperSLMGpuConfigureResult::DeviceUnavailable;
+						Outcome->Message = FString::Printf(TEXT("sslm_gpu_seq_create_budgeted (pool sequence %d of %d, SequenceBudget %d, %u pages) returned %s"),
+							I + 1, S->ThreadSlots.Num(), S->Config.SequenceBudget, Pages, *GpuStatusText(St));
+						return;
+					}
+					TS.Cap = S->Config.ContextCap; // Cp: the plugin's cap bounds every holder (UP-15)
+					TS.KvBytes = 0;                // a pooled holder owns no K/V buffer: the pool is declared once
+					TS.Limit = WarmLimit;
+				}
 			}
 
 			// The adapter Layer 1 dispatches on, for the live video-memory reading (D-SLM7335).
@@ -5031,6 +7386,15 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 		*S->DeviceHeadStatus,
 		SuperSLMFinishHook::ShouldInstall(Config.FinishParallelTasks) ? *FString::Printf(TEXT("split into at most %d ParallelFor tasks"), Config.FinishParallelTasks) : TEXT("serial"),
 		*S->ShaderDirectory);
+	if (S->bPooled)
+	{
+		// Plugin paging plan §3.2 (K6): the pooled shape, in the ledger's own figures.
+		Report.Message += FString::Printf(TEXT("; pooled K/V: SequenceBudget %d, a pool of %u pages of %lld positions (%lld bytes, and a host mirror of the same size): "
+			"S %u, P %u, H %u, C %u"),
+			Config.SequenceBudget, S->PoolPageCount, static_cast<int64>(S->PageGeometry.page_positions), S->PoolBytes,
+			S->Ledger.RegionCapacity(SuperSLMPaging::ERegion::S), S->Ledger.RegionCapacity(SuperSLMPaging::ERegion::P),
+			S->Ledger.RegionCapacity(SuperSLMPaging::ERegion::H), FSuperSLMGpuSubsystemState::CacheRegionPages());
+	}
 	UE_LOG(LogSuperSLM, Log, TEXT("%s"), *Report.Message);
 	return Report;
 }
@@ -5051,12 +7415,21 @@ FSuperSLMGpuConfigureReport USuperSLMGpuSubsystem::Configure(USuperSLMModel* Mod
 	}
 	FGpuConfigureDiagnostics Diag;
 	FSuperSLMGpuSubsystemState* S = nullptr;
-	const FSuperSLMGpuConfigureReport Report = PrepareGpuState(Model != nullptr ? &Bytes : nullptr, Config, ResolveShaderDirectory(), Diag, S);
+	// Plugin paging plan §3.9 (K6): the Configure seams arm the next Configure(), which spends them.
+	const int32 PageCountPerturbation = NextConfigurePageCountPerturbation;
+	const uint32 PoolCreateStatusOverride = NextPoolCreateStatusOverride;
+	NextConfigurePageCountPerturbation = 0;
+	NextPoolCreateStatusOverride = 0;
+	const FSuperSLMGpuConfigureReport Report = PrepareGpuState(Model != nullptr ? &Bytes : nullptr, Config, ResolveShaderDirectory(),
+		PageCountPerturbation, PoolCreateStatusOverride, Diag, S);
 	LastConfigureShaderDirectory = Diag.ShaderDirectory;
 	LastPreMapLocalVideoMemoryBytes = Diag.PreMapLocalVideoMemoryBytes;
 	LastPostMapLocalVideoMemoryBytes = Diag.PostMapLocalVideoMemoryBytes;
 	if (S != nullptr)
 	{
+		// Plugin paging plan §3.5 "Handle ids stay unique" (K6): the new state's handle counter starts
+		// above every tombstoned id.
+		S->NextLifecycleOpHandleId = FirstHandleIdAfterTombstones();
 		State = S;
 		ConfiguredModel = Model;
 		RegisterConfigured(this);
@@ -5091,15 +7464,22 @@ void USuperSLMGpuSubsystem::BeginConfigure(USuperSLMModel* Model, const FSuperSL
 	TWeakObjectPtr<USuperSLMGpuSubsystem> WeakThis(this);
 	TSharedPtr<FSuperSLMGpuConfigureFlight, ESPMode::ThreadSafe> Flight = MakeShared<FSuperSLMGpuConfigureFlight, ESPMode::ThreadSafe>();
 	InFlightConfigures.Add(Flight);
+	// Plugin paging plan §3.9 (K6): spent by this BeginConfigure(), as by Configure().
+	const int32 PageCountPerturbation = NextConfigurePageCountPerturbation;
+	const uint32 PoolCreateStatusOverride = NextPoolCreateStatusOverride;
+	NextConfigurePageCountPerturbation = 0;
+	NextPoolCreateStatusOverride = 0;
 
 	// Pool thread: PrepareGpuState(). Its device jobs run on the new state's own submission thread
 	// and this pool thread is the one that waits for them.
 	Async(EAsyncExecution::ThreadPool,
-		[WeakThis, Serial, bHasModel, Bytes = MoveTemp(Bytes), Hold = MoveTemp(Hold), Flight, Config, ShaderDirectory, OnDone = MoveTemp(OnDone)]() mutable
+		[WeakThis, Serial, bHasModel, Bytes = MoveTemp(Bytes), Hold = MoveTemp(Hold), Flight, Config, ShaderDirectory, PageCountPerturbation, PoolCreateStatusOverride,
+			OnDone = MoveTemp(OnDone)]() mutable
 		{
 			FGpuConfigureDiagnostics Diag;
 			FSuperSLMGpuSubsystemState* Built = nullptr;
-			const FSuperSLMGpuConfigureReport Report = PrepareGpuState(bHasModel ? &Bytes : nullptr, Config, ShaderDirectory, Diag, Built);
+			const FSuperSLMGpuConfigureReport Report = PrepareGpuState(bHasModel ? &Bytes : nullptr, Config, ShaderDirectory,
+				PageCountPerturbation, PoolCreateStatusOverride, Diag, Built);
 			{
 				FScopeLock ScopeLock(&Flight->Lock);
 				Flight->Prepared = Built;
@@ -5134,6 +7514,7 @@ void USuperSLMGpuSubsystem::BeginConfigure(USuperSLMModel* Model, const FSuperSL
 					Self->LastPostMapLocalVideoMemoryBytes = Diag.PostMapLocalVideoMemoryBytes;
 					if (S != nullptr)
 					{
+						S->NextLifecycleOpHandleId = Self->FirstHandleIdAfterTombstones(); // plugin paging plan §3.5 (K6)
 						Self->State = S;
 						Self->ConfiguredModel = Hold.IsValid() ? Hold->Get() : nullptr;
 						RegisterConfigured(Self);
@@ -5415,7 +7796,8 @@ bool USuperSLMGpuSubsystem::SetLayersPerTick(int32 LayersPerTick, FString& OutEr
 	// D-SLM7381, as Configure() computes it: BlockCount composed sequences sharing Layers per tick
 	// need ceil(BlockCount x L / Layers) ticks per token; one-call sequences need BlockCount.
 	const int64 ComposedMinimumK = (static_cast<int64>(State->Config.BlockCount) * State->NumHiddenLayers + Layers - 1) / Layers;
-	const int32 NewMinimumK = static_cast<int32>(FMath::Max<int64>(ComposedMinimumK, State->Config.BlockCount));
+	const int64 OneCallMinimumK = static_cast<int64>(State->Config.BlockCount) + (State->IsPooled() && State->Config.PrefixBlockCount > 0 ? 1 : 0); // K7: the build seat
+	const int32 NewMinimumK = static_cast<int32>(FMath::Max<int64>(ComposedMinimumK, OneCallMinimumK));
 	constexpr int32 kMaxJobTicks = 1 << 20;
 	if (NewMinimumK > kMaxJobTicks)
 	{
@@ -5509,6 +7891,7 @@ bool USuperSLMGpuSubsystem::MapAdapter(const FString& AbsolutePath, USuperSLMMod
 	if (!State->RunSync([St8, ViewPtr, Outcome]()
 	{
 		Outcome->St = sslm_gpu_adapter_map(St8->Ctx, St8->Model, ViewPtr, &Outcome->Handle);
+		St8->NoteLayer1Status(Outcome->St); // K6 review S2
 	}, TEXT("load-time call (adapter map)"), LoadTimeBoundSeconds(Entry.ResidentBytes), Entry.ResidentBytes)) // row 21, D-SLM7762
 	{
 		// Row 21: the view the map may still be reading is leaked, never freed under it.
@@ -5564,13 +7947,16 @@ void USuperSLMGpuSubsystem::UnmapAdapter(const FSuperSLMGpuAdapterHandle& Adapte
 		{
 			if (TS.BoundAdapter == Handle && TS.Handle != nullptr)
 			{
-				if (sslm_gpu_seq_bind_adapter(St8->Ctx, TS.Handle, nullptr) == FGpuStatus::SSLM_OK)
+				const FGpuStatus UnbindSt = sslm_gpu_seq_bind_adapter(St8->Ctx, TS.Handle, nullptr);
+				St8->NoteLayer1Status(UnbindSt); // K6 review S2
+				if (UnbindSt == FGpuStatus::SSLM_OK)
 				{
 					TS.BoundAdapter = nullptr;
 				}
 			}
 		}
 		*St = sslm_gpu_adapter_unmap(St8->Ctx, Handle);
+		St8->NoteLayer1Status(*St);
 	});
 	if (!bFinished)
 	{
@@ -5727,6 +8113,10 @@ void USuperSLMGpuSubsystem::Tick(float DeltaSeconds)
 	// submission thread issues restores at the start of a tick, before that tick's slices" (§5)
 	// generalized to every op kind this queue now carries.
 	State->AdmitQueuedOps();
+	{
+		FScopeLock Guard(&State->TimingLock);
+		State->GameTiming = State->CompletedTiming;
+	}
 	State->PlanAndIssue();
 
 	// Read-only reporting of this tick's own game-thread cost -- the frame pays only issue and
@@ -5790,7 +8180,10 @@ FSuperSLMLifecycleOpHandle USuperSLMGpuSubsystem::RequestBeginGeneration(const F
 	}
 	// The request SHAPE is validated here, synchronously, exactly as the prior synchronous
 	// BeginGeneration() did -- none of it needs Layer 1 or the sequence's own turn in the queue.
-	if (Request.PromptTokens.Num() == 0)
+	// Plugin paging plan §3.4 "An empty prompt after adopt" (K7, rev 1.9 ruling 6): in pooled mode an
+	// empty prompt is accepted here and checked at the generation's queue-head admission, where the
+	// sequence's armed flag is known (AdmitBeginGenerationOp()). Dedicated mode refuses it here.
+	if (Request.PromptTokens.Num() == 0 && !State->IsPooled())
 	{
 		State->LastLifecycleRequestError = TEXT("the prompt is empty; a GPU sequence is primed by prefilling at least one prompt token");
 		return FSuperSLMLifecycleOpHandle();
@@ -5841,6 +8234,46 @@ FSuperSLMLifecycleOpHandle USuperSLMGpuSubsystem::RequestAdoptPrefix(const FSupe
 	return Handle;
 }
 
+// Plugin paging plan §3.4 "Adopt", rev 1.9 ruling 2 (K6 for dedicated mode). Dedicated: queued in the
+// sequence's own order like the no-prefix overload, and resolved UnsupportedOnGpu at its admission,
+// with a reason naming the mode (AdmitAdoptPrefixOp()). Pooled (K7): the prefix must be Ready at the
+// call (refused Malformed, with no handle, otherwise); the adopt is queued in the sequence's own order
+// and admitted by the page ledger at its turn (AdmitPooledAdoptOp()).
+FSuperSLMLifecycleOpHandle USuperSLMGpuSubsystem::RequestAdoptPrefix(const FSuperSLMGpuSequence& Sequence, const FSuperSLMPrefix& Prefix)
+{
+	if (State == nullptr)
+	{
+		return FSuperSLMLifecycleOpHandle();
+	}
+	if (State->IsPooled())
+	{
+		if (State->FindReadyPrefix(Prefix.Id) == nullptr)
+		{
+			State->LastLifecycleRequestError = TEXT("Malformed: the prefix is not a Ready GPU prefix of this subsystem (unknown, released, faulted, still building, or another backend's)");
+			return FSuperSLMLifecycleOpHandle();
+		}
+		FLifecycleOpEntry* PooledEntry = nullptr;
+		int32 PooledSlotIndex = INDEX_NONE;
+		const FSuperSLMLifecycleOpHandle PooledHandle = State->EnqueueSlotOp(Sequence, ELifecycleOpKind::AdoptPrefix, &PooledSlotIndex, &PooledEntry);
+		if (PooledEntry != nullptr)
+		{
+			PooledEntry->bPrefixOverload = true;
+			PooledEntry->AdoptPrefixId = Prefix.Id;
+			State->TryAdmitImmediately(PooledSlotIndex);
+		}
+		return PooledHandle;
+	}
+	FLifecycleOpEntry* Entry = nullptr;
+	int32 SlotIndex = INDEX_NONE;
+	const FSuperSLMLifecycleOpHandle Handle = State->EnqueueSlotOp(Sequence, ELifecycleOpKind::AdoptPrefix, &SlotIndex, &Entry);
+	if (Entry != nullptr)
+	{
+		Entry->bPrefixOverload = true;
+		State->TryAdmitImmediately(SlotIndex);
+	}
+	return Handle;
+}
+
 FSuperSLMLifecycleOpHandle USuperSLMGpuSubsystem::RequestRestoreSequence(const TArray<uint8>& Blob, USuperSLMModel* ExpectedModel)
 {
 	if (State == nullptr)
@@ -5856,8 +8289,33 @@ FSuperSLMLifecycleOpHandle USuperSLMGpuSubsystem::RequestRestoreSequence(const T
 	return Handle;
 }
 
+// Plugin paging plan §3.5 (K7): the hinted restore. In pooled mode the hint names the prefix whose
+// pages the restored sequence may share (sslm_gpu_seq_restore_into_pool's prefix_or_null); a hint
+// that names no Ready prefix of this subsystem when the restore arrives is dropped, and the restore
+// runs unhinted (a hint is never a requirement). Dedicated mode, or an invalid hint: the overload above.
+FSuperSLMLifecycleOpHandle USuperSLMGpuSubsystem::RequestRestoreSequence(const TArray<uint8>& Blob, USuperSLMModel* ExpectedModel, const FSuperSLMPrefix& Hint)
+{
+	if (State == nullptr || !State->IsPooled() || !Hint.IsValid())
+	{
+		return RequestRestoreSequence(Blob, ExpectedModel);
+	}
+	FLifecycleOpEntry* Entry = nullptr;
+	const FSuperSLMLifecycleOpHandle Handle = State->EnqueueRestoreOp(Blob, ExpectedModel, &Entry);
+	if (Entry != nullptr)
+	{
+		Entry->RestoreHintPrefixId = Hint.Id;
+		State->TryAdmitRestoreImmediately();
+	}
+	return Handle;
+}
+
 ESuperSLMRestoreResult USuperSLMGpuSubsystem::GetLifecycleOpResult(const FSuperSLMLifecycleOpHandle& Handle) const
 {
+	// Plugin paging plan §3.5 (K6): a handle a pooled teardown left Pending reads NotConfigured.
+	if (Handle.IsValid() && LifecycleTombstones.Contains(Handle.Id))
+	{
+		return ESuperSLMRestoreResult::NotConfigured;
+	}
 	if (State == nullptr || !Handle.IsValid())
 	{
 		return ESuperSLMRestoreResult::Pending;
@@ -5870,7 +8328,8 @@ ESuperSLMRestoreResult USuperSLMGpuSubsystem::GetLifecycleOpResult(const FSuperS
 
 int64 USuperSLMGpuSubsystem::GetLifecycleOpResolutionOrdinal(const FSuperSLMLifecycleOpHandle& Handle) const
 {
-	if (State == nullptr || !Handle.IsValid())
+	// K6 review N3: a tombstoned handle has no resolution ordinal (it never resolved in its state).
+	if (State == nullptr || !Handle.IsValid() || LifecycleTombstones.Contains(Handle.Id))
 	{
 		return -1;
 	}
@@ -5881,6 +8340,11 @@ int64 USuperSLMGpuSubsystem::GetLifecycleOpResolutionOrdinal(const FSuperSLMLife
 ESuperSLMRestoreResult USuperSLMGpuSubsystem::GetSaveResult(const FSuperSLMLifecycleOpHandle& Handle, TArray<uint8>& OutBlob)
 {
 	OutBlob.Reset();
+	// Plugin paging plan §3.5 (K6): a tombstone reads NotConfigured, with no blob.
+	if (Handle.IsValid() && LifecycleTombstones.Contains(Handle.Id))
+	{
+		return ESuperSLMRestoreResult::NotConfigured;
+	}
 	if (State == nullptr || !Handle.IsValid())
 	{
 		return ESuperSLMRestoreResult::Pending;
@@ -5909,6 +8373,11 @@ ESuperSLMRestoreResult USuperSLMGpuSubsystem::GetSaveResult(const FSuperSLMLifec
 
 bool USuperSLMGpuSubsystem::ReleaseLifecycleOpHandle(const FSuperSLMLifecycleOpHandle& Handle)
 {
+	// Plugin paging plan §3.5 (K6): releasing a tombstone erases it; the handle then reads Pending.
+	if (Handle.IsValid() && LifecycleTombstones.Remove(Handle.Id) > 0)
+	{
+		return true;
+	}
 	if (State == nullptr || !Handle.IsValid())
 	{
 		return false;
@@ -5930,7 +8399,8 @@ int64 USuperSLMGpuSubsystem::GetRetainedResultBytes() const
 
 int32 USuperSLMGpuSubsystem::GetLifecycleHandleEntryCount() const
 {
-	return State != nullptr ? State->HandleResults.Num() : 0;
+	// Plugin paging plan §3.5 (K6): tombstones count, since the game still owes their release.
+	return (State != nullptr ? State->HandleResults.Num() : 0) + LifecycleTombstones.Num();
 }
 
 int32 USuperSLMGpuSubsystem::GetRestoreOpEntryCount() const
@@ -5942,7 +8412,8 @@ bool USuperSLMGpuSubsystem::GetSaveTokenCounts(const FSuperSLMLifecycleOpHandle&
 {
 	OutObservedAtSave = -1;
 	OutProducedAtSave = -1;
-	if (State == nullptr || !Handle.IsValid())
+	// K6 review N3: a tombstoned save produced no blob, so it has no counts.
+	if (State == nullptr || !Handle.IsValid() || LifecycleTombstones.Contains(Handle.Id))
 	{
 		return false;
 	}
@@ -5960,6 +8431,11 @@ bool USuperSLMGpuSubsystem::GetSaveTokenCounts(const FSuperSLMLifecycleOpHandle&
 ESuperSLMRestoreResult USuperSLMGpuSubsystem::GetRestoreResult(const FSuperSLMLifecycleOpHandle& Handle, FSuperSLMGpuSequence& OutSequence) const
 {
 	OutSequence = FSuperSLMGpuSequence();
+	// Plugin paging plan §3.5 (K6): a tombstone reads NotConfigured, with no sequence.
+	if (Handle.IsValid() && LifecycleTombstones.Contains(Handle.Id))
+	{
+		return ESuperSLMRestoreResult::NotConfigured;
+	}
 	if (State == nullptr || !Handle.IsValid())
 	{
 		return ESuperSLMRestoreResult::Pending;
@@ -6004,6 +8480,12 @@ FString USuperSLMGpuSubsystem::GetLastLifecycleRequestError() const
 double USuperSLMGpuSubsystem::GetLastGpuBusyMs() const
 {
 	return State != nullptr ? State->LastGpuBusyMs.load() : 0.0;
+}
+
+FSuperSLMGpuTimingSnapshot USuperSLMGpuSubsystem::GetGpuTimingSnapshot() const
+{
+	check(IsInGameThread());
+	return State != nullptr ? State->GameTiming : FSuperSLMGpuTimingSnapshot{};
 }
 
 double USuperSLMGpuSubsystem::GetLastHostFinishMs() const
@@ -6108,7 +8590,15 @@ int64 USuperSLMGpuSubsystem::GetDeclaredGpuResidencyBytes() const
 	int64 Bytes = State->DeclaredModelBytes;
 	for (const FThreadSlot& TS : State->ThreadSlots)
 	{
-		Bytes += TS.KvBytes;
+		Bytes += TS.KvBytes; // 0 for a pooled holder
+	}
+	// Plugin paging plan §3.4 (K6): a pooled subsystem's K/V is its page pool. K6 review S1, plan
+	// §3.2/§3.4 rev 1.10 (K7 review S2): this figure is the device-local lower bound the header and the
+	// query window promise, so it counts the pool's device buffer once (PoolPages x PageBytes); the
+	// engine's host mirror of the same size is system RAM, reported in the page stats as their product.
+	if (State->IsPooled())
+	{
+		Bytes += State->PoolBytes;
 	}
 	for (const TPair<int64, FAdapterEntry>& Pair : State->Adapters)
 	{
@@ -6129,6 +8619,180 @@ int64 USuperSLMGpuSubsystem::GetLocalVideoMemoryUsageBytes() const
 		return 0;
 	}
 	return static_cast<int64>(Info.CurrentUsage);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Paged KV, pooled mode (plugin paging plan §3.2-§3.6; step K6)
+// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+	// Plan rev 1.9 ruling 2: every prefix verb on a dedicated subsystem is UnsupportedOnGpu before
+	// any other check (the tokens, a schema handle or a parent are never read), with no handle and a
+	// reason naming SequenceBudget. Unconfigured is NotConfigured. In pooled mode the verb proceeds
+	// (Success here), and FSuperSLMGpuSubsystemState::CreateGpuPrefix() decides it (K7).
+	ESuperSLMPrefixResult RefuseGpuPrefixVerb(const FSuperSLMGpuSubsystemState* S, bool bActive, const TCHAR* Verb, FString* OutError)
+	{
+		if (S == nullptr || !bActive)
+		{
+			if (OutError != nullptr)
+			{
+				*OutError = FString::Printf(TEXT("%s: the GPU subsystem is not configured"), Verb);
+			}
+			return ESuperSLMPrefixResult::NotConfigured;
+		}
+		if (!S->IsPooled())
+		{
+			if (OutError != nullptr)
+			{
+				*OutError = FString::Printf(TEXT("%s is unsupported on a dedicated GPU subsystem: GPU prefixes need pooled mode (FSuperSLMGpuRuntimeConfig::SequenceBudget > 0)"), Verb);
+			}
+			return ESuperSLMPrefixResult::UnsupportedOnGpu;
+		}
+		return ESuperSLMPrefixResult::Success;
+	}
+
+	// The verbs' common tail: the state's verdict, its error copied out when the caller asked.
+	ESuperSLMPrefixResult FinishGpuPrefixVerb(ESuperSLMPrefixResult Result, const FString& Error, FString* OutError)
+	{
+		if (OutError != nullptr)
+		{
+			*OutError = Error;
+		}
+		return Result;
+	}
+}
+
+ESuperSLMPrefixResult USuperSLMGpuSubsystem::CreatePrefix(const TArray<int32>& Tokens, FSuperSLMPrefix& OutPrefix, FString* OutError)
+{
+	OutPrefix = FSuperSLMPrefix();
+	const ESuperSLMPrefixResult Refusal = RefuseGpuPrefixVerb(State, IsGpuBackendActive(), TEXT("CreatePrefix"), OutError);
+	if (Refusal != ESuperSLMPrefixResult::Success)
+	{
+		return Refusal;
+	}
+	FString Error;
+	const ESuperSLMPrefixResult Result = State->CreateGpuPrefix(Tokens, 0, -1, 0, OutPrefix, Error);
+	return FinishGpuPrefixVerb(Result, Error, OutError);
+}
+
+ESuperSLMPrefixResult USuperSLMGpuSubsystem::CreatePrefix(const TArray<int32>& Tokens, const FSuperSLMGpuSchemaHandle& Schema, ESuperSLMSpanKind SpanKind,
+	FSuperSLMPrefix& OutPrefix, FString* OutError)
+{
+	OutPrefix = FSuperSLMPrefix();
+	const ESuperSLMPrefixResult Refusal = RefuseGpuPrefixVerb(State, IsGpuBackendActive(), TEXT("CreatePrefix (schema-bound)"), OutError);
+	if (Refusal != ESuperSLMPrefixResult::Success)
+	{
+		return Refusal;
+	}
+	// Plan rev 1.9 ruling 5: the schema is bound to the prefix (sslm_gpu_prefix_set_schema) before
+	// its tokens are fed, and SchemaContent tokens are fed as prefill kind 1. A SchemaContent span
+	// needs a schema to walk.
+	if (!Schema.IsNone() && State->Schemas.ByIndex(static_cast<size_t>(Schema.Index)) == nullptr)
+	{
+		return FinishGpuPrefixVerb(ESuperSLMPrefixResult::Malformed,
+			FString::Printf(TEXT("Malformed: schema index %d does not exist in the configured artifact"), Schema.Index), OutError);
+	}
+	if (SpanKind == ESuperSLMSpanKind::SchemaContent && Schema.IsNone())
+	{
+		return FinishGpuPrefixVerb(ESuperSLMPrefixResult::Malformed,
+			TEXT("Malformed: a SchemaContent prefix needs a schema to walk; pass the schema handle, or feed the tokens as a Prompt span"), OutError);
+	}
+	const int32 Kind = SpanKind == ESuperSLMSpanKind::SchemaContent ? 1 : 0;
+	FString Error;
+	const ESuperSLMPrefixResult Result = State->CreateGpuPrefix(Tokens, 0, Schema.IsNone() ? -1 : Schema.Index, Kind, OutPrefix, Error);
+	return FinishGpuPrefixVerb(Result, Error, OutError);
+}
+
+ESuperSLMPrefixResult USuperSLMGpuSubsystem::CreatePrefixFrom(const FSuperSLMPrefix& Parent, const TArray<int32>& Tokens, FSuperSLMPrefix& OutPrefix, FString* OutError)
+{
+	OutPrefix = FSuperSLMPrefix();
+	const ESuperSLMPrefixResult Refusal = RefuseGpuPrefixVerb(State, IsGpuBackendActive(), TEXT("CreatePrefixFrom"), OutError);
+	if (Refusal != ESuperSLMPrefixResult::Success)
+	{
+		return Refusal;
+	}
+	// An invalid parent handle (Id 0) names no prefix: the state reads it as unknown (id -1 is never
+	// minted).
+	FString Error;
+	const ESuperSLMPrefixResult Result = State->CreateGpuPrefix(Tokens, Parent.IsValid() ? Parent.Id : -1, -1, 0, OutPrefix, Error);
+	return FinishGpuPrefixVerb(Result, Error, OutError);
+}
+
+// Plugin paging plan §3.3, §3.4 (K7). Dedicated or unconfigured: there are no GPU prefixes to release.
+bool USuperSLMGpuSubsystem::ReleasePrefix(const FSuperSLMPrefix& Prefix, FString& OutError)
+{
+	if (State == nullptr || !IsGpuBackendActive())
+	{
+		OutError = TEXT("the GPU subsystem is not configured");
+		return false;
+	}
+	if (!State->IsPooled())
+	{
+		OutError = TEXT("ReleasePrefix is unsupported on a dedicated GPU subsystem: GPU prefixes need pooled mode (FSuperSLMGpuRuntimeConfig::SequenceBudget > 0)");
+		return false;
+	}
+	return State->ReleaseGpuPrefix(Prefix, OutError);
+}
+
+ESuperSLMPrefixPhase USuperSLMGpuSubsystem::GetPrefixPhase(const FSuperSLMPrefix& Prefix) const
+{
+	if (State == nullptr || !Prefix.IsValid())
+	{
+		return ESuperSLMPrefixPhase::Invalid;
+	}
+	const FSuperSLMGpuSubsystemState::FGpuPrefixEntry* Entry = State->Prefixes.Find(Prefix.Id);
+	return Entry != nullptr && !Entry->bReleased ? Entry->Phase : ESuperSLMPrefixPhase::Invalid;
+}
+
+// The page ledger's count: built and building prefixes and nested children, not released.
+int32 USuperSLMGpuSubsystem::GetLivePrefixCount() const
+{
+	return State != nullptr && State->IsPooled() ? static_cast<int32>(State->Ledger.LivePrefixCount()) : 0;
+}
+
+// Plan §3.2: the ledger's regions and counters, and the pool's stats as Configure's cross-check read
+// them, all game-thread data. LedgerFaults is this subsystem's own count, kept across re-Configure()
+// (PriorLedgerFaults holds the ended states' counts).
+FSuperSLMKvPageStats USuperSLMGpuSubsystem::GetKvPageStats() const
+{
+	FSuperSLMKvPageStats Stats;
+	Stats.LedgerFaults = PriorLedgerFaults + (State != nullptr ? static_cast<uint64>(State->Ledger.LedgerFaults()) : 0);
+	if (State == nullptr || !State->IsPooled())
+	{
+		return Stats;
+	}
+	const FSuperSLMGpuSubsystemState& S = *State;
+	const SuperSLMPaging::FPageLedgerStats L = S.Ledger.GetStats();
+	auto Region = [&L](SuperSLMPaging::ERegion R)
+	{
+		FSuperSLMKvRegionStats Out;
+		Out.CapacityPages = L.Regions[static_cast<int32>(R)].Capacity;
+		Out.ChargedPages = L.Regions[static_cast<int32>(R)].Charged;
+		return Out;
+	};
+	Stats.bPagedMode = true;
+	Stats.PagePositions = static_cast<int64>(S.PageGeometry.page_positions);
+	Stats.PageBytes = static_cast<int64>(S.PageGeometry.page_bytes);
+	Stats.PoolPages = L.PoolPages;
+	Stats.Sequences = Region(SuperSLMPaging::ERegion::S);
+	Stats.Prefixes = Region(SuperSLMPaging::ERegion::P);
+	Stats.RestoreHeadroom = Region(SuperSLMPaging::ERegion::H);
+	Stats.CacheSharing = Region(SuperSLMPaging::ERegion::A);
+	Stats.Cache = Region(SuperSLMPaging::ERegion::C);
+	Stats.LivePrefixCount = static_cast<int32>(L.LivePrefixCount);
+	Stats.GhostCount = static_cast<int32>(L.GhostCount);
+	Stats.InFlightRestores = static_cast<int32>(L.InFlightRestores);
+	Stats.WaitingRestores = static_cast<int32>(L.WaitingRestores);
+	Stats.FreeHeadroomPages = L.FreeHeadroomPages;
+	Stats.bHasPoolSnapshot = S.bHasPoolSnapshot;
+	if (S.bHasPoolSnapshot)
+	{
+		Stats.SnapshotPageCount = S.LastPoolStats.page_count;
+		Stats.SnapshotFreePages = S.LastPoolStats.free_pages;
+		Stats.SnapshotSharedPages = S.LastPoolStats.shared_pages;
+	}
+	return Stats;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -6516,6 +9180,25 @@ int32 FSuperSLMGpuTestAccess::GetOutstandingTickJobCount(const USuperSLMGpuSubsy
 	return Gpu.State != nullptr ? Gpu.State->OutstandingTickJobs.load() : 0;
 }
 
+bool FSuperSLMGpuTestAccess::ReadAndDrainDebugLayer(FSuperSLMGpuDebugLayerReading& OutReading, bool bInjectWarning)
+{
+	check(IsInGameThread());
+	OutReading = {};
+	superslm_gpu::harness::Device& DebugDevice = superslm_gpu::harness::GetDevice();
+	OutReading.bEnabled = DebugDevice.debug_layer_enabled;
+	OutReading.bQueueAvailable = DebugDevice.debug_info_queue.Get() != nullptr;
+	if (!OutReading.bEnabled || !OutReading.bQueueAvailable) { return false; }
+	if (bInjectWarning)
+	{
+		OutReading.bWarningInjected = SUCCEEDED(DebugDevice.debug_info_queue->AddApplicationMessage(
+			D3D12_MESSAGE_SEVERITY_WARNING, "SuperSLM K8 InfoQueue warning canary"));
+		if (!OutReading.bWarningInjected) { return false; }
+	}
+	OutReading.DiscardedMessages = static_cast<int64>(DebugDevice.debug_info_queue->GetNumMessagesDiscardedByMessageCountLimit());
+	OutReading.ReportableMessages = static_cast<int64>(DebugDevice.DrainDebugLayerMessages());
+	return true;
+}
+
 int32 FSuperSLMGpuTestAccess::GetOutstandingOtherJobCount(const USuperSLMGpuSubsystem& Gpu)
 {
 	return Gpu.State != nullptr ? Gpu.State->OutstandingOtherJobs.load() : 0;
@@ -6624,6 +9307,600 @@ bool FSuperSLMGpuTestAccess::SeedDeferredRefusal(USuperSLMGpuSubsystem& Gpu, con
 	S->bHasDeferredRefusal = true;
 	return true;
 }
+
+// ---------------------------------------------------------------------------------------------
+// FSuperSLMPagedGpuTestSeam (plugin paging plan §3.9): the K6 seams, then the K7 ones (prefixes, the
+// armed flag, the status overrides, the adopt fault).
+// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+	// RunOnPoolThread()'s access object: thin calls of the engine verbs on the subsystem's own
+	// context, model and pool, made on the submission thread inside the seam's job. Holds what the
+	// callback creates, and releases it (sequences, then prefixes, each newest first).
+	class FGpuPoolThreadAccess final : public FSuperSLMGpuPoolThreadAccess
+	{
+	public:
+		explicit FGpuPoolThreadAccess(FSuperSLMGpuSubsystemState& InState) : S(InState) {}
+		virtual ~FGpuPoolThreadAccess() override { ReleaseAll(); }
+
+		virtual int64 ModelCap() const override { return S.Ledger.GetConfig().EngineContextCap; }
+		virtual int64 PagePositions() const override { return static_cast<int64>(S.PageGeometry.page_positions); }
+		// The engine's stats carry no page size: the page bytes are the geometry the pool was created
+		// with and cross-checked against (Configure's job 3).
+		virtual int64 PageBytes() const override { return static_cast<int64>(S.PageGeometry.page_bytes); }
+		virtual int64 PoolPageCount() const override
+		{
+			SslmGpuKvPoolStats Stats = {};
+			Stats.struct_size = static_cast<uint32_t>(sizeof(Stats));
+			const FGpuStatus St = sslm_gpu_kv_pool_stats(S.Pool, &Stats);
+			S.NoteLayer1Status(St); // K6 review S2: the seam's calls are submission-thread calls too
+			return St == FGpuStatus::SSLM_OK ? static_cast<int64>(Stats.page_count) : -1;
+		}
+		virtual int64 PagesForBudget(int32 Budget) const override
+		{
+			return static_cast<int64>(superslm_gpu::kv_pool::ReservationPages(Budget, S.PageGeometry, ModelCap()));
+		}
+		virtual uint32 TokenDispatches() const override { return S.FullTokenBudget(); }
+
+		virtual SslmGpuStatus CreateBudgeted(int32 Budget) override
+		{
+			SslmGpuSequenceHandle* Seq = nullptr;
+			const FGpuStatus St = sslm_gpu_seq_create_budgeted(S.Ctx, S.Model, S.Pool, Budget, &Seq);
+			S.NoteLayer1Status(St);
+			if (St == FGpuStatus::SSLM_OK && Seq != nullptr)
+			{
+				Sequences.Add(Seq);
+			}
+			return St;
+		}
+		virtual int32 SequenceCount() const override { return Sequences.Num(); }
+
+		virtual SslmGpuStatus BeginPrefix(int32 Budget) override
+		{
+			SslmGpuPrefixHandle* Prefix = nullptr;
+			const FGpuStatus St = sslm_gpu_prefix_begin(S.Ctx, S.Model, S.Pool, Budget, &Prefix);
+			S.NoteLayer1Status(St);
+			if (St == FGpuStatus::SSLM_OK && Prefix != nullptr)
+			{
+				Prefixes.Add(Prefix);
+			}
+			return St;
+		}
+		virtual int32 PrefixCount() const override { return Prefixes.Num(); }
+		virtual SslmGpuStatus PrefillPrefix(int32 PrefixIndex, int32 Token, int32& OutConsumed) override
+		{
+			OutConsumed = 0;
+			if (!Prefixes.IsValidIndex(PrefixIndex))
+			{
+				return FGpuStatus::SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+			}
+			const int32_t Tokens[1] = { static_cast<int32_t>(Token) };
+			int32_t Consumed = 0;
+			const FGpuStatus St = sslm_gpu_prefix_prefill(S.Ctx, Prefixes[PrefixIndex], Tokens, 1, 0, TokenDispatches(), &Consumed);
+			S.NoteLayer1Status(St);
+			OutConsumed = static_cast<int32>(Consumed);
+			return St;
+		}
+		virtual SslmGpuStatus FreezePrefix(int32 PrefixIndex) override
+		{
+			if (!Prefixes.IsValidIndex(PrefixIndex))
+			{
+				return FGpuStatus::SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+			}
+			const FGpuStatus St = sslm_gpu_prefix_freeze(S.Ctx, Prefixes[PrefixIndex]);
+			S.NoteLayer1Status(St);
+			return St;
+		}
+		virtual SslmGpuStatus AdoptPrefix(int32 SequenceIndex, int32 PrefixIndex) override
+		{
+			if (!Sequences.IsValidIndex(SequenceIndex) || !Prefixes.IsValidIndex(PrefixIndex))
+			{
+				return FGpuStatus::SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+			}
+			const FGpuStatus St = sslm_gpu_seq_adopt_prefix(S.Ctx, Sequences[SequenceIndex], Prefixes[PrefixIndex]);
+			S.NoteLayer1Status(St);
+			return St;
+		}
+		// One call at a whole token's dispatches is one token (the bridge embeds, drives the token to
+		// full depth and finishes it, or takes its ready shortcut and only finishes).
+		virtual SslmGpuStatus DecodeStep(int32 SequenceIndex, int32 TokenToEmbedIfNeeded, int32& OutToken) override
+		{
+			OutToken = -1;
+			if (!Sequences.IsValidIndex(SequenceIndex))
+			{
+				return FGpuStatus::SSLM_SEQUENCE_KV_BUFFER_MISMATCH;
+			}
+			int32_t Token = -1;
+			const FGpuStatus St = SslmGpuSeqDecodeStepForG5Bridge(S.Ctx, Sequences[SequenceIndex], static_cast<int32_t>(TokenToEmbedIfNeeded), TokenDispatches(), &Token);
+			S.NoteLayer1Status(St);
+			OutToken = static_cast<int32>(Token);
+			return St;
+		}
+		virtual int64 ContextLength(int32 SequenceIndex) const override
+		{
+			if (!Sequences.IsValidIndex(SequenceIndex))
+			{
+				return -1;
+			}
+			const int64_t* Length = SslmGpuSeqHandleContextLengthForBench(Sequences[SequenceIndex]);
+			return Length != nullptr ? static_cast<int64>(*Length) : -1;
+		}
+
+		virtual void ReleaseAll() override
+		{
+			for (int32 I = Sequences.Num() - 1; I >= 0; --I)
+			{
+				S.NoteLayer1Status(sslm_gpu_seq_release(S.Ctx, Sequences[I]));
+			}
+			Sequences.Reset();
+			for (int32 I = Prefixes.Num() - 1; I >= 0; --I)
+			{
+				S.NoteLayer1Status(sslm_gpu_prefix_release(S.Ctx, Prefixes[I]));
+			}
+			Prefixes.Reset();
+		}
+
+	private:
+		FSuperSLMGpuSubsystemState& S;
+		TArray<SslmGpuSequenceHandle*> Sequences;
+		TArray<SslmGpuPrefixHandle*> Prefixes;
+	};
+
+	// The seam's request kinds and the subsystem's job kinds are the same list in the same order.
+	EGpuPagedJobKind ToGpuPagedJobKind(ESuperSLMPagedRequestKind Kind)
+	{
+		switch (Kind)
+		{
+			case ESuperSLMPagedRequestKind::Reset:         return EGpuPagedJobKind::Reset;
+			case ESuperSLMPagedRequestKind::Return:        return EGpuPagedJobKind::Return;
+			case ESuperSLMPagedRequestKind::Adopt:         return EGpuPagedJobKind::Adopt;
+			case ESuperSLMPagedRequestKind::Restore:       return EGpuPagedJobKind::Restore;
+			case ESuperSLMPagedRequestKind::PrefixBuild:   return EGpuPagedJobKind::PrefixBuild;
+			case ESuperSLMPagedRequestKind::NestedBuild:   return EGpuPagedJobKind::NestedBuild;
+			case ESuperSLMPagedRequestKind::PrefixRelease: return EGpuPagedJobKind::PrefixRelease;
+		}
+		return EGpuPagedJobKind::Count;
+	}
+
+	// The warm slot a vended sequence occupies, read without the non-const FindSlot().
+	int32 GpuSlotIndexOf(const FSuperSLMGpuSubsystemState* S, const FSuperSLMGpuSequence& Sequence)
+	{
+		const int32* Index = S != nullptr ? S->IdToSlot.Find(Sequence.Id) : nullptr;
+		return Index != nullptr ? *Index : INDEX_NONE;
+	}
+}
+
+// Runs Fn on the submission thread, behind every queued job (FIFO), so every job has drained except
+// the applies HoldApply() holds on the game thread, whose Layer-1 work is done. A host-only state
+// query identifies Submitted handles, and sslm_gpu_ready drains those first (E13). Calling ready
+// on an idle handle would revoke its schema-bind eligibility (gpu_1p0.cpp), so idle handles are
+// left untouched. Nothing is Submitted when Fn runs.
+// K6 review S3: the seam is test-only, so it is not held to the frame-path bound, whose overrun marks
+// the subsystem unresponsive (row 21) and leaks the state. Its job carries no bound the overrun check
+// can reach, and the game thread waits for it up to kRunOnPoolThreadBoundSeconds itself; past that
+// the seam returns false and logs an Error naming it (which fails the running test by name), and the
+// subsystem stays usable once the callback returns.
+// K7 review N4: Fn may capture the caller's stack, so it never runs after the seam has returned. The
+// job and the seam share one state block: past the bound, a callback that has not started is
+// abandoned (the job then skips it) and the seam returns false; one that has started is waited for to
+// its end, however long, since returning would leave it writing a dead frame.
+bool FSuperSLMPagedGpuTestSeam::RunOnPoolThread(USuperSLMGpuSubsystem& Gpu, TFunction<void(FSuperSLMGpuPoolThreadAccess&)> Fn)
+{
+	constexpr double kRunOnPoolThreadBoundSeconds = 120.0;
+	FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr || !Gpu.IsGpuBackendActive() || !S->IsPooled() || !Fn || S->bUnresponsive.load())
+	{
+		return false;
+	}
+	// Held in shared state: a job that outlives the wait never reads this stack frame, and runs Fn only
+	// if the seam has not abandoned it (K7 review N4).
+	struct FRunOnPoolThreadShared
+	{
+		TFunction<void(FSuperSLMGpuPoolThreadAccess&)> Fn;
+		// 0 pending, 1 running, 2 abandoned, 3 callback done, 4 quiescence failed (callback not run).
+		std::atomic<int32> Stage{0};
+	};
+	TSharedRef<FRunOnPoolThreadShared, ESPMode::ThreadSafe> Held = MakeShared<FRunOnPoolThreadShared, ESPMode::ThreadSafe>();
+	Held->Fn = MoveTemp(Fn);
+	// As RunSync(): the test gate never holds this job.
+	S->ReleaseTestGate();
+	S->bTestHoldNextTickJob = false;
+	TSharedPtr<FJob> Job = MakeShared<FJob>();
+	Job->Custom = [S, Held]()
+	{
+		for (FThreadSlot& TS : S->ThreadSlots)
+		{
+			if (TS.Handle != nullptr)
+			{
+				// This query returns BUSY iff Submitted, and changes neither the handle nor its
+				// bind gate. The query's schema-bound output is irrelevant to the state check.
+				int32_t SchemaBound = 0;
+				const FGpuStatus StateStatus = SslmGpuSeqSchemaBoundForG5Bridge(S->Ctx, TS.Handle, &SchemaBound);
+				S->NoteLayer1Status(StateStatus);
+				if (StateStatus == FGpuStatus::SSLM_BUSY)
+				{
+					int32_t Ready = 0;
+					FGpuStatus Drained = FGpuStatus::SSLM_OK;
+					const FGpuStatus ReadyStatus = sslm_gpu_ready(S->Ctx, TS.Handle, 1, &Ready, &Drained);
+					S->NoteLayer1Status(ReadyStatus);
+					S->NoteLayer1Status(Drained);
+					if (ReadyStatus != FGpuStatus::SSLM_OK || Drained != FGpuStatus::SSLM_OK || Ready == 0)
+					{
+						UE_LOG(LogSuperSLM, Error, TEXT("RunOnPoolThread: cannot quiesce a Submitted handle (ready call %s, drained %s, ready %d); callback not run."),
+							*GpuStatusText(ReadyStatus), *GpuStatusText(Drained), Ready);
+						Held->Fn = nullptr;
+						Held->Stage.store(4, std::memory_order_release);
+						return;
+					}
+				}
+				else if (StateStatus != FGpuStatus::SSLM_OK)
+				{
+					UE_LOG(LogSuperSLM, Error, TEXT("RunOnPoolThread: cannot read a handle's state (%s); callback not run."), *GpuStatusText(StateStatus));
+					Held->Fn = nullptr;
+					Held->Stage.store(4, std::memory_order_release);
+					return;
+				}
+			}
+		}
+		int32 Pending = 0;
+		if (!Held->Stage.compare_exchange_strong(Pending, 1, std::memory_order_acq_rel))
+		{
+			return; // abandoned: the seam returned, and Fn's captures may be gone
+		}
+		{
+			FGpuPoolThreadAccess Access(*S);
+			Held->Fn(Access);
+			Access.ReleaseAll();
+		}
+		Held->Fn = nullptr; // its captures go before the seam's frame can
+		Held->Stage.store(3, std::memory_order_release);
+	};
+	Job->CallKind = TEXT("test seam (RunOnPoolThread)");
+	Job->BoundSeconds = 1.0e9; // beyond any overrun check: the seam bounds its own wait below
+	S->Enqueue(Job);
+	const double Deadline = FPlatformTime::Seconds() + kRunOnPoolThreadBoundSeconds;
+	bool bLoggedRunning = false;
+	while (!Job->bDone.load(std::memory_order_acquire))
+	{
+		if (FPlatformTime::Seconds() > Deadline)
+		{
+			int32 Pending = 0;
+			if (Held->Stage.compare_exchange_strong(Pending, 2, std::memory_order_acq_rel))
+			{
+				UE_LOG(LogSuperSLM, Error, TEXT("FSuperSLMPagedGpuTestSeam::RunOnPoolThread: the job did not reach the callback within %.0f s; the callback is abandoned (it will not run) and the seam returns false (the subsystem is not marked unresponsive)."),
+					kRunOnPoolThreadBoundSeconds);
+				return false;
+			}
+			if (Held->Stage.load(std::memory_order_acquire) >= 3)
+			{
+				break; // callback finished or quiescence failed; its captures have been released
+			}
+			if (!bLoggedRunning)
+			{
+				bLoggedRunning = true;
+				UE_LOG(LogSuperSLM, Error, TEXT("FSuperSLMPagedGpuTestSeam::RunOnPoolThread: the callback has run for more than %.0f s; the seam waits for it to return, since it may write the caller's frame."),
+					kRunOnPoolThreadBoundSeconds);
+			}
+		}
+		if (S->DoneEvent != nullptr)
+		{
+			S->DoneEvent->Wait(1);
+		}
+		else
+		{
+			FPlatformProcess::Sleep(0.001f);
+		}
+	}
+	return !Job->bSkipped && Held->Stage.load(std::memory_order_acquire) == 3;
+}
+
+FSuperSLMPagedHold FSuperSLMPagedGpuTestSeam::HoldApply(USuperSLMGpuSubsystem& Gpu, ESuperSLMPagedRequestKind Kind)
+{
+	FSuperSLMPagedHold Hold;
+	const EGpuPagedJobKind JobKind = ToGpuPagedJobKind(Kind);
+	if (Gpu.State == nullptr || !Gpu.State->IsPooled() || JobKind == EGpuPagedJobKind::Count)
+	{
+		return Hold;
+	}
+	FGpuPagedHold& Armed = Gpu.State->PagedHolds.AddDefaulted_GetRef();
+	Armed.Id = GNextGpuPagedHoldId++;
+	Armed.Kind = JobKind;
+	Hold.Id = Armed.Id;
+	return Hold;
+}
+
+bool FSuperSLMPagedGpuTestSeam::IsHoldReached(const USuperSLMGpuSubsystem& Gpu, const FSuperSLMPagedHold& Hold)
+{
+	if (Gpu.State == nullptr || !Hold.IsValid())
+	{
+		return false;
+	}
+	const FGpuPagedHold* Found = Gpu.State->PagedHolds.FindByPredicate([&Hold](const FGpuPagedHold& H) { return H.Id == Hold.Id; });
+	return Found != nullptr && Found->bReached && !Found->bReleased;
+}
+
+// Lets the held apply run at the next poll; an armed hold not yet attached is disarmed.
+bool FSuperSLMPagedGpuTestSeam::ReleaseHold(USuperSLMGpuSubsystem& Gpu, const FSuperSLMPagedHold& Hold)
+{
+	if (Gpu.State == nullptr || !Hold.IsValid())
+	{
+		return false;
+	}
+	FGpuPagedHold* Found = Gpu.State->PagedHolds.FindByPredicate([&Hold](const FGpuPagedHold& H) { return H.Id == Hold.Id; });
+	if (Found == nullptr || Found->bReleased)
+	{
+		return false;
+	}
+	Found->bReleased = true;
+	return true;
+}
+
+FSuperSLMPagedLedgerView FSuperSLMPagedGpuTestSeam::Ledger(const USuperSLMGpuSubsystem& Gpu)
+{
+	FSuperSLMPagedLedgerView View;
+	const FSuperSLMGpuSubsystemState* S = Gpu.State;
+	View.LedgerFaults = Gpu.PriorLedgerFaults + (S != nullptr ? static_cast<uint64>(S->Ledger.LedgerFaults()) : 0);
+	if (S == nullptr || !S->IsPooled())
+	{
+		return View;
+	}
+	const SuperSLMPaging::FPageLedgerStats L = S->Ledger.GetStats();
+	View.bConfigured = L.bConfigured;
+	View.PoolPages = L.PoolPages;
+	for (int32 Region = 0; Region < static_cast<int32>(ESuperSLMPagedRegion::Count); ++Region)
+	{
+		View.Capacity[Region] = L.Regions[Region].Capacity;
+		View.Charged[Region] = L.Regions[Region].Charged;
+	}
+	View.TotalCharged = S->Ledger.TotalCharged();
+	View.LivePrefixCount = static_cast<int32>(L.LivePrefixCount);
+	View.GhostCount = static_cast<int32>(L.GhostCount);
+	View.InFlightRestores = static_cast<int32>(L.InFlightRestores);
+	View.WaitingRestores = static_cast<int32>(L.WaitingRestores);
+	return View;
+}
+
+int64 FSuperSLMPagedGpuTestSeam::SequenceHeadroomHold(const USuperSLMGpuSubsystem& Gpu, const FSuperSLMGpuSequence& Sequence)
+{
+	const int32 Index = GpuSlotIndexOf(Gpu.State, Sequence);
+	if (Index == INDEX_NONE || !Gpu.State->IsPooled())
+	{
+		return -1;
+	}
+	return static_cast<int64>(Gpu.State->Ledger.SlotHeadroomHold(Index));
+}
+
+bool FSuperSLMPagedGpuTestSeam::SequenceHasOpenJob(const USuperSLMGpuSubsystem& Gpu, const FSuperSLMGpuSequence& Sequence)
+{
+	const int32 Index = GpuSlotIndexOf(Gpu.State, Sequence);
+	return Index != INDEX_NONE && Gpu.State->IsPooled() && Gpu.State->Ledger.SlotHasJob(Index);
+}
+
+int32 FSuperSLMPagedGpuTestSeam::SlotIndexOf(const USuperSLMGpuSubsystem& Gpu, const FSuperSLMGpuSequence& Sequence)
+{
+	return GpuSlotIndexOf(Gpu.State, Sequence);
+}
+
+bool FSuperSLMPagedGpuTestSeam::IsSlotRecyclePending(const USuperSLMGpuSubsystem& Gpu, int32 SlotIndex)
+{
+	const FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr || !S->Slots.IsValidIndex(SlotIndex)) { return false; }
+	if (S->Slots[SlotIndex].bReturnPending) { return true; }
+	for (const auto& Recycle : S->PendingRecycles)
+	{
+		if (Recycle.SlotIndex == SlotIndex) { return true; }
+	}
+	return false;
+}
+
+int64 FSuperSLMPagedGpuTestSeam::SlotHolderGeneration(const USuperSLMGpuSubsystem& Gpu, int32 SlotIndex)
+{
+	const FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr || !S->Slots.IsValidIndex(SlotIndex))
+	{
+		return -1;
+	}
+	return S->Slots[SlotIndex].HolderGeneration;
+}
+
+int64 FSuperSLMPagedGpuTestSeam::SequenceContextUsed(const USuperSLMGpuSubsystem& Gpu, const FSuperSLMGpuSequence& Sequence)
+{
+	const int32 Index = GpuSlotIndexOf(Gpu.State, Sequence);
+	return Index != INDEX_NONE ? Gpu.State->Slots[Index].ContextUsedMirror : -1;
+}
+
+bool FSuperSLMPagedGpuTestSeam::ForceUnderCharge(USuperSLMGpuSubsystem& Gpu, ESuperSLMPagedChargeKind Kind, uint32 Pages)
+{
+	if (Gpu.State == nullptr || !Gpu.State->IsPooled())
+	{
+		return false;
+	}
+#if SUPERSLM_PAGE_LEDGER_TEST_HOOKS
+	SuperSLMPaging::EChargeKind Charge = SuperSLMPaging::EChargeKind::Count;
+	switch (Kind)
+	{
+		case ESuperSLMPagedChargeKind::PrefixBuild:         Charge = SuperSLMPaging::EChargeKind::PrefixBuild; break;
+		case ESuperSLMPagedChargeKind::NestedBuild:         Charge = SuperSLMPaging::EChargeKind::NestedBuild; break;
+		case ESuperSLMPagedChargeKind::BudgetRestore:       Charge = SuperSLMPaging::EChargeKind::BudgetRestore; break;
+		case ESuperSLMPagedChargeKind::WholeReserveRestore: Charge = SuperSLMPaging::EChargeKind::WholeReserveRestore; break;
+	}
+	if (Charge == SuperSLMPaging::EChargeKind::Count)
+	{
+		return false;
+	}
+	Gpu.State->Ledger.SetForceUnderChargeForTest(Charge, Pages);
+	return true;
+#else
+	(void)Kind;
+	(void)Pages;
+	return false;
+#endif
+}
+
+int64 FSuperSLMPagedGpuTestSeam::JobsPosted(const USuperSLMGpuSubsystem& Gpu, ESuperSLMPagedRequestKind Kind)
+{
+	const EGpuPagedJobKind JobKind = ToGpuPagedJobKind(Kind);
+	if (Gpu.State == nullptr || JobKind == EGpuPagedJobKind::Count)
+	{
+		return -1;
+	}
+	return Gpu.State->JobsPostedByKind[static_cast<int32>(JobKind)];
+}
+
+int64 FSuperSLMPagedGpuTestSeam::Layer1BusyCount(const USuperSLMGpuSubsystem& Gpu)
+{
+	return Gpu.State != nullptr ? Gpu.State->Layer1BusyCount.load() : -1;
+}
+
+bool FSuperSLMPagedGpuTestSeam::SetNextConfigurePageCountPerturbation(USuperSLMGpuSubsystem& Gpu, int32 Delta)
+{
+	Gpu.NextConfigurePageCountPerturbation = Delta;
+	return true;
+}
+
+bool FSuperSLMPagedGpuTestSeam::SetNextPoolCreateStatusOverride(USuperSLMGpuSubsystem& Gpu, SslmGpuStatus Status)
+{
+	Gpu.NextPoolCreateStatusOverride = static_cast<uint32>(Status);
+	return true;
+}
+
+// --- K7: the prefix and armed seams (plugin paging plan §3.9) ---
+
+namespace
+{
+	// A pooled subsystem's prefix entry for Prefix, released ones included (a ghost is read through
+	// its kept entry); nullptr for an unknown handle and in dedicated mode.
+	const FSuperSLMGpuSubsystemState::FGpuPrefixEntry* GpuSeamPrefix(const FSuperSLMGpuSubsystemState* S, const FSuperSLMPrefix& Prefix)
+	{
+		if (S == nullptr || !S->IsPooled() || !Prefix.IsValid())
+		{
+			return nullptr;
+		}
+		return S->Prefixes.Find(Prefix.Id);
+	}
+}
+
+int64 FSuperSLMPagedGpuTestSeam::PrefixChargedPages(const USuperSLMGpuSubsystem& Gpu, const FSuperSLMPrefix& Prefix)
+{
+	const FSuperSLMGpuSubsystemState::FGpuPrefixEntry* Entry = GpuSeamPrefix(Gpu.State, Prefix);
+	return Entry != nullptr ? static_cast<int64>(Gpu.State->Ledger.NodeChargedPages(Entry->Node)) : -1;
+}
+
+int32 FSuperSLMPagedGpuTestSeam::PrefixDependentCount(const USuperSLMGpuSubsystem& Gpu, const FSuperSLMPrefix& Prefix)
+{
+	const FSuperSLMGpuSubsystemState::FGpuPrefixEntry* Entry = GpuSeamPrefix(Gpu.State, Prefix);
+	return Entry != nullptr ? static_cast<int32>(Gpu.State->Ledger.DependentCount(Entry->Node)) : -1;
+}
+
+bool FSuperSLMPagedGpuTestSeam::IsPrefixGhost(const USuperSLMGpuSubsystem& Gpu, const FSuperSLMPrefix& Prefix)
+{
+	const FSuperSLMGpuSubsystemState::FGpuPrefixEntry* Entry = GpuSeamPrefix(Gpu.State, Prefix);
+	return Entry != nullptr && Gpu.State->Ledger.IsGhost(Entry->Node);
+}
+
+bool FSuperSLMPagedGpuTestSeam::IsPrefixReleasePending(const USuperSLMGpuSubsystem& Gpu, const FSuperSLMPrefix& Prefix)
+{
+	const FSuperSLMGpuSubsystemState::FGpuPrefixEntry* Entry = GpuSeamPrefix(Gpu.State, Prefix);
+	return Entry != nullptr && Entry->bReleased && Entry->ReleaseTicket != SuperSLMPaging::InvalidTicket;
+}
+
+int32 FSuperSLMPagedGpuTestSeam::SequenceArmed(const USuperSLMGpuSubsystem& Gpu, const FSuperSLMGpuSequence& Sequence)
+{
+	const int32 Index = GpuSlotIndexOf(Gpu.State, Sequence);
+	if (Index == INDEX_NONE || !Gpu.State->IsPooled())
+	{
+		return -1;
+	}
+	return Gpu.State->Slots[Index].bArmedMirror ? 1 : 0;
+}
+
+int64 FSuperSLMPagedGpuTestSeam::PrefixBuiltTokens(const USuperSLMGpuSubsystem& Gpu, const FSuperSLMPrefix& Prefix)
+{
+	const FSuperSLMGpuSubsystemState::FGpuPrefixEntry* Entry = GpuSeamPrefix(Gpu.State, Prefix);
+	return Entry != nullptr ? static_cast<int64>(Entry->BuiltTokens) : -1;
+}
+
+bool FSuperSLMPagedGpuTestSeam::GetPrefixBuildTurnTicks(const USuperSLMGpuSubsystem& Gpu, const FSuperSLMPrefix& Prefix, TArray<int64>& OutTicks)
+{
+	OutTicks.Reset();
+	const FSuperSLMGpuSubsystemState::FGpuPrefixEntry* Entry = GpuSeamPrefix(Gpu.State, Prefix);
+	if (Entry == nullptr)
+	{
+		return false;
+	}
+	OutTicks = Entry->TurnTicks;
+	return true;
+}
+
+bool FSuperSLMPagedGpuTestSeam::GetRetainedPrefixBookkeeping(const USuperSLMGpuSubsystem& Gpu, int32& OutEntries, uint64& OutPayloadBytes)
+{
+	OutEntries = 0;
+	OutPayloadBytes = 0;
+	if (Gpu.State == nullptr || !Gpu.State->IsPooled()) { return false; }
+	OutEntries = Gpu.State->Prefixes.Num();
+	for (const auto& Pair : Gpu.State->Prefixes)
+	{
+		const auto& Entry = Pair.Value;
+		OutPayloadBytes += Entry.Tokens.GetAllocatedSize() + Entry.TurnsInFlight.GetAllocatedSize()
+			+ Entry.TurnTicks.GetAllocatedSize() + Entry.FaultMessage.GetAllocatedSize();
+	}
+	return true;
+}
+
+bool FSuperSLMPagedGpuTestSeam::ReadCompletedLayer1Timing(USuperSLMGpuSubsystem& Gpu, double& OutBusyMs)
+{
+	OutBusyMs = 0.0;
+	FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr || !Gpu.IsGpuBackendActive() || !S->IsPooled() || S->Thread == nullptr) { return false; }
+	// RunSync's FIFO job takes Layer1GpuLock. Shared output stays alive if a prior job overruns
+	// and the bounded wait returns before this observer executes. No engine API is called here.
+	const auto Busy = MakeShared<double, ESPMode::ThreadSafe>(0.0);
+	if (!S->RunSync([Busy]() { *Busy = superslm_gpu::LastCallTiming().gpu_busy_ms; }, TEXT("test timing observer"))) { return false; }
+	OutBusyMs = *Busy;
+	return true;
+}
+
+// The one-shot status for the next job of Kind. Return and PrefixRelease have no override: a
+// recycle's statuses are the reset's (Reset), and a refused release keeps its handle, which no cell
+// constructs; both read false.
+bool FSuperSLMPagedGpuTestSeam::SetNextLayer1StatusOverride(USuperSLMGpuSubsystem& Gpu, ESuperSLMPagedRequestKind Kind, SslmGpuStatus Status)
+{
+	FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr || !S->IsPooled())
+	{
+		return false;
+	}
+	std::atomic<uint32>* Slot = nullptr;
+	switch (Kind)
+	{
+		case ESuperSLMPagedRequestKind::Reset:         Slot = &S->TestNextResetStatus; break;
+		case ESuperSLMPagedRequestKind::Restore:       Slot = &S->TestNextRestoreStatus; break;
+		case ESuperSLMPagedRequestKind::Adopt:         Slot = &S->TestNextAdoptStatus; break;
+		case ESuperSLMPagedRequestKind::PrefixBuild:   Slot = &S->TestNextPrefixBuildStatus; break;
+		case ESuperSLMPagedRequestKind::NestedBuild:   Slot = &S->TestNextNestedBuildStatus; break;
+		case ESuperSLMPagedRequestKind::Return:
+		case ESuperSLMPagedRequestKind::PrefixRelease:
+			break;
+	}
+	if (Slot == nullptr)
+	{
+		return false;
+	}
+	Slot->store(static_cast<uint32>(Status), std::memory_order_release);
+	return true;
+}
+
+bool FSuperSLMPagedGpuTestSeam::ArmAdoptFaultAfterShare(USuperSLMGpuSubsystem& Gpu, SslmGpuStatus Status)
+{
+	FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr || !S->IsPooled())
+	{
+		return false;
+	}
+	S->TestAdoptFaultAfterShare.store(static_cast<uint32>(Status), std::memory_order_release);
+	return true;
+}
 #endif // WITH_DEV_AUTOMATION_TESTS
 
 #else // SUPERSLMUNREAL_WITH_GPU == 0: the class exists for UnrealHeaderTool; no instance is created.
@@ -6692,6 +9969,7 @@ ESuperSLMRestoreResult USuperSLMGpuSubsystem::GetRestoreResult(const FSuperSLMLi
 int32 USuperSLMGpuSubsystem::GetPendingLifecycleOperationCount(const FSuperSLMGpuSequence&) const { return 0; }
 FString USuperSLMGpuSubsystem::GetLastLifecycleRequestError() const { return FString(); }
 double USuperSLMGpuSubsystem::GetLastGpuBusyMs() const { return 0.0; }
+FSuperSLMGpuTimingSnapshot USuperSLMGpuSubsystem::GetGpuTimingSnapshot() const { return {}; }
 double USuperSLMGpuSubsystem::GetLastHostFinishMs() const { return 0.0; }
 double USuperSLMGpuSubsystem::GetTimeToFirstTokenMs(const FSuperSLMGpuSequence&) const { return -1.0; }
 int32 USuperSLMGpuSubsystem::GetHitchCount() const { return 0; }
@@ -6768,6 +10046,7 @@ bool FSuperSLMGpuTestAccess::SetEventLogEnabled(USuperSLMGpuSubsystem&, bool) { 
 TArray<FSuperSLMGpuEventLogEntry> FSuperSLMGpuTestAccess::GetEventLog(const USuperSLMGpuSubsystem&) { return TArray<FSuperSLMGpuEventLogEntry>(); }
 TArray<FSuperSLMGpuPlanLogEntry> FSuperSLMGpuTestAccess::GetPlanLog(const USuperSLMGpuSubsystem&) { return TArray<FSuperSLMGpuPlanLogEntry>(); }
 int32 FSuperSLMGpuTestAccess::GetOutstandingTickJobCount(const USuperSLMGpuSubsystem&) { return 0; }
+bool FSuperSLMGpuTestAccess::ReadAndDrainDebugLayer(FSuperSLMGpuDebugLayerReading& OutReading, bool) { OutReading = {}; return false; }
 int32 FSuperSLMGpuTestAccess::GetOutstandingOtherJobCount(const USuperSLMGpuSubsystem&) { return 0; }
 int32 FSuperSLMGpuTestAccess::GetGameHitchCount(const USuperSLMGpuSubsystem&) { return 0; }
 int32 FSuperSLMGpuTestAccess::GetThreadHitchCount(const USuperSLMGpuSubsystem&) { return 0; }
@@ -6780,9 +10059,96 @@ void FSuperSLMGpuTestAccess::ReleaseHeldTickJob(USuperSLMGpuSubsystem&) {}
 void FSuperSLMGpuTestAccess::SetNextResetStatusOverride(USuperSLMGpuSubsystem&, SslmGpuStatus) {}
 void FSuperSLMGpuTestAccess::SetNextRestoreStatusOverride(USuperSLMGpuSubsystem&, SslmGpuStatus) {}
 bool FSuperSLMGpuTestAccess::SeedDeferredRefusal(USuperSLMGpuSubsystem&, const FSuperSLMGpuSequence&, const FString&) { return false; }
+
+// Plugin paging plan §3.9 (K6): no GPU subsystem is ever configured here, so every seam reads
+// "not configured".
+bool FSuperSLMPagedGpuTestSeam::RunOnPoolThread(USuperSLMGpuSubsystem&, TFunction<void(FSuperSLMGpuPoolThreadAccess&)>) { return false; }
+FSuperSLMPagedHold FSuperSLMPagedGpuTestSeam::HoldApply(USuperSLMGpuSubsystem&, ESuperSLMPagedRequestKind) { return FSuperSLMPagedHold(); }
+bool FSuperSLMPagedGpuTestSeam::IsHoldReached(const USuperSLMGpuSubsystem&, const FSuperSLMPagedHold&) { return false; }
+bool FSuperSLMPagedGpuTestSeam::ReleaseHold(USuperSLMGpuSubsystem&, const FSuperSLMPagedHold&) { return false; }
+FSuperSLMPagedLedgerView FSuperSLMPagedGpuTestSeam::Ledger(const USuperSLMGpuSubsystem&) { return FSuperSLMPagedLedgerView(); }
+int64 FSuperSLMPagedGpuTestSeam::SequenceHeadroomHold(const USuperSLMGpuSubsystem&, const FSuperSLMGpuSequence&) { return -1; }
+bool FSuperSLMPagedGpuTestSeam::SequenceHasOpenJob(const USuperSLMGpuSubsystem&, const FSuperSLMGpuSequence&) { return false; }
+bool FSuperSLMPagedGpuTestSeam::IsSlotRecyclePending(const USuperSLMGpuSubsystem&, int32) { return false; }
+int32 FSuperSLMPagedGpuTestSeam::SlotIndexOf(const USuperSLMGpuSubsystem&, const FSuperSLMGpuSequence&) { return INDEX_NONE; }
+int64 FSuperSLMPagedGpuTestSeam::SlotHolderGeneration(const USuperSLMGpuSubsystem&, int32) { return -1; }
+int64 FSuperSLMPagedGpuTestSeam::SequenceContextUsed(const USuperSLMGpuSubsystem&, const FSuperSLMGpuSequence&) { return -1; }
+bool FSuperSLMPagedGpuTestSeam::ForceUnderCharge(USuperSLMGpuSubsystem&, ESuperSLMPagedChargeKind, uint32) { return false; }
+int64 FSuperSLMPagedGpuTestSeam::JobsPosted(const USuperSLMGpuSubsystem&, ESuperSLMPagedRequestKind) { return -1; }
+int64 FSuperSLMPagedGpuTestSeam::Layer1BusyCount(const USuperSLMGpuSubsystem&) { return -1; }
+bool FSuperSLMPagedGpuTestSeam::SetNextConfigurePageCountPerturbation(USuperSLMGpuSubsystem& Gpu, int32 Delta) { Gpu.NextConfigurePageCountPerturbation = Delta; return true; }
+bool FSuperSLMPagedGpuTestSeam::SetNextPoolCreateStatusOverride(USuperSLMGpuSubsystem& Gpu, SslmGpuStatus Status) { Gpu.NextPoolCreateStatusOverride = static_cast<uint32>(Status); return true; }
+int64 FSuperSLMPagedGpuTestSeam::PrefixChargedPages(const USuperSLMGpuSubsystem&, const FSuperSLMPrefix&) { return -1; }
+int32 FSuperSLMPagedGpuTestSeam::PrefixDependentCount(const USuperSLMGpuSubsystem&, const FSuperSLMPrefix&) { return -1; }
+bool FSuperSLMPagedGpuTestSeam::IsPrefixGhost(const USuperSLMGpuSubsystem&, const FSuperSLMPrefix&) { return false; }
+int32 FSuperSLMPagedGpuTestSeam::SequenceArmed(const USuperSLMGpuSubsystem&, const FSuperSLMGpuSequence&) { return -1; }
+int64 FSuperSLMPagedGpuTestSeam::PrefixBuiltTokens(const USuperSLMGpuSubsystem&, const FSuperSLMPrefix&) { return -1; }
+bool FSuperSLMPagedGpuTestSeam::GetPrefixBuildTurnTicks(const USuperSLMGpuSubsystem&, const FSuperSLMPrefix&, TArray<int64>& OutTicks) { OutTicks.Reset(); return false; }
+bool FSuperSLMPagedGpuTestSeam::GetRetainedPrefixBookkeeping(const USuperSLMGpuSubsystem&, int32& OutEntries, uint64& OutPayloadBytes) { OutEntries = 0; OutPayloadBytes = 0; return false; }
+bool FSuperSLMPagedGpuTestSeam::ReadCompletedLayer1Timing(USuperSLMGpuSubsystem&, double& OutBusyMs) { OutBusyMs = 0.0; return false; }
+bool FSuperSLMPagedGpuTestSeam::SetNextLayer1StatusOverride(USuperSLMGpuSubsystem&, ESuperSLMPagedRequestKind, SslmGpuStatus) { return false; }
+bool FSuperSLMPagedGpuTestSeam::ArmAdoptFaultAfterShare(USuperSLMGpuSubsystem&, SslmGpuStatus) { return false; }
 #endif // WITH_DEV_AUTOMATION_TESTS
 
+// Plugin paging plan (K6): the pooled verbs, with no GPU backend to configure.
+ESuperSLMPrefixResult USuperSLMGpuSubsystem::CreatePrefix(const TArray<int32>&, FSuperSLMPrefix& OutPrefix, FString* OutError)
+{
+	OutPrefix = FSuperSLMPrefix();
+	if (OutError != nullptr)
+	{
+		*OutError = TEXT("CreatePrefix: the GPU backend is built on Windows x64 only");
+	}
+	return ESuperSLMPrefixResult::NotConfigured;
+}
+ESuperSLMPrefixResult USuperSLMGpuSubsystem::CreatePrefix(const TArray<int32>&, const FSuperSLMGpuSchemaHandle&, ESuperSLMSpanKind, FSuperSLMPrefix& OutPrefix, FString* OutError)
+{
+	OutPrefix = FSuperSLMPrefix();
+	if (OutError != nullptr)
+	{
+		*OutError = TEXT("CreatePrefix: the GPU backend is built on Windows x64 only");
+	}
+	return ESuperSLMPrefixResult::NotConfigured;
+}
+ESuperSLMPrefixResult USuperSLMGpuSubsystem::CreatePrefixFrom(const FSuperSLMPrefix&, const TArray<int32>&, FSuperSLMPrefix& OutPrefix, FString* OutError)
+{
+	OutPrefix = FSuperSLMPrefix();
+	if (OutError != nullptr)
+	{
+		*OutError = TEXT("CreatePrefixFrom: the GPU backend is built on Windows x64 only");
+	}
+	return ESuperSLMPrefixResult::NotConfigured;
+}
+FSuperSLMLifecycleOpHandle USuperSLMGpuSubsystem::RequestAdoptPrefix(const FSuperSLMGpuSequence&, const FSuperSLMPrefix&) { return FSuperSLMLifecycleOpHandle(); }
+bool USuperSLMGpuSubsystem::ReleasePrefix(const FSuperSLMPrefix&, FString& OutError)
+{
+	OutError = TEXT("ReleasePrefix: the GPU backend is built on Windows x64 only");
+	return false;
+}
+ESuperSLMPrefixPhase USuperSLMGpuSubsystem::GetPrefixPhase(const FSuperSLMPrefix&) const { return ESuperSLMPrefixPhase::Invalid; }
+int32 USuperSLMGpuSubsystem::GetLivePrefixCount() const { return 0; }
+FSuperSLMLifecycleOpHandle USuperSLMGpuSubsystem::RequestRestoreSequence(const TArray<uint8>&, USuperSLMModel*, const FSuperSLMPrefix&) { return FSuperSLMLifecycleOpHandle(); }
+FSuperSLMKvPageStats USuperSLMGpuSubsystem::GetKvPageStats() const
+{
+	FSuperSLMKvPageStats Stats;
+	Stats.LedgerFaults = PriorLedgerFaults;
+	return Stats;
+}
+
 #endif // SUPERSLMUNREAL_WITH_GPU
+
+// Plugin paging plan §3.5 "Handle ids stay unique" (K6): the handle counter lives in the
+// per-Configure state and restarts with it, so a new state starts above the highest tombstoned id,
+// and a fresh operation can never take a tombstone's id. With no tombstones it starts at 1. Every
+// platform (the member is declared on every platform; elsewhere there are never tombstones).
+int64 USuperSLMGpuSubsystem::FirstHandleIdAfterTombstones() const
+{
+	int64 Highest = 0;
+	for (const int64 Id : LifecycleTombstones)
+	{
+		Highest = FMath::Max(Highest, Id);
+	}
+	return Highest + 1;
+}
 
 // Outside the GPU guard: the restore's status mapping is pure host code over Layer 1's portable
 // status enum, so a cell reads it on every platform, with or without a device.
@@ -6792,5 +10158,11 @@ bool FSuperSLMGpuTestAccess::SeedDeferredRefusal(USuperSLMGpuSubsystem&, const F
 ESuperSLMRestoreResult FSuperSLMGpuTestAccess::RestoreFailureResult(SslmGpuStatus Status, bool bSchemaCrossCheckFailed)
 {
 	return SuperSLMGpuStatusMapping::ToRestoreFailureResult(Status, bSchemaCrossCheckFailed);
+}
+
+// Plugin paging plan §3.7 (K6): the mode-aware mapping the restore itself calls, pure, on every platform.
+ESuperSLMRestoreResult FSuperSLMPagedGpuTestSeam::RestoreFailureResult(SslmGpuStatus Status, bool bPooled, bool bSchemaCrossCheckFailed)
+{
+	return SuperSLMGpuStatusMapping::ToRestoreFailureResult(Status, bPooled, bSchemaCrossCheckFailed);
 }
 #endif // WITH_DEV_AUTOMATION_TESTS

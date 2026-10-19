@@ -305,13 +305,25 @@ bool FSuperSLML2S1ReleaseMidBatchYieldsSequenceNoLongerValidTest::RunTest(const 
 		FPlatformProcess::Sleep(0.001f);
 	}
 
+	// Tick (including the extra post-release Tick) can finish after the deadline
+	// checked at the top of the loop. Completion must satisfy the same ceiling
+	// after that work returns; reaching Complete alone does not prove it was on time.
+	const double DrainElapsedSeconds = FPlatformTime::Seconds() - DrainStartSeconds;
+	const bool bWithinWallCeiling = FMath::IsFinite(DrainElapsedSeconds)
+		&& DrainElapsedSeconds >= 0.0 && FMath::IsFinite(WallCeilingSeconds)
+		&& WallCeilingSeconds > 0.0 && DrainElapsedSeconds < WallCeilingSeconds;
+	AddInfo(FString::Printf(TEXT("R-S1d wall: elapsed %.17g seconds, ceiling %.17g seconds, released=%d, loop_completed=%d, within_ceiling=%d"),
+		DrainElapsedSeconds, WallCeilingSeconds, int32(bReleasedMidBatch),
+		int32(bBoundedTermination), int32(bWithinWallCeiling)));
+
 	if (!TestTrue(TEXT("sequence 1 must have been released while still mid-generation"), bReleasedMidBatch))
 	{
 		return false;
 	}
 	// The released sequence's -3 outcome (SequenceNoLongerValid) must never be re-queued;
 	// completion is bounded by the workload-derived wall-clock deadline above.
-	if (!TestTrue(*FString::Printf(TEXT("the tick loop must terminate within the workload-derived %.3f-second ceiling"), WallCeilingSeconds), bBoundedTermination))
+	if (!TestTrue(*FString::Printf(TEXT("the tick loop must terminate within the workload-derived %.3f-second ceiling"), WallCeilingSeconds),
+		bBoundedTermination && bWithinWallCeiling))
 	{
 		return false;
 	}

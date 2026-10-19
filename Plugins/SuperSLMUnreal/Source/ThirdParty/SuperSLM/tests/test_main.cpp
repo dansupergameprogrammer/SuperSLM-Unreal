@@ -13,6 +13,7 @@
 #include "superslm/decode_digest.h"
 #include "superslm/forward_sites.h"
 #include "superslm/gpu_port.h"
+#include "../src/gpu/gpu_inflight_token.h"  // GpuInFlightToken (plan G3): complete for construction/destruction
 #include "superslm/intmath.h"
 #include "superslm/layer_marshal.h"
 #include "superslm/matmul.h"
@@ -81,6 +82,7 @@
 #ifdef _WIN32
 using enum SslmGpuStatus;
 #endif
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -143,6 +145,189 @@ static void TestSha256KnownVectors() {
 	Sha256Hash(reinterpret_cast<const uint8_t*>(long_msg.data()), long_msg.size(), d);
 	CHECK(ToHex(d) ==
 	      "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+}
+
+// --- Hardware SHA-256 (x86 SHA extensions) against the portable reference ---
+//
+// src/sha256.cpp selects its block compression at run time: the SHA-extension path
+// (sha256rnds2/sha256msg1/sha256msg2) when CPUID reports it, the portable FIPS 180-4
+// code otherwise. The digest is a fixed function of the bytes, so every cell below
+// demands byte equality between the dispatched path, the portable reference
+// (Sha256HashPortableRef) and, on a CPU that has the extensions, the hardware path
+// called directly (Sha256HashShaNiRef). On a CPU without them the hardware cells are
+// skipped and say so; the portable-forced build (tests/sha256_portable_forced_tests.cpp)
+// runs the streaming cells with the portable path as the dispatched one.
+
+static std::vector<uint8_t> Sha256TestBytes(size_t n, uint32_t seed) {
+	std::vector<uint8_t> v(n);
+	uint32_t x = seed;
+	for (auto& b : v) {
+		x = x * 1664525u + 1013904223u;
+		b = static_cast<uint8_t>(x >> 24);
+	}
+	return v;
+}
+
+static bool Sha256HostHasShaExtensions() {
+	return DetectSha256ImplForCpu() == kSha256ImplShaNi;
+}
+
+// Hashes `data` with every implementation this host can run and checks they agree
+// with each other and, when `want_hex` is non-null, with the expected digest.
+static void CheckSha256AllImplsAgree(const uint8_t* data, size_t len, const char* want_hex,
+                                     const char* what) {
+	uint8_t dispatched[32], portable[32];
+	Sha256Hash(data, len, dispatched);
+	Sha256HashPortableRef(data, len, portable);
+	CHECK_MSG(std::memcmp(dispatched, portable, 32) == 0,
+	          "%s (len %zu): dispatched %s != portable %s", what, len, ToHex(dispatched).c_str(),
+	          ToHex(portable).c_str());
+	if (want_hex != nullptr) {
+		CHECK_MSG(ToHex(portable) == want_hex, "%s (len %zu): portable %s, want %s", what, len,
+		          ToHex(portable).c_str(), want_hex);
+	}
+#if SUPERSLM_SHA256_HAVE_SHANI_X64
+	if (Sha256HostHasShaExtensions()) {
+		uint8_t hw[32];
+		Sha256HashShaNiRef(data, len, hw);
+		CHECK_MSG(std::memcmp(hw, portable, 32) == 0, "%s (len %zu): hardware %s != portable %s",
+		          what, len, ToHex(hw).c_str(), ToHex(portable).c_str());
+	}
+#endif
+}
+
+static void TestSha256ImplResolverFromFields() {
+	// Pure resolver over fabricated CPUID fields: leaf 0 EAX (max basic leaf), leaf 1
+	// ECX (SSSE3 bit 9, SSE4.1 bit 19), leaf 7/0 EBX (SHA bit 29).
+	const int kSsse3 = 1 << 9, kSse41 = 1 << 19, kSha = 1 << 29;
+	const int all1 = kSsse3 | kSse41;
+	CHECK(ResolveSha256Impl(7, all1, kSha) == kSha256ImplShaNi);
+	CHECK(ResolveSha256Impl(0x10, all1, kSha | (1 << 5)) == kSha256ImplShaNi);
+	// Leaf 7 is architecturally undefined below max basic leaf 7: its bits must be ignored.
+	CHECK(ResolveSha256Impl(6, all1, kSha) == kSha256ImplPortable);
+	CHECK(ResolveSha256Impl(7, all1, 0) == kSha256ImplPortable);
+	CHECK(ResolveSha256Impl(7, all1, ~kSha) == kSha256ImplPortable);
+	CHECK(ResolveSha256Impl(7, kSse41, kSha) == kSha256ImplPortable);   // no SSSE3
+	CHECK(ResolveSha256Impl(7, kSsse3, kSha) == kSha256ImplPortable);   // no SSE4.1
+	CHECK(ResolveSha256Impl(0, 0, 0) == kSha256ImplPortable);
+}
+
+static void TestSha256ActiveImplIsTheDetectedOne() {
+	// This binary is built without SUPERSLM_FORCE_PORTABLE_SHA256, so the dispatched
+	// path must be exactly what the CPU probe selects (portable-only on a non-x64 build).
+	const int detected = DetectSha256ImplForCpu();
+	CHECK(detected == kSha256ImplPortable || detected == kSha256ImplShaNi);
+	CHECK(ActiveSha256Impl() == detected);
+#if !SUPERSLM_SHA256_HAVE_SHANI_X64
+	CHECK(detected == kSha256ImplPortable);
+#endif
+	std::printf("sha256: dispatched implementation = %s\n",
+	            ActiveSha256Impl() == kSha256ImplShaNi ? "x86 SHA extensions" : "portable");
+}
+
+static void TestSha256FipsVectorsAllImpls() {
+	// FIPS 180-4 / NIST known answers, including both multi-block padding cases and the
+	// one-million-'a' long message.
+	struct Vec {
+		std::string msg;
+		const char* hex;
+	};
+	const Vec vecs[] = {
+	    {"", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+	    {"abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
+	    {"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+	     "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"},
+	    {"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqr"
+	     "lmnopqrsmnopqrstnopqrstu",
+	     "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1"},
+	    {std::string(1000000, 'a'),
+	     "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"},
+	};
+	for (const Vec& v : vecs) {
+		CheckSha256AllImplsAgree(reinterpret_cast<const uint8_t*>(v.msg.data()), v.msg.size(),
+		                         v.hex, "FIPS vector");
+	}
+#if SUPERSLM_SHA256_HAVE_SHANI_X64
+	if (!Sha256HostHasShaExtensions()) {
+		std::printf("sha256: host has no SHA extensions -- hardware-path cells not executed\n");
+	}
+#endif
+}
+
+static void TestSha256EveryLength0To1024AllImpls() {
+	// Every length 0..1024 covers every padding residue (0..63 bytes past a block, both
+	// the one-block and two-block padding cases) over 17 block counts. Run at an aligned
+	// and at an odd offset so the hardware path's unaligned loads are exercised too.
+	const std::vector<uint8_t> bytes = Sha256TestBytes(1024 + 3, 0xC0FFEEu);
+	for (size_t off : {size_t(0), size_t(3)}) {
+		for (size_t len = 0; len <= 1024; ++len) {
+			CheckSha256AllImplsAgree(bytes.data() + off, len, nullptr, "every length");
+		}
+	}
+}
+
+static void TestSha256MultiMegabyteAllImpls() {
+	// Digests pinned from the portable implementation as it stood before the hardware path
+	// existed, and cross-checked against an independent SHA-256.
+	const std::vector<uint8_t> a = Sha256TestBytes((size_t(3) << 20) + 17, 0x5A17u);
+	CheckSha256AllImplsAgree(a.data(), a.size(),
+	                         "29fe1f49486287b54b24dd1461d5de93cf5cc5b8e0842fd8e2dcf64b0eb609dd",
+	                         "3 MiB + 17");
+	const std::vector<uint8_t> b = Sha256TestBytes(size_t(8) << 20, 0x5A17u);
+	CheckSha256AllImplsAgree(b.data(), b.size(),
+	                         "35ac12ceae8a53ba17582aa94f381a24882eedf6c3c391b4b715cf9433539d87",
+	                         "8 MiB");
+	CheckSha256AllImplsAgree(b.data() + 1, b.size() - 1, nullptr, "8 MiB - 1 at offset 1");
+}
+
+static void TestSha256StreamingEverySplitMatchesPortable() {
+	// The streaming object (dispatched path) fed in pieces must equal the portable
+	// one-shot digest, whatever the split: every two-way split for lengths 0..256, every
+	// three-way split for lengths 0..96, and byte-at-a-time for lengths 0..1024.
+	const std::vector<uint8_t> bytes = Sha256TestBytes(1024, 0x51u);
+	auto portable = [&](size_t len) {
+		uint8_t d[32];
+		Sha256HashPortableRef(bytes.data(), len, d);
+		return ToHex(d);
+	};
+	int mismatches = 0;
+	for (size_t len = 0; len <= 256; ++len) {
+		const std::string want = portable(len);
+		for (size_t k = 0; k <= len; ++k) {
+			Sha256 h;
+			h.Update(bytes.data(), k);
+			h.Update(bytes.data() + k, len - k);
+			uint8_t d[32];
+			h.Final(d);
+			if (ToHex(d) != want) ++mismatches;
+		}
+	}
+	CHECK_MSG(mismatches == 0, "two-way splits: %d mismatches", mismatches);
+	mismatches = 0;
+	for (size_t len = 0; len <= 96; ++len) {
+		const std::string want = portable(len);
+		for (size_t i = 0; i <= len; ++i) {
+			for (size_t j = i; j <= len; ++j) {
+				Sha256 h;
+				h.Update(bytes.data(), i);
+				h.Update(bytes.data() + i, j - i);
+				h.Update(bytes.data() + j, len - j);
+				uint8_t d[32];
+				h.Final(d);
+				if (ToHex(d) != want) ++mismatches;
+			}
+		}
+	}
+	CHECK_MSG(mismatches == 0, "three-way splits: %d mismatches", mismatches);
+	mismatches = 0;
+	for (size_t len = 0; len <= 1024; ++len) {
+		Sha256 h;
+		for (size_t i = 0; i < len; ++i) h.Update(bytes.data() + i, 1);
+		uint8_t d[32];
+		h.Final(d);
+		if (ToHex(d) != portable(len)) ++mismatches;
+	}
+	CHECK_MSG(mismatches == 0, "byte-at-a-time: %d mismatches", mismatches);
 }
 
 static void TestDtypeSizes() {
@@ -5806,6 +5991,43 @@ static int RunCrashProbe(const std::string& name) {
 		std::fflush(stdout);
 		return 0;
 	}
+	// Tiled-matmul plan slice 1, cell 3.5: the same fresh-process race, through the TILED path. Each of
+	// 8 threads makes the process's first GEMM call with 8 tokens (the tiled threshold), so every
+	// thread races the tier probe's first touch and then the tiled kernel's per-call scratch. Every
+	// token row is {1, 2, 3, 4} against the weight row {5, 6, 7, 8}: every output is 70.
+	if (name == "matmul_first_tiled_call_race") {
+		std::printf("%s\n", CrashProbeBeganMarker(name).c_str());
+		std::fflush(stdout);
+		constexpr int kThreads = 8;
+		constexpr size_t kTokens = 8;
+		constexpr size_t kInChannels = 4;
+		static const int8_t kActs[kTokens * kInChannels] = {1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4,
+		                                                    1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4};
+		static const int8_t kWgts[kInChannels] = {5, 6, 7, 8};
+		std::vector<std::vector<int64_t>> results(static_cast<size_t>(kThreads),
+		                                          std::vector<int64_t>(kTokens, INT64_MIN));
+		std::vector<std::thread> threads;
+		threads.reserve(static_cast<size_t>(kThreads));
+		for (int i = 0; i < kThreads; ++i) {
+			threads.emplace_back([i, &results]() {
+				GemmInt8Accumulate(kActs, kWgts, kTokens, kInChannels, /*out_channels=*/1,
+				                   results[static_cast<size_t>(i)].data());
+			});
+		}
+		for (auto& t : threads) t.join();
+		for (int i = 0; i < kThreads; ++i) {
+			int64_t worst = 70;
+			for (int64_t v : results[static_cast<size_t>(i)]) {
+				if (v != 70) worst = v;
+			}
+			std::printf("THREAD_RESULT:%d:%lld\n", i, static_cast<long long>(worst));
+		}
+		std::printf("PROBE_INVOCATIONS:%lld\n",
+		            static_cast<long long>(superslm_test::g_dot_row_tier_probe_invocations.load()));
+		std::printf("TILED_ENTRIES:%lld\n", superslm_test::TiledEntryInvocationsTotal());
+		std::fflush(stdout);
+		return 0;
+	}
 #endif  // SUPERSLM_T2149_AVX_TIERS_BUILT
 	// S3 (Poirot review ac34677, 2026-07-28): RowBoundsWide (src/intmath.cpp:
 	// 279-280) reads x[0] before testing n at all -- with a null data pointer
@@ -6960,6 +7182,44 @@ static void TestMatmulFirstCallDispatchRaceUnderConcurrency() {
 		          "racing thread reaches it simultaneously (design §10 dimensions 1 and 3)",
 		          inv);
 	}
+}
+
+// Tiled-matmul plan slice 1, cell 3.5: the first-call race of the cell above, through the tiled path
+// (the probe "matmul_first_tiled_call_race"). Each thread's 8 outputs must equal the hand-computed 70,
+// the tier probe must run exactly once, and on a tier that tiles at 8 tokens every one of the 8 calls
+// must have entered the tiled kernel -- so the race is on the path this cell is about.
+static void TestMatmulFirstTiledCallRaceUnderConcurrency() {
+	using namespace superslm_test;
+	std::string tail;
+	CrashProbeOutcome outcome = RunsCrashProbeAndCrashes("matmul_first_tiled_call_race", &tail);
+	CHECK_MSG(outcome == CrashProbeOutcome::kRanNoCrash,
+	          "matmul_first_tiled_call_race probe outcome == %s, want ran-no-crash -- child output: %s",
+	          CrashProbeOutcomeName(outcome), tail.c_str());
+	if (outcome != CrashProbeOutcome::kRanNoCrash) return;
+	constexpr int kThreads = 8;
+	for (int i = 0; i < kThreads; ++i) {
+		char marker[64];
+		std::snprintf(marker, sizeof(marker), "THREAD_RESULT:%d:", i);
+		const size_t pos = tail.find(marker);
+		CHECK_MSG(pos != std::string::npos, "first tiled call race: THREAD_RESULT:%d: missing -- %s", i,
+		          tail.c_str());
+		if (pos == std::string::npos) continue;
+		const long long got = std::strtoll(tail.c_str() + pos + std::strlen(marker), nullptr, 10);
+		CHECK_MSG(got == 70, "first tiled call race: thread %d produced %lld, want 70 in all 8 outputs", i,
+		          got);
+	}
+	const size_t inv_pos = tail.find("PROBE_INVOCATIONS:");
+	const size_t te_pos = tail.find("TILED_ENTRIES:");
+	CHECK(inv_pos != std::string::npos && te_pos != std::string::npos);
+	if (inv_pos == std::string::npos || te_pos == std::string::npos) return;
+	const long long inv = std::strtoll(tail.c_str() + inv_pos + std::strlen("PROBE_INVOCATIONS:"), nullptr, 10);
+	const long long te = std::strtoll(tail.c_str() + te_pos + std::strlen("TILED_ENTRIES:"), nullptr, 10);
+	CHECK_MSG(inv == 1, "first tiled call race: tier probe ran %lld times, want exactly 1", inv);
+	const bool tiles = superslm::detail::DispatchGemmPath(superslm::detail::ActiveGemmTier(), 8) ==
+	                   superslm::detail::GemmPath::kTiled;
+	CHECK_MSG(te == (tiles ? kThreads : 0),
+	          "first tiled call race: %lld tiled entries, want %d (the active tier %s at 8 tokens)", te,
+	          tiles ? kThreads : 0, tiles ? "tiles" : "does not tile");
 }
 
 #endif  // SUPERSLM_T2149_AVX_TIERS_BUILT
@@ -25858,7 +26118,7 @@ static void TestT2053_M1_TableWalkAgainstGuardsDef() {
 	// the BUILD, per the commission's own "verify kCount's static_assert
 	// wiring is itself alive" ask -- proven by construction: this line does
 	// not compile if `kCount` and the literal `9` disagree.
-	static_assert(static_cast<int>(superslm_gpu::GpuLayerLoopGuard::kCount) == 9,
+	static_assert(static_cast<int>(superslm_gpu::GpuLayerLoopGuard::kCount) == 10,
 	              "gpu_layer_loop_guards.def's own row count changed -- update this table "
 	              "walk's own row count (T2053_GuardRows below) to match, in CPU's own "
 	              "source order (forward_sites.cpp:1137-1354)");
@@ -25949,6 +26209,14 @@ static void TestT2053_M1_TableWalkAgainstGuardsDef() {
 	int8_t codes9[2] = {5, -5};
 	s = SequenceLayerState{}; s.hidden_codes = codes9; s.hidden_scale = CarriedScale{INT64_C(1073741824), 0}; s.layer_index = 0; s.context_length = 1;
 	run_both("KvCapacityExhausted", s, s, fixture.layers, 8, 8, 2, 2, 1, 2, /*context_cap=*/1, 32, 0);
+
+	// Paged-KV plan §3.2 item 5 (step M1), the tenth row. RunLayerLoop's flat workspace is a one-page
+	// view, so KvPageUnmapped's fixture (the first row past the view) is the cap itself, where
+	// KvCapacityExhausted fires first on both sides; the row pins agreement on that ordering until a
+	// paged view reaches the guard (C2 on CPU, G2/G3 on GPU).
+	int8_t codes10[2] = {5, -5};
+	s = SequenceLayerState{}; s.hidden_codes = codes10; s.hidden_scale = CarriedScale{INT64_C(1073741824), 0}; s.layer_index = 0; s.context_length = 2;
+	run_both("KvPageUnmapped", s, s, fixture.layers, 8, 8, 2, 2, 1, 2, /*context_cap=*/2, 64, 0);
 
 	CHECK_MSG(rows_tested == static_cast<int>(superslm_gpu::GpuLayerLoopGuard::kCount),
 	          "T2053 table-walk: %d rows tested, want %d (gpu_layer_loop_guards.def's own "
@@ -28004,9 +28272,22 @@ static void TestT2572_M2_MarshalLayerAcceptsArmCsNonQkNormOutput() {
 // because they call the C ABI, whose unscoped sslm_status enumerators collide with this
 // file's `using enum SslmGpuStatus;` on Windows. Adds its own counts to the two passed in.
 void RunSlm18xSaturationCensusCells(int& checks, int& failures);
+// Pool teardown order (map, create pool, unmap, destroy pool) and the pin seam's refusal while a pool
+// lives, defined in the same unit (T-3262).
+void RunPoolTeardownOrderCells(int& checks, int& failures);
 // 1.9.x schema-constrained and damped-greedy decoding cells
 // (tests/test_slm19x_schema_damped_greedy.cpp), a separate unit for the same reason.
 void RunSlm19xSchemaDampedGreedyCells(int& checks, int& failures);
+// Tiled-matmul plan slice 1: the tiled GEMM cells (tests/test_tiled_gemm.cpp).
+void RunTiledGemmCells(int& checks, int& failures);
+// Attention and per-row sites plan: its slices' cells (tests/test_attn_rowsites.cpp).
+void RunAttnRowsiteCells(int& checks, int& failures);
+// Decode-threading plan: its steps' cells (tests/test_decode_threading.cpp).
+void RunDecodeThreadingCells(int& checks, int& failures);
+void RunDecodeThreadingD1Cells(int& checks, int& failures);
+// GPU paged-KV plan step G3: cell 3.6h and the ledger's host-only cells
+// (tests/gpu-g3-core/g3_superslm_tests_adapter.cpp).
+void RunGpuLedgerG3Cells(int& checks, int& failures);
 
 #ifdef _WIN32  // resumes the Windows/D3D12 block closed above T-2572
 
@@ -28308,8 +28589,10 @@ static void TestT2577_S1b_ModelGenerationReachesTheG5BridgeChunkEntryPoint() {
 		return block;
 	};
 
+	// One fixture for both chunks: the rope cache is keyed on the host table pointers, so a fixture
+	// rebuilt per chunk hits only when the heap happens to reuse the freed block.
+	RopeSaturationFixture fixture;
 	auto run_one_chunk = [&](uint64_t generation) -> bool {
-		RopeSaturationFixture fixture;
 		int8_t hidden_codes[2] = {5, -5};
 		SequenceLayerState seq;
 		seq.hidden_codes = hidden_codes;
@@ -28317,7 +28600,7 @@ static void TestT2577_S1b_ModelGenerationReachesTheG5BridgeChunkEntryPoint() {
 		uint8_t ws[kWorkspaceSize] = {};
 		const CarriedScale scale{INT64_C(1073741824), 0};
 		const std::vector<uint8_t> block = pack_block(hidden_codes, 2, scale);
-		superslm_gpu::GpuLayerLoopInFlight* inflight = nullptr;
+		superslm_gpu::GpuInFlightToken inflight;
 		const auto submit_st = superslm_gpu::SubmitChunkToFullDepthForG5Bridge(
 		    seq, &fixture.layer, /*num_hidden_layers=*/1, /*hidden_size=*/2, /*head_dim=*/2,
 		    /*num_key_value_heads=*/1, /*intermediate_size=*/2, /*context_cap=*/1,
@@ -28327,14 +28610,14 @@ static void TestT2577_S1b_ModelGenerationReachesTheG5BridgeChunkEntryPoint() {
 		    /*external_rope_sin_resident=*/nullptr, /*external_rope_has=*/false,
 		    /*external_rope_cos_elems=*/0, /*external_rope_sin_elems=*/0, /*adapter_bridge=*/nullptr,
 		    &inflight, /*q_width=*/0, generation);
-		CHECK_MSG(submit_st == SslmForwardStatus::Ok && inflight != nullptr,
+		CHECK_MSG(submit_st == SslmForwardStatus::Ok && inflight,
 		          "SubmitChunkToFullDepthForG5Bridge(generation=%llu) status == %s, want Ok "
 		          "with a live inflight token",
 		          (unsigned long long)generation, SslmForwardStatusName(submit_st));
 		if (submit_st != SslmForwardStatus::Ok || !inflight) return false;
 		int32_t ready = 0;
 		const auto finish_st =
-		    superslm_gpu::RunLayerLoopGpuFinish(inflight, seq, ws, /*block=*/1, &ready);
+		    superslm_gpu::RunLayerLoopGpuFinish(std::move(inflight), seq, ws, /*block=*/1, &ready);
 		CHECK_MSG(finish_st == SslmForwardStatus::Ok,
 		          "RunLayerLoopGpuFinish after the G5-bridge submit status == %s, want Ok",
 		          SslmForwardStatusName(finish_st));
@@ -29168,6 +29451,12 @@ int main(int argc, char** argv) {
 #endif  // _WIN32
 
 	TestSha256KnownVectors();
+	TestSha256ImplResolverFromFields();
+	TestSha256ActiveImplIsTheDetectedOne();
+	TestSha256FipsVectorsAllImpls();
+	TestSha256EveryLength0To1024AllImpls();
+	TestSha256MultiMegabyteAllImpls();
+	TestSha256StreamingEverySplitMatchesPortable();
 	TestDtypeSizes();
 	TestKnownSectionTypes();
 
@@ -29587,6 +29876,7 @@ int main(int argc, char** argv) {
 #if !defined(SUPERSLM_FORCE_SCALAR_MATMUL) && !defined(SUPERSLM_FORCE_SSE2_MATMUL) && \
     !defined(SUPERSLM_FORCE_AVX2_MATMUL) && !defined(SUPERSLM_FORCE_AVX512_MATMUL)
 	TestMatmulFirstCallDispatchRaceUnderConcurrency();
+	TestMatmulFirstTiledCallRaceUnderConcurrency();
 #endif
 #endif
 #if SUPERSLM_MATMUL_HAVE_SIMD_X64
@@ -29868,7 +30158,13 @@ int main(int argc, char** argv) {
 	TestT2572_S2_RunLayerLoopWiresRopeSaturationCounterThroughBothPaths();
 	TestT2572_M2_MarshalLayerAcceptsArmCsNonQkNormOutput();
 	RunSlm18xSaturationCensusCells(GChecks, GFailures);
+	RunPoolTeardownOrderCells(GChecks, GFailures);
 	RunSlm19xSchemaDampedGreedyCells(GChecks, GFailures);
+	RunTiledGemmCells(GChecks, GFailures);
+	RunAttnRowsiteCells(GChecks, GFailures);
+	RunDecodeThreadingCells(GChecks, GFailures);
+	RunDecodeThreadingD1Cells(GChecks, GFailures);
+	RunGpuLedgerG3Cells(GChecks, GFailures);
 	TestKvStoreEarlyWriteSurvivesLateReadAcrossEightFurtherPositions();
 	TestRunLayerLoopContextAxisAndCapacityExhaustedFailFast();
 	TestRunLayerLoopColdPrefillAndIncrementalDecodeAgreeAtSamePosition();

@@ -4,6 +4,7 @@
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Trace/Trace.h"
 #include "SuperSLMAdapterHandle.h"
+#include "SuperSLMPagedKvTypes.h"
 #include "SuperSLMRuntimeConfig.h"
 #include "SuperSLMSaveRestoreTypes.h"
 #include "SuperSLMSchemaHandle.h"
@@ -65,6 +66,14 @@ public:
 	// size BEFORE committing to the allocation -- a budget-exceeding config never allocates
 	// (R-S1e). Config.BlockCount <= 0, or any call-shape field <= 0, is refused with a named
 	// result and no allocation (R-S1f).
+	//
+	// Decode-threading D4 (plan §10.3.1 item 5b): before anything else, the decode mode, task count
+	// and thirteen costs resolve on this thread from Config, this process's SuperSLM.SetDecodeMode /
+	// SuperSLM.SetFinishParallelTasks selection, Saved/SuperSLM/RuntimeSettings.ini and a matching
+	// SuperSLM.EstimateCosts profile in Saved/SuperSLM/CalibratedCosts.ini (FSuperSLMRuntimeConfig
+	// states the order). The report's Resolved carries the result, and a successful configuration
+	// logs LogSuperSLM Display "SuperSLM: CPU Configure: bParallelDecode=<effective 0|1>
+	// FinishParallelTasks=<n> cost profile=<caller|saved-estimate|mode-default> caller_cost_fields=<0..13>".
 	FSuperSLMConfigureReport Configure(USuperSLMModel* Model, const FSuperSLMRuntimeConfig& Config);
 
 	// Configure() without blocking the calling thread (fold-round ruling 1: a load must not block
@@ -77,9 +86,17 @@ public:
 	// (a queued task, a later frame): the state is published and OnDone receives the same report
 	// Configure() would have returned. Until then the subsystem is unconfigured
 	// (IsConfigurePending() is true). A later Configure(), BeginConfigure() or Deinitialize()
-	// supersedes it: its state is discarded on a pool thread and OnDone is not called.
+	// supersedes it: its state is discarded on a pool thread and OnDone is not called. The decode
+	// mode, task count and costs resolve at this call, on the game thread, exactly as Configure()
+	// resolves them; a selection or --save made after the call applies to the next configuration.
 	void BeginConfigure(USuperSLMModel* Model, const FSuperSLMRuntimeConfig& Config, TUniqueFunction<void(const FSuperSLMConfigureReport&)> OnDone);
 	bool IsConfigurePending() const { return bConfigurePending; }
+
+	// The configured model's resolved CPU configuration (decode-threading D4, D-SLM8165): the
+	// decode mode, task count and thirteen costs the lanes run and price with. Null when the
+	// subsystem is not configured (a BeginConfigure() still pending included). The pointer is
+	// valid until the next Configure(), BeginConfigure() or Deinitialize().
+	const FSuperSLMResolvedCpuConfig* GetResolvedConfig() const;
 
 	// --- Sequence vend/return (§4, §5) ---
 
@@ -255,7 +272,11 @@ public:
 	// Plan §2.5 row 19 (D-SLM7763): releases a resolved lifecycle-op handle's entry (its result,
 	// and a save blob nobody took). Returns true when an entry was erased; false for an unknown
 	// or already-released handle, and for one still Pending, which is left alone. Afterwards the
-	// handle reads Pending (it names nothing). TearDown() releases every entry.
+	// handle reads Pending (it names nothing). TearDown() releases every entry. In budget (or
+	// pooled GPU) mode (paging plan §3.5), a teardown first records every entry still Pending as a tombstone: it
+	// reads NotConfigured across the next Configure(), is counted by GetLifecycleHandleEntryCount(),
+	// and is erased by this call (true); Deinitialize() drops every tombstone, and the next
+	// Configure() starts handle ids above the highest tombstoned id.
 	bool ReleaseLifecycleOpHandle(const FSuperSLMLifecycleOpHandle& Handle);
 
 	// The pooled-resource monitor's retention readings (plan §7 item 8, D-SLM7763): the bytes of
@@ -289,6 +310,48 @@ public:
 	// that already adopted it are unaffected (adoption is a copy).
 	bool ReleasePrefix(const FSuperSLMPrefix& Prefix, FString& OutError);
 	bool ReleasePrefix(const FSuperSLMPrefix& Prefix);
+
+	// --- Paged KV (plugin paging plan §3.3, §3.5, §3.6). Additive; budget mode is opted into by
+	// FSuperSLMRuntimeConfig::SequenceBudget > 0. ---
+
+	// CreatePrefix() that reports by name (§3.6). Same admission as the bool overload above, plus,
+	// in budget mode, the page rule (UP-6): the build is charged R(max(Tokens.Num(), 1)) on region
+	// P before its job is enqueued, and refused KvPagesExhausted when P cannot take it. An empty
+	// token list is admitted in budget mode (begun with budget 1). OutError, when given, receives
+	// the reason.
+	ESuperSLMPrefixResult CreatePrefix(const TArray<int32>& Tokens, FSuperSLMPrefix& OutPrefix, FString* OutError = nullptr);
+
+	// A nested prefix (§3.3, sslm_prefix_begin_from): Parent's full pages are shared and Tokens are
+	// prefilled after it. Budget mode only (NestedRequiresBudgetMode otherwise). Parent must be live
+	// and frozen (ParentNotUsable otherwise), and is pinned from admission until the build's
+	// begin_from applies. Parent length + Tokens.Num() above the model's cap is Malformed. The
+	// child counts against PrefixBlockCount and is charged R(max(Tokens.Num(), 1)) on region P,
+	// settling at freeze to its private pages, ceil((Lp + T) / B) - floor(Lp / B).
+	ESuperSLMPrefixResult CreatePrefixFrom(const FSuperSLMPrefix& Parent, const TArray<int32>& Tokens, FSuperSLMPrefix& OutPrefix, FString* OutError = nullptr);
+
+	// RestoreSequence() with a sharing hint (§3.5, UP-10; sslm_seq_restore_shared). The hint is
+	// never a requirement: the restore shares Hint's full pages only when the engine's identity
+	// check passes, and is private otherwise. An invalid Hint is the overloads above. A hint on a
+	// whole-reserve ('SSB5') payload is ignored and pins nothing. The hinted prefix is pinned
+	// while the restore is queued or waiting. Copy and move forms, as above.
+	ESuperSLMRestoreResult RestoreSequence(
+		const TArray<uint8>& Blob,
+		USuperSLMModel* ExpectedModel,
+		const FSuperSLMPrefix& Hint,
+		FSuperSLMSequence& OutSequence,
+		FSuperSLMLifecycleOpHandle& OutHandle,
+		FString& OutError);
+	ESuperSLMRestoreResult RestoreSequence(
+		TArray<uint8>&& Blob,
+		USuperSLMModel* ExpectedModel,
+		const FSuperSLMPrefix& Hint,
+		FSuperSLMSequence& OutSequence,
+		FSuperSLMLifecycleOpHandle& OutHandle,
+		FString& OutError);
+
+	// The page ledger's regions and counters and the last applied job's pool snapshot (§3.2).
+	// Game-thread data only: no Layer-1 call. bPagedMode is false in legacy mode.
+	FSuperSLMKvPageStats GetKvPageStats() const;
 
 	// --- Diagnostics (§5.1; §9 R-S1b, R-S1e, R-S1g, R-S1i, R-S1j) ---
 
@@ -400,10 +463,27 @@ private:
 	// SuperSLMSchedulingTestAccess.h.
 	friend struct FSuperSLMSchedulingTestAccess;
 
+	// Test-only (WITH_DEV_AUTOMATION_TESTS): the paged-KV seams of plugin paging plan §3.9
+	// (SuperSLMPagedTestSeam.h).
+	friend struct FSuperSLMPagedTestSeam;
+
 	// Every Layer-1 handle, buffer, slot, and scheduler figure (SuperSLMSubsystem.cpp). Owned
 	// here and freed by Deinitialize()/BeginDestroy(); held by pointer so this reflected header
 	// includes no Layer-1 header.
 	FSuperSLMSubsystemState* State = nullptr;
+
+	// Plugin paging plan §3.7: the ledger faults of every state TearDown() has ended, so
+	// GetKvPageStats().LedgerFaults is cumulative across re-Configure(). Game thread.
+	uint64 PriorLedgerFaults = 0;
+
+	// Plugin paging plan §3.5 "When a lifecycle exit ends a wait" (step K3): the lifecycle-op
+	// handle ids a budget-mode teardown left Pending, held here, outside the per-Configure state.
+	// Each reads NotConfigured until ReleaseLifecycleOpHandle() erases it; Deinitialize() drops
+	// them all; the next Configure() starts its handle ids above the highest. Game thread.
+	TSet<int64> LifecycleTombstones;
+
+	// The first handle id a newly configured state may mint: above every tombstoned id, else 1.
+	int64 FirstHandleIdAfterTombstones() const;
 
 	/** The configured model, referenced so it is not collected while its mapping serves this subsystem's sequences. */
 	UPROPERTY(Transient)

@@ -4,6 +4,115 @@ All notable changes to SuperSLM-Unreal are recorded here. Versions follow the `V
 `Plugins/SuperSLMUnreal/SuperSLMUnreal.uplugin`. The plugin versions independently of SuperSLM; each entry
 names the SuperSLM release it vendors.
 
+## 1.2.0 - 2026-10-19
+
+**Vendored SuperSLM:** `v1.13.1` (`d697927f6d5ce5fa73ecbb8660020a425518b923`). This release also carries the 1.11.0 integration
+that was not released on its own, so it is the first release after 1.0.0.
+
+**Saves:** a save made by 1.0.x is refused by 1.2.0 with `Layer1Mismatch`, and the reverse, because
+the vendored SuperSLM release changed. See [PAGING.md](docs/PAGING.md#8-saves-across-releases).
+
+**Known issue:** on an AMD Radeon RX 7900 XTX with driver 32.0.23033.1002, the packaged example's
+rendering hangs the GPU even with no model loaded. The GPU backend's tests pass on that card
+without a renderer; running it beside Unreal's renderer there is not certified.
+
+### Changed
+
+- **SuperSLM 1.11.0.** Tokens are identical to 1.0's. What it brings to the plugin:
+  - SuperSLM 1.10.0's CPU speed-ups on AVX2 and AVX-512 CPUs: a tiled kernel for prefill calls of 8
+    or more tokens (see `MinPrefillChunk` below), faster attention and per-row steps in prefill and
+    decode, and a hardware SHA-256 for the model's load-time integrity hash on CPUs with the x86
+    SHA extensions. On AVX-512 CPUs the tiled kernel and the attention steps keep 1.0's code in this
+    build, because the plugin is compiled with MSVC or clang-cl, where SuperSLM leaves them off.
+  - SuperSLM 1.11.0's threaded decode is off by default; `bParallelDecode` (below) turns it on for
+    the CPU backend.
+  - A prefill call that fails before admitting a token now leaves the sequence's saturation counts
+    as they were before the call.
+  - A save made by 1.0 is refused on restore, by name, because it records a different SuperSLM tag.
+
+- **Prefill in chunks of 8 or more tokens** (CPU backend). A prefill job now carries at least
+  `MinPrefillChunk` prompt tokens (new `FSuperSLMRuntimeConfig` field, default 8) while the prompt
+  has that many left, so each prefill call reaches SuperSLM's tiled prefill kernel. A shorter tail
+  goes as one shorter job. Set `MinPrefillChunk` to 1 to restore 1.0's one-token prefill jobs.
+  Tokens are identical at every setting, and prefill stays on the worker thread.
+- **A batched prompt price.** Chunks of 8 or more tokens are priced with two new fields,
+  `BatchedPromptTokenCostMs` and `BatchedPromptTokenCostPerPositionMs`. With decode threading off
+  they default to 15.023 and 0.004791, measured on a Zen 2 desktop, against 33.583 and 0.004547 for
+  one token (with it on, 15.682 and 0.004437 against 22.108 and 0.005209). `SuperSLM.EstimateCosts`
+  measures them with a second prompt arm timed at 8 tokens per call.
+- **The cost defaults are two per-mode profiles.** Unset cost fields take the one-time measured
+  profile of the effective decode mode (off, or on with more than one finish task), from six
+  per-call capture blocks on one Zen 2 desktop with the 0.5B model. They are reasonable measured
+  starting costs, not certified ones. `LayerCostMs` is 1.397 with decode threading off and 0.906
+  with it on; `docs/ARCHITECTURE.md` lists all thirteen.
+- **`Configure()` reads a matching saved estimate.** When `Saved/SuperSLM/CalibratedCosts.ini`
+  holds a `SuperSLM.EstimateCosts` profile for the configured artifact, effective decode mode and
+  task count, its values price the cost fields the caller left unset. A profile with a missing,
+  non-finite or out-of-range value, or one that would put a job past the scheduler's tick limit
+  where the mode profile would not, is skipped with one warning.
+- **Changed, source-incompatible: `FSuperSLMRuntimeConfig`'s decode mode, task count and thirteen
+  cost fields are `TOptional`.** An assignment sets a field whatever its value, so a caller's
+  `false` or `4` overrides a saved setting. Each field resolves on its own: the caller's value,
+  else the running editor's `SetDecodeMode`/`SetFinishParallelTasks` choice, else the saved file, else
+  the shipped value or profile. Code that read these fields reads `FSuperSLMConfigureReport::Resolved`
+  or `USuperSLMSubsystem::GetResolvedConfig()` instead. `Configure()` logs
+  `SuperSLM: CPU Configure: bParallelDecode=<0|1> FinishParallelTasks=<n> cost profile=<caller|saved-estimate|mode-default> caller_cost_fields=<0..13>`.
+- **An overrun is now a job that took longer than its own planned ticks.** A job planned for K
+  ticks is not an overrun at tick 2. At K = 1 the rule is unchanged.
+- **Configure** refuses the two batched fields by name, as it refuses the one-token pair, and
+  refuses `MinPrefillChunk` below 1. It logs a warning when `MaxPrefillChunkBudget` or
+  `MinPrefillChunk` is below 8: prefill will not reach the tiled kernel.
+
+### Added
+
+- **Opt-in paged KV on both backends.** Positive `SequenceBudget` selects a shared page pool,
+  explicit shared/nested prefixes, per-sequence budget stops and restore headroom. Zero keeps
+  the existing mode. [PAGING.md](docs/PAGING.md) documents the API and compatibility rules.
+  On the GPU backend the whole page pool is one D3D12 buffer, so its size is capped at D3D12's
+  required single-resource size for the card: a quarter of its dedicated video memory, at most
+  2 GiB and at least 128 MiB. The largest GPU pool is therefore 2 GiB, or a quarter of video memory
+  on a card with less than 8 GiB. A larger pool is refused at `Configure()` with `KvPoolRefused`,
+  naming `SSLM_GPU_KV_POOL_TOO_LARGE` and the page count. The 50-NPC example's pool is 178.7 MiB.
+- **Measured CPU budget lifecycle defaults.** Adopt, full-cap restore and prefix Begin use
+  separate cap/mode profiles measured on the real 0.5B and 1.5B artifacts. All thirteen fields
+  retain caller-over-saved-over-default priority; legacy defaults are unchanged. Native
+  selection and release validation are still pending.
+
+- **`bParallelDecode`** on `FSuperSLMRuntimeConfig`, off by default: splits CPU one-row decode
+  projections through the finish hook. It takes effect only above one finish task, and the Insights
+  scope for the hook's tasks is `SuperSLM.ParallelTask`. Tokens are identical either way.
+- **`SuperSLM.SetDecodeMode 0|1 [--save]`** and **`SuperSLM.SetFinishParallelTasks <0..256> [--save]`**
+  console commands: they choose the CPU decode mode and finish task count for the next
+  `Configure()` that leaves them unset. `--save` keeps the choice in
+  `Saved/SuperSLM/RuntimeSettings.ini`, which later sessions, packaged games included, load. A
+  configuration already made keeps its settings.
+- **`SuperSLM.EstimateCosts "<ArtifactPath.sslm>" [--write-ini]`**, a console command that measures
+  both CPU decode modes on the machine it runs on (about 4-5 minutes for the 0.5B model) and prints
+  a `CALIBRATION ESTIMATE — not verified`: per-arm medians and spread, thirteen suggested costs per
+  mode rounded up, and the foreign CPU load it ran under. Desktop load is reported, never a reason to
+  stop. Only `--write-ini` writes `Saved/SuperSLM/CalibratedCosts.ini`.
+
+### Removed
+
+- The `SuperSLM.CalibrateCosts` console command, replaced by `SuperSLM.EstimateCosts`. A script
+  that calls the old name gets Unreal's unknown-command message; it is not an alias, because the old
+  command wrote its file without a flag.
+- The public header `SuperSLMCalibrateCostsCommand.h` (`EOutcome`, `GetLastOutcome`).
+- The idleness types and accessors in `SuperSLMCalibrationTestAccess.h`. The header keeps the fit
+  seams `BatchedArmDepthsForCap`, `FitBatchedArmFromSyntheticTimings` and `BatchedArmSkipValues`,
+  which now takes the decode mode.
+
+### Cost: waiting behind a prefill job
+
+With one worker lane (the default), a longer prefill job holds the lane longer. With no worker
+overrun, another sequence's reset, save, restore, prefix adoption or first prompt job can wait about
+250 ms longer at the start of a context and about 400 ms longer at depth 1000, at the default
+prices and any frame-rate budget; with worker continuation on, the added wait is about 505 ms and
+799 ms. The calibrated batched price shortens it. While the worker runs late, a request can wait
+behind up to one job per sequence slot and one per shared-prefix slot on its lane
+(`BlockCount + PrefixBlockCount`; 4 with the default settings), for those jobs' real run time.
+`MaxConcurrentCalls` 2 (a second lane) or `MinPrefillChunk` 1 shortens the wait.
+
 ## 1.0.0 - 2026-09-28
 
 First release. Unreal Engine 5.8. **Windows x64**, CPU and GPU (D3D12) backends. Linux x64 and

@@ -349,6 +349,9 @@ namespace SuperSLML2S2Fixtures
 			case ESuperSLMRestoreResult::Consumed: return TEXT("Consumed");
 			case ESuperSLMRestoreResult::ResetRequired: return TEXT("ResetRequired");
 			case ESuperSLMRestoreResult::OutOfMemory: return TEXT("OutOfMemory");
+			case ESuperSLMRestoreResult::KvPagesExhausted: return TEXT("KvPagesExhausted");
+			case ESuperSLMRestoreResult::KvModeMismatch: return TEXT("KvModeMismatch");
+			case ESuperSLMRestoreResult::ContextCapMismatch: return TEXT("ContextCapMismatch");
 		}
 		return TEXT("an unnamed result");
 	}

@@ -37,8 +37,8 @@ env:
   # The routine suite (CONTRIBUTING.md, Testing): every SuperSLM test and the example project's
   # own test (SuperSLMExample), less the one test that needs editor rendering on the reference GPU
   # (SuperSLM.L2S3.QueryWindow.GpuSliceDurationSweepWithRendering), which refuses by name under
-  # -nullrhi. The calibration groups (SuperSLM.U1.Calibration, SuperSLM.U1.Relevance) need an idle
-  # machine and are left out. CONTRIBUTING.md's command uses this same filter.
+  # -nullrhi. Historical calibration/relevance diagnostics exercise the retired idle-box claim;
+  # D4's estimate validation has its own ordered runs (CONTRIBUTING.md). This filter is unchanged.
   TEST_FILTER: SuperSLM.L2S0+SuperSLM.L2S1+SuperSLM.L2S2+SuperSLM.U1.Cpu+SuperSLM.U1.Gpu+SuperSLM.L2S3.AdapterSwitch+SuperSLM.L2S3.Blueprint+SuperSLM.L2S3.PreCheck+SuperSLM.L2S3.PromptResult+SuperSLM.L2S3.Query.+SuperSLM.L2S3.QueryWindow.Checkbox+SuperSLM.L2S3.QueryWindow.GpuQueryRunsWithinDrainBound+SuperSLM.L2S3.QueryWindow.InvariantHolds+SuperSLM.L2S3.MCP+SuperSLMExample
 
 jobs:

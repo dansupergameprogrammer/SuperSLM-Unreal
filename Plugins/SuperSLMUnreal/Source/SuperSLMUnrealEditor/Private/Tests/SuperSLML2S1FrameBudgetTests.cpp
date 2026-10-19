@@ -31,12 +31,9 @@
 //     prefix, 64 tokens each) via the shared helper; asserts all five properties against the
 //     resulting ledger.
 //   - PrefillAdvancesOneTokenPerTick: "a prefill job still advances at least one whole prompt
-//     token" (plan §5) -- now a per-JOB claim, not a per-GAME-TICK one (a prefill job's K can
-//     exceed 1 tick, so counting Prefilling-phase game ticks no longer corresponds to prompt
-//     tokens). Rewritten to read the ledger: every prefill job advances exactly one whole prompt
-//     token (PromptTokenCostMs alone already exceeds the default headroom share on this box, so
-//     the static cost model can never fit two in one job), and the number of prefill jobs equals
-//     the prompt's own token count.
+//     token" (plan §5) -- a per-JOB claim, read from the ledger. Slice 1P restates it: at the
+//     shipped chunk floor every prefill job advances min(8, tokens left) and the job count is
+//     ceil(tokens / 8); at MinPrefillChunk 1, 1.0's one token per job and one job per token.
 //   - RecycledResetAdoptMeasured: cycles generations through a 2-sequence pool; waits for each
 //     returned sequence's queued Reset to appear as delivered in the job ledger before reading
 //     GetLastResetMs(), then reports it (AddInfo) beside the importer's prediction. The returned
@@ -75,7 +72,13 @@ using namespace SuperSLML2S1Fixtures;
 
 namespace
 {
-	constexpr double kTickBudgetMs = 16.6; // one 60 Hz frame -- the plan's own worked cadence throughout §5/§8
+	// 9.P-13 re-runs R-S1b(ii) and R-S1g at 8.0 and 1000 ms: SUPERSLM_L2S1_TICK_BUDGET_MS sets this
+	// file's budget for one run. Unset, it is 16.6, one 60 Hz frame -- the plan's own worked cadence throughout §5/§8.
+	const double kTickBudgetMs = []
+	{
+		const FString Value = FPlatformMisc::GetEnvironmentVariable(TEXT("SUPERSLM_L2S1_TICK_BUDGET_MS")).TrimStartAndEnd();
+		return Value.IsEmpty() ? 16.6 : FCString::Atod(*Value);
+	}();
 
 	// Three-way, not a bool: "A-EX is absent" (T-2805 L23 repair: fails the cell by name via
 	// AddError, never a silent skip) and "A-EX is present but failed to import" (a genuine test
@@ -170,8 +173,8 @@ bool FSuperSLML2S1FrameBudgetConcurrentTest::RunTest(const FString& Parameters)
 		{
 			++AdoptJobCount;
 			bOk &= TestTrue(*FString::Printf(TEXT("AdoptPrefix job %lld: PlannedJobMs must equal Config.AdoptCostMs (%.6f ms) exactly, not a measured/p99/Sequence-Lifecycle-Budget figure"),
-					Job.JobId, ConfigUsed.AdoptCostMs),
-				FMath::IsNearlyEqual(Job.PlannedJobMs, ConfigUsed.AdoptCostMs, 1e-9));
+					Job.JobId, SuperSLMConfigAccess::GetCost(ConfigUsed, TEXT("AdoptCostMs"))),
+				FMath::IsNearlyEqual(Job.PlannedJobMs, SuperSLMConfigAccess::GetCost(ConfigUsed, TEXT("AdoptCostMs")), 1e-9));
 		}
 	}
 	bOk &= TestEqual(TEXT("exactly 8 AdoptPrefix jobs must appear in the ledger, one per sequence"), AdoptJobCount, 8);
@@ -190,13 +193,16 @@ bool FSuperSLML2S1FrameBudgetConcurrentTest::RunTest(const FString& Parameters)
 	return bOk;
 }
 
-// D-SLM7407/D-SLM7414: prefill is now a per-JOB claim, not a per-GAME-TICK one. A prompt token's
-// own PromptTokenCostMs (46.0 ms default) already exceeds this cell's headroom share (0.7 x 16.6
-// = 11.62 ms), so the static cost model can never fit two whole prompt tokens into one job's
-// planned cost -- but a prefill job's own K can span several game ticks before it delivers, so
-// counting how many game ticks the sequence spends in Prefilling no longer equals the prompt's
-// token count (round 8 and earlier rounds' own per-tick counting loop is retired). This cell now
-// reads the ledger directly.
+// D-SLM7407/D-SLM7414: prefill is a per-JOB claim, not a per-GAME-TICK one: a prefill job's own K
+// can span several game ticks before it delivers, so this cell reads the ledger.
+//
+// Slice 1P (SuperSLM tiled-matmul plan §4A.1 item 1, rev 11.1 amendment; 9.P-14): restated. The
+// name is kept so the gate filter still finds it. With the shipped chunk floor (MinPrefillChunk 8)
+// a prefill job carries min(8, tokens left) prompt tokens, not one: at 16.6 ms one prompt token
+// (36 ms) already exceeds the share (0.7 x 16.6 = 11.62 ms), so the planner's own growth stops at
+// 1 and the floor raises every chunk to 8, and the job count is ceil(tokens / 8). At
+// MinPrefillChunk 1 the 1.0 assertions hold unchanged: one token per job, as many jobs as tokens.
+// Floor-on precondition (rev 11.1 audit F9): the ledger shows at least one prefill job of exactly 8.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FSuperSLML2S1FrameBudgetPrefillAdvancesOneTokenPerTickTest,
 	"SuperSLM.L2S1.FrameBudget.PrefillAdvancesOneTokenPerTick",
@@ -226,89 +232,120 @@ bool FSuperSLML2S1FrameBudgetPrefillAdvancesOneTokenPerTickTest::RunTest(const F
 		return false;
 	}
 
-	FSuperSLMRuntimeConfig Config;
-	Config.MaxSequencesPerDecodeCall = 1;
-	// A single whole prompt token through all 24 layers is well above 16.6 ms (T-2815 §11.1's own
-	// 46.0 ms median), so a generous chunk budget does not change the composition the static cost
-	// model actually picks -- this cell reads what the ledger actually reports, never assumes.
-	Config.MaxPrefillChunkBudget = 64;
-	Config.MaxLayerBudget = 24;
-	Config.BlockCount = 1;
-	Config.SequenceLifecycleBudgetMs = 1000.0;
-	Config.TickBudgetMs = kTickBudgetMs;
-	if (!TestTrue(TEXT("configured prompt intercept alone exceeds half the available share"),
-		Config.PromptTokenCostMs > Config.TickBudgetMs * Config.BudgetHeadroom * 0.5)) { return false; }
-
-	if (!TestEqual(TEXT("Configure() result"), (uint8)Subsystem->Configure(Model, Config).Result, (uint8)ESuperSLMConfigureResult::Success))
+	// One run at a given floor: the prefill jobs' prompt-token counts, in ledger (post) order.
+	auto RunOnce = [this, Subsystem, Model](int32 MinPrefillChunk, TArray<int32>& OutPromptTokens, TArray<int32>& OutChunks) -> bool
 	{
-		return false;
-	}
-
-	// A deliberately longer prompt (well above one token) so the correspondence between prefill
-	// jobs and prompt length is unambiguous.
-	TArray<int32> PromptTokens;
-	if (!TestTrue(TEXT("Tokenize"), Subsystem->Tokenize(
-			TEXT("Please describe, in detail, the kind of customer who walks into a tattoo shop on a slow Tuesday afternoon."),
-			PromptTokens)))
-	{
-		return false;
-	}
-	if (!TestTrue(TEXT("the prompt must be more than one token, or this cell cannot discriminate one-token-per-job from all-at-once"),
-			PromptTokens.Num() > 1))
-	{
-		return false;
-	}
-
-	FSuperSLMSequence Seq;
-	if (!TestEqual(TEXT("Vend sequence"), (uint8)Subsystem->VendSequence(Seq), (uint8)ESuperSLMVendResult::Success))
-	{
-		return false;
-	}
-
-	FSuperSLMGenerationRequest Request;
-	Request.PromptTokens = PromptTokens;
-	Request.MaxNewTokens = 1; // this cell only needs to observe prefill, not the decode that follows
-	FString BeginError;
-	const bool bBeginOk = Subsystem->BeginGeneration(Seq, Request, BeginError);
-	if (!TestTrue(*FString::Printf(TEXT("BeginGeneration: %s"), *BeginError), bBeginOk))
-	{
-		return false;
-	}
-
-	DrainTicks(*Subsystem, 1.0f / 60.0f, EL2S1DrainPacing::FastAsPossible,
-		[Subsystem, &Seq]()
+		FSuperSLMRuntimeConfig Config; // default-constructed: the shipped floor and prices
+		Config.MaxSequencesPerDecodeCall = 1;
+		Config.MaxPrefillChunkBudget = 64;
+		Config.MaxLayerBudget = 24;
+		Config.BlockCount = 1;
+		Config.SequenceLifecycleBudgetMs = 1000.0;
+		Config.TickBudgetMs = kTickBudgetMs;
+		if (MinPrefillChunk > 0)
 		{
-			const ESuperSLMSequencePhase Phase = Subsystem->GetPhase(Seq);
-			return Phase == ESuperSLMSequencePhase::Complete || Phase == ESuperSLMSequencePhase::Faulted;
-		},
-		/*MaxWallClockSeconds*/ 60.0);
-	Subsystem->ReturnSequence(Seq);
-
-	const TArray<FSuperSLMWorkerJobReport>& Ledger = Subsystem->GetJobLedger();
-	int32 PrefillJobCount = 0;
-	bool bOk = true;
-	for (const FSuperSLMWorkerJobReport& Job : Ledger)
-	{
-		if (Job.Kind == ESuperSLMWorkerJobKind::DecodeOrPrefill && Job.PromptTokens > 0)
-		{
-			++PrefillJobCount;
-			// D-SLM7414: "a prefill job still advances at least one whole prompt token" -- on
-			// this box, at the default headroom share, PromptTokenCostMs alone already exceeds
-			// the share, so the static cost model can never fit a second token in the same job.
-			bOk &= TestEqual(*FString::Printf(TEXT("prefill job %lld must advance exactly one whole prompt token"), Job.JobId),
-				Job.PromptTokens, 1);
-			bOk &= TestEqual(*FString::Printf(TEXT("prefill job %lld must run no decode layers and no finish"), Job.JobId),
-				Job.DecodeLayers + Job.TokenFinishes, 0);
+			Config.MinPrefillChunk = MinPrefillChunk;
 		}
+		if (!TestTrue(TEXT("configured prompt intercept alone exceeds half the available share"),
+			SuperSLMConfigAccess::GetCost(Config, TEXT("PromptTokenCostMs")) > Config.TickBudgetMs * Config.BudgetHeadroom * 0.5)) { return false; }
+		if (!TestEqual(TEXT("Configure() result"), (uint8)Subsystem->Configure(Model, Config).Result, (uint8)ESuperSLMConfigureResult::Success))
+		{
+			return false;
+		}
+		if (OutPromptTokens.Num() == 0)
+		{
+			// A deliberately longer prompt (well above 8 tokens) so both one-token jobs and 8-token
+			// chunks are unambiguous, and the last chunk may be a shorter tail.
+			if (!TestTrue(TEXT("Tokenize"), Subsystem->Tokenize(
+					TEXT("Please describe, in detail, the kind of customer who walks into a tattoo shop on a slow Tuesday afternoon."),
+					OutPromptTokens)))
+			{
+				return false;
+			}
+		}
+		if (!TestTrue(TEXT("the prompt must be more than 8 tokens, or this cell cannot tell a chunk of 8 from the whole prompt"),
+				OutPromptTokens.Num() > 8))
+		{
+			return false;
+		}
+		FSuperSLMSequence Seq;
+		if (!TestEqual(TEXT("Vend sequence"), (uint8)Subsystem->VendSequence(Seq), (uint8)ESuperSLMVendResult::Success))
+		{
+			return false;
+		}
+		FSuperSLMGenerationRequest Request;
+		Request.PromptTokens = OutPromptTokens;
+		Request.MaxNewTokens = 1; // this cell only needs to observe prefill, not the decode that follows
+		FString BeginError;
+		const bool bBeginOk = Subsystem->BeginGeneration(Seq, Request, BeginError);
+		if (!TestTrue(*FString::Printf(TEXT("BeginGeneration: %s"), *BeginError), bBeginOk))
+		{
+			return false;
+		}
+		DrainTicks(*Subsystem, 1.0f / 60.0f, EL2S1DrainPacing::FastAsPossible,
+			[Subsystem, &Seq]()
+			{
+				const ESuperSLMSequencePhase Phase = Subsystem->GetPhase(Seq);
+				return Phase == ESuperSLMSequencePhase::Complete || Phase == ESuperSLMSequencePhase::Faulted;
+			},
+			/*MaxWallClockSeconds*/ 60.0);
+		Subsystem->ReturnSequence(Seq);
+		bool bRunOk = true;
+		for (const FSuperSLMWorkerJobReport& Job : Subsystem->GetJobLedger())
+		{
+			if (Job.Kind == ESuperSLMWorkerJobKind::DecodeOrPrefill && Job.PromptTokens > 0)
+			{
+				OutChunks.Add(Job.PromptTokens);
+				bRunOk &= TestEqual(*FString::Printf(TEXT("floor %d: prefill job %lld must run no decode layers and no finish"), MinPrefillChunk, Job.JobId),
+					Job.DecodeLayers + Job.TokenFinishes, 0);
+			}
+		}
+		return bRunOk;
+	};
+
+	TArray<int32> PromptTokens;
+	bool bOk = true;
+
+	// --- The shipped floor (a default-constructed config: MinPrefillChunk 8) ---
+	TArray<int32> Chunks;
+	if (!RunOnce(/*MinPrefillChunk: the default*/ 0, PromptTokens, Chunks))
+	{
+		return false;
 	}
+	const int32 N = PromptTokens.Num();
+	if (!TestTrue(TEXT("floor-on precondition: the ledger shows a prefill job of exactly 8 prompt tokens"), Chunks.Contains(8)))
+	{
+		return false;
+	}
+	int32 Consumed = 0;
+	for (int32 I = 0; I < Chunks.Num(); ++I)
+	{
+		const int32 Expected = FMath::Min(8, N - Consumed);
+		bOk &= TestEqual(*FString::Printf(TEXT("floor 8: prefill job %d advances min(8, %d left) prompt tokens"), I, N - Consumed), Chunks[I], Expected);
+		Consumed += Chunks[I];
+	}
+	bOk &= TestEqual(TEXT("floor 8: the prefill jobs cover the prompt exactly"), Consumed, N);
+	bOk &= TestEqual(TEXT("floor 8: the prefill job count is ceil(tokens / 8)"), Chunks.Num(), (N + 7) / 8);
+	AddInfo(FString::Printf(TEXT("R-S1b: floor 8: %d prefill jobs for a %d-token prompt"), Chunks.Num(), N));
 
-	AddInfo(FString::Printf(TEXT("R-S1b: %d prefill jobs for a %d-token prompt"), PrefillJobCount, PromptTokens.Num()));
-
-	// A scheduler that (incorrectly) prefills the WHOLE prompt in one job reports a job count of
-	// 1, not PromptTokens.Num(); one that stalls (never advancing) never reaches
-	// Decoding/Complete/Faulted within the tick cap, and this loop times out with an empty ledger.
-	bOk &= TestEqual(TEXT("prefill job count must equal the prompt's own token count (one whole token per job)"),
-		PrefillJobCount, PromptTokens.Num());
+	// --- MinPrefillChunk 1: 1.0's assertions, unchanged ---
+	TArray<int32> OneTokenChunks;
+	if (!RunOnce(1, PromptTokens, OneTokenChunks))
+	{
+		return false;
+	}
+	for (int32 I = 0; I < OneTokenChunks.Num(); ++I)
+	{
+		// D-SLM7414: "a prefill job still advances at least one whole prompt token" -- at the default
+		// headroom share, PromptTokenCostMs alone already exceeds the share, so the static cost model
+		// can never fit a second token in the same job.
+		bOk &= TestEqual(*FString::Printf(TEXT("floor 1: prefill job %d must advance exactly one whole prompt token"), I), OneTokenChunks[I], 1);
+	}
+	// A scheduler that prefills the WHOLE prompt in one job reports a job count of 1, not N; one that
+	// stalls never reaches Complete/Faulted within the cap, and the ledger holds no prefill job.
+	bOk &= TestEqual(TEXT("floor 1: prefill job count must equal the prompt's own token count (one whole token per job)"),
+		OneTokenChunks.Num(), N);
+	AddInfo(FString::Printf(TEXT("R-S1b: floor 1: %d prefill jobs for a %d-token prompt"), OneTokenChunks.Num(), N));
 	return bOk;
 }
 
@@ -444,8 +481,8 @@ bool FSuperSLML2S1FrameBudgetRecycledResetAdoptTest::RunTest(const FString& Para
 		{
 			++ResetJobCount;
 			bOk &= TestTrue(*FString::Printf(TEXT("Reset job %lld: PlannedJobMs must equal Config.ResetCostMs (%.6f ms) exactly"),
-					Job.JobId, Config.ResetCostMs),
-				FMath::IsNearlyEqual(Job.PlannedJobMs, Config.ResetCostMs, 1e-9));
+					Job.JobId, SuperSLMConfigAccess::GetCost(Config, TEXT("ResetCostMs"))),
+				FMath::IsNearlyEqual(Job.PlannedJobMs, SuperSLMConfigAccess::GetCost(Config, TEXT("ResetCostMs")), 1e-9));
 		}
 	}
 	bOk &= TestEqual(TEXT("exactly 6 Reset jobs must appear in the ledger, one per generation"), ResetJobCount, GenerationCount);

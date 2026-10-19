@@ -20,6 +20,7 @@ public class SuperSLMUnreal : ModuleRules
 	public SuperSLMUnreal(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+		bWarningsAsErrors = true;
 
 		// Layer 1 forbids implicit FP contraction: its scalar/SIMD-tier bit-equality depends
 		// on exact mul-then-add rounding (SuperSLM's own design, §6/§13; this plugin's own plan §2.1
@@ -113,6 +114,17 @@ public class SuperSLMUnreal : ModuleRules
 		// version, read from the .uplugin descriptor so the report cannot drift from it.
 		string PluginVersion = ReadPluginVersionName();
 		PrivateDefinitions.Add("SUPERSLM_PLUGIN_VERSION=\"" + PluginVersion + "\"");
+
+		// Plugin paging plan §3.9 (step K2): the page ledger core's test hooks
+		// (Private/Core/SuperSLMPageLedgerCore.h) follow the automation-test switch, so
+		// FSuperSLMPagedTestSeam::ForceUnderCharge() reaches the core in Development builds and the
+		// hooks compile out of Shipping. The core reads the macro with #if, so it must expand to a
+		// value: UnrealBuildTool defines WITH_DEV_AUTOMATION_TESTS (0 or 1) as a global definition
+		// on every module's compile command line (UEBuildTarget.cs, GlobalCompileEnvironment), so it
+		// is defined before any header and does not depend on the PCH. Never define
+		// WITH_DEV_AUTOMATION_TESTS here: it would collide with UBT's. A fallback, if one is ever
+		// needed, defines SUPERSLM_PAGE_LEDGER_TEST_HOOKS itself per configuration.
+		PrivateDefinitions.Add("SUPERSLM_PAGE_LEDGER_TEST_HOOKS=WITH_DEV_AUTOMATION_TESTS");
 
 		// L2-S2 (plan §7 item 11): the shipped self-check reference digests (one JSON file per
 		// artifact the plugin ships a reference for), staged with every packaged build.

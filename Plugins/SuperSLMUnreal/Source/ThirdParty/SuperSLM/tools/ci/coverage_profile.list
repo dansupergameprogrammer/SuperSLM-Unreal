@@ -1,0 +1,7 @@
+# The Linux coverage job checks out project sources outside /usr.
+# System-header functions (including SIMD intrinsics and STL templates) are
+# absent from the project coverage report but otherwise get hot atomic counters.
+# Keep every project source, header and test instrumented; omit only system code.
+[clang]
+source:/usr/*=forbid
+default:allow

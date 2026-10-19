@@ -205,3 +205,19 @@ def test_all_pinned_files_at_floor_is_ok(tmp_path, monkeypatch, capsys):
     assert exit_code == 0
     assert err == ""
     assert "OK -- 1 file(s) at or above their pinned floor" in out
+
+
+def test_record_describes_current_cell_without_rewriting_pinned_provenance(tmp_path, monkeypatch):
+    floors = tmp_path / "pinned.json"
+    original = '{"_measured_cell": "historical full suite", "src/a.cpp": 50.0}'
+    floors.write_text(original)
+    monkeypatch.setattr(chk, "_FLOORS_PATH", str(floors))
+    export = _write_export(tmp_path, {"src/a.cpp": 60.0})
+    artifact = tmp_path / "measured.json"
+    monkeypatch.setattr(sys, "argv", ["gate", "--record-floors-to", str(artifact),
+                                     "--measured-cell", "current routine selection", export])
+    assert chk.main() == 0
+    recorded = json.loads(artifact.read_text())
+    assert recorded["_measured_cell"] == "current routine selection"
+    assert recorded["src/a.cpp"] == 60.0
+    assert floors.read_text() == original

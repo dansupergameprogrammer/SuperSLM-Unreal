@@ -8,6 +8,14 @@
 tests/golden/**  -text
 *.sslm  binary
 
+# The paged-KV references (tests/paged-kv/reference/*.ref) carry the sha256 of the fixture they
+# were recorded against, and the cells compare it and every record's digests byte for byte; a
+# CRLF checkout made the sha read with a trailing '\r' and every reference cell false-fail under
+# POSIX. LF on every checkout (the reader strips a '\r' as well; R0.self.ref_crlf). The pinned
+# blobs beside them (reference/pins/*.zrl) are bytes, never text.
+*.ref  text eol=lf
+*.zrl  binary
+
 # Source: normalized to LF in the repo, tool-native on checkout.
 *.h    text
 *.cpp  text
@@ -31,3 +39,12 @@ tests/golden/**  -text
 # T-2814: the recorded dumpbin read that tests/t2807-api-slot/consumed_symbols.txt is generated from, and
 # whose SHA-256 its header states. Byte-exact on every platform.
 tests/t2807-api-slot/recorded/*.tsv  -text
+
+# Generated golden-pin headers claim byte-for-byte regeneration by their
+# generators, which emit LF; pin them to LF so a Windows checkout matches.
+tests/attn_rowsite_golden_pin.h   text eol=lf
+tests/matmul_tiled_golden_pin.h   text eol=lf
+
+# The pre-SLM5 GPU base the T-2899 suite compiles (five files of commit ccf87c1, hashed by their manifest): byte-exact on
+# every platform, so a checkout and `git archive` keep the bytes the manifest's SHA-256 values describe.
+tests/t2899-schema-deadend-red-suite/pristine_pre_slm5/** -text

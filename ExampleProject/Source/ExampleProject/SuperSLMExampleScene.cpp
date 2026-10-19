@@ -31,6 +31,7 @@
 #include "SuperSLMGpuSubsystem.h"
 #include "SuperSLMModel.h"
 #include "SuperSLMSubsystem.h"
+#include "SuperSLMPagingCertification.h"
 #include "UObject/SoftObjectPath.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogSuperSLMExample, Log, All);
@@ -111,6 +112,8 @@ void ASuperSLMExampleScene::OnModelPackageLoaded(EAsyncLoadingResult::Type Resul
 		LoadState = ELoadState::Failed;
 		Status = FString::Printf(TEXT("No model asset at %s. Import the release's example .sslm there (see GETTING_STARTED.md, \"The example project\")."), *ModelPath);
 		UE_LOG(LogSuperSLMExample, Error, TEXT("%s"), *Status);
+		FString PagingBackend;
+		if (FParse::Value(FCommandLine::Get(), TEXT("SuperSLMPagingCertification="), PagingBackend)) { FPlatformMisc::RequestExitWithStatus(false, 1); }
 		return;
 	}
 	UGameInstance* GameInstance = GetGameInstance();
@@ -121,6 +124,24 @@ void ASuperSLMExampleScene::OnModelPackageLoaded(EAsyncLoadingResult::Type Resul
 		LoadState = ELoadState::Failed;
 		Status = TEXT("The SuperSLM CPU subsystem is missing; is the SuperSLMUnreal plugin enabled?");
 		UE_LOG(LogSuperSLMExample, Error, TEXT("%s"), *Status);
+		return;
+	}
+	FString PagingBackend;
+	if (FParse::Value(FCommandLine::Get(), TEXT("SuperSLMPagingCertification="), PagingBackend))
+	{
+		int32 ModelCap = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("SuperSLMPagingModelCap="), ModelCap);
+		if ((PagingBackend != TEXT("CPU") && PagingBackend != TEXT("GPU"))
+			|| (ModelCap != 4096 && ModelCap != 32768))
+		{
+			Status = TEXT("Paging certification requires CPU or GPU and an explicit model cap of 4096 or 32768.");
+			LoadState = ELoadState::Failed;
+			FPlatformMisc::RequestExitWithStatus(false, 1);
+			return;
+		}
+		PagingCertification = MakeShared<FSuperSLMPagingCertification>(*Model, *Cpu, Gpu, PagingBackend == TEXT("GPU"), ModelCap, ModelPath);
+		LoadState = ELoadState::Ready;
+		Status = TEXT("Running the unattended 50-NPC paging certification; raw progress is written under Saved/SuperSLMPagingCertification.");
 		return;
 	}
 	Demo = MakeUnique<FSuperSLMExampleDemo>(*Model, *Cpu, Gpu);
@@ -137,6 +158,7 @@ void ASuperSLMExampleScene::EndPlay(const EEndPlayReason::Type EndPlayReason)
 		GEngine->GameViewport->RemoveViewportWidgetContent(Widget.ToSharedRef());
 	}
 	Widget.Reset();
+	PagingCertification.Reset();
 	if (Demo.IsValid())
 	{
 		// Nothing waits: a pending BeginConfigure() callback finds the demo gone and does nothing,
@@ -237,6 +259,11 @@ bool ASuperSLMExampleScene::RequestSelfCheck()
 void ASuperSLMExampleScene::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
+	if (PagingCertification.IsValid())
+	{
+		PagingCertification->Tick(DeltaSeconds);
+		return;
+	}
 
 	if (!bInputConfigured)
 	{

@@ -11,6 +11,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Guid.h"
 #include "Misc/OutputDevice.h"
+#include "Misc/OutputDeviceRedirector.h"
 #include "Misc/Paths.h"
 #include "SuperSLMCalibrateCostsCommand.h"
 #include "SuperSLMCalibrationTestAccess.h"
@@ -229,8 +230,9 @@ namespace
 	bool Invoke(FAutomationTestBase& Test, const FString& Artifact)
 	{
 		const FString Command = FString::Printf(TEXT("SuperSLM.CalibrateCosts \"%s\""), *Artifact);
-		return Test.TestTrue(TEXT("calibration command registered"),
-			IConsoleManager::Get().ProcessUserConsoleInput(*Command, *GLog, nullptr));
+		const bool bInvoked = IConsoleManager::Get().ProcessUserConsoleInput(*Command, *GLog, nullptr);
+		GLog->Flush(); // deliver buffered observations before the unchanged log assertions read them
+		return Test.TestTrue(TEXT("calibration command registered"), bInvoked);
 	}
 
 	bool UnchangedFile(FAutomationTestBase& Test, bool bExisted, const TArray<uint8>& Before)
@@ -516,6 +518,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMU1CalibrationHealthyMustAcceptTest,
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMU1CalibrationHealthyMustAcceptTest::RunTest(const FString& Parameters)
 {
+	FSuperSLMLegacyCalibrationScope CommandScope;
 	FString Artifact, Reason;
 	if (!TestTrue(TEXT("A-EX present for real calibration"), TryGetAExArtifactPath(Artifact, Reason))) { return false; }
 	FOverridesGuard Overrides;
@@ -595,6 +598,31 @@ bool FSuperSLMU1CalibrationHealthyMustAcceptTest::RunTest(const FString& Paramet
 			Matches == 1 && FMath::IsFinite(Value) &&
 			(FString(Key).Contains(TEXT("PerPosition")) ? Value >= 0.0 : Value > 0.0));
 	}
+	// Slice 1P item 3: at A-EX's cap (4096 >= 33) the batched arm runs and writes its pair once,
+	// with the batched intercept no higher than the chunk-1 one (the arm's own premise check).
+	{
+		auto ReadKey = [&Lines](const TCHAR* Key, int32& OutMatches) -> double
+		{
+			const FString Prefix = FString(Key) + TEXT("=");
+			double Value = 0.0;
+			OutMatches = 0;
+			for (const FString& Line : Lines)
+			{
+				if (Line.StartsWith(Prefix)) { ++OutMatches; Value = FCString::Atod(*Line.Mid(Prefix.Len())); }
+			}
+			return Value;
+		};
+		int32 BatchedMatches = 0, BatchedSlopeMatches = 0, Chunk1Matches = 0;
+		const double Batched = ReadKey(TEXT("BatchedPromptTokenCostMs"), BatchedMatches);
+		const double BatchedSlope = ReadKey(TEXT("BatchedPromptTokenCostPerPositionMs"), BatchedSlopeMatches);
+		const double Chunk1 = ReadKey(TEXT("PromptTokenCostMs"), Chunk1Matches);
+		bOk &= TestTrue(TEXT("BatchedPromptTokenCostMs occurs once, finite and positive"),
+			BatchedMatches == 1 && FMath::IsFinite(Batched) && Batched > 0.0);
+		bOk &= TestTrue(TEXT("BatchedPromptTokenCostPerPositionMs occurs once, finite and non-negative"),
+			BatchedSlopeMatches == 1 && FMath::IsFinite(BatchedSlope) && BatchedSlope >= 0.0);
+		bOk &= TestTrue(*FString::Printf(TEXT("batched intercept %.6f ms does not exceed the chunk-1 intercept %.6f ms"), Batched, Chunk1),
+			Chunk1Matches == 1 && Batched <= Chunk1);
+	}
 	bOk &= CheckValueLog(*this, Log, false);
 	bOk &= CheckDepthLogs(*this, Log, 4096, true, false);
 	const int32 BoxLogicalProcessors = static_cast<int32>(::GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
@@ -618,6 +646,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMU1CalibrationPreWindowMustRejectTest,
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMU1CalibrationPreWindowMustRejectTest::RunTest(const FString& Parameters)
 {
+	FSuperSLMLegacyCalibrationScope CommandScope;
 	return RunRefusal(*this, EConstruction::Pre);
 }
 
@@ -626,6 +655,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMU1CalibrationWorkloadStartMustRejectTe
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMU1CalibrationWorkloadStartMustRejectTest::RunTest(const FString& Parameters)
 {
+	FSuperSLMLegacyCalibrationScope CommandScope;
 	return RunRefusal(*this, EConstruction::ThroughReturn);
 }
 
@@ -634,6 +664,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMU1CalibrationWorkloadInteriorMustRejec
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMU1CalibrationWorkloadInteriorMustRejectTest::RunTest(const FString& Parameters)
 {
+	FSuperSLMLegacyCalibrationScope CommandScope;
 	return RunRefusal(*this, EConstruction::Interior);
 }
 
@@ -642,6 +673,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMU1CalibrationForeignOwnerMustRejectTes
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMU1CalibrationForeignOwnerMustRejectTest::RunTest(const FString& Parameters)
 {
+	FSuperSLMLegacyCalibrationScope CommandScope;
 	return RunLockRefusal(*this, ELockConstruction::DifferentToken);
 }
 
@@ -650,6 +682,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMU1CalibrationMissingOwnerMustRejectTes
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMU1CalibrationMissingOwnerMustRejectTest::RunTest(const FString& Parameters)
 {
+	FSuperSLMLegacyCalibrationScope CommandScope;
 	return RunLockRefusal(*this, ELockConstruction::MissingMarker);
 }
 
@@ -658,6 +691,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMU1CalibrationRefusedRealMediansTest,
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMU1CalibrationRefusedRealMediansTest::RunTest(const FString& Parameters)
 {
+	FSuperSLMLegacyCalibrationScope CommandScope;
 	FString Artifact, Reason;
 	if (!TestTrue(TEXT("A-EX present"), TryGetAExArtifactPath(Artifact, Reason))) { return false; }
 	FOwnerMarkerGuard Marker(*this);

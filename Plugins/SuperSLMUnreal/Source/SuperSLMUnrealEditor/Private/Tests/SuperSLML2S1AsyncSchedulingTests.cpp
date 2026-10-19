@@ -17,7 +17,8 @@
 //   every §5.1 CPU scope with a real instance count bounded by the product's own job ledger and
 //   tick history, every §5.1 counter with a real sample checked against a reading taken outside
 //   the trace, Plan/Apply and WorkerJob placed on their threads and read against each other, and
-//   the U1 FinishTask arm on an engine task thread. Its channel-off twin
+//   the U1 ParallelTask arm on an engine task thread. D4 restates the R-S1h name from
+//   SuperSLM.FinishTask to SuperSLM.ParallelTask in this same change. Its channel-off twin
 //   (InsightsMarkupAbsentWhenChannelOff) runs the same assertions and must see every one fail.
 //   Rebuilt at L4 (2026-09-25); the withdrawn byte scan (D-SLM7502/D-SLM7507) is not used.
 //
@@ -95,7 +96,13 @@ using namespace SuperSLML2S1Fixtures;
 
 namespace
 {
-	constexpr double kTickBudgetMs = 16.6;
+	// 9.P-13 re-runs R-S1b(ii) and R-S1g at 8.0 and 1000 ms: SUPERSLM_L2S1_TICK_BUDGET_MS sets this
+	// file's budget for one run. Unset, it is 16.6.
+	const double kTickBudgetMs = []
+	{
+		const FString Value = FPlatformMisc::GetEnvironmentVariable(TEXT("SUPERSLM_L2S1_TICK_BUDGET_MS")).TrimStartAndEnd();
+		return Value.IsEmpty() ? 16.6 : FCString::Atod(*Value);
+	}();
 
 	enum class EAExAvailability { Absent, ImportFailed, Ready };
 
@@ -156,12 +163,12 @@ namespace
 	// therefore the names production writes; there is no corrupted-name commissioning branch here.
 	//
 	// ONE NAME COLLISION, FOUND BY THIS REBUILD (routed, not fixed here): SuperSLMFinishHook.cpp
-	// passes "SuperSLM.FinishTask" as the ParallelFor DEBUG NAME as well as its own scope name.
+	// passes "SuperSLM.ParallelTask" as the ParallelFor DEBUG NAME as well as its own scope name.
 	// ParallelFor's executor opens TRACE_CPUPROFILER_EVENT_SCOPE_TEXT(DebugName) on the CPU channel
 	// alone (Async/ParallelFor.h), so an executor scope of the same name appears with SuperSLMChannel
-	// OFF, and TraceServices merges both into one timer. A name count of SuperSLM.FinishTask cannot
+	// OFF, and TraceServices merges both into one timer. A name count of SuperSLM.ParallelTask cannot
 	// tell the plugin's markup from the engine's, and would pass the channel-off control. The grader
-	// therefore counts only FinishTask events whose DIRECT PARENT is the ParallelFor executor scope
+	// therefore counts only ParallelTask events whose DIRECT PARENT is the ParallelFor executor scope
 	// (plan §5.1: "inside UE's own ParallelFor scope"), and kFinishParallelForDebugName must track the
 	// debug name SuperSLMFinishHook.cpp passes. The U1 arm this replaces could not tell them apart,
 	// and it compared TraceServices thread ids (the trace's own ids, MiscTraceAnalysis.cpp
@@ -175,7 +182,10 @@ namespace
 	// default 36 ms a single token exceeds the tick's share (16.6 ms x 0.7), so every prefill call
 	// carried one token -- 84 tokens over 84 calls -- and the PrefillChunk bracket could not tell a
 	// per-token count from a per-call one. At 1 ms (and no per-position term) a chunk is up to 11
-	// tokens, so calls carry several.
+	// tokens, so calls carry several. Slice 1P: the chunk floor (8) alone now gives multi-token
+	// calls at the default, and chunks of 8 or more are priced with the batched pair, so the
+	// workload prices both pairs at this figure (RunEightSequenceSharedPrefixShape's override does
+	// the same).
 	constexpr double kRs1hPromptTokenCostMs = 1.0;
 	// Emitted immediately before the workload's final re-Configure. That re-Configure publishes a
 	// fresh, zeroed tick report (SuperSLMSubsystem.cpp:1738), so every counter's last sample in the
@@ -184,18 +194,18 @@ namespace
 	const TCHAR* const kRs1hBeforeReconfigureBookmark = TEXT("R-S1h/BeforeFinalReConfigure");
 
 	// Must equal the ParallelFor debug name SuperSLMFinishHook.cpp passes (see the collision note).
-	const TCHAR* const kFinishParallelForDebugName = TEXT("SuperSLM.FinishTask");
+	const TCHAR* const kFinishParallelForDebugName = TEXT("SuperSLM.ParallelTask");
 	const TCHAR* const kWorkerThreadNamePrefix = TEXT("SuperSLM CPU Worker "); // §5.1 Threads
 	const TCHAR* const kProbeCpuScope = TEXT("R-S1h.Probe.Cpu");
 	const TCHAR* const kProbeChannelScope = TEXT("R-S1h.Probe.SuperSLMChannel");
 	const TCHAR* const kProbeCounter = TEXT("R-S1h/Probe/Counter");
 
-	// Plan §5.1, "CPU backend": every scope it names (18, FinishTask included -- the U1 arm).
+	// Plan §5.1, "CPU backend": every scope it names (18, ParallelTask included -- the U1 arm).
 	const TCHAR* const kRs1hScopeNames[] = {
 		TEXT("SuperSLM.Tick"), TEXT("SuperSLM.Tick.Plan"), TEXT("SuperSLM.Tick.Apply"),
 		TEXT("SuperSLM.WorkerJob"),
 		TEXT("SuperSLM.Prefill"), TEXT("SuperSLM.PrefillChunk"), TEXT("SuperSLM.PrefixPrefill"),
-		TEXT("SuperSLM.DecodeLayers"), TEXT("SuperSLM.Finish"), TEXT("SuperSLM.FinishTask"),
+		TEXT("SuperSLM.DecodeLayers"), TEXT("SuperSLM.Finish"), TEXT("SuperSLM.ParallelTask"),
 		TEXT("SuperSLM.Reset"), TEXT("SuperSLM.Adopt"), TEXT("SuperSLM.PrefixBegin"), TEXT("SuperSLM.PrefixRelease"),
 		TEXT("SuperSLM.Save"), TEXT("SuperSLM.Restore"), TEXT("SuperSLM.PoolAlloc"), TEXT("SuperSLM.PoolFree"),
 	};
@@ -244,8 +254,10 @@ namespace
 		Config.PrefixBlockCount = 1;
 		Config.SequenceLifecycleBudgetMs = 1000.0;
 		Config.TickBudgetMs = kTickBudgetMs;
-		Config.PromptTokenCostMs = kRs1hPromptTokenCostMs;
-		Config.PromptTokenCostPerPositionMs = 0.0;
+		SuperSLMConfigAccess::SetCost(Config, TEXT("PromptTokenCostMs"), kRs1hPromptTokenCostMs);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("PromptTokenCostPerPositionMs"), 0.0);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("BatchedPromptTokenCostMs"), kRs1hPromptTokenCostMs);
+		SuperSLMConfigAccess::SetCost(Config, TEXT("BatchedPromptTokenCostPerPositionMs"), 0.0);
 		return Config;
 	}
 
@@ -669,7 +681,7 @@ namespace
 		int32 ThreadsWithTimelines = 0;
 		TMap<FString, uint64> AggregatedInstances;          // exact name -> summed CreateAggregation InstanceCount
 		TMap<FString, TArray<FRs1hScopeEvent>> Events;      // exact name -> every timeline event
-		TArray<FRs1hScopeEvent> PluginFinishTaskEvents;     // FinishTask directly inside the ParallelFor executor
+		TArray<FRs1hScopeEvent> PluginParallelTaskEvents;     // ParallelTask directly inside the ParallelFor executor
 		int32 PrefillChunkInPrefillScope = 0;               // PrefillChunk directly inside Prefill or PrefixPrefill
 		TMap<uint32, FString> ThreadNames;                  // trace thread id -> name
 		TMap<FString, TArray<double>> CounterSamples;       // exact name -> every sample, in time order
@@ -716,8 +728,8 @@ namespace
 
 		// Timer ids carrying a tracked exact name (several ids may share one name).
 		TMap<uint32, FString> TrackedTimerNames;
-		Timing->ReadTimers([&R, &TrackedScopes, &TrackedTimerNames](const ITimingProfilerTimerReader& Timers)
 		{
+			const ITimingProfilerTimerReader& Timers = Timing->GetTimerReader();
 			R.TimerCount = Timers.GetTimerCount();
 			for (uint32 Id = 0; Id < R.TimerCount; ++Id)
 			{
@@ -731,7 +743,7 @@ namespace
 					}
 				}
 			}
-		});
+		}
 		if (R.TimerCount == 0) { R.WhyNot = TEXT("the timer table is empty"); return R; }
 
 		// Instance counts as Insights' Timers panel reports them (R-S2h's pattern), summed per name.
@@ -758,7 +770,7 @@ namespace
 		}
 
 		// Every CPU thread's timeline, depth-first: thread placement, timestamps and direct parents.
-		const FString FinishTaskName(TEXT("SuperSLM.FinishTask"));
+		const FString ParallelTaskName(TEXT("SuperSLM.ParallelTask"));
 		const FString ExecutorName(kFinishParallelForDebugName);
 		const FString PrefillChunkName(TEXT("SuperSLM.PrefillChunk"));
 		const FString PrefillName(TEXT("SuperSLM.Prefill"));
@@ -785,12 +797,12 @@ namespace
 						if (const FString* Name = TrackedTimerNames.Find(Event.TimerIndex))
 						{
 							R.Events.FindOrAdd(*Name).Add({ Start, End, ThreadId });
-							if (*Name == FinishTaskName && D > 0)
+							if (*Name == ParallelTaskName && D > 0)
 							{
 								const FString* Parent = TrackedTimerNames.Find(Stack[D - 1]);
 								if (Parent && *Parent == ExecutorName)
 								{
-									R.PluginFinishTaskEvents.Add({ Start, End, ThreadId });
+									R.PluginParallelTaskEvents.Add({ Start, End, ThreadId });
 								}
 							}
 							else if (*Name == PrefillChunkName && D > 0)
@@ -998,19 +1010,19 @@ namespace
 				FString::Printf(TEXT("readability: first Tick.Plan at %.6f s precedes the first WorkerJob at %.6f s, and a Tick.Apply follows its end"),
 					FirstPlan == TNumericLimits<double>::Max() ? -1.0 : FirstPlan, FirstJob ? FirstJob->Start : -1.0));
 		}
-		// --- The U1 task arm: the plugin's FinishTask (inside the ParallelFor executor) on a thread
+		// --- The U1 task arm: the plugin's ParallelTask (inside the ParallelFor executor) on a thread
 		// that is neither the game thread nor a SuperSLM worker. Floor 1: Layer 1 chooses how many
 		// tasks a finish is split into and no product diagnostic counts them, so no larger floor is
 		// derivable; the claim is the placement.
 		{
 			int32 OnTaskThreads = 0;
-			for (const FRs1hScopeEvent& E : R.PluginFinishTaskEvents)
+			for (const FRs1hScopeEvent& E : R.PluginParallelTaskEvents)
 			{
 				OnTaskThreads += (E.ThreadTraceId != GameThread && !IsWorkerThread(E.ThreadTraceId)) ? 1 : 0;
 			}
-			Add(R.PluginFinishTaskEvents.Num() >= 1 && OnTaskThreads >= 1,
-				FString::Printf(TEXT("scope 'SuperSLM.FinishTask' (plugin-owned, inside the ParallelFor executor): %d instance(s), %d on engine task threads"),
-					R.PluginFinishTaskEvents.Num(), OnTaskThreads));
+			Add(R.PluginParallelTaskEvents.Num() >= 1 && OnTaskThreads >= 1,
+				FString::Printf(TEXT("scope 'SuperSLM.ParallelTask' (plugin-owned, inside the ParallelFor executor): %d instance(s), %d on engine task threads"),
+					R.PluginParallelTaskEvents.Num(), OnTaskThreads));
 		}
 
 		// --- Counters: at least one sample in the capture, and the value against a reading taken
@@ -1154,9 +1166,9 @@ namespace
 	void ReportRs1hReading(FAutomationTestBase& T, const FRs1hTraceReading& R, const FRs1hWorkloadFacts& F, const TCHAR* Label)
 	{
 		T.AddInfo(FString::Printf(TEXT("[%s] session %.3f s, %u timers, %d thread timelines"), Label, R.DurationSeconds, R.TimerCount, R.ThreadsWithTimelines));
-		const int32 AllFinishTask = R.Events.Contains(TEXT("SuperSLM.FinishTask")) ? R.Events[TEXT("SuperSLM.FinishTask")].Num() : 0;
-		T.AddInfo(FString::Printf(TEXT("[%s] 'SuperSLM.FinishTask' timer: %d event(s), %d plugin-owned; the rest are ParallelFor's own executor scopes under the same debug name (routed)"),
-			Label, AllFinishTask, R.PluginFinishTaskEvents.Num()));
+		const int32 AllParallelTask = R.Events.Contains(TEXT("SuperSLM.ParallelTask")) ? R.Events[TEXT("SuperSLM.ParallelTask")].Num() : 0;
+		T.AddInfo(FString::Printf(TEXT("[%s] 'SuperSLM.ParallelTask' timer: %d event(s), %d plugin-owned; the rest are ParallelFor's own executor scopes under the same debug name (routed)"),
+			Label, AllParallelTask, R.PluginParallelTaskEvents.Num()));
 		const TArray<double>* Due = R.CounterSamples.Find(TEXT("SuperSLM/CPU/DueJobs"));
 		const TArray<double>* Delivered = R.CounterSamples.Find(TEXT("SuperSLM/CPU/DeliveredJobs"));
 		T.AddInfo(FString::Printf(TEXT("[%s] DueJobs/DeliveredJobs last samples %s/%s; per-tick values, as plan §5.1 now states (last tick: %d planned, %d delivered)"),
@@ -1249,7 +1261,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 // R-S1h (plan §9; §5.1 "Verification"), rebuilt at L4 (2026-09-25) on TraceServices -- see the
 // "R-S1h's grading instrument" block in this file's anonymous namespace for the reader, the name
-// list, the floors, the unknown case and the FinishTask collision. The capture recipe (absolute
+// list, the floors, the unknown case and the ParallelTask collision. The capture recipe (absolute
 // path, bExcludeTail, IsTracing() poll after Stop) is the round-10 cell's, unchanged. What is new
 // is that every §5.1 CPU scope and counter is graded, by exact name, with a real count or value,
 // and that the same assertions are run against a channel-off capture by the cell below, which must
@@ -1414,7 +1426,7 @@ bool FSuperSLMU1CpuEarlyFinishedResultDeliveredTest::RunTest(const FString& Para
 	Config.MaxPrefillChunkBudget = 64;
 	Config.MaxLayerBudget = 24;
 	Config.TickBudgetMs = 16.6;
-	Config.ResetCostMs = 1000.0; // plan-time K is intentionally much larger than the actual reset
+	SuperSLMConfigAccess::SetCost(Config, TEXT("ResetCostMs"), 1000.0); // plan-time K is intentionally much larger than the actual reset
 	Config.SequenceLifecycleBudgetMs = 2000.0;
 	if (!TestEqual(TEXT("Configure"), (uint8)Cpu->Configure(Model, Config).Result,
 			(uint8)ESuperSLMConfigureResult::Success)) { return false; }

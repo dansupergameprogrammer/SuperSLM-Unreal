@@ -54,6 +54,17 @@ namespace SuperSLMGpuStatusMapping
 			case SslmGpuStatus::SSLM_GPU_PARALLEL_FOR_INVALID: return "SSLM_GPU_PARALLEL_FOR_INVALID";
 			case SslmGpuStatus::SSLM_GPU_PARALLEL_FOR_INCOMPLETE: return "SSLM_GPU_PARALLEL_FOR_INCOMPLETE";
 			case SslmGpuStatus::SSLM_GPU_RESIDENCY_FLAGS_INVALID: return "SSLM_GPU_RESIDENCY_FLAGS_INVALID";
+			// Ordinals 24-29, appended at 1.13.0 for paged K/V (gpu_1p0.h; docs/api.md "Paged KV memory on
+			// the GPU"). Every one arises only on a page-pool verb (pool create, budgeted create, prefix
+			// verbs, restore into pool) except SSLM_GPU_HOLDER_MODE_MISMATCH, which sslm_gpu_seq_restore also
+			// returns for a pooled sequence's 'SLM6' blob. A plugin that never makes a pool sees none of
+			// them on its own calls.
+			case SslmGpuStatus::SSLM_GPU_KV_BUDGET_EXCEEDED: return "SSLM_GPU_KV_BUDGET_EXCEEDED";
+			case SslmGpuStatus::SSLM_GPU_KV_POOL_EXHAUSTED: return "SSLM_GPU_KV_POOL_EXHAUSTED";
+			case SslmGpuStatus::SSLM_GPU_KV_POOL_TOO_LARGE: return "SSLM_GPU_KV_POOL_TOO_LARGE";
+			case SslmGpuStatus::SSLM_GPU_HOLDER_MODE_MISMATCH: return "SSLM_GPU_HOLDER_MODE_MISMATCH";
+			case SslmGpuStatus::SSLM_GPU_PREFIX_REJECTED: return "SSLM_GPU_PREFIX_REJECTED";
+			case SslmGpuStatus::SSLM_GPU_PREFIX_SCHEMA_MISMATCH: return "SSLM_GPU_PREFIX_SCHEMA_MISMATCH";
 		}
 		// After the switch, not a default label inside it (see SuperSLMStatusMapping.h).
 		return "SSLM_GPU_STATUS_UNKNOWN";
@@ -74,6 +85,13 @@ namespace SuperSLMGpuStatusMapping
 	// reads Malformed whatever status it carries. SSLM_GPU_ALLOCATION_FAILED is Layer 1 running
 	// out of GPU memory, which is retryable, so it reads OutOfMemory. A lost device
 	// (SSLM_DEVICE_LOST) and every other status keep the default arm's Malformed.
+	// Paged K/V (1.13.0) adds two arms. SSLM_GPU_HOLDER_MODE_MISMATCH is what sslm_gpu_seq_restore
+	// now returns for a pooled sequence's 'SLM6' blob; 1.12.0 and earlier refused that blob with
+	// SSLM_SEQUENCE_KV_BUFFER_MISMATCH (docs/api.md), so it reads KvMismatch, the result it had
+	// before the pin. SSLM_GPU_KV_POOL_EXHAUSTED is a restore into a page pool too short for the
+	// blob, nothing drawn and retryable once pages are returned: the same shape as
+	// SSLM_GPU_ALLOCATION_FAILED, so it reads OutOfMemory. The other four (budget exceeded, pool too
+	// large, prefix rejected, prefix schema mismatch) are not restore statuses and keep Malformed.
 	inline ESuperSLMRestoreResult ToRestoreFailureResult(SslmGpuStatus Status, bool bSchemaCrossCheckFailed)
 	{
 		if (bSchemaCrossCheckFailed)
@@ -85,7 +103,37 @@ namespace SuperSLMGpuStatusMapping
 			case SslmGpuStatus::SSLM_RESTORE_MODEL_MISMATCH: return ESuperSLMRestoreResult::ModelMismatch;
 			case SslmGpuStatus::SSLM_SEQUENCE_KV_BUFFER_MISMATCH: return ESuperSLMRestoreResult::KvMismatch;
 			case SslmGpuStatus::SSLM_GPU_ALLOCATION_FAILED: return ESuperSLMRestoreResult::OutOfMemory;
+			case SslmGpuStatus::SSLM_GPU_HOLDER_MODE_MISMATCH: return ESuperSLMRestoreResult::KvMismatch;
+			case SslmGpuStatus::SSLM_GPU_KV_POOL_EXHAUSTED: return ESuperSLMRestoreResult::OutOfMemory;
 			default: return ESuperSLMRestoreResult::Malformed;
 		}
+	}
+
+	// Plugin paging plan §3.7 (step K6): the mapping by mode. Dedicated mode (bPooled false) is the
+	// function above, unchanged (cell 8.1's legacy identity). Pooled mode reads §3.7's table for the
+	// three statuses that differ: SSLM_GPU_KV_POOL_EXHAUSTED is KvPagesExhausted (the caller also
+	// counts it as a ledger fault, since an admitted restore was charged for it),
+	// SSLM_GPU_HOLDER_MODE_MISMATCH is KvModeMismatch (a dedicated-mode blob offered to a pool), and
+	// SSLM_SEQUENCE_KV_BUFFER_MISMATCH is Malformed (§5: a pooled restore's handles are the
+	// plugin's own, so that status can only mean a malformed payload). Every other status, and a
+	// failed schema cross-check, reads as in dedicated mode.
+	inline ESuperSLMRestoreResult ToRestoreFailureResult(SslmGpuStatus Status, bool bPooled, bool bSchemaCrossCheckFailed)
+	{
+		if (bPooled && !bSchemaCrossCheckFailed)
+		{
+			if (Status == SslmGpuStatus::SSLM_GPU_KV_POOL_EXHAUSTED)
+			{
+				return ESuperSLMRestoreResult::KvPagesExhausted;
+			}
+			if (Status == SslmGpuStatus::SSLM_GPU_HOLDER_MODE_MISMATCH)
+			{
+				return ESuperSLMRestoreResult::KvModeMismatch;
+			}
+			if (Status == SslmGpuStatus::SSLM_SEQUENCE_KV_BUFFER_MISMATCH)
+			{
+				return ESuperSLMRestoreResult::Malformed;
+			}
+		}
+		return ToRestoreFailureResult(Status, bSchemaCrossCheckFailed);
 	}
 }

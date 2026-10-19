@@ -44,7 +44,7 @@
 //    reference digest shipped with the plugin for this artifact, produced at the pin by Layer 1's
 //    own sslm_generate, built by Layer 1's own CMake (comparison 2). With no shipped reference for
 //    the artifact the CPU arm reads Not Yet Run and says why. sslm_generate cannot bind a schema
-//    at the pinned Layer 1 (v1.5.0, 1.7.0 and 1.9.0), and a schema mask is applied on the host by both
+//    at the pinned Layer 1 (v1.5.0, 1.7.0, 1.9.0 and 1.11.0), and a schema mask is applied on the host by both
 //    backends, so binding one would add no device coverage; schema-path identity on the GPU is
 //    R-S2e's and R-S2g's claim. The GPU arm runs the logits head the configured model asset
 //    selects (the device-resident head by default) and the report names it.

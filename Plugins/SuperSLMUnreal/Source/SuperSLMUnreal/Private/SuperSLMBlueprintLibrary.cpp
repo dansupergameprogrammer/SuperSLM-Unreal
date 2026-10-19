@@ -34,11 +34,15 @@ SUPERSLM_BP_MIRRORS(ESuperSLMRestoreResult, ESuperSLMRestoreResultBP, Layer1Mism
 SUPERSLM_BP_MIRRORS(ESuperSLMRestoreResult, ESuperSLMRestoreResultBP, Consumed)
 SUPERSLM_BP_MIRRORS(ESuperSLMRestoreResult, ESuperSLMRestoreResultBP, ResetRequired)
 SUPERSLM_BP_MIRRORS(ESuperSLMRestoreResult, ESuperSLMRestoreResultBP, OutOfMemory)
+SUPERSLM_BP_MIRRORS(ESuperSLMRestoreResult, ESuperSLMRestoreResultBP, KvPagesExhausted)
+SUPERSLM_BP_MIRRORS(ESuperSLMRestoreResult, ESuperSLMRestoreResultBP, KvModeMismatch)
+SUPERSLM_BP_MIRRORS(ESuperSLMRestoreResult, ESuperSLMRestoreResultBP, ContextCapMismatch)
 
 SUPERSLM_BP_MIRRORS(ESuperSLMDecodeOutcome, ESuperSLMDecodeOutcomeBP, TokenProduced)
 SUPERSLM_BP_MIRRORS(ESuperSLMDecodeOutcome, ESuperSLMDecodeOutcomeBP, Generating)
 SUPERSLM_BP_MIRRORS(ESuperSLMDecodeOutcome, ESuperSLMDecodeOutcomeBP, SchemaDeadEnd)
 SUPERSLM_BP_MIRRORS(ESuperSLMDecodeOutcome, ESuperSLMDecodeOutcomeBP, SequenceNoLongerValid)
+SUPERSLM_BP_MIRRORS(ESuperSLMDecodeOutcome, ESuperSLMDecodeOutcomeBP, KvBudgetExceeded)
 
 SUPERSLM_BP_MIRRORS(ESuperSLMSequencePhase, ESuperSLMSequencePhaseBP, Idle)
 SUPERSLM_BP_MIRRORS(ESuperSLMSequencePhase, ESuperSLMSequencePhaseBP, Prefilling)

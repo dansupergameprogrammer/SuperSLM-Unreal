@@ -369,7 +369,12 @@ enum class SslmForwardStatus {
 	                                          // or device fault: the CPU ABI maps it to
 	                                          // SSLM_INVALID_ARGUMENT, the GPU bridge finish to
 	                                          // SSLM_GPU_PARALLEL_FOR_INCOMPLETE, and both leave the
-	                                          // sequence ready to retry the finish.
+	                                          // sequence ready to retry the finish. The layer
+	                                          // loops' one-row projection groups return it too
+	                                          // (MatvecGroupParallel, SSLM_PARALLEL_FOR_MATVEC):
+	                                          // RunLayerLoop then rests the sequence at the
+	                                          // failing layer's start with that layer's saturation
+	                                          // counts put back.
 	GpuOperationFailed,                       // SuperSLM 1.8.0 (TE-426), appended last so no
 	                                          // existing ordinal moves: a GPU operation failed for
 	                                          // a reason other than memory, on a device not
@@ -385,6 +390,18 @@ enum class SslmForwardStatus {
 	                                          // advice no size fixes for any of these. The CPU path
 	                                          // never produces it; MapForwardStatus (sslm_abi.cpp)
 	                                          // carries an explicit arm anyway.
+	KvPageUnmapped,                           // Paged-KV plan §3.2 item 4, appended last so no
+	                                          // existing ordinal moves: the K/V page view maps
+	                                          // fewer positions than this call writes
+	                                          // (`context_length + 1 > mapped_pages * B`, or the
+	                                          // chunk's `context_length_start + chunk_tokens`).
+	                                          // Checked after KvCapacityExhausted and the workspace
+	                                          // guard, before the first write. A flat workspace is
+	                                          // a one-page view (`B = context_cap`), where
+	                                          // KvCapacityExhausted fires first, so only a paged
+	                                          // view reaches it. The view is a caller argument:
+	                                          // MapForwardStatus maps it to SSLM_INVALID_ARGUMENT,
+	                                          // and no C ABI path builds a view this guard refuses.
 };
 
 // Human-readable name, for diagnostics and test messages (mirrors SslmStatusName,

@@ -11,6 +11,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Guid.h"
 #include "Misc/OutputDevice.h"
+#include "Misc/OutputDeviceRedirector.h"
 #include "Misc/Paths.h"
 #include "SuperSLMCalibrateCostsCommand.h"
 #include "SuperSLMCalibrationTestAccess.h"
@@ -260,6 +261,7 @@ namespace
 		FValueLog Values;
 		const FString Command = FString::Printf(TEXT("SuperSLM.CalibrateCosts \"%s\""), *Artifact);
 		const bool bInvoked = IConsoleManager::Get().ProcessUserConsoleInput(*Command, *GLog, nullptr);
+		GLog->Flush(); // synchronize the captured value line before its assertions and CSV write
 		const FSuperSLMCalibrationIdlenessReport& Report = FSuperSLMCalibrationTestAccess::GetLastIdlenessReport();
 		const SuperSLMCalibrateCostsCommand::EOutcome Outcome = SuperSLMCalibrateCostsCommand::GetLastOutcome();
 		if (Condition == 1 && !bLoadStopped) { Load.StopMeasured(); }
@@ -313,6 +315,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMU1RelevanceBlock1Test,
 	"SuperSLM.U1.Relevance.Block1", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMU1RelevanceBlock1Test::RunTest(const FString& Parameters)
 {
+	FSuperSLMLegacyCalibrationScope CommandScope;
 	return RunBlock(*this, 1, TEXT("SuperSLM.U1.Relevance.Block1"));
 }
 
@@ -320,6 +323,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMU1RelevanceBlock2Test,
 	"SuperSLM.U1.Relevance.Block2", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMU1RelevanceBlock2Test::RunTest(const FString& Parameters)
 {
+	FSuperSLMLegacyCalibrationScope CommandScope;
 	return RunBlock(*this, 2, TEXT("SuperSLM.U1.Relevance.Block2"));
 }
 
@@ -327,6 +331,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMU1RelevanceBlock3Test,
 	"SuperSLM.U1.Relevance.Block3", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMU1RelevanceBlock3Test::RunTest(const FString& Parameters)
 {
+	FSuperSLMLegacyCalibrationScope CommandScope;
 	return RunBlock(*this, 3, TEXT("SuperSLM.U1.Relevance.Block3"));
 }
 
@@ -334,6 +339,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMU1RelevanceBlock4Test,
 	"SuperSLM.U1.Relevance.Block4", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMU1RelevanceBlock4Test::RunTest(const FString& Parameters)
 {
+	FSuperSLMLegacyCalibrationScope CommandScope;
 	return RunBlock(*this, 4, TEXT("SuperSLM.U1.Relevance.Block4"));
 }
 
@@ -341,6 +347,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMU1RelevanceBlock5Test,
 	"SuperSLM.U1.Relevance.Block5", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMU1RelevanceBlock5Test::RunTest(const FString& Parameters)
 {
+	FSuperSLMLegacyCalibrationScope CommandScope;
 	return RunBlock(*this, 5, TEXT("SuperSLM.U1.Relevance.Block5"));
 }
 
@@ -348,6 +355,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMU1RelevanceRTest,
 	"SuperSLM.U1.Relevance.R", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMU1RelevanceRTest::RunTest(const FString& Parameters)
 {
+	FSuperSLMLegacyCalibrationScope CommandScope;
 	FString Artifact, Reason;
 	if (!TryGetAExArtifactPath(Artifact, Reason)) { AddError(Reason); return false; }
 	bool bOk = true;

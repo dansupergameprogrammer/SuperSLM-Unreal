@@ -47,6 +47,7 @@ enum class ESuperSLMBuildLockState : uint8
 // logical processor), from GetSystemTimes for the box and GetProcessTimes for this process.
 struct SUPERSLMUNREAL_API FSuperSLMIdlenessSample
 {
+	double StartSeconds = 0.0;  // the same monotonic origin as EndSeconds; interval's preceding reading
 	double EndSeconds = 0.0;    // the sample's end, seconds since the sampler started
 	ESuperSLMCalibrationPhase Phase = ESuperSLMCalibrationPhase::PreWindow; // the phase at the sample's end
 	double BoxSharePercent = 0.0;     // (kernel + user - idle) / (kernel + user)
@@ -121,5 +122,24 @@ struct SUPERSLMUNREAL_API FSuperSLMCalibrationTestAccess
 	// GetLastOutcome(); verdict, ceiling, first refusing window (index and phases) and the
 	// per-sample series are here.
 	static const FSuperSLMCalibrationIdlenessReport& GetLastIdlenessReport();
+
+	// Slice 1P (SuperSLM tiled-matmul plan §4A.1 item 3, rev 11.1 audit F10): the batched prompt
+	// arm's reading path with synthetic timings, so the known-slope, envelope and intercept cells run
+	// without an artifact. MedianCallMs[i] stands for the median time of one 8-token sslm_prefill
+	// from Depths[i]. Each reading goes through the arm's own construction (per-token time = call / 8,
+	// position = depth + 3.5) and the arm's own fit (the upper envelope, intercept at position 0) and
+	// check (the batched intercept must not exceed Chunk1TokenMs). Returns false, with OutError named,
+	// exactly when the timed arm would fail the run; the fitted pair is written either way.
+	// OutPositions and OutPerTokenMs are the readings as the arm recorded them.
+	static bool FitBatchedArmFromSyntheticTimings(const TArray<int64>& Depths, const TArray<double>& MedianCallMs,
+		double Chunk1TokenMs, double& OutTokenMs, double& OutPerPositionMs, TArray<double>& OutPositions, TArray<double>& OutPerTokenMs, FString& OutError);
+
+	// The batched arm's depths for a cap, as Setup takes them: 1, C/4, C/2, 3C/4 and C - 8, or false
+	// (the named skip) below a cap of 33.
+	static bool BatchedArmDepthsForCap(int64 Cap, TArray<int64>& OutDepths);
+
+	// The values the named skip writes into the batched pair: FSuperSLMRuntimeConfig's defaults.
+	static void BatchedArmSkipValues(double& OutTokenMs, double& OutPerPositionMs);
+	static void BatchedArmSkipValues(bool bParallelDecode, double& OutTokenMs, double& OutPerPositionMs);
 };
 #endif // WITH_DEV_AUTOMATION_TESTS

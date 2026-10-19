@@ -8,6 +8,17 @@
 
 class USuperSLMGpuSubsystem;
 
+#if WITH_DEV_AUTOMATION_TESTS
+struct FSuperSLMGpuDebugLayerReading
+{
+	bool bEnabled = false;
+	bool bQueueAvailable = false;
+	bool bWarningInjected = false;
+	int64 ReportableMessages = 0;
+	int64 DiscardedMessages = 0;
+};
+#endif
+
 // The statuses Layer 1 returned to the GPU subsystem's teardown (ReleaseLayer1(), plan §9 R-S1l
 // (j)), by status name ("SSLM_OK", "SSLM_ADAPTER_HAS_BOUND_SEQUENCES", ...). Recorded on every
 // teardown, diagnostic only; read through FSuperSLMGpuTestAccess::TearDownWithStatuses().
@@ -19,6 +30,7 @@ struct SUPERSLMUNREAL_API FSuperSLMGpuTeardownStatuses
 	TArray<FString> SequenceReleaseStatuses; // sslm_gpu_seq_release, per entry of SequenceSlots
 	TArray<int64> AdapterIds;              // FSuperSLMGpuAdapterHandle ids unmapped, in order
 	TArray<FString> AdapterUnmapStatuses;  // sslm_gpu_adapter_unmap, per entry of AdapterIds
+	FString KvPoolDestroyStatus;           // sslm_gpu_kv_pool_destroy (plugin paging plan, K6); empty when no pool existed
 	FString ModelUnmapStatus;              // empty when no model was mapped
 	FString ContextDestroyStatus;          // empty when no context existed
 };
@@ -99,6 +111,11 @@ struct SUPERSLMUNREAL_API FSuperSLMGpuPlanLogEntry
 // USuperSLMGpuSubsystem.
 struct SUPERSLMUNREAL_API FSuperSLMGpuTestAccess
 {
+#if WITH_DEV_AUTOMATION_TESTS
+	// K8: read the actual D3D12 InfoQueue after all GPU work/teardown has drained. The optional
+	// application warning is a canary in that same queue, consumed by this call. Never a game path.
+	static bool ReadAndDrainDebugLayer(FSuperSLMGpuDebugLayerReading& OutReading, bool bInjectWarning = false);
+#endif
 	// R-S1l (j): runs Gpu's own teardown (the path Deinitialize() takes) and returns the statuses
 	// Layer 1 gave ReleaseLayer1(). False, with OutStatuses empty, when Gpu is not configured.
 	static bool TearDownWithStatuses(USuperSLMGpuSubsystem& Gpu, FSuperSLMGpuTeardownStatuses& OutStatuses);

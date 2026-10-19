@@ -44,7 +44,8 @@
 //    before the tick that took it (Prefilling -> prompt, Decoding -> decode). A result applies K
 //    ticks after it is planned, so the K samples after the phase turns Decoding may time a prompt
 //    slice or a decode slice; they are excluded from both medians and counted. The sample stream is
-//    the controller's own (a sample whenever GetGpuDispatchCount() moved), and the cell checks its
+//    the completed timing published by each tick, independently observed here and by the controller;
+//    worker progress between those observations cannot change it. The cell checks its
 //    classified count does not exceed the readout's GpuBusyMsSamplesPerSlice.
 //  - Reports R-S2f's recorded headless medians beside each setting, with their source, and says
 //    "none on record" where there is none.
@@ -60,7 +61,7 @@
 //
 // Signatures used: FSuperSLMQueryWindowController::BeginQuery/TickQuery/
 // GetLiveView/CancelQuery (SuperSLMQueryWindowController.h); USuperSLMGpuSubsystem::
-// GetGpuDispatchCount/GetLastGpuBusyMs/GetConfiguredK/GetLayersPerTick; SuperSLM::TokenizeText
+// GetGpuTimingSnapshot/GetConfiguredK/GetLayersPerTick; SuperSLM::TokenizeText
 // (SuperSLMDetokenizer.h).
 
 #include "Misc/AutomationTest.h"
@@ -436,7 +437,7 @@ bool FSuperSLML2S3GpuSliceSweepTest::RunTest(const FString& Parameters)
 				AddError(FString::Printf(TEXT("R-S3f: layers/slice=%d did not start: %s"), Next, *Error));
 				return Finish();
 			}
-			S.DispatchesSeen = Gpu->GetGpuDispatchCount();
+			S.DispatchesSeen = Gpu->GetGpuTimingSnapshot().Dispatches;
 			S.LastPhase = ESuperSLMSequencePhase::Idle;
 			S.TicksSinceDecoding = -1;
 			S.KForRow = 0; // read once the controller has applied the query's k
@@ -502,11 +503,11 @@ bool FSuperSLML2S3GpuSliceSweepTest::RunTest(const FString& Parameters)
 		const bool bStopped = S.Controller->TickQuery(FApp::GetDeltaTime(), bSucceeded, Readout, Error);
 		Row.Ticks += 1;
 
-		const int64 Dispatches = Gpu->GetGpuDispatchCount();
-		if (Dispatches != S.DispatchesSeen)
+		const FSuperSLMGpuTimingSnapshot Timing = Gpu->GetGpuTimingSnapshot();
+		if (Timing.Dispatches != S.DispatchesSeen)
 		{
-			S.DispatchesSeen = Dispatches;
-			const double Ms = Gpu->GetLastGpuBusyMs();
+			S.DispatchesSeen = Timing.Dispatches;
+			const double Ms = Timing.GpuBusyMs;
 			if (PhaseBefore == ESuperSLMSequencePhase::Prefilling)
 			{
 				Row.PromptSamples.Add(Ms);

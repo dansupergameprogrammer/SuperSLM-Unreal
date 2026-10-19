@@ -1,5 +1,6 @@
 #include "SuperSLMUnrealModule.h"
 #include "SuperSLMCalibrateCostsCommand.h"
+#include "SuperSLMEstimateCostsCommand.h"
 #include "SuperSLMLog.h"
 #include "SuperSLMRuntimeRegistry.h"
 #include "SuperSLMStatusMapping.h"
@@ -12,9 +13,9 @@ void FSuperSLMUnrealModule::StartupModule()
 	// exercised part of this module's startup path -- see that header's own comment.
 	SuperSLMStatusMapping::VerifyEveryStatusHasDiagnosticText();
 
-	// §10.2 item 10: forces SuperSLMCalibrateCostsCommand.cpp's static FAutoConsoleCommand to
-	// link (an otherwise-unreferenced translation unit is a candidate for the linker to strip).
+	// Retain the legacy regression instrument without registering its retired public commands.
 	SuperSLMCalibrateCostsCommand::Register();
+	SuperSLMEstimateCostsCommand::Register();
 }
 
 void FSuperSLMUnrealModule::ShutdownModule()

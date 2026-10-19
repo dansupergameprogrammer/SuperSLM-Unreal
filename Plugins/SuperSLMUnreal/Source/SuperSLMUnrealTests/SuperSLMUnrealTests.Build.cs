@@ -26,6 +26,7 @@ public class SuperSLMUnrealTests : ModuleRules
 	public SuperSLMUnrealTests(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+		bWarningsAsErrors = true;
 		bUseUnity = false;
 
 		// §9 dim 8 (M7 re-cross): this dependency set contains NO editor-only module, and that

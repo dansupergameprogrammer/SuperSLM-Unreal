@@ -126,8 +126,8 @@ namespace
 
 		TArray<double> PromptSliceSamples;
 		// Unpaced (M-24's second witness, ruling 2026-09-26 as folded); a sample is taken only when
-		// GetGpuDispatchCount() has moved since the last one, so a spinning tick adds no duplicates.
-		int64 LastSampledDispatch = Gpu->GetGpuDispatchCount();
+		// the published completed timing has moved, so a spinning tick adds no duplicates.
+		int64 LastSampledDispatch = Gpu->GetGpuTimingSnapshot().Dispatches;
 		const double PromptStartSeconds = FPlatformTime::Seconds();
 		while (FPlatformTime::Seconds() - PromptStartSeconds < 180.0)
 		{
@@ -137,10 +137,11 @@ namespace
 				break; // prompt ingestion is over -- every later sample would be decode's, not the prompt's
 			}
 			Gpu->Tick(1.0f / 60.0f);
-			const int64 Dispatch = Gpu->GetGpuDispatchCount();
+			const FSuperSLMGpuTimingSnapshot Timing = Gpu->GetGpuTimingSnapshot();
+			const int64 Dispatch = Timing.Dispatches;
 			if (Dispatch != LastSampledDispatch)
 			{
-				PromptSliceSamples.Add(Gpu->GetLastGpuBusyMs());
+				PromptSliceSamples.Add(Timing.GpuBusyMs);
 				LastSampledDispatch = Dispatch;
 			}
 			FPlatformProcess::Sleep(0);
@@ -209,19 +210,25 @@ bool FSuperSLML2S2SliceCostTest::RunTest(const FString& Parameters)
 		TArray<double> GpuBusySamples, HostFinishSamples;
 		// Unpaced on purpose: this cell is M-24's second witness (plan §2.5 row 21, "Ruling
 		// 2026-09-26"). The tick no longer waits on the device, so it can spin; a sample is taken
-		// only when GetGpuDispatchCount() has moved since the last one, so a spinning tick adds
-		// no duplicate readings.
-		int64 LastSampledDispatch = Gpu->GetGpuDispatchCount();
+		// only when the published completed GPU timing moves. Host finish keeps its separate
+		// live observation stream; it is not the timing of a GPU drain.
+		int64 LastSampledDispatch = Gpu->GetGpuTimingSnapshot().Dispatches;
+		int64 LastHostSampledDispatch = Gpu->GetGpuDispatchCount();
 		const double StartSeconds = FPlatformTime::Seconds();
 		while (FPlatformTime::Seconds() - StartSeconds < 180.0)
 		{
 			Gpu->Tick(1.0f / 60.0f);
-			const int64 Dispatch = Gpu->GetGpuDispatchCount();
-			if (Dispatch != LastSampledDispatch)
+			const FSuperSLMGpuTimingSnapshot Timing = Gpu->GetGpuTimingSnapshot();
+			if (Timing.Dispatches != LastSampledDispatch)
 			{
-				GpuBusySamples.Add(Gpu->GetLastGpuBusyMs());
+				GpuBusySamples.Add(Timing.GpuBusyMs);
+				LastSampledDispatch = Timing.Dispatches;
+			}
+			const int64 Dispatch = Gpu->GetGpuDispatchCount();
+			if (Dispatch != LastHostSampledDispatch)
+			{
 				HostFinishSamples.Add(Gpu->GetLastHostFinishMs());
-				LastSampledDispatch = Dispatch;
+				LastHostSampledDispatch = Dispatch;
 			}
 			if (Gpu->GetPhase(Seq) == ESuperSLMSequencePhase::Complete || Gpu->GetPhase(Seq) == ESuperSLMSequencePhase::Faulted)
 			{
@@ -395,21 +402,22 @@ bool FSuperSLMU1GpuDeepSliceCostTest::RunTest(const FString& Parameters)
 	TArray<double> BusySamples, FinishSamples;
 	int32 LastObserved = 0;
 	double DecodeStart = 0.0;
-	// Unpaced; each sample stream takes a reading only when GetGpuDispatchCount() has moved since
-	// its own last sample, so a spinning tick adds no duplicates (ruling 2026-09-26).
-	int64 LastBusyDispatch = Gpu->GetGpuDispatchCount();
-	int64 LastFinishDispatch = LastBusyDispatch;
+	// Unpaced; completed GPU timings and live host finishes have separate observation streams,
+	// so a spinning tick adds no duplicates (ruling 2026-09-26).
+	int64 LastBusyDispatch = Gpu->GetGpuTimingSnapshot().Dispatches;
+	int64 LastFinishDispatch = Gpu->GetGpuDispatchCount();
 	const double Start = FPlatformTime::Seconds();
 	while (FPlatformTime::Seconds() - Start < 600.0)
 	{
 		const ESuperSLMSequencePhase Before = Gpu->GetPhase(Seq);
 		if (Before == ESuperSLMSequencePhase::Decoding && DecodeStart == 0.0) { DecodeStart = FPlatformTime::Seconds(); }
 		Gpu->Tick(1.0f / 60.0f);
+		const FSuperSLMGpuTimingSnapshot Timing = Gpu->GetGpuTimingSnapshot();
 		const int64 Dispatch = Gpu->GetGpuDispatchCount();
-		if (Before == ESuperSLMSequencePhase::Decoding && Dispatch != LastBusyDispatch)
+		if (Before == ESuperSLMSequencePhase::Decoding && Timing.Dispatches != LastBusyDispatch)
 		{
-			BusySamples.Add(Gpu->GetLastGpuBusyMs());
-			LastBusyDispatch = Dispatch;
+			BusySamples.Add(Timing.GpuBusyMs);
+			LastBusyDispatch = Timing.Dispatches;
 		}
 		const int32 Observed = Gpu->GetGeneratedTokens(Seq).Num();
 		if (Observed > LastObserved && Dispatch != LastFinishDispatch)

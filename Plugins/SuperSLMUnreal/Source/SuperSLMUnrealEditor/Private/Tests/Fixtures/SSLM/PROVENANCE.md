@@ -32,7 +32,7 @@ Regeneration: `git -C <SuperSLM checkout> archive v1.2.0 tools/ include/ | tar -
 non-stdlib dependency). Per Layer 1's own S-HARDEN-5 discipline ("regenerated fresh every run, never
 committed as a binary blob") this generator is not re-run by CI — it is documented here so the fixture's
 origin is checkable. The fixture itself is committed because the vendored tree
-(`Source/ThirdParty/SuperSLM`) is a later tag, `v1.9.0`, which carries the script but not
+(`Source/ThirdParty/SuperSLM`) is a later tag, `v1.11.0`, which carries the script but not
 necessarily the same output, and the plugin's CI does not run Layer 1's Python tooling.
 
 ## The five hostile variants — `gen_hostile_fixtures.py`

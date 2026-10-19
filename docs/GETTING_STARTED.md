@@ -180,12 +180,15 @@ inference runs on the plugin's own threads, so the scene keeps rendering. A quer
 runs on the plugin's own threads. The game thread ticks the backends' bookkeeping, reads results,
 turns the finished tokens into text, and draws the panel.
 
-**Controls.** Thinking/Frame Budget (one control: layers per slice; the whole-token setting uses
-the GPU's one-call path); Backend (CPU or GPU); concurrent queries (up to four); and K (GPU only:
-the fixed-tick latency; the panel shows the minimum the current settings need). On the CPU
-backend no control changes the answer: the frame budget and the number of concurrent queries
-change only how many frames an answer takes and what it costs, and the tokens and the digest stay
-the same. The panel says whether the digest matches the first run with the same input. 1.0 does
+**Controls.** Thinking/Frame Budget (one control, with a value per backend: the panel shows the
+selected backend's); Backend (CPU or GPU); concurrent queries (up to four); and K (GPU only: the
+fixed-tick latency; the panel shows the minimum the current settings need). On the GPU the budget
+is the layers per slice, which is what one frame issues (default 4; the whole-token setting uses
+the one-call path). On the CPU it is the layer budget of each worker job (default 24, a whole
+token): the inference runs on worker threads, so it sizes the job and never the game thread's
+cost. On the CPU backend no control changes the answer: the layer budget and the number of
+concurrent queries change only how many frames an answer takes and what it costs, and the tokens
+and the digest stay the same. The panel says whether the digest matches the first run with the same input. 1.0 does
 not claim that the GPU backend's tokens match the CPU's, so GPU runs are compared with that only
 when the GPU verdict is shown and reads *Verified*, which in 1.0 it never is.
 

@@ -45,11 +45,11 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FSuperSLMLoadModelDoneBP, const FSup
 // Loaded fires when the CPU backend is configured; the GPU's outcome is in the result (a GPU
 // refusal leaves the CPU usable, matching the editor host). Failed fires, naming why, when:
 // there is no model or no GameInstance; the model has no readable shape; a backend about to be
-// reconfigured still holds a vended sequence, a CPU prefix or a mapped GPU adapter, or is
+// reconfigured still holds a vended sequence, a prefix on either backend or a mapped GPU adapter, or is
 // mid-configure (refused before anything is torn down: a reconfigure destroys them all); the CPU
 // refuses; or a later configure or the subsystem's shutdown superseded this one. The GPU is
 // checked again after the CPU phase, just before its own teardown: if something was vended or
-// mapped on it meanwhile, it is left untouched and Loaded fires with the CPU only, naming why.
+// mapped, or a prefix built on it meanwhile, it is left untouched and Loaded fires with the CPU only, naming why.
 
 /**
  * Loads a model into the CPU backend and, when asked, the GPU backend, off the game thread.
@@ -66,24 +66,27 @@ public:
 	// the CPU worker's per-job budget, from which the planner derives K (D-SLM7407); GpuTickBudgetMs
 	// the GPU's per-slice target. SequenceLifecycleBudgetMs is the project's Sequence Lifecycle
 	// Budget (plan §5), which the CPU configure checks the model's predicted reset/adopt against.
-	// PrefixBlockCount is how many CPU shared prefixes (CreatePrefix) can be live at once: the CPU
+	// PrefixBlockCount is how many shared prefixes (CreatePrefix) can be live at once: the CPU
 	// KV pool reserves that many blocks beyond PoolSize (D-SLM7342). It defaults to 0 (no prefixes),
 	// matching FSuperSLMRuntimeConfig, so a load reserves no extra KV block unless asked: set it >0
 	// to use shared prefixes. Negative, or PoolSize + PrefixBlockCount past INT32_MAX, is refused by
-	// name by Configure(). The GPU config has no prefix blocks, so it applies to the CPU only.
+	// name by Configure(). It also applies to the pooled GPU when SequenceBudget > 0.
+	// SequenceBudget is appended with default 0 for existing Blueprint graphs; positive values
+	// opt both backends into paging and are validated by their Configure().
 
 	/**
 	 * Loads Model. PoolSize: the most concurrent sequences on each backend. CpuTickBudgetMs: the
 	 * CPU worker's time budget per job. GpuTickBudgetMs: the GPU's time target per slice.
 	 * SequenceLifecycleBudgetMs: the budget the model's predicted reset and adopt costs are
-	 * checked against. PrefixBlockCount: how many CPU shared prefixes can be live at once (0, the
-	 * default, reserves none).
+	 * checked against. PrefixBlockCount: how many shared prefixes can be live at once (0, the
+	 * default, reserves none); applies to CPU and pooled GPU. SequenceBudget: 0 keeps legacy
+	 * mode; a positive value opts both backends into paging.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "SuperSLM|Load",
 		meta = (BlueprintInternalUseOnly = "true", WorldContext = "WorldContextObject", DisplayName = "Load SuperSLM Model"))
 	static USuperSLMLoadModelAsyncAction* LoadSuperSLMModelAsync(UObject* WorldContextObject, USuperSLMModel* Model,
 		bool bConfigureGpu = true, int32 PoolSize = 4, float CpuTickBudgetMs = 16.6f, float GpuTickBudgetMs = 2.0f,
-		float SequenceLifecycleBudgetMs = 16.0f, int32 PrefixBlockCount = 0);
+		float SequenceLifecycleBudgetMs = 16.0f, int32 PrefixBlockCount = 0, int32 SequenceBudget = 0);
 
 	UPROPERTY(BlueprintAssignable, Category = "SuperSLM|Load")
 	FSuperSLMLoadModelDoneBP Loaded;
@@ -118,6 +121,7 @@ private:
 	bool bConfigureGpu = true;
 	int32 PoolSize = 4;
 	int32 PrefixBlockCount = 0;
+	int32 SequenceBudget = 0;
 	double CpuTickBudgetMs = 16.6;
 	double GpuTickBudgetMs = 2.0;
 	double SequenceLifecycleBudgetMs = 16.0;

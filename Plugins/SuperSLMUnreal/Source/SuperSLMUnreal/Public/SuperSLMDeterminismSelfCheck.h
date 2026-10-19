@@ -9,8 +9,9 @@ class USuperSLMModel;
 // D-SLM7223; Coverage Model §9 R-S2b). This header declares the computation every entry point
 // calls: the editor's query window, the Run Determinism Self-Check Blueprint node (which a game,
 // including a packaged build, uses), and FSuperSLMSelfCheckRun / Run() from C++. The self-check
-// has no console command; the plugin's one console command is SuperSLM.CalibrateCosts, which
-// measures scheduling costs and is unrelated.
+// has no console command. The plugin's console commands are SuperSLM.EstimateCosts, which
+// estimates scheduling costs, and SuperSLM.SetDecodeMode and SuperSLM.SetFinishParallelTasks, which
+// select the CPU decode settings; none is related to this check.
 //
 // Runs the pinned reference workload (the example artifact, a pinned prompt, no schema bound,
 // greedy decoding, 32 decode steps) on each backend at two granularities
@@ -79,7 +80,7 @@ struct SUPERSLMUNREAL_API FSuperSLMSelfCheckReport
 
 	// The platform's own device label (plan §7 item 11: "the platform's, not Layer 1's
 	// pick, which cannot be queried" -- no GetGpuDeviceIdentity-style verb exists at
-	// the pinned Layer 1, v1.5.0, 1.7.0 or 1.9.0, plan §2.1).
+	// the pinned Layer 1, v1.5.0, 1.7.0, 1.9.0 or 1.11.0, plan §2.1).
 	FString DeviceLabel;
 	FString LayerOneTagAndCommit;
 	FString PluginVersion;

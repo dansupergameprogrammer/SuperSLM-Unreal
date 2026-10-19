@@ -41,13 +41,13 @@ The test names' middle part (`L2S0` to `L2S3`, `U1`) is the stage of the private
 that added the test, and `R-S…` ids in the source name the requirement a test covers. Roughly:
 `SuperSLM.L2S0` is import, cooking and memory mapping; `L2S1` the CPU backend; `L2S2` the GPU backend
 and the self-check; `L2S3` the Blueprint surface, the editor tools and MCP; `U1` later fixes to both
-backends (`U1.Cpu`, `U1.Gpu`) and the cost calibration (`U1.Calibration`, `U1.Relevance`). `U0`,
+backends (`U1.Cpu`, `U1.Gpu`); `D4` the CPU decode-threading settings and the cost estimate. `U0`,
 which appears only in source comments, was a clean-up stage: it removed tests, a commandlet and a
 CI workflow, and no current test is named after it.
 
 **On any machine**, run this. It leaves out every test whose result depends on which GPU the
 machine has or on figures measured on the maintainer's machine (the GPU backend's tests and the
-example test), the calibration tests and the rendering test. Two tests it keeps are timed: see
+example test), the decode-threading tests and the rendering test. Two tests it keeps are timed: see
 below.
 
 ```
@@ -78,8 +78,10 @@ the example test to the run above:
   recorded SuperSLM run (`SuperSLM.L2S2.SliceInvariance.AgainstSslmGenerateAnchor`). GPU
   determinism is per device, and SuperSLM certifies only the RTX 2080 SUPER and the AMD Radeon RX
   7900 XTX. On other hardware these tests can fail without a defect in your change.
-- The calibration tests (`SuperSLM.U1.Calibration`, `SuperSLM.U1.Relevance`) need an otherwise idle
-  machine and are not in the filter.
+- The decode-threading tests (`SuperSLM.D4`) are not in the filter: each estimate test runs
+  `SuperSLM.EstimateCosts` for several minutes, the settings tests write and restore
+  `Saved/SuperSLM/RuntimeSettings.ini`, and the `Restart` pairs need two editor sessions in order
+  (the `Prepare` test, then the `Observe` test).
 - `SuperSLM.L2S3.QueryWindow.GpuSliceDurationSweepWithRendering` is not in the filter either: it
   measures slices with the editor rendering, so under `-nullrhi` it refuses by name, and it also
   refuses on any GPU but the NVIDIA RTX 2080 SUPER its reference figures come from. Run it in an
@@ -89,7 +91,7 @@ the example test to the run above:
 On an AMD Ryzen 9 3950X with an NVIDIA RTX 2080 SUPER, with the MCP plugin enabled, a routine run
 took about 78 minutes.
 
-**Every test**, the calibration and rendering tests included, is
+**Every test**, the decode-threading and rendering tests included, is
 `-ExecCmds="Automation RunTests SuperSLM;Quit"` on the same command line. Off the maintainer's
 machine, expect those to fail.
 
@@ -123,8 +125,8 @@ with its LoRA adapter.
 | `SUPERSLM_ARTIFACTS_DIR` | A directory holding `superslm/aex/qwen2.5-0.5b-instruct-cap4096-aex-pr.sslm`: the example model, byte-identical to the release asset (same size and SHA-256). Download it from the release and place it there under that name. `SUPERSLM_L2S1_AEX_PATH` or `SUPERSLM_L2S2_AEX_PATH` can point to the file directly instead. | Most of `SuperSLM.L2S1`, `SuperSLM.L2S2`, `SuperSLM.L2S3`, `SuperSLM.U1.Cpu` and `SuperSLM.U1.Gpu` |
 | `SUPERSLM_HF_CACHE` | A model-cache root holding `hub/` (Hugging Face snapshots of Qwen2.5-0.5B-Instruct, Qwen2.5-1.5B-Instruct and Qwen3-Embedding-0.6B, at the revisions named in `Fixtures/L2S3/SuperSLML2S3Fixtures.h`) and `superslm_artifacts/` (artifacts converted with SuperSLM's converter: `qwen2.5-0.5b-instruct.sslm`, the CPU reference model, and `qwen2.5-1.5b-instruct.sslm` with the LoRA adapter named in `Fixtures/SuperSLML2S1Fixtures.h`). The CPU reference model must be the exact file whose size and SHA-256 `SuperSLML2S1Fixtures.h` records, because the recorded reference outputs came from it (the tests do not check those values; a different file shows up as token mismatches); `SUPERSLM_L2S1_ACPU_PATH` can point to it directly. The CPU reference model, the 1.5B model and the adapter are not published (see above). | `hub/`: `SuperSLM.L2S3.PreCheck`. The CPU reference model: `SuperSLM.L2S1.CpuDeterminism`, `.Misuse`, `.SaveRestore`, `.Teardown`, `SuperSLM.L2S3.BlueprintParity`. The 1.5B model and adapter: `SuperSLM.L2S1.Misuse`, `.SaveRestore`, `SuperSLM.L2S3.AdapterSwitch`, `SuperSLM.L2S3.Blueprint`, `SuperSLM.U1.Cpu`, `SuperSLM.U1.Gpu` |
 | `SUPERSLM_BUILD_ROOT` | A checkout that has built the plugin (the directory holding `Plugins/`), for the Python checks under `Plugins/SuperSLMUnreal/ci/tests` that read the module's captured compile line (`SuperSLMUnreal.Shared.rsp` and the per-file `.rsp` files a build writes under the plugin's `Intermediate/`) when the current checkout has not built it. With neither this checkout's build nor the variable, the two status-switch checks skip, but five vendoring checks (`test_thirdparty_vendoring.py`'s `test_e`, `test_f`, `test_g`, `test_g2` and `test_h`) **fail** with "no captured SuperSLMUnreal.Shared.rsp found": they pass once a build has produced the compile line. | `ci/tests`: the vendoring and status-switch checks |
-| `SUPERSLM_BUILD_LOCK` | The path of a build lock directory, when builds on the machine take one. `SuperSLM.CalibrateCosts` refuses to write its figures while a foreign owner holds it. Unset, the lock check is not configured and never refuses. | `SuperSLM.U1.Calibration`, `SuperSLM.U1.Relevance` |
-| `SSU_BUILD_LOCK_TOKEN` | The token a build wrapper that holds the lock passes to the run it launches: the first line of `owner.txt` inside the lock directory. With it, a lock held by that wrapper reads as the run's own; without it, any lock present reads as foreign. | `SuperSLM.U1.Calibration`, `SuperSLM.U1.Relevance` |
+| `SUPERSLM_BUILD_LOCK` | The path of a build lock directory, when builds on the machine take one. `SuperSLM.EstimateCosts` reports the lock's state (absent, own, foreign) at every sample and never stops on it; unset, the state reads `not-configured`. | `SuperSLM.D4.Estimate.NoFlagReportsBothModes`, which expects every sample to read `own` and fails by name when the variable is unset |
+| `SSU_BUILD_LOCK_TOKEN` | The token a build wrapper that holds the lock passes to the run it launches: the first line of `owner.txt` inside the lock directory. With it, a lock held by that wrapper reads as the run's own; without it, any lock present reads as foreign. | `SuperSLM.D4.Estimate.NoFlagReportsBothModes` |
 | `SUPERSLM_EXAMPLE_MODEL_FILE` | The release asset `qwen2.5-0.5b-instruct-cap4096.sslm`, for the example project's test when the project has not imported it as `/Game/SuperSLMExample/ExampleModel`. With neither, the test fails and says so. | `SuperSLMExample` |
 
 The self-check's shipped reference is found in `Plugins/SuperSLMUnreal/Resources/SelfCheck/`

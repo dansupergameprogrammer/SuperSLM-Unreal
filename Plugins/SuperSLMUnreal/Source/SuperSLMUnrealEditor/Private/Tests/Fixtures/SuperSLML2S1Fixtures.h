@@ -53,6 +53,7 @@
 #include "SuperSLMJson.h" // the plugin's one JSON-object read (review R4-W1)
 #include "SuperSLMSlotGates.h"
 #include "SuperSLMSchedulingTestAccess.h"
+#include "Fixtures/SuperSLMConfigAccess.h" // T-3102: the only reader/writer of the config's mode, task and cost fields
 #include "SuperSLMSubsystem.h"
 #include "Templates/Function.h"
 #include "Tests/AutomationCommon.h" // FTestWorldWrapper (Engine module, already a dependency)
@@ -471,27 +472,45 @@ namespace SuperSLML2S1Fixtures
 	// Job.Kind value outside the enum's declared range (not reachable through any current
 	// production call site, since PostLedgerJob only ever constructs a declared enumerator) --
 	// it fails the calling test outright rather than returning a value at all.
-	inline double ExpectedPlannedJobMs(FAutomationTestBase& T, const FSuperSLMWorkerJobReport& Job, const FSuperSLMRuntimeConfig& Config)
+	// T-3102 (D-SLM8146): the thirteen costs come from a cost map. The config form below builds that
+	// map with SuperSLMConfigAccess::GetCosts -- each field the cell set, else the one-time profile of
+	// the expected effective mode -- so the oracle reads the TOptional (D4) and plain shapes alike.
+	inline double ExpectedPlannedJobMs(FAutomationTestBase& T, const FSuperSLMWorkerJobReport& Job, const TMap<FString, double>& Costs)
 	{
+		auto Cost = [&Costs](const TCHAR* Field) { const double* V = Costs.Find(Field); return V ? *V : std::numeric_limits<double>::quiet_NaN(); };
 		switch (Job.Kind)
 		{
-			case ESuperSLMWorkerJobKind::Reset:         return Config.ResetCostMs;
-			case ESuperSLMWorkerJobKind::Adopt:         return Config.AdoptCostMs;
-			case ESuperSLMWorkerJobKind::Save:          return Config.SaveCostMs;
-			case ESuperSLMWorkerJobKind::Restore:       return Config.RestoreCostMs;
-			case ESuperSLMWorkerJobKind::PrefixBegin:   return Config.PrefixBeginCostMs;
-			case ESuperSLMWorkerJobKind::PrefixRelease: return Config.PrefixReleaseCostMs;
+			case ESuperSLMWorkerJobKind::Reset:         return Cost(TEXT("ResetCostMs"));
+			case ESuperSLMWorkerJobKind::Adopt:         return Cost(TEXT("AdoptCostMs"));
+			case ESuperSLMWorkerJobKind::Save:          return Cost(TEXT("SaveCostMs"));
+			case ESuperSLMWorkerJobKind::Restore:       return Cost(TEXT("RestoreCostMs"));
+			case ESuperSLMWorkerJobKind::PrefixBegin:   return Cost(TEXT("PrefixBeginCostMs"));
+			case ESuperSLMWorkerJobKind::PrefixRelease: return Cost(TEXT("PrefixReleaseCostMs"));
 			case ESuperSLMWorkerJobKind::DecodeOrPrefill:
-				return Job.DecodeLayers * Config.LayerCostMs
-					+ Job.DecodeLayerDepthSum * Config.LayerCostPerPositionMs
-					+ Job.PromptTokens * Config.PromptTokenCostMs
-					+ Job.PromptPositionSum * Config.PromptTokenCostPerPositionMs
-					+ Job.TokenFinishes * Config.FinishCostMs;
+			{
+				// Slice 1P item 2: a prefill job is one chunk, priced with the pair its own size
+				// selects -- the batched pair at 8 tokens or more (the engine's tiled-GEMM threshold),
+				// the chunk-1 pair below it. Written out here rather than read from the production
+				// header, so the oracle stays independent of the code it checks.
+				const bool bBatched = Job.PromptTokens >= 8;
+				const double TokenMs = bBatched ? Cost(TEXT("BatchedPromptTokenCostMs")) : Cost(TEXT("PromptTokenCostMs"));
+				const double PerPositionMs = bBatched ? Cost(TEXT("BatchedPromptTokenCostPerPositionMs")) : Cost(TEXT("PromptTokenCostPerPositionMs"));
+				return Job.DecodeLayers * Cost(TEXT("LayerCostMs"))
+					+ Job.DecodeLayerDepthSum * Cost(TEXT("LayerCostPerPositionMs"))
+					+ Job.PromptTokens * TokenMs
+					+ Job.PromptPositionSum * PerPositionMs
+					+ Job.TokenFinishes * Cost(TEXT("FinishCostMs"));
+			}
 		}
 		T.AddError(FString::Printf(
 			TEXT("ExpectedPlannedJobMs: unhandled ESuperSLMWorkerJobKind value %d (job %lld) -- the oracle was never taught this kind; teach it a case rather than trust the fallthrough"),
 			(int32)Job.Kind, Job.JobId));
 		return -1.0; // never a legitimate cost; visibly wrong in any log line that prints it
+	}
+
+	inline double ExpectedPlannedJobMs(FAutomationTestBase& T, const FSuperSLMWorkerJobReport& Job, const FSuperSLMRuntimeConfig& Config)
+	{
+		return ExpectedPlannedJobMs(T, Job, SuperSLMConfigAccess::GetCosts(Config));
 	}
 
 	// D-SLM7407: K = max(1, ceil(PlannedJobMs / TickBudgetMs)).
@@ -556,8 +575,12 @@ namespace SuperSLML2S1Fixtures
 		// prompt token below the share; every other caller leaves the default.
 		if (PromptTokenCostMsOverride >= 0.0)
 		{
-			Config.PromptTokenCostMs = PromptTokenCostMsOverride;
-			Config.PromptTokenCostPerPositionMs = 0.0;
+			SuperSLMConfigAccess::SetCost(Config, TEXT("PromptTokenCostMs"), PromptTokenCostMsOverride);
+			SuperSLMConfigAccess::SetCost(Config, TEXT("PromptTokenCostPerPositionMs"), 0.0);
+			// Slice 1P: chunks of 8 or more are priced with the batched pair, whose default would
+			// otherwise price every such chunk above the share. The override prices both.
+			SuperSLMConfigAccess::SetCost(Config, TEXT("BatchedPromptTokenCostMs"), PromptTokenCostMsOverride);
+			SuperSLMConfigAccess::SetCost(Config, TEXT("BatchedPromptTokenCostPerPositionMs"), 0.0);
 		}
 
 		// The caller reads the whole run's ledger and tick history, so this configuration keeps
@@ -746,8 +769,12 @@ namespace SuperSLML2S1Fixtures
 					RunLabel, Job.JobId, Job.K, ExpectedKValue),
 				Job.K, ExpectedKValue);
 
-			bOk &= T.TestEqual(*FString::Printf(TEXT("%s job %lld: CommittedDeliveryTick must equal PlannedAtTick + K"), RunLabel, Job.JobId),
-				Job.CommittedDeliveryTick, Job.PlannedAtTick + Job.K);
+			// 1.1 (plan §5 item 1a): a continuation commits from the tick the job it follows is
+			// committed to; ChainedWaitTicks is that wait, and is 0 on every other job.
+			bOk &= T.TestTrue(*FString::Printf(TEXT("%s job %lld: ChainedWaitTicks (%d) is 0 unless the job is a continuation, and never negative"), RunLabel, Job.JobId, Job.ChainedWaitTicks),
+				Job.ChainedWaitTicks >= 0 && (Job.bContinuation || Job.ChainedWaitTicks == 0));
+			bOk &= T.TestEqual(*FString::Printf(TEXT("%s job %lld: CommittedDeliveryTick must equal PlannedAtTick + ChainedWaitTicks + K"), RunLabel, Job.JobId),
+				Job.CommittedDeliveryTick, Job.PlannedAtTick + Job.ChainedWaitTicks + Job.K);
 
 			if (Job.DeliveredAtTick < 0)
 			{
@@ -771,9 +798,9 @@ namespace SuperSLML2S1Fixtures
 					RunLabel, Job.JobId, Job.WorkerSpanMs),
 				Job.WorkerSpanMs >= 0.0);
 			const bool bLateByTicks = Job.DeliveredAtTick > Job.CommittedDeliveryTick;
-			const bool bExpectedHitch = bLateByTicks && Job.WorkerSpanMs > double(Job.K) * Config.TickBudgetMs;
-			bOk &= T.TestEqual(*FString::Printf(TEXT("%s job %lld: bHitch must equal (delivered tick %d > committed %d) AND (WorkerSpanMs %.3f > K %d x TickBudgetMs %.3f)"),
-					RunLabel, Job.JobId, Job.DeliveredAtTick, Job.CommittedDeliveryTick, Job.WorkerSpanMs, Job.K, Config.TickBudgetMs),
+			const bool bExpectedHitch = bLateByTicks && Job.WorkerSpanMs > double(Job.ChainedWaitTicks + Job.K) * Config.TickBudgetMs;
+			bOk &= T.TestEqual(*FString::Printf(TEXT("%s job %lld: bHitch must equal (delivered tick %d > committed %d) AND (WorkerSpanMs %.3f > (ChainedWaitTicks %d + K %d) x TickBudgetMs %.3f)"),
+					RunLabel, Job.JobId, Job.DeliveredAtTick, Job.CommittedDeliveryTick, Job.WorkerSpanMs, Job.ChainedWaitTicks, Job.K, Config.TickBudgetMs),
 				Job.bHitch, bExpectedHitch);
 			if (bExpectedHitch)
 			{
@@ -790,27 +817,47 @@ namespace SuperSLML2S1Fixtures
 
 			// (iv) a finished result may apply before its planned tick at U1. It cannot
 			// apply before the planning tick, and cannot overtake an earlier result -- checked
-			// per owner (one shared key for every DecodeOrPrefill job, since with the default one
-			// worker lane they drain strictly in commit order on one thread; each lifecycle-op
-			// job's own sequence for the rest).
+			// per owner. With one worker lane every DecodeOrPrefill job drains strictly in commit
+			// order on one thread, so they share one key. With more than one lane, jobs on
+			// different lanes may legitimately finish out of order, so the owner is each member
+			// sequence. A lifecycle-op job's owner is its own sequence.
 			bOk &= T.TestTrue(*FString::Printf(TEXT("%s job %lld: DeliveredAtTick (%d) must not precede PlannedAtTick (%d)"),
 					RunLabel, Job.JobId, Job.DeliveredAtTick, Job.PlannedAtTick),
 				Job.DeliveredAtTick >= Job.PlannedAtTick);
 
-			const int64 OwnerKey = Job.Kind == ESuperSLMWorkerJobKind::DecodeOrPrefill ? -1 : Job.LifecycleOpSequence.Id;
-			if (const int32* PrevTick = LastDeliveredTickBySequence.Find(OwnerKey))
+			TArray<int64, TInlineAllocator<8>> OwnerKeys;
+			if (Job.Kind != ESuperSLMWorkerJobKind::DecodeOrPrefill)
 			{
-				bOk &= T.TestTrue(*FString::Printf(TEXT("%s job %lld: must not deliver before an earlier job's own delivery (prev tick %d, this tick %d)"),
-						RunLabel, Job.JobId, *PrevTick, Job.DeliveredAtTick),
-					Job.DeliveredAtTick >= *PrevTick);
+				OwnerKeys.Add(Job.LifecycleOpSequence.Id);
 			}
-			LastDeliveredTickBySequence.Add(OwnerKey, Job.DeliveredAtTick);
+			else if (Config.MaxConcurrentCalls <= 1)
+			{
+				OwnerKeys.Add(-1);
+			}
+			else
+			{
+				for (const FSuperSLMSequence& Member : Job.MemberSequences)
+				{
+					OwnerKeys.AddUnique(Member.Id);
+				}
+			}
+			for (const int64 OwnerKey : OwnerKeys)
+			{
+				if (const int32* PrevTick = LastDeliveredTickBySequence.Find(OwnerKey))
+				{
+					bOk &= T.TestTrue(*FString::Printf(TEXT("%s job %lld: must not deliver before an earlier job's own delivery (owner %lld, prev tick %d, this tick %d)"),
+							RunLabel, Job.JobId, OwnerKey, *PrevTick, Job.DeliveredAtTick),
+						Job.DeliveredAtTick >= *PrevTick);
+				}
+				LastDeliveredTickBySequence.Add(OwnerKey, Job.DeliveredAtTick);
+			}
 
-			// (v) a job's own Layer-1 call time exceeding TickBudgetMs is reported as a
-			// worker-side overrun exactly on that job, independent of K's own headroom.
-			const bool bExpectedOverran = Job.WorkerCallMs > Config.TickBudgetMs;
-			bOk &= T.TestEqual(*FString::Printf(TEXT("%s job %lld: bWorkerOverran must equal (WorkerCallMs %.3f ms > TickBudgetMs %.3f ms)"),
-					RunLabel, Job.JobId, Job.WorkerCallMs, Config.TickBudgetMs),
+			// (v) a job's own Layer-1 call time exceeding its own K ticks is reported as a
+			// worker-side overrun exactly on that job (slice 1P item 4: the job's own K, never
+			// ChainedWaitTicks + K; at K = 1 this is 1.0's rule).
+			const bool bExpectedOverran = Job.WorkerCallMs > double(Job.K) * Config.TickBudgetMs;
+			bOk &= T.TestEqual(*FString::Printf(TEXT("%s job %lld: bWorkerOverran must equal (WorkerCallMs %.3f ms > K %d x TickBudgetMs %.3f ms)"),
+					RunLabel, Job.JobId, Job.WorkerCallMs, Job.K, Config.TickBudgetMs),
 				Job.bWorkerOverran, bExpectedOverran);
 		}
 

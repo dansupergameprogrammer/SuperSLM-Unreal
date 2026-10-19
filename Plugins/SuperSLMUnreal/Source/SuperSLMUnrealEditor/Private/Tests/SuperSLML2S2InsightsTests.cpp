@@ -66,8 +66,8 @@
 // this ticket's scope but named here since it is the SAME defect in the SAME shape, and R-S1h's
 // own byte-scan-based cell -- if one exists on that side under the same construction -- would have
 // missed it for the identical reason). ROUTED to the maintainer; this cell's own scope
-// assertions below intentionally assert the INTENDED, undecorated names §5.1 specifies and stay
-// RED until the production fix lands -- rewriting this cell's own names to match the bug would
+// assertions below intentionally assert the INTENDED, undecorated names §5.1 specifies (the
+// production fix has landed, so they pass) -- rewriting this cell's own names to match the bug would
 // launder a real, user-visible defect (any human opening this capture in Unreal Insights sees the
 // broken `L"..."`-quoted names on every SuperSLM track) rather than report it.
 //

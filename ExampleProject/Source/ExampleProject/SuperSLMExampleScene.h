@@ -9,6 +9,7 @@
 class ACameraActor;
 class SSuperSLMExampleWidget;
 class USuperSLMModel;
+class FSuperSLMPagingCertification;
 
 // The example scene, authored in code: this actor builds a small lit set, puts the demonstrator's
 // panel over the game viewport, loads the example model asset, configures both backends, runs
@@ -109,6 +110,7 @@ private:
 	TObjectPtr<ACameraActor> Camera;
 
 	TUniquePtr<FSuperSLMExampleDemo> Demo;
+	TSharedPtr<FSuperSLMPagingCertification> PagingCertification;
 	TSharedPtr<SSuperSLMExampleWidget> Widget;
 
 	FSuperSLMExampleSettings Settings;

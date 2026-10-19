@@ -99,6 +99,24 @@ enum class ESuperSLMRestoreResult : uint8
 	// GPU restore: Layer 1 ran out of GPU memory (SSLM_GPU_ALLOCATION_FAILED); the save is intact
 	// and the restore may be retried later.
 	OutOfMemory,
+
+	// --- Paged KV (plugin paging plan §3.6). Appended after OutOfMemory so every earlier value
+	// keeps its number; the Blueprint mirror gains all three, in this order. ---
+
+	// Budget/pooled mode: the request's page charge does not fit its region of the page ledger
+	// (a restore on arrival, a prefix or nested build, or the engine's KV_POOL_EXHAUSTED on one
+	// of the plan's own requests, which is also counted as a ledger fault). Nothing is drawn and
+	// the sequence is untouched.
+	KvPagesExhausted,
+
+	// The payload's holder mode and the subsystem's mode differ (an 'SSB6' payload into legacy
+	// mode; on the GPU an 'SLM5'/'SLM6' crossing), or an adopt onto a holder that has not been
+	// normalized yet ("reset first"). Decided by the payload magic, never by a wrapper field.
+	KvModeMismatch,
+
+	// GPU pooled mode: a valid 'SLM6' whose budget, origin or context_length is within the
+	// model's cap but above the subsystem's ContextCap. The CPU never returns it.
+	ContextCapMismatch,
 };
 
 namespace SuperSLM

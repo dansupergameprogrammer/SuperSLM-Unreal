@@ -115,7 +115,7 @@ void SSuperSLMExampleWidget::Construct(const FArguments& InArgs)
 						]
 					]
 
-					// Thinking/Frame Budget: one control
+					// Thinking/Frame Budget: one control, showing and editing the selected backend's value
 					+ SVerticalBox::Slot().AutoHeight().Padding(0, 2)
 					[
 						SNew(SHorizontalBox)
@@ -126,8 +126,8 @@ void SSuperSLMExampleWidget::Construct(const FArguments& InArgs)
 							[
 								SNew(SSpinBox<int32>).MinValue(1).MaxValue(SuperSLMExample::NumHiddenLayers)
 								.IsEnabled(this, &SSuperSLMExampleWidget::IsIdle)
-								.Value_Lambda([Settings]() { const FSuperSLMExampleSettings* S = Settings(); return S ? S->FrameBudgetLayers : 1; })
-								.OnValueChanged_Lambda([Settings](int32 V) { if (FSuperSLMExampleSettings* S = Settings()) { S->FrameBudgetLayers = V; } })
+								.Value_Lambda([Settings]() { const FSuperSLMExampleSettings* S = Settings(); return S ? S->BudgetLayers() : 1; })
+								.OnValueChanged_Lambda([Settings](int32 V) { if (FSuperSLMExampleSettings* S = Settings()) { S->SetBudgetLayers(V); } })
 							]
 						]
 						+ SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center).Padding(8, 0, 0, 0)
@@ -313,7 +313,7 @@ FText SSuperSLMExampleWidget::DigestText() const
 	const FSuperSLMExampleReadout& R = Demo->GetReadout();
 	if (R.State != ESuperSLMExampleRunState::Done)
 	{
-		return LOCTEXT("NoDigest", "Ask a question. Then, on the CPU backend, move Thinking/Frame Budget, concurrent queries or k and ask again: only the frames and the cost change. Switching Backend can change the answer.");
+		return LOCTEXT("NoDigest", "Ask a question. Then, on the CPU backend, move Thinking/Frame Budget (the CPU's layer budget) or concurrent queries and ask again: only the frames and the cost change. Switching Backend can change the answer.");
 	}
 	FString Text = FString::Printf(TEXT("%s\n%d of %d concurrent queries produced this digest."), *R.TokenDigestHex, R.QueriesMatchingDigest, R.QueryCount);
 
@@ -372,7 +372,9 @@ FText SSuperSLMExampleWidget::FrameBudgetHint() const
 	const FSuperSLMExampleSettings& S = Scene->GetSettings();
 	if (S.Backend == ESuperSLMExampleBackend::CPU)
 	{
-		return FText::FromString(FString::Printf(TEXT("layers per worker call (layer_budget)%s"), S.IsWholeToken() ? TEXT(", whole token") : TEXT("")));
+		// The CPU's value sizes the worker's job, never the frame: the inference is off the game thread.
+		return FText::FromString(FString::Printf(TEXT("CPU layers per worker job (layer_budget)%s; not a frame cost"),
+			S.CpuLayerBudget >= SuperSLMExample::NumHiddenLayers ? TEXT(", whole token") : TEXT("")));
 	}
 	return S.IsWholeToken() ? LOCTEXT("WholeToken", "whole token (one-call path)") : LOCTEXT("PerSlice", "layers per GPU slice (composed path)");
 }

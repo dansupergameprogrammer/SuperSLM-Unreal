@@ -5,15 +5,16 @@
 #include "superslm/parallel_for.h"
 
 // Layer 1's host parallel-for hook (1.7.0; the plan §2.5 row 2, §5 CPU
-// path item 7, D-SLM7657, D-SLM7663). Only the token finish's logits step reads it: its rows are
-// split into at most FinishParallelTasks blocks and handed to one plugin-owned `run`, which calls
+// path item 7, D-SLM7657, D-SLM7663; decode-threading D4). The token finish's logits step and,
+// with bit 1 enabled, CPU one-row decode projections read it. Work is split into at most
+// FinishParallelTasks blocks and handed to one plugin-owned `run`, which calls
 // UE's ParallelFor. The calling thread (a CPU worker lane, the GPU submission thread, or the
-// calibration command) takes part and waits for the rest, so the hook meets Layer 1's contract:
+// cost estimate, SuperSLM.EstimateCosts) takes part and waits for the rest, so the hook meets Layer 1's contract:
 // every index in [0, task_count) is invoked exactly once, and `run` returns only after the last
 // invocation has returned (Engine/Source/Runtime/Core/Public/Async/ParallelFor.h). Tokens are
 // identical at every setting and with no hook.
 //
-// One definition serves the CPU workspaces, the GPU context and the calibration command, so
+// One definition serves the CPU workspaces, the GPU context and the cost estimate, so
 // FinishCostMs is measured on the same finish the runtime runs.
 namespace SuperSLMFinishHook
 {
@@ -32,6 +33,7 @@ namespace SuperSLMFinishHook
 	}
 
 	// The hook the plugin installs: run = the ParallelFor bridge, host_ctx = null, max_tasks =
-	// FinishParallelTasks. Holds no state; Layer 1 copies it into the workspace or context.
-	sslm_parallel_for Make(int32 FinishParallelTasks);
+	// FinishParallelTasks, reserved = Bits. Holds no state; Layer 1 copies it into the workspace
+	// or context. GPU callers pass zero bits.
+	sslm_parallel_for Make(int32 FinishParallelTasks, uint32 Bits);
 }

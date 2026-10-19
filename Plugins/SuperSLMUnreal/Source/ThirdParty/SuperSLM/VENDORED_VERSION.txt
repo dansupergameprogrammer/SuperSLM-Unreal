@@ -1,30 +1,93 @@
 SuperSLM -- vendored source dependency
 
-Tag:    v1.9.0
-Commit: d870d27863c73afb0d558b376f5e8ad84f83951c
+Tag:    v1.13.1
+Commit: d697927f6d5ce5fa73ecbb8660020a425518b923
+Base release commit: d697927f6d5ce5fa73ecbb8660020a425518b923
+Release status: published release v1.13.1
 Source repository: the upstream SuperSLM repository (not this repository)
 
-Vendored 2026-08-22 (at v1.2.0, corrected the same day), re-pinned to v1.5.0 2026-09-18,
-to v1.7.0 2026-09-23 (1.6.0 was skipped), to v1.7.1 2026-09-24, and to v1.9.0 2026-09-25 (one
-pin from v1.7.1; 1.8.0 and 1.8.1 were skipped; the tag, never main), in a clone of the upstream
-repository, via:
-  git ls-tree -r v1.9.0
-  git cat-file blob <blob id>   -- per file, the raw blob written to this tree
+The Tag line names the release and the Commit line the commit the tag points to. 1.13.1 is v1.13.0 plus
+three fixes: default-heap GPU buffers are created in COMMON, their real D3D12 creation state (0d1c3785,
+b75bc964, with probes in 002094a6); a GPU page pool is capped at D3D12's required single-resource size for
+the adapter, max(128 MiB, min(1/4 of its reported dedicated video memory, 2048 MiB)), refusing a larger pool
+with SSLM_GPU_KV_POOL_TOO_LARGE before allocating (2efa82d3; the cap was 2^32 bytes, and the RX 7900 XTX's
+driver removed the device on a 4 GiB pool); and the three Windows GPU schema test builders link
+gpu_inflight_registry.cpp. The public ABI is 1.13.0's plus one additive GPU verb,
+sslm_gpu_kv_pool_max_page_count. Release note: docs/releases/1.13.1.md.
 
-This tree is the tag's full source distribution (CMakeLists.txt, cmake/, include/, src/,
-tests/, tools/, docs/, build.bat, build_cert.bat, license and policy files), byte-identical to
-`git show v1.9.0:<path>` for every file, except `.github/` (CI workflow definitions for the
-upstream repository, not consumed by this plugin's own build). 892 files, each re-checked at
-re-vendoring time against its tag blob id: 852 at v1.7.1 plus 40 files added by v1.9.0, with
-none removed (up from 845 at v1.7.0, 684 at v1.5.0 and 526 at v1.2.0). The 40 added files are
-three release notes, one CI checker under tools/ci/, four under tests/ci/, and test suites
-under tests/; none is a library source, so the wrapper set is unchanged. The product change
-across v1.7.1..v1.9.0 is: 1.8.0's GPU allocation-failure status contract (src/gpu/,
-include/superslm/gpu_1p0.h, gpu_port.h, checked_chain_funnel.h, src/sslm_abi.cpp); 1.8.1's
-per-site saturation counts through CPU prefill and prefix adoption (src/sslm_abi.cpp); and
-1.9.0's CPU save format SSB5 (src/sslm_abi.cpp; SSB4, SSB3 and SSB2 still restore) and the
-map-time damped-greedy i-exp peak check (src/damped_greedy_phaseD.cpp,
-include/superslm/sslm_phaseD.h). The shader set is unchanged at 35.
+The distribution has 1459 files, excluding .github/ and this vendoring metadata. Each is byte-identical
+to git show d697927f6d5ce5fa73ecbb8660020a425518b923:<path>, except the five existing consumer-witness repairs listed below. The library
+sources (src/, include/) are byte-identical to the validated candidate 2efa82d3; v1.13.1 adds the version,
+docs, the test-builder fix, and main's CI and test tooling changes since v1.13.0.
+
+Raw blobs were read through git ls-tree and git cat-file --batch. The complete SHA-256 manifest
+records every file and is checked by ci/check_vendored_tree_matches_manifest.py. The five local
+T-3050 witness/tool adaptations to SuperSLMFinishHook::Make are retained unchanged:
+route_p_hook_witness.cpp, route_p_run_count.cpp, run_route_p_hook_witness.sh, run_merge_acceptance.sh,
+and shim/CoreMinimal.h under tools/consumer_reach/route_p_hook/. Their hashes remain explicit.
+
+History: v1.13.0 was re-vendored from v1.11.0 on 2026-10-15, skipping v1.12.0; its 1452 files added the
+paged-K/V sources, suites and headers. The 1.13.1 candidates 002094a6 and 2efa82d3 were vendored on
+2026-10-17/18 for validation, and v1.13.1 on 2026-10-19. No library source or existing test is removed.
+Earlier source pins and the initial v1.2.0 import are retained in Git history.
+
+The v1.13.0 base added two library sources, both in SUPERSLM_CORE_SOURCES, so the wrapper set gains
+two unguarded wrappers:
+- src/kv_pages.cpp (with its private header src/kv_pages.h), the CPU page pool and page tables:
+  Private/Vendored/SuperSLMVendored_kv_pages.cpp.
+- src/gpu/gpu_inflight_registry.cpp, which sits under src/gpu/ but is D3D12-free (standard library
+  only) and is in the core list, not the superslm_gpu list; src/forward/parallel_split.cpp includes
+  its header on every platform: Private/Vendored/SuperSLMVendored_gpu_inflight_registry.cpp, NOT
+  guarded by SUPERSLMUNREAL_WITH_GPU.
+The superslm_gpu source list is unchanged (gpu_1p0.cpp and superslm_gpu.cpp). The new GPU headers
+(gpu_inflight_token.h, submission_ledger.h, gpu_kv_pool_geometry.h, gpu_call_timing_snapshot.h,
+gpu_resource_state_tracker.h) are header-only; the state tracker compiles to nothing unless
+SUPERSLM_GPU_STATE_TRACKING is defined, and this plugin defines it nowhere. The 1.13.0 CMake
+changes beyond the version and those two source lines are test-only (test seams, test suites, and
+a configure guard against SUPERSLM_MUTANT_* reaching the production library); this plugin defines
+no SUPERSLM_MUTANT_* and no SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS. (v1.11.0 had added the earlier
+core source src/forward/parallel_split.cpp and its wrapper.)
+
+The product change across v1.11.0..v1.13.0:
+- 1.12.0, CPU paged K/V: the CPU backend stores K/V in pages of B positions (B follows from the
+  model; 64 for Qwen2.5-0.5B at cap 4,096) through a per-holder page table, with tokens and K/V
+  values bit-identical to 1.11.0. Thirteen C verbs are added (budget-mode sequences and prefixes,
+  page pools, pool and sequence statistics) and one status, SSLM_KV_BUDGET_EXCEEDED (ordinal 29);
+  no signature, struct layout or existing ordinal changes. The memory savings come only from the
+  new budget-mode verbs. A budget holder saves the new SSB6; a no-budget holder keeps writing
+  SSB5, byte-equal to 1.11.0's. The no-budget save was slower than 1.11.0's at 1.12.0 (improved,
+  not fully recovered, at 1.13.0, below).
+- 1.13.0, GPU paged K/V: GPU page pools, budgeted GPU sequences and prefixes, shared prefix pages
+  and the SLM6 save blob, through 12 new gpu_1p0.h verbs and six new SslmGpuStatus values
+  (ordinals 24-29: SSLM_GPU_KV_BUDGET_EXCEEDED, SSLM_GPU_KV_POOL_EXHAUSTED,
+  SSLM_GPU_KV_POOL_TOO_LARGE, SSLM_GPU_HOLDER_MODE_MISMATCH, SSLM_GPU_PREFIX_REJECTED,
+  SSLM_GPU_PREFIX_SCHEMA_MISMATCH). No existing gpu_1p0.h declaration, struct layout or ordinal
+  changes. Three gpu_port.h internals change signature (RunLayerLoopGpuSubmit,
+  RunLayerLoopGpuFinish, SubmitChunkToFullDepthForG5Bridge); this plugin calls none of them.
+  Also: a barrier-race fix in the shipped shaders (eight .hlsl files and site_common.hlsli change;
+  the shader count is still 35, and SuperSLMUnreal.Build.cs rebuilds and stages the whole set from
+  this tree, so shaders and library come from one release by construction), atomic live-handle
+  counts, a faster no-budget CPU save at 16 MiB blocks and up (bytes unchanged), and new SSLM_BUSY
+  refusals for a second guarded GPU call while earlier work is unobserved and for two decodes
+  raced on one handle (previously undefined). 1.13.0 is verified on the NVIDIA card only; its
+  release note says nothing in it is verified on the AMD Radeon RX 7900 XTX.
+
+What changed in this plugin for the pin: the two wrappers above; six arms in
+SuperSLMGpuStatusMapping.h's exhaustive SslmGpuStatus switch (the pin is a compile break without
+them); two arms in its restore mapping, SSLM_GPU_HOLDER_MODE_MISMATCH -> KvMismatch (what an SLM6
+blob read through SSLM_SEQUENCE_KV_BUFFER_MISMATCH at 1.12.0 and earlier) and
+SSLM_GPU_KV_POOL_EXHAUSTED -> OutOfMemory, with the four non-restore statuses on its default arm
+(Malformed); the restore-mapping test's enumerator list; and the CI pins. The plugin calls no
+paging verb at this pin.
+
+Legacy mode is unchanged. The CPU save is still SSB5 for every sequence this plugin makes
+(byte-equal to 1.11.0's), and the GPU save is still SLM5: a sequence made by
+sslm_gpu_seq_create keeps a whole-cap buffer, now addressed through a one-page table that is the
+old flat layout by construction. sslm_seq_state_size is 20 bytes larger and remains an upper
+bound, and sslm_kv_pool_overhead_size changes only at caps B does not divide; the plugin asks both
+verbs rather than assuming their values. sslm_gpu_seq_restore now refuses an SLM6 blob with
+SSLM_GPU_HOLDER_MODE_MISMATCH, which no legacy save produces. As at every pin, the Layer-1 tag in
+the save wrapper changes, so a save taken at the v1.11.0 pin is refused Layer1Mismatch.
 
 **The first vendoring pass at v1.2.0 (2026-08-22) was corrected the same day**: `git archive`
 on Windows applies `.gitattributes`' `text`/`eol=crlf`
@@ -40,10 +103,10 @@ the full CMake project -- including its test and tool executables' source, not o
 and the library sources -- is vendored: CMakeLists.txt declares those targets unconditionally
 at configure time, and configure fails if their sources are absent.
 
-Do not hand-edit any file under this directory. A correction to SuperSLM is made upstream and
-this tree is re-vendored at the new pin. `VENDORED_MANIFEST.sha256` records this tree's own
-per-file hashes at vendoring time, checked by `ci/tests/test_vendored_tree_checks_run_in_ci.py`
-against the COMMITTED tree at every `ci/tests` run -- a hand-edit that alters any file's content
-fails that check. (`ci/check_vendored_tree_matches_manifest.py` and
+Do not hand-edit Layer 1 engine files under this directory. A correction to SuperSLM is made upstream and
+this tree is re-vendored at the new pin. The T-3050 witness repairs above are tracked local exceptions.
+`VENDORED_MANIFEST.sha256` records this tree's current per-file hashes, checked by
+`ci/tests/test_vendored_tree_checks_run_in_ci.py` against the COMMITTED tree at every `ci/tests`
+run -- an unrecorded edit that alters any file's content fails that check. (`ci/check_vendored_tree_matches_manifest.py` and
 `ci/check_vendored_wrappers_complete.py` are the checkers; `ci/tests` runs them, and the
 repository's coherence-checks workflow runs them too.)

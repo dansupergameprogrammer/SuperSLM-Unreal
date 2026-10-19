@@ -8,9 +8,11 @@ the game thread, and gives the same answer to the same prompt every time.
 It needs no server, API key or internet connection. The model ships with your game as an Unreal
 asset, and the plugin schedules its work around your frame.
 
-> **Status: 1.0.** Released; built and tested on Windows x64. Performance tuning is the current focus: expect generation to take many
-> frames, and measure on your own target hardware before you design around it. What 1.0 covers
-> and does not cover is in [What 1.0 covers](docs/STATUS.md).
+> **Status: 1.2.** Released; built and tested on Windows x64. 1.2 adds an optional shared page pool
+> for sequence memory, off unless you turn it on ([Paging](docs/PAGING.md)). Performance tuning is the
+> current focus: expect generation to take many frames, and measure on your own target hardware before
+> you design around it. What 1.0 covers and does not cover is in [What 1.0 covers](docs/STATUS.md);
+> the [changelog](CHANGELOG.md) has what changed since.
 
 ---
 
@@ -61,7 +63,7 @@ frame carries. Neither backend runs inference on the game thread.
 SuperSLM computes in integers. On the CPU backend, the same model, prompt and settings produce the
 same tokens every time, however the work was sliced and however many frames it took. The plugin
 includes a determinism self-check that runs in the editor or a packaged build and reports what it
-verified. GPU determinism depends on the device and is not claimed in 1.0. See
+verified. GPU determinism depends on the device and is not claimed. See
 [Determinism](docs/DETERMINISM.md).
 
 ### Built for shipping
@@ -138,8 +140,8 @@ if (Query->TickQuery(DeltaSeconds, bSucceeded, Readout, Error) && bSucceeded)
 
 **The example model.** Each release attaches one ready-to-use model: Qwen2.5-0.5B-Instruct,
 converted with SuperSLM at a context length of 4096, with the example project's schemas. It is a
-release download rather than a file in the repository, and will appear on the
-[Releases](https://github.com/dansupergameprogrammer/SuperSLM-Unreal/releases) page with 1.0.
+release download rather than a file in the repository, attached to each release on the
+[Releases](https://github.com/dansupergameprogrammer/SuperSLM-Unreal/releases) page.
 
 | | |
 |---|---|
@@ -179,8 +181,8 @@ on the CPU), and speeding that up is the current work. Every figure, with its co
 ## Known limitations
 
 - Windows x64 only for now. The GPU backend is Windows-only.
-- GPU determinism is not claimed in 1.0, and the self-check's GPU verdict is withheld.
-- Shared prompt prefixes are CPU-only.
+- GPU determinism is not claimed, and the self-check's GPU verdict is withheld.
+- On the GPU, shared prompt prefixes need the shared page pool ([Paging](docs/PAGING.md)).
 - The plugin uses greedy decoding; sampling is not exposed.
 - Performance is still being tuned, and every published figure comes from one development machine.
 
@@ -204,7 +206,7 @@ The complete list, with every measured figure and the machine it came from, is i
 | [Assets and Import](docs/ASSETS_AND_IMPORT.md) | Models, schemas, adapters and cooking. |
 | [Architecture](docs/ARCHITECTURE.md) | How the two backends schedule work, and where memory lives. |
 | [Determinism](docs/DETERMINISM.md) | What is guaranteed, and the self-check. |
-| [Profiling](docs/PROFILING.md) and [Tooling](docs/TOOLING.md) | Unreal Insights, editor tools, calibration and the MCP toolset. |
+| [Profiling](docs/PROFILING.md) and [Tooling](docs/TOOLING.md) | Unreal Insights, editor tools, the cost estimate and the MCP toolset. |
 | [What 1.0 covers](docs/STATUS.md) | Tested platforms, limits and measurements. |
 
 ## Contributing, security and license

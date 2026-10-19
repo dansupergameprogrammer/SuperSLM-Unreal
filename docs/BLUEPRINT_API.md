@@ -223,6 +223,6 @@ time, or behind a loading screen):
 - GPU `MapAdapter()` and `UnmapAdapter()` wait on the GPU submission queue.
 - GPU `ProbeContextUsable()` waits on the GPU submission queue. It is also a real GPU submission,
   and a false result tears the GPU backend down, so do not call it speculatively.
-- The `SuperSLM.CalibrateCosts` console command runs its whole measurement on the game thread,
+- The `SuperSLM.EstimateCosts` console command runs its whole measurement on the game thread,
   prefills included, and the editor or game does not respond until it finishes. See
   [TOOLING.md](TOOLING.md#commands-and-c-tools).

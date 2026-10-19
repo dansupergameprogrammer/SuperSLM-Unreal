@@ -49,16 +49,17 @@ namespace
 		}
 		const int32 Vended = Gpu.GetPoolOccupiedCount();
 		const int32 Adapters = Gpu.GetMappedAdapterCount();
-		if (Vended > 0 || Adapters > 0)
+		const int32 Prefixes = Gpu.GetLivePrefixCount();
+		if (Vended > 0 || Adapters > 0 || Prefixes > 0)
 		{
-			return FString::Printf(TEXT("the GPU backend still holds %d vended sequence(s) and %d mapped adapter(s); return and unmap them first"), Vended, Adapters);
+			return FString::Printf(TEXT("the GPU backend still holds %d vended sequence(s) and %d mapped adapter(s), plus %d prefix(es); return, unmap and release them first"), Vended, Adapters, Prefixes);
 		}
 		return FString();
 	}
 }
 
 USuperSLMLoadModelAsyncAction* USuperSLMLoadModelAsyncAction::LoadSuperSLMModelAsync(UObject* WorldContextObject, USuperSLMModel* InModel,
-	bool bInConfigureGpu, int32 InPoolSize, float InCpuTickBudgetMs, float InGpuTickBudgetMs, float InSequenceLifecycleBudgetMs, int32 InPrefixBlockCount)
+	bool bInConfigureGpu, int32 InPoolSize, float InCpuTickBudgetMs, float InGpuTickBudgetMs, float InSequenceLifecycleBudgetMs, int32 InPrefixBlockCount, int32 InSequenceBudget)
 {
 	USuperSLMLoadModelAsyncAction* Action = NewObject<USuperSLMLoadModelAsyncAction>();
 	Action->Model = InModel;
@@ -67,6 +68,7 @@ USuperSLMLoadModelAsyncAction* USuperSLMLoadModelAsyncAction::LoadSuperSLMModelA
 	// Out-of-range figures go to Configure() as given, which refuses them by name (R-S1f).
 	Action->PoolSize = InPoolSize;
 	Action->PrefixBlockCount = InPrefixBlockCount;
+	Action->SequenceBudget = InSequenceBudget;
 	Action->CpuTickBudgetMs = InCpuTickBudgetMs;
 	Action->GpuTickBudgetMs = InGpuTickBudgetMs;
 	Action->SequenceLifecycleBudgetMs = InSequenceLifecycleBudgetMs;
@@ -122,6 +124,7 @@ void USuperSLMLoadModelAsyncAction::Activate()
 	Config.MaxLayerBudget = Shape.NumHiddenLayers;
 	Config.BlockCount = PoolSize;
 	Config.PrefixBlockCount = PrefixBlockCount;
+	Config.SequenceBudget = SequenceBudget;
 	Config.SequenceLifecycleBudgetMs = SequenceLifecycleBudgetMs;
 	Config.TickBudgetMs = CpuTickBudgetMs;
 
@@ -161,7 +164,7 @@ void USuperSLMLoadModelAsyncAction::OnCpuConfigured(const FSuperSLMConfigureRepo
 		return;
 	}
 	// Review R5-W1: the GPU stayed configured with its previous model through the CPU phase, so a
-	// sequence may have been vended on it (or an adapter mapped, or a configure started) since
+	// sequence may have been vended on it (or a prefix created, an adapter mapped, or a configure started) since
 	// Activate(). Checked again here, before BeginGpu()'s teardown; on a hit the GPU is left as it
 	// is and the load finishes with the CPU only, naming why.
 	const FString WhyGpu = WhyGpuBusy(*Gpu);
@@ -181,6 +184,8 @@ void USuperSLMLoadModelAsyncAction::BeginGpu(int32 K, bool bRetryAtMinimumK)
 	FSuperSLMGpuRuntimeConfig Config;
 	Config.ContextCap = ContextCap;
 	Config.BlockCount = PoolSize;
+	Config.SequenceBudget = SequenceBudget;
+	Config.PrefixBlockCount = SequenceBudget > 0 ? PrefixBlockCount : 0;
 	Config.DispatchBudget = kMaxDispatchesPerLayer * static_cast<uint32>(NumHiddenLayers);
 	Config.K = K;
 	Config.TickBudgetMs = GpuTickBudgetMs;

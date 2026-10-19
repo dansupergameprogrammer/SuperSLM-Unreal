@@ -107,11 +107,19 @@ struct FSuperSLMExampleSettings
 {
 	ESuperSLMExampleBackend Backend = ESuperSLMExampleBackend::CPU;
 
-	// Thinking/Frame Budget, one control: layers per slice, 1 to NumHiddenLayers. On the CPU it is
-	// the sequence's layer_budget. On the GPU it sets the composed path's dispatch_budget in whole
-	// layers per slice, and the top position (NumHiddenLayers) selects the one-call path, labelled
-	// "whole token".
+	// Thinking/Frame Budget, one control, with a value per backend: the panel shows and edits the
+	// selected backend's.
+	//
+	// GPU: layers per slice, 1 to NumHiddenLayers. It sets the composed path's dispatch_budget in
+	// whole layers per slice, which is what one tick issues, so it is a real frame cost; the top
+	// position (NumHiddenLayers) selects the one-call path, labelled "whole token".
 	int32 FrameBudgetLayers = SuperSLMExample::DefaultFrameBudgetLayers;
+
+	// CPU: the sequence's layer_budget, 1 to NumHiddenLayers. It sizes the worker's job, not the
+	// frame: the inference runs on the plugin's worker threads, so moving it changes the worker's
+	// throughput and the K a job earns, never the game thread's own cost. The default is the whole
+	// token, the setting with the fewest jobs per token.
+	int32 CpuLayerBudget = SuperSLMExample::NumHiddenLayers;
 
 	int32 ConcurrentQueries = 1;
 
@@ -122,7 +130,12 @@ struct FSuperSLMExampleSettings
 
 	FString Utterance = SuperSLMExample::DefaultUtterance();
 
+	// The GPU's Frame Budget at its top position: the one-call path.
 	bool IsWholeToken() const { return FrameBudgetLayers >= SuperSLMExample::NumHiddenLayers; }
+
+	// The selected backend's value of the Thinking/Frame Budget control.
+	int32 BudgetLayers() const { return Backend == ESuperSLMExampleBackend::CPU ? CpuLayerBudget : FrameBudgetLayers; }
+	void SetBudgetLayers(int32 Layers) { (Backend == ESuperSLMExampleBackend::CPU ? CpuLayerBudget : FrameBudgetLayers) = Layers; }
 };
 
 enum class ESuperSLMExampleRunState : uint8
@@ -183,6 +196,10 @@ struct FSuperSLMExampleReadout
 	int32 GpuLayersPerTick = 0;
 	double CpuMaxTickMs = -1.0;
 	int32 CpuTicks = 0;
+
+	// CPU: the most decode layers any of this run's worker jobs ran (GetJobLedger() DecodeLayers),
+	// which the layer_budget bounds per sequence. -1 when no decode job was read.
+	int32 CpuMaxDecodeLayersPerJob = -1;
 
 	TArray<FSuperSLMExampleFigure> Figures;
 };

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(superslm VERSION 1.9.0 LANGUAGES CXX)
+project(superslm VERSION 1.13.1 LANGUAGES CXX)
 
 # C++20: the S-LoRA delta path is specified at -std=c++20 (SuperSLM_Plan.md §19),
 # and the core carries wide-integer (int64) composition arithmetic throughout. One
@@ -27,6 +27,8 @@ set(SUPERSLM_INSTALL_GPU_SHADER_DIR "${CMAKE_INSTALL_DATADIR}/superslm/gpu-shade
 
 # The core library. Layer 1 is independently embeddable — no Unreal, no third-party
 # runtime dependency in its graph (DecisionLog D-SLM13). Standard library only.
+# src/gpu/gpu_inflight_registry.cpp is GPU paged-KV plan G3's run-site task trampoline, D3D12-free.
+# Keep comments out of the list below: tools and tests read it with plain text parsers.
 set(SUPERSLM_CORE_SOURCES
 	src/artifact.cpp
 	src/sha256.cpp
@@ -39,7 +41,10 @@ set(SUPERSLM_CORE_SOURCES
 	src/trace_hook.cpp
 	src/forward/checked_chain_funnel.cpp
 	src/forward/forward_sites.cpp
+	src/forward/parallel_split.cpp
+	src/gpu/gpu_inflight_registry.cpp
 	src/decode_digest.cpp
+	src/kv_pages.cpp
 	src/sslm_abi.cpp
 	src/damped_greedy_antilm.cpp
 	src/damped_greedy_topk.cpp
@@ -84,6 +89,14 @@ add_library(superslm_test_injection STATIC ${SUPERSLM_CORE_SOURCES})
 target_include_directories(superslm_test_injection PUBLIC include)
 target_include_directories(superslm_test_injection PRIVATE tests)
 target_compile_definitions(superslm_test_injection PRIVATE SUPERSLM_ENABLE_BAD_ALLOC_INJECTION)
+# Decode-threading plan §3.9: the minimum-work and layer-site fault seams (src/forward/
+# parallel_split.h). Test libraries only; the production library reads the constant. PUBLIC so
+# the suite's own compile of tests/test_decode_threading_d1.cpp sees the seam declarations.
+target_compile_definitions(superslm_test_injection PUBLIC SUPERSLM_ENABLE_MATVEC_TEST_SEAMS)
+# Paged-KV plan §3.3 / §7 cells 7.13 and 11.3: the page module's table-sentinel and double-unmap
+# seams (src/kv_pages.h). Test library only; the production address read is a plain load. PUBLIC so
+# a cell that includes src/kv_pages.h sees the seam declarations.
+target_compile_definitions(superslm_test_injection PUBLIC SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS)
 if(MSVC)
 	target_compile_options(superslm_test_injection PRIVATE /W4 /fp:precise)
 else()
@@ -91,13 +104,19 @@ else()
 endif()
 
 add_executable(superslm_tests tests/test_main.cpp tests/test_slm18x_saturation_census.cpp
-	tests/test_slm19x_schema_damped_greedy.cpp)
+	tests/test_slm19x_schema_damped_greedy.cpp tests/test_tiled_gemm.cpp tests/test_attn_rowsites.cpp
+	tests/test_decode_threading.cpp tests/test_decode_threading_d1.cpp)
 target_link_libraries(superslm_tests PRIVATE superslm_test_injection)
 if(MSVC)
 	target_compile_options(superslm_tests PRIVATE /W4 /fp:precise)
 else()
 	target_compile_options(superslm_tests PRIVATE -Wall -Wextra -ffp-contract=off)
 endif()
+
+# Paged-KV plan (rev 16.1) step C1: the red suite's per-step executables, all EXCLUDE_FROM_ALL.
+include(tests/paged-kv/paged_kv.cmake)
+# GPU paged-KV plan (rev 16) step G3: the D3D12-free core's host-only cells.
+include(tests/gpu-g3-core/g3_core.cmake)
 
 # T-2152 (outside strike item 1): tests/test_main.cpp's own T-2019/T-2024 GPU-serial-port
 # section calls `superslm_gpu::*` directly (#ifdef _WIN32-guarded in that file so the same
@@ -122,6 +141,49 @@ endif()
 
 enable_testing()
 add_test(NAME superslm_tests COMMAND superslm_tests)
+
+# The portable arm of src/sha256.cpp's run-time dispatch, pinned by
+# SUPERSLM_FORCE_PORTABLE_SHA256 (the SHA-256 analogue of SUPERSLM_FORCE_SCALAR_MATMUL):
+# superslm_tests covers whichever path the CPU selects, this binary covers the portable
+# path through the same public API. It compiles src/sha256.cpp itself rather than a whole
+# forced copy of the core library, since that file is the only one the macro touches.
+add_executable(sha256_portable_forced_tests tests/sha256_portable_forced_tests.cpp src/sha256.cpp)
+target_include_directories(sha256_portable_forced_tests PRIVATE include src)
+target_compile_definitions(sha256_portable_forced_tests PRIVATE SUPERSLM_FORCE_PORTABLE_SHA256)
+if(MSVC)
+	target_compile_options(sha256_portable_forced_tests PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(sha256_portable_forced_tests PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+add_test(NAME sha256_portable_forced_tests COMMAND sha256_portable_forced_tests)
+
+# Paged-KV plan (rev 16.1) step G2: the GPU K/V page-table addressing, checked on the host. CPU-only:
+# it runs src/gpu/shaders/kv_page_addr_model.h (the C++ transliteration of site_common.hlsli's
+# KvRowAddrGpu and of the page-run loop bounds) against the pre-G2 flat layout, the CPU engine's own
+# KvPageView accessors and the uint ceiling, and checks the transliteration reads as the shader text.
+add_executable(gpu_kv_page_addr_tests tests/gpu_kv_page_addr_tests.cpp)
+target_link_libraries(gpu_kv_page_addr_tests PRIVATE superslm)
+target_include_directories(gpu_kv_page_addr_tests PRIVATE src)
+target_compile_definitions(gpu_kv_page_addr_tests PRIVATE SSLM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+if(MSVC)
+	target_compile_options(gpu_kv_page_addr_tests PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(gpu_kv_page_addr_tests PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+add_test(NAME gpu_kv_page_addr_tests COMMAND gpu_kv_page_addr_tests)
+
+# Paged-KV plan (rev 16.1) step G3: the GPU page pool's host-only arithmetic (src/gpu/
+# gpu_kv_pool_geometry.h: page geometry, the 2^32 size refusal, R(budget), the zero-fill's staging
+# chunks, the chunk-wide coverage twin) and §4 item 6b on the kv_pages module the pool reuses.
+add_executable(gpu_kv_pool_geometry_tests tests/gpu_kv_pool_geometry_tests.cpp)
+target_link_libraries(gpu_kv_pool_geometry_tests PRIVATE superslm)
+target_include_directories(gpu_kv_pool_geometry_tests PRIVATE src)
+if(MSVC)
+	target_compile_options(gpu_kv_pool_geometry_tests PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(gpu_kv_pool_geometry_tests PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+add_test(NAME gpu_kv_pool_geometry_tests COMMAND gpu_kv_pool_geometry_tests)
 endif()
 
 # The §13 item 7 independent converter verifier (S-HARDEN-3, F13): loads a
@@ -260,6 +322,43 @@ else()
 	target_compile_options(sslm_axis_digest_scalar_forced PRIVATE -Wall -Wextra -ffp-contract=off)
 endif()
 
+# Decode-threading plan §8 4.5 (F9): the scalar tier has no full-suite binary (the scalar library
+# above feeds the digest only), so the decode-threading cells get their own: a seam-enabled scalar
+# library and a standalone main that runs tests/test_decode_threading{,_d1}.cpp alone. Excluded
+# from `all`, like the other forced targets; the SSE2-forced CI leg builds and runs it.
+add_library(superslm_scalar_forced_seams STATIC EXCLUDE_FROM_ALL ${SUPERSLM_CORE_SOURCES})
+target_include_directories(superslm_scalar_forced_seams PUBLIC include)
+target_include_directories(superslm_scalar_forced_seams PRIVATE tests)
+target_compile_definitions(superslm_scalar_forced_seams PUBLIC SUPERSLM_FORCE_SCALAR_MATMUL
+	SUPERSLM_ENABLE_MATVEC_TEST_SEAMS)
+target_compile_definitions(superslm_scalar_forced_seams PRIVATE SUPERSLM_ENABLE_BAD_ALLOC_INJECTION)
+add_executable(superslm_decode_threading_scalar_forced EXCLUDE_FROM_ALL
+	tests/decode_threading_standalone_main.cpp tests/test_decode_threading.cpp
+	tests/test_decode_threading_d1.cpp)
+target_link_libraries(superslm_decode_threading_scalar_forced PRIVATE superslm_scalar_forced_seams)
+target_include_directories(superslm_decode_threading_scalar_forced PRIVATE tests)
+if(MSVC)
+	target_compile_options(superslm_scalar_forced_seams PRIVATE /W4 /fp:precise)
+	target_compile_options(superslm_decode_threading_scalar_forced PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(superslm_scalar_forced_seams PRIVATE -Wall -Wextra -ffp-contract=off)
+	target_compile_options(superslm_decode_threading_scalar_forced PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+# Decode-threading plan §8 7.4 (F12): no new heap allocation per decode token. Its own executable,
+# because it replaces the global operator new (the dim7_contract_red.cpp pattern). It links
+# superslm_test_injection, which exists only with BUILD_TESTING, so it is built only then: the
+# advertised CPU-only BUILD_TESTING=OFF configuration (tests/cmake-cpu-only) builds no test target.
+if(BUILD_TESTING)
+	add_executable(superslm_decode_threading_alloc tests/decode_threading_alloc_main.cpp)
+	target_link_libraries(superslm_decode_threading_alloc PRIVATE superslm_test_injection)
+	add_test(NAME superslm_decode_threading_alloc COMMAND superslm_decode_threading_alloc)
+	if(MSVC)
+		target_compile_options(superslm_decode_threading_alloc PRIVATE /W4 /fp:precise)
+	else()
+		target_compile_options(superslm_decode_threading_alloc PRIVATE -Wall -Wextra -ffp-contract=off)
+	endif()
+endif()
+
 # T-2149 (Claude/Vitruvius/t2149-avx-kernel-design-2026-08-18.md) / T-2158 red suite
 # (Claude/Curie/t2158-t2149-avx-red-suite-2026-08-18.md): the AVX2/AVX-512 matmul tiers,
 # the cached CPUID dispatch (DetectBestDotRowTier), and the four-macro force selection
@@ -308,6 +407,14 @@ foreach(_sslm_tier SSE2 AVX2 AVX512)
 	# actual execution of these three binaries to completion, T-2159 §11 step 10). Every
 	# forced-tier full-suite binary needs the identical seam superslm_test_injection has.
 	target_compile_definitions(superslm_${_sslm_tier_lower}_forced PRIVATE SUPERSLM_ENABLE_BAD_ALLOC_INJECTION)
+	# Decode-threading plan §3.9 / §8 4.5: the forced full suites run the D1 cells too, so each
+	# forced library carries the same seams superslm_test_injection has (above).
+	target_compile_definitions(superslm_${_sslm_tier_lower}_forced PUBLIC SUPERSLM_ENABLE_MATVEC_TEST_SEAMS)
+	# Paged-KV plan §3.1 (R9 step T1, D-SLM8439): the forced paged-KV legs (superslm_pkv_c5_<tier>_forced,
+	# superslm_pkv_r9_<tier>_forced) pin their fixtures through the test-only pin and read the geometry seam,
+	# which, with the page module's seams, are compiled only under this macro; superslm_test_injection's own
+	# PUBLIC definition (above) is the precedent.
+	target_compile_definitions(superslm_${_sslm_tier_lower}_forced PUBLIC SUPERSLM_ENABLE_KV_PAGES_TEST_SEAMS)
 	# Both the bad-alloc-injection seam above (src/bad_alloc_wrap.h) and the dispatch-
 	# instrument seam below (src/matmul.cpp) #include "support/*.h" headers that resolve
 	# against a "tests" search directory -- the same PRIVATE include superslm_test_injection
@@ -342,7 +449,9 @@ foreach(_sslm_tier SSE2 AVX2 AVX512)
 	# to any target linking that library, which satisfies this without a second
 	# target_compile_definitions call.
 	add_executable(superslm_tests_${_sslm_tier_lower}_forced EXCLUDE_FROM_ALL tests/test_main.cpp
-		tests/test_slm18x_saturation_census.cpp tests/test_slm19x_schema_damped_greedy.cpp)
+		tests/test_slm18x_saturation_census.cpp tests/test_slm19x_schema_damped_greedy.cpp
+		tests/test_tiled_gemm.cpp tests/test_attn_rowsites.cpp tests/test_decode_threading.cpp
+		tests/test_decode_threading_d1.cpp)
 	target_link_libraries(superslm_tests_${_sslm_tier_lower}_forced PRIVATE superslm_${_sslm_tier_lower}_forced)
 	target_include_directories(superslm_tests_${_sslm_tier_lower}_forced PRIVATE tests)
 	if(MSVC)
@@ -356,6 +465,12 @@ foreach(_sslm_tier SSE2 AVX2 AVX512)
 		target_include_directories(superslm_tests_${_sslm_tier_lower}_forced PRIVATE src/gpu)
 		target_link_libraries(superslm_tests_${_sslm_tier_lower}_forced PRIVATE d3d12 dxgi dxguid)
 	endif()
+	# test_main.cpp calls the G3 ledger cells, so each forced suite carries the same adapter,
+	# include path and whole-target SUPERSLM_LEDGER_YIELD_HOOK as superslm_tests (g3_core.cmake).
+	target_sources(superslm_tests_${_sslm_tier_lower}_forced PRIVATE
+		tests/gpu-g3-core/g3_superslm_tests_adapter.cpp tests/gpu-g3-core/g3_cells_ledger.cpp)
+	target_include_directories(superslm_tests_${_sslm_tier_lower}_forced PRIVATE tests/gpu-g3-core src/gpu)
+	target_compile_definitions(superslm_tests_${_sslm_tier_lower}_forced PRIVATE SUPERSLM_LEDGER_YIELD_HOOK)
 
 	# The forced digest executable (design §8.3), mirroring sslm_axis_digest_scalar_forced.
 	add_executable(sslm_axis_digest_${_sslm_tier_lower}_forced EXCLUDE_FROM_ALL tools/ci/sslm_axis_digest.cpp)
@@ -389,6 +504,25 @@ endforeach()
 # any x64 target (MSVC does not gate _mm512_* intrinsics behind /arch) and SIGILLs at runtime
 # (STATUS_ILLEGAL_INSTRUCTION) on hardware lacking AVX-512F/BW -- the same documented, expected
 # outcome as this project's forced-suite/digest AVX-512 pair (F:\t2149-avx512-run\README.txt).
+# Decode-threading plan rev 1.2 §7 (B0, B1): the decode-threading bench, on the production library,
+# and a seam build of it for B1's minimum-work sweep (superslm_test_injection carries the seam).
+add_executable(sslm_decode_threading_bench tools/decode_threading_bench.cpp)
+target_link_libraries(sslm_decode_threading_bench PRIVATE superslm)
+set(_sslm_dt_benches sslm_decode_threading_bench)
+# The seam build links superslm_test_injection, which exists only with BUILD_TESTING.
+if(BUILD_TESTING)
+	add_executable(sslm_decode_threading_bench_seams EXCLUDE_FROM_ALL tools/decode_threading_bench.cpp)
+	target_link_libraries(sslm_decode_threading_bench_seams PRIVATE superslm_test_injection)
+	list(APPEND _sslm_dt_benches sslm_decode_threading_bench_seams)
+endif()
+foreach(_sslm_dt_bench ${_sslm_dt_benches})
+	if(MSVC)
+		target_compile_options(${_sslm_dt_bench} PRIVATE /W4 /fp:precise)
+	else()
+		target_compile_options(${_sslm_dt_bench} PRIVATE -Wall -Wextra -ffp-contract=off)
+	endif()
+endforeach()
+
 add_executable(sslm_bench_prefill tools/t2147_chunk_batched_pins.cpp)
 target_link_libraries(sslm_bench_prefill PRIVATE superslm)
 if(MSVC)
@@ -401,11 +535,73 @@ foreach(_sslm_bench_tier AVX2 AVX512)
 	string(TOLOWER "${_sslm_bench_tier}" _sslm_bench_tier_lower)
 	add_executable(sslm_bench_prefill_${_sslm_bench_tier_lower}_forced EXCLUDE_FROM_ALL tools/t2147_chunk_batched_pins.cpp)
 	target_link_libraries(sslm_bench_prefill_${_sslm_bench_tier_lower}_forced PRIVATE superslm_${_sslm_bench_tier_lower}_forced)
+	# The forced library carries SUPERSLM_ENABLE_MATMUL_DISPATCH_INSTRUMENT PUBLIC, so this tool's own
+	# compile takes its instrument branch (#include "support/matmul_dispatch_instrument.h") and needs
+	# tests/ on its include path; without it the target does not compile (found by the attention and
+	# per-row sites plan's S1 bench).
+	target_include_directories(sslm_bench_prefill_${_sslm_bench_tier_lower}_forced PRIVATE tests)
 	if(MSVC)
 		target_compile_options(sslm_bench_prefill_${_sslm_bench_tier_lower}_forced PRIVATE /W4 /fp:precise)
 	else()
 		target_compile_options(sslm_bench_prefill_${_sslm_bench_tier_lower}_forced PRIVATE -Wall -Wextra -ffp-contract=off)
 	endif()
+endforeach()
+
+# Tiled-matmul plan slice 1, cell 10.1: the per-shape GEMM bench (tools/sslm_gemm_bench.cpp), no artifact.
+# One source, several builds: sslm_gemm_bench links the production library (auto dispatch);
+# sslm_gemm_bench_${tier}_forced links the tier-forced library; and sslm_gemm_bench_${tier}_forced_dinf
+# links a matmul-only library compiled with that tier forced AND SUPERSLM_TEST_TILED_MIN_TOKENS=SIZE_MAX
+# ("D-infinity": the shipped one-cell-at-a-time loop at every M), so a ratio between a forced bench and
+# its D-infinity twin is the tiled kernel's own speedup on that tier. The bench calls only matmul.cpp's
+# entry points, so the D-infinity library needs no other engine source. All EXCLUDE_FROM_ALL except the
+# production bench, for the same non-x64 reason as the forced targets above.
+# Attention and per-row sites plan, cell 10.1: the engine bench (tools/sslm_sites_bench.cpp; kernel, prefill
+# and decode modes). Reports, not gates. Linked here against the production library; the base arm of a
+# comparison is the same source linked against the base's library.
+add_executable(sslm_sites_bench tools/sslm_sites_bench.cpp)
+target_link_libraries(sslm_sites_bench PRIVATE superslm)
+if(MSVC)
+	target_compile_options(sslm_sites_bench PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(sslm_sites_bench PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
+# Attention and per-row sites plan, §3.3 evidence 3: the golden-pin generator. The committed pin
+# (tests/attn_rowsite_golden_pin.h) is generated by this source built against the v1.9.0 TAG's library
+# (recipe in the source's header); this target builds it against the current tree, where it must print
+# the same hash -- a consistency check on the generator, never the pin's provenance.
+add_executable(gen_attn_rowsite_golden tools/gen_attn_rowsite_golden.cpp)
+target_link_libraries(gen_attn_rowsite_golden PRIVATE superslm)
+if(MSVC)
+	target_compile_options(gen_attn_rowsite_golden PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(gen_attn_rowsite_golden PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
+add_executable(sslm_gemm_bench tools/sslm_gemm_bench.cpp)
+target_link_libraries(sslm_gemm_bench PRIVATE superslm)
+if(MSVC)
+	target_compile_options(sslm_gemm_bench PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(sslm_gemm_bench PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+foreach(_sslm_gemm_tier AVX2 AVX512)
+	string(TOLOWER "${_sslm_gemm_tier}" _sslm_gemm_tier_lower)
+	add_library(superslm_matmul_${_sslm_gemm_tier_lower}_forced_dinf STATIC EXCLUDE_FROM_ALL src/matmul.cpp)
+	target_include_directories(superslm_matmul_${_sslm_gemm_tier_lower}_forced_dinf PUBLIC include)
+	target_compile_definitions(superslm_matmul_${_sslm_gemm_tier_lower}_forced_dinf PUBLIC
+		SUPERSLM_FORCE_${_sslm_gemm_tier}_MATMUL SUPERSLM_TEST_TILED_MIN_TOKENS=SIZE_MAX)
+	add_executable(sslm_gemm_bench_${_sslm_gemm_tier_lower}_forced EXCLUDE_FROM_ALL tools/sslm_gemm_bench.cpp)
+	target_link_libraries(sslm_gemm_bench_${_sslm_gemm_tier_lower}_forced PRIVATE superslm_${_sslm_gemm_tier_lower}_forced)
+	add_executable(sslm_gemm_bench_${_sslm_gemm_tier_lower}_forced_dinf EXCLUDE_FROM_ALL tools/sslm_gemm_bench.cpp)
+	target_link_libraries(sslm_gemm_bench_${_sslm_gemm_tier_lower}_forced_dinf PRIVATE superslm_matmul_${_sslm_gemm_tier_lower}_forced_dinf)
+	foreach(_sslm_gemm_target superslm_matmul_${_sslm_gemm_tier_lower}_forced_dinf sslm_gemm_bench_${_sslm_gemm_tier_lower}_forced sslm_gemm_bench_${_sslm_gemm_tier_lower}_forced_dinf)
+		if(MSVC)
+			target_compile_options(${_sslm_gemm_target} PRIVATE /W4 /fp:precise)
+		else()
+			target_compile_options(${_sslm_gemm_target} PRIVATE -Wall -Wextra -ffp-contract=off)
+		endif()
+	endforeach()
 endforeach()
 
 # T-2158 dimension 7 item (d) (design §10, D-SLM3510): a persisted CI guard for the
@@ -842,6 +1038,15 @@ if(WIN32 AND (SUPERSLM_BUILD_GPU OR BUILD_TESTING))
 	if(BUILD_TESTING)
 		add_dependencies(superslm_tests superslm_gpu_shaders)
 	endif()
+	# The forced-tier full suites compile the same GPU sources on WIN32 and run the same GPU
+	# cells, so they need the same shaders. A build of only a forced target (the Windows forced
+	# CI legs) otherwise leaves <config>/shaders empty, and the GPU cells meet a missing .cso.
+	foreach(_sslm_forced_suite superslm_tests_sse2_forced superslm_tests_avx2_forced
+	                           superslm_tests_avx512_forced)
+		if(TARGET ${_sslm_forced_suite})
+			add_dependencies(${_sslm_forced_suite} superslm_gpu_shaders)
+		endif()
+	endforeach()
 
 	if(SUPERSLM_BUILD_GPU)
 		add_library(superslm_gpu STATIC
@@ -881,6 +1086,24 @@ if(WIN32 AND (SUPERSLM_BUILD_GPU OR BUILD_TESTING))
 		# for a library that ships: the seams count every device allocation.
 		if(SUPERSLM_GPU_TEST_SEAMS)
 			target_compile_definitions(superslm_gpu PRIVATE SUPERSLM_GPU_ALLOC_FAULT_INJECTION)
+		endif()
+		if(BUILD_TESTING AND MSVC)
+			set(SUPERSLM_TEST_D3D12_SDK_VERSION "" CACHE STRING "Optional Agility version for buffer-state probes; stage matching runtime DLLs under the executable's D3D12/ directory")
+			if(SUPERSLM_TEST_D3D12_SDK_VERSION AND NOT SUPERSLM_TEST_D3D12_SDK_VERSION MATCHES "^[0-9]+$")
+				message(FATAL_ERROR "SUPERSLM_TEST_D3D12_SDK_VERSION must be an integer SDK version")
+			endif()
+			foreach(_buffer_state_target gpu_buffer_initial_state_tests gpu_buffer_initial_state_tracking_tests)
+				add_executable(${_buffer_state_target} tests/gpu_buffer_initial_state_tests.cpp)
+				target_include_directories(${_buffer_state_target} PRIVATE src/gpu)
+				target_link_libraries(${_buffer_state_target} PRIVATE superslm d3d12 dxgi dxguid)
+				target_compile_options(${_buffer_state_target} PRIVATE /W4 /fp:precise)
+				if(SUPERSLM_TEST_D3D12_SDK_VERSION)
+					target_compile_definitions(${_buffer_state_target} PRIVATE SUPERSLM_TEST_D3D12_SDK_VERSION=${SUPERSLM_TEST_D3D12_SDK_VERSION})
+				endif()
+				add_test(NAME ${_buffer_state_target} COMMAND ${_buffer_state_target})
+				set_tests_properties(${_buffer_state_target} PROPERTIES ENVIRONMENT "SSLM_GPU_ENABLE_DEBUG_LAYER=1")
+			endforeach()
+			target_compile_definitions(gpu_buffer_initial_state_tracking_tests PRIVATE SUPERSLM_GPU_STATE_TRACKING)
 		endif()
 	endif()
 endif()
@@ -960,3 +1183,29 @@ install(FILES
 	"${CMAKE_CURRENT_BINARY_DIR}/superslmConfigVersion.cmake"
 	DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/superslm
 )
+
+# Paged-KV cell 7.9's must-reject mutant (SUPERSLM_MUTANT_PKV_MR_OPT: B = 16, unrotated) builds only as the
+# superslm_mr_opt target (tests/paged-kv/paged_kv.cmake). At configure time this checks four places for the text
+# SUPERSLM_MUTANT: the superslm target's COMPILE_DEFINITIONS and COMPILE_OPTIONS, the top directory's
+# COMPILE_DEFINITIONS, and CMAKE_C_FLAGS and CMAKE_CXX_FLAGS with every configuration's variants (T-3202 F-4). It does
+# not check the directory's COMPILE_OPTIONS (add_compile_options), definitions inherited through linked targets'
+# INTERFACE_COMPILE_DEFINITIONS, or anything CMake cannot see (the CL environment variable). The #error in
+# src/sslm_abi.cpp and include/superslm/forward_sites.h refuses every one of those at compile time unless
+# SUPERSLM_MUTANT_PKV_MR_OPT_TARGET, the superslm_mr_opt target's acknowledgement, is defined with it.
+get_target_property(_sslm_prod_defs superslm COMPILE_DEFINITIONS)
+get_target_property(_sslm_prod_opts superslm COMPILE_OPTIONS)
+get_directory_property(_sslm_dir_defs COMPILE_DEFINITIONS)
+set(_sslm_flags "${CMAKE_C_FLAGS} ${CMAKE_CXX_FLAGS}")
+foreach(_sslm_cfg IN ITEMS DEBUG RELEASE RELWITHDEBINFO MINSIZEREL ${CMAKE_CONFIGURATION_TYPES} ${CMAKE_BUILD_TYPE})
+	string(TOUPPER "${_sslm_cfg}" _sslm_cfg)
+	string(APPEND _sslm_flags " ${CMAKE_C_FLAGS_${_sslm_cfg}} ${CMAKE_CXX_FLAGS_${_sslm_cfg}}")
+endforeach()
+if("${_sslm_prod_defs};${_sslm_prod_opts};${_sslm_dir_defs};${_sslm_flags}" MATCHES "SUPERSLM_MUTANT")
+	message(FATAL_ERROR "a SUPERSLM_MUTANT_* definition reaches the production superslm library; only the "
+		"superslm_mr_opt target may build 7.9-MR-OPT")
+endif()
+unset(_sslm_prod_defs)
+unset(_sslm_prod_opts)
+unset(_sslm_dir_defs)
+unset(_sslm_flags)
+unset(_sslm_cfg)

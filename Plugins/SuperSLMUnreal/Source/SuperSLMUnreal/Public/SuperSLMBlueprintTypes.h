@@ -35,6 +35,8 @@ enum class ESuperSLMDecodeOutcomeBP : uint8
 	SchemaDeadEnd = 2,
 	/** The sequence is no longer live: it was released while the step was queued. */
 	SequenceNoLongerValid = 3,
+	/** The sequence reached its own budget limit (paged KV mode), below the context cap, and stopped. */
+	KvBudgetExceeded = 4,
 };
 
 /** Where a sequence is in its generation. */
@@ -109,6 +111,9 @@ enum class ESuperSLMRestoreResultBP : uint8
 	Consumed,
 	ResetRequired, // Mirrors the C++ GPU result; no Blueprint node returns it: a GPU generation queued behind a reset Layer 1 refused, at its turn
 	OutOfMemory,   // Mirrors the C++ GPU result; no Blueprint node returns it: a GPU restore ran out of GPU memory
+	KvPagesExhausted,   // Paged KV mode: the request's pages do not fit; nothing was drawn
+	KvModeMismatch,     // Paged KV mode: the save's holder mode differs from the backend's mode, or the sequence needs a reset first
+	ContextCapMismatch, // GPU paged KV mode: the save was taken under a larger Context Cap
 };
 
 // Mirrors ESuperSLMPrefixPhase (SuperSLMSequenceTypes.h) -- the shared-prefix wrappers (D-SLM7347).

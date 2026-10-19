@@ -102,6 +102,7 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("export_json", help="Path to llvm-cov export --format=text output")
+    parser.add_argument("--measured-cell", help="Describe this measurement when recording an artifact; does not change committed floor provenance")
     parser.add_argument(
         "--record-floors-to",
         metavar="PATH",
@@ -117,6 +118,8 @@ def main() -> int:
         "tools/ci/branch_coverage_floors.json deliberately.).",
     )
     args = parser.parse_args()
+    if args.measured_cell and not args.record_floors_to:
+        parser.error("--measured-cell requires --record-floors-to")
 
     with open(args.export_json, "r", encoding="utf-8") as f:
         export_json = json.load(f)
@@ -140,6 +143,8 @@ def main() -> int:
                 existing = json.load(f)
             existing_comments = {k: v for k, v in existing.items() if k.startswith("_")}
         recorded = dict(existing_comments)
+        if args.measured_cell:
+            recorded["_measured_cell"] = args.measured_cell
         recorded.update(sorted(measured.items()))
         out_path = args.record_floors_to
         out_dir = os.path.dirname(out_path)

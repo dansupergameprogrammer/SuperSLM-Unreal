@@ -17,7 +17,7 @@
 //    SuperSLMExample::GpuSliceBudgetMs, the criterion the default slice was selected by (measured
 //    headless at context depths up to about 400 tokens; the query's prompts are shorter).
 //  - Self-check: no single frame of the stepped self-check (one TickFrame(), which is one Step())
-//    takes SelfCheckFrameBoundMs or more. The step waits on neither backend (T-2818 nonblock), so a
+//    takes SelfCheckFrameBoundMs or more. The step waits on neither backend (it never blocks), so a
 //    frame costs the step budget plus one tick's overshoot and, at an arm boundary, the small
 //    reference and prior-run files.
 // A figure that cannot be read (no GPU backend, no slice reading, no tick history) fails the test
@@ -53,7 +53,7 @@ namespace SuperSLMExampleTests
 	// A limit on waiting for each phase, not a measurement: a phase not finished by then has failed.
 	constexpr double PhaseWaitLimitSeconds = 600.0;
 
-	// T-2818 nonblock: the longest one self-check frame may take. A declared bound, not a
+	// The longest one self-check frame may take. A declared bound, not a
 	// measurement: SuperSLMExample::SelfCheckStepBudgetSeconds (2 ms) of ticking, one tick's
 	// overshoot, and at the arm boundaries a vend and the reference and prior-run reads and writes
 	// (small JSON files) fit well inside it, while a step that waits for a GPU submission job --
@@ -114,7 +114,7 @@ namespace SuperSLMExampleTests
 		double PhaseDeadline = 0.0;
 		int32 PhaseFrames = 0;
 		double MaxTickFrameMs = 0.0; // reported, not asserted: the assertions read the plugin's figures
-		double MaxSelfCheckFrameMs = 0.0; // asserted against SelfCheckFrameBoundMs (T-2818 nonblock)
+		double MaxSelfCheckFrameMs = 0.0; // asserted against SelfCheckFrameBoundMs
 		double MaxCpuQueryFrameMs = 0.0; // reported; at most one CPU query frame may exceed SelfCheckFrameBoundMs
 		double MaxGpuQueryFrameMs = 0.0; // reported; at most one GPU query frame may exceed SelfCheckFrameBoundMs (ruling 2026-09-26, round 3)
 		int32 CpuQueryFramesOverBound = 0;

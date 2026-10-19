@@ -617,14 +617,18 @@ FText SSuperSLMQueryWindow::GetCostText() const
 		else
 		{
 			// Worker-side counts, not game-thread time (plan §5 "What counts as a hitch").
-			B.Appendf(TEXT("[CPU] worker hitches this query: %d (%d late past K x budget, %d over the %.1f ms budget; not game-thread time)\n"),
+			B.Appendf(TEXT("[CPU] worker hitches this query: %d (%d late past K x budget, %d over their own K x %.1f ms budget; not game-thread time)\n"),
 				R.HitchCount, R.CpuLateJobs, R.CpuOverBudgetJobs, Host->GetSettings().CpuTickBudgetMs);
 		}
 	}
 	if (Cpu != nullptr)
 	{
-		B.Appendf(TEXT("[CPU] last Tick(): %.3f ms; tokens per second (GetTokensPerSecond): %.2f; finish parallel tasks: %d\n"),
-			Cpu->GetLastTickDurationMs(), Cpu->GetTokensPerSecond(), FSuperSLMRuntimeConfig().FinishParallelTasks);
+		// Decode-threading D4 (D-SLM8144): the task count the configured model resolved, not a
+		// struct default.
+		const FSuperSLMResolvedCpuConfig* Resolved = Cpu->GetResolvedConfig();
+		B.Appendf(TEXT("[CPU] last Tick(): %.3f ms; tokens per second (GetTokensPerSecond): %.2f; finish parallel tasks: %s\n"),
+			Cpu->GetLastTickDurationMs(), Cpu->GetTokensPerSecond(),
+			Resolved != nullptr ? *FString::FromInt(Resolved->ParallelTasks) : TEXT("not configured"));
 	}
 	if (Gpu != nullptr)
 	{

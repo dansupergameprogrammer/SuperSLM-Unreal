@@ -77,6 +77,10 @@ which you enable in your project. In practice both mean a source-built engine.
 - **Unreal Engine 5.8.**
 - The GPU backend runs its own D3D12 device, separate from the engine's renderer, and loads its
   compute shaders from the plugin's own directory.
+- From 1.2.0 the GPU backend's tests also pass on an AMD Radeon RX 7900 XTX, without a renderer.
+  On that card and driver (32.0.23033.1002) the packaged example's rendering hangs the GPU even
+  with no model loaded, so running the GPU backend beside Unreal's renderer there is not certified
+  ([PAGING.md](PAGING.md#9-gpu-pool-size-and-the-amd-card)).
 - The GPU backend has been run in a source-built engine's editor and in a packaged Development
   build. In an installed (launcher) engine's editor it has
   not been run.
@@ -128,16 +132,17 @@ through the same path; the plugin is not tied to one model. See
 
 The CPU scheduler sizes each worker job from fixed per-unit costs (milliseconds per layer, per
 prompt token, per token finish, and per lifecycle operation) rather than from a live estimate, so
-the job size is predictable. The shipped defaults were measured on one machine, an AMD Ryzen 9
-3950X, and two of them were then **set by hand**: the layer cost measured by the calibration
-command came out too low for layers run inside a real job, so `LayerCostMs` (2.0) and
-`LayerCostPerPositionMs` (0.001) ship above the measured values.
+the job size is predictable. The shipped defaults are two measured profiles, one per CPU decode
+mode, from per-call captures on one machine, an AMD Ryzen 9 3950X, with the 0.5B example model:
+`LayerCostMs` is 1.397 with decode threading off and 0.906 with `bParallelDecode` on, and the other
+twelve fields are listed in [ARCHITECTURE.md](ARCHITECTURE.md#the-cpu-backend). They are reasonable
+starting costs, not certified ones. Layers timed alone have read lower than layers run inside a
+real job; the job ledger reports both the planned and the measured time of every job.
 
-The `SuperSLM.CalibrateCosts` console command measures these costs on your own hardware. **Its
-layer measurement under-prices layers run inside a job**, so do not lower `LayerCostMs` below the
-shipped value on the strength of a calibration run alone. An under-priced cost makes jobs overrun
-their CPU budget; an over-priced one only lowers throughput. See
-[ARCHITECTURE.md](ARCHITECTURE.md#the-cpu-backend).
+The `SuperSLM.EstimateCosts` console command measures these costs on your own hardware and prints
+them as an estimate that is not verified; with `--write-ini` the next `Configure()` uses them for a
+matching model, decode mode and task count. An under-priced cost makes jobs overrun their CPU
+budget; an over-priced one only lowers throughput.
 
 ## Measured
 

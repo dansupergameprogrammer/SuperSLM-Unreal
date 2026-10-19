@@ -115,8 +115,8 @@ namespace
 		int32 Best = 1;
 		for (int32 Count = 2; Count <= FMath::Min(Config.MaxPrefillChunkBudget, Remaining); ++Count)
 		{
-			const double Price = Count * Config.PromptTokenCostMs +
-				PositionSum(Count, Start) * Config.PromptTokenCostPerPositionMs;
+			const double Price = Count * SuperSLMConfigAccess::GetCost(Config, TEXT("PromptTokenCostMs")) +
+				PositionSum(Count, Start) * SuperSLMConfigAccess::GetCost(Config, TEXT("PromptTokenCostPerPositionMs"));
 			if (Price > Config.TickBudgetMs * Config.BudgetHeadroom) { break; }
 			Best = Count;
 		}
@@ -140,10 +140,17 @@ bool FSuperSLMU1CpuDepthPricingTest::RunTest(const FString& Parameters)
 	Config.SequenceLifecycleBudgetMs = 1000.0;
 	Config.TickBudgetMs = 16.6;
 	Config.BudgetHeadroom = 0.5;
-	Config.LayerCostMs = 2.0;
-	Config.LayerCostPerPositionMs = 0.0015;
-	Config.PromptTokenCostMs = 1.0;
-	Config.PromptTokenCostPerPositionMs = 0.0015;
+	SuperSLMConfigAccess::SetCost(Config, TEXT("LayerCostMs"), 2.0);
+	SuperSLMConfigAccess::SetCost(Config, TEXT("LayerCostPerPositionMs"), 0.0015);
+	SuperSLMConfigAccess::SetCost(Config, TEXT("PromptTokenCostMs"), 1.0);
+	SuperSLMConfigAccess::SetCost(Config, TEXT("PromptTokenCostPerPositionMs"), 0.0015);
+	// Slice 1P: this cell pins 1.0's depth-priced chunk sizing (ExpectedChunk above, one price over
+	// every size, no floor). The floor at 1 and the batched pair equal to the chunk-1 pair restore
+	// exactly that rule (plan of record §4A.1 item 1); the floor and the pair's own selection are
+	// graded by SuperSLM.Slice1P.
+	Config.MinPrefillChunk = 1;
+	SuperSLMConfigAccess::SetCost(Config, TEXT("BatchedPromptTokenCostMs"), SuperSLMConfigAccess::GetCost(Config, TEXT("PromptTokenCostMs")));
+	SuperSLMConfigAccess::SetCost(Config, TEXT("BatchedPromptTokenCostPerPositionMs"), SuperSLMConfigAccess::GetCost(Config, TEXT("PromptTokenCostPerPositionMs")));
 	FTestWorldWrapper World;
 	USuperSLMSubsystem* Cpu = nullptr;
 	USuperSLMModel* Model = nullptr;
@@ -214,7 +221,7 @@ bool FSuperSLMU1CpuDepthPricingTest::RunTest(const FString& Parameters)
 		bOk &= TestEqual(TEXT("prefix chunk is largest fitting at its own start position"), Job.PromptTokens, Expected);
 		bOk &= TestEqual(TEXT("prefix chunk reports served positions"), Job.PromptPositionSum, PositionSum(Job.PromptTokens, Consumed));
 		bOk &= TestTrue(TEXT("prefix chunk has exact depth-priced cost"), FMath::IsNearlyEqual(Job.PlannedJobMs,
-			Job.PromptTokens * Config.PromptTokenCostMs + PositionSum(Job.PromptTokens, Consumed) * Config.PromptTokenCostPerPositionMs, 1e-6));
+			Job.PromptTokens * SuperSLMConfigAccess::GetCost(Config, TEXT("PromptTokenCostMs")) + PositionSum(Job.PromptTokens, Consumed) * SuperSLMConfigAccess::GetCost(Config, TEXT("PromptTokenCostPerPositionMs")), 1e-6));
 		Consumed += Job.PromptTokens;
 	}
 	bOk &= TestEqual(TEXT("prefix chunks cover all 1030 positions"), Consumed, 1030);

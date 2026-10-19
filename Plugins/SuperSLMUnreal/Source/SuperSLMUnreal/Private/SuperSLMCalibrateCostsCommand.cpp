@@ -5,8 +5,10 @@
 #include "SuperSLMLog.h"
 #include "SuperSLMModel.h"
 #include "SuperSLMModelImport.h"
+#include "SuperSLMPrefillPlanning.h"
 #include "SuperSLMRuntimeConfig.h"
 #include "SuperSLMRuntimeRegistry.h"
+#include "SuperSLMRuntimeResolve.h"
 #include "SuperSLMStatusMapping.h"
 
 #include "HAL/FileManager.h"
@@ -18,6 +20,7 @@
 #include "HAL/Runnable.h"
 #include "HAL/RunnableThread.h"
 #include "HAL/UnrealMemory.h"
+#include "Misc/DateTime.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 
@@ -72,15 +75,14 @@ namespace
 			return GTestFinishParallelTasksOverride;
 		}
 #endif
-		return FSuperSLMRuntimeConfig().FinishParallelTasks;
+		return SuperSLMRuntimeResolve::kShippedParallelTasks;
 	}
 
 	// Plan §2.5 row 2 (D-SLM7663): installs the runtime's own finish hook on a calibration
-	// workspace, at FSuperSLMRuntimeConfig's shipped default FinishParallelTasks -- the setting
-	// the runtime runs by default and plan §10.3.1 item 5b calibrates -- or, in an automation
-	// build, at a test's override (item 5a.2's R). At 0 or 1 nothing is installed, exactly as the
-	// runtime does. OutFinishParallelTasks is the value the run used; the values line logs it.
-	bool InstallFinishHook(sslm_workspace Workspace, int32& OutFinishParallelTasks, FString& OutError)
+	// workspace, at the runtime's shipped default FinishParallelTasks (or an automation override)
+	// and the command's explicit bParallelDecode mode. At 0 or 1 nothing is installed, exactly as
+	// the runtime does. The values line records both settings used for this measurement.
+	bool InstallFinishHook(sslm_workspace Workspace, bool bParallelDecode, int32& OutFinishParallelTasks, FString& OutError)
 	{
 		const int32 FinishParallelTasks = EffectiveFinishParallelTasks();
 		OutFinishParallelTasks = FinishParallelTasks;
@@ -93,7 +95,8 @@ namespace
 		{
 			return true;
 		}
-		const sslm_parallel_for Hook = SuperSLMFinishHook::Make(FinishParallelTasks);
+		const sslm_parallel_for Hook = SuperSLMFinishHook::Make(FinishParallelTasks,
+			bParallelDecode ? SSLM_PARALLEL_FOR_MATVEC : 0);
 		const sslm_status Status = sslm_workspace_set_parallel_for(Workspace, &Hook);
 		if (Status != SSLM_OK)
 		{
@@ -119,8 +122,12 @@ namespace
 	{
 		int64 Depth = 0;                  // the context_length the arm timed at
 		int64 RestoredContextLength = -1; // what the restored blob's context_length read (asserted == Depth)
-		double MedianMs = -1.0;
+		double MedianMs = -1.0;           // the batched arm: the per-token median, call / 8
 		int32 Samples = 0;
+		// Slice 1P (tiled-matmul plan §4A.1 item 3, rev 11.1 audit F10): the batched arm's reading
+		// position, Depth + 3.5, the mean of the 8 positions one call serves. A double, because Depth
+		// is an int64. -1 on the chunk-1 arms, which keep Depth.
+		double PositionMean = -1.0;
 	};
 
 	// The eleven values (plan §5 item 2), plus the per-depth readings they were fitted from.
@@ -141,13 +148,98 @@ namespace
 		double PrefixBeginCostMs = -1.0;
 		double PrefixReleaseCostMs = -1.0;
 
+		// Slice 1P (tiled-matmul plan §4A.1 item 3): the batched prompt pair, fitted from the batched
+		// arm, or the FSuperSLMRuntimeConfig defaults when the arm is a named skip (a cap under 33)
+		// -- never the -1 the fields above start at.
+		double BatchedPromptTokenCostMs = -1.0;
+		double BatchedPromptTokenCostPerPositionMs = -1.0;
+		bool bBatchedArmSkipped = false;
+		FString BatchedArmSkipReason;
+
 		int64 CapTokens = 0;
 		// The FinishParallelTasks the run installed (InstallFinishHook), logged on the values line
 		// so item 5a.2's analysis can confirm R ran at 1. -1 until Setup installs the hook.
 		int32 FinishParallelTasks = -1;
+		bool bMeasuredDecodeMode = false;
 		TArray<FDepthArmReading> LayerArm;  // one per depth, in depth order
 		TArray<FDepthArmReading> PromptArm; // one per depth, in depth order
+		TArray<FDepthArmReading> BatchedArm; // slice 1P: one per batched depth, in depth order; empty when skipped
 	};
+
+	// T-3050d evidence only. Times use the same two clock reads as Measure's existing elapsed
+	// time; Add runs after the second read, so it is outside the measured ABI interval.
+	struct FCallTiming
+	{
+		const TCHAR* Arm = nullptr;
+		int64 Depth = -1;
+		int32 Rep = -1;
+		int32 Layer = -1;
+		double StartSeconds = 0.0;
+		double EndSeconds = 0.0;
+	};
+
+	struct FPerCallTrace
+	{
+		double Origin = 0.0;
+		TArray<FCallTiming> Calls;
+		void Add(const TCHAR* Arm, int64 Depth, int32 Rep, int32 Layer, double Start, double End)
+		{
+			Calls.Add(FCallTiming{ Arm, Depth, Rep, Layer, Start - Origin, End - Origin });
+		}
+	};
+
+	// Slice 1P (tiled-matmul plan §4A.1 item 3, rev 11.1 audit F10): the batched arm's reading path,
+	// shared by the timed arm (FCalibrationSession::Measure) and the synthetic-timing seam
+	// (FSuperSLMCalibrationTestAccess::FitBatchedArmFromSyntheticTimings), so a seam cell exercises
+	// the code the calibration runs.
+	//  - One reading per depth d: the median of its calls' times, divided by 8 (the per-token time),
+	//    recorded at the chunk's mean position d + 3.5.
+	//  - The fit: the upper envelope over (position, per-token median), intercept at position 0.
+	//  - The check: the batched per-token intercept must not exceed the chunk-1 one, or the chunk-1
+	//    pair (the batched default) was never an upper bound; a named failure, nothing written.
+	FDepthArmReading MakeBatchedReading(int64 Depth, int64 RestoredContextLength, double MedianCallMs, int32 Samples)
+	{
+		FDepthArmReading R;
+		R.Depth = Depth;
+		R.RestoredContextLength = RestoredContextLength;
+		R.PositionMean = SuperSLMPrefillPlanning::BatchedReadingPosition(Depth);
+		R.MedianMs = SuperSLMPrefillPlanning::BatchedReadingPerTokenMs(MedianCallMs);
+		R.Samples = Samples;
+		return R;
+	}
+
+	bool FitBatchedArm(const TArray<FDepthArmReading>& Arm, double Chunk1TokenMs, double& OutTokenMs, double& OutPerPositionMs, FString& OutError)
+	{
+		if (Arm.Num() == 0)
+		{
+			OutError = TEXT("batched prompt arm: no readings");
+			return false;
+		}
+		TArray<double> Positions, Medians;
+		for (const FDepthArmReading& R : Arm)
+		{
+			Positions.Add(R.PositionMean);
+			Medians.Add(R.MedianMs);
+		}
+		SuperSLMPrefillPlanning::FitBatchedUpperEnvelope(Positions.GetData(), Medians.GetData(), Arm.Num(), OutTokenMs, OutPerPositionMs);
+		if (!SuperSLMPrefillPlanning::BatchedInterceptWithinChunk1(OutTokenMs, Chunk1TokenMs))
+		{
+			OutError = FString::Printf(TEXT("batched prompt arm: the per-token intercept %.6f ms at chunk 8 exceeds the chunk-1 intercept %.6f ms, so the chunk-1 pair is not an upper bound for a token inside an 8-token call; nothing is written"),
+				OutTokenMs, Chunk1TokenMs);
+			return false;
+		}
+		return true;
+	}
+
+	// The named skip's values follow the shipped off-mode profile, never the measurement's
+	// negative initializers. The mode-aware estimate uses its selected mode's profile.
+	void BatchedArmSkipValues(double& OutTokenMs, double& OutPerPositionMs)
+	{
+		FSuperSLMResolvedCpuConfig Defaults;
+		SuperSLMRuntimeResolve::ApplyModeProfile(false, Defaults);
+		OutTokenMs = Defaults.BatchedPromptTokenCostMs;
+		OutPerPositionMs = Defaults.BatchedPromptTokenCostPerPositionMs;
+	}
 
 	// Samples per arm (D-SLM7444's 50-repetition pattern). Each depth of the layer arm records the
 	// pure layers of every repetition, so it holds kReps x (num_hidden_layers - 2) samples.
@@ -171,7 +263,7 @@ namespace
 		return FString(ANSI_TO_TCHAR(SuperSLMStatusMapping::ToDiagnosticText(Status)));
 	}
 
-	// Layer 1's 'SSB5' sequence blob (src/sslm_abi.cpp, sslm_seq_save's write order at v1.9.0):
+	// Layer 1's 'SSB5' sequence blob (src/sslm_abi.cpp, sslm_seq_save's write order at v1.9.0, unchanged at v1.11.0):
 	// magic 4, model hash 32, kv_precision 4, schema_name_hash 8, dfa_walk_state 4,
 	// adapter_binding_id 8, then context_length as a little-endian int64 at byte 60. 'SSB5' appends
 	// its four per-site saturation counts at bytes 124-155, so this offset is 'SSB4''s. Read here only
@@ -245,9 +337,16 @@ namespace
 	{
 	public:
 		~FCalibrationSession() { Cleanup(); }
-
-		bool Setup(const FString& ArtifactPath, FMeasuredCosts& OutCosts, FString& OutError)
+		int32 ExpectedTimedCallCount(int32 Reps) const
 		{
+			// Seven depth-independent arms, a prompt and (NumLayers - 2) pure layers at
+			// each depth, plus one batched prompt call at each eligible depth.
+			return Reps * (7 + Depths.Num() * (NumLayers - 1) + BatchedDepths.Num());
+		}
+
+		bool Setup(const FString& ArtifactPath, bool bParallelDecode, FMeasuredCosts& OutCosts, FString& OutError)
+		{
+			OutCosts.bMeasuredDecodeMode = bParallelDecode;
 			FSuperSLMImportDiagnostic Diag;
 			Model = FSuperSLMModelImport::ImportFromFile(ArtifactPath, Diag);
 			if (Model == nullptr || !Diag.bAccepted)
@@ -278,6 +377,32 @@ namespace
 			Depths = { 1, Cap / 4, Cap / 2, (3 * Cap) / 4, Cap - 1 };
 			UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM.CalibrateCosts: cap C = %lld; depths %lld, %lld, %lld, %lld, %lld."),
 				Cap, Depths[0], Depths[1], Depths[2], Depths[3], Depths[4]);
+			// Slice 1P (tiled-matmul plan §4A.1 item 3): the batched arm's depths 1, C/4, C/2, 3C/4 and
+			// C - 8, which ascend and are distinct only from a cap of 33 up. Below it, a named skip.
+			int64 BatchedDepthValues[5] = {};
+			BatchedDepths.Reset();
+			if (SuperSLMPrefillPlanning::BatchedArmDepths(Cap, BatchedDepthValues))
+			{
+				BatchedDepths.Append(BatchedDepthValues, 5);
+				UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM.CalibrateCosts: batched prompt arm (chunk %d): depths %lld, %lld, %lld, %lld, %lld."),
+					SuperSLMPrefillPlanning::kBatchedArmChunk, BatchedDepths[0], BatchedDepths[1], BatchedDepths[2], BatchedDepths[3], BatchedDepths[4]);
+			}
+			else
+			{
+				BatchedArmSkipReason = FString::Printf(TEXT("the artifact's cap C = %lld is under %lld, so the depths 1, C/4, C/2, 3C/4 and C - %d do not ascend"),
+					Cap, SuperSLMPrefillPlanning::kBatchedArmMinCap, SuperSLMPrefillPlanning::kBatchedArmChunk);
+				double DefaultTokenMs = 0.0, DefaultPerPositionMs = 0.0;
+				BatchedArmSkipValues(DefaultTokenMs, DefaultPerPositionMs);
+				UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM.CalibrateCosts: batched prompt arm skipped: %s; BatchedPromptTokenCostMs=%.6f BatchedPromptTokenCostPerPositionMs=%.9f keep their defaults."),
+					*BatchedArmSkipReason, DefaultTokenMs, DefaultPerPositionMs);
+			}
+			// Every depth a timed arm restores from, ascending and distinct: one blob each.
+			BlobDepths = Depths;
+			for (int64 D : BatchedDepths)
+			{
+				BlobDepths.AddUnique(D);
+			}
+			BlobDepths.Sort();
 
 			FString MapError;
 			Mapping = SuperSLMRuntime::AcquireModelMapping(*Model, MapError);
@@ -334,9 +459,10 @@ namespace
 				return false;
 			}
 			// Plan §2.5 row 2 (D-SLM7663): the identical finish hook the runtime installs, at the
-			// shipped default FinishParallelTasks, so FinishCostMs measures the finish the runtime runs.
+			// shipped default FinishParallelTasks and requested decode mode, so the layer, prompt,
+			// and finish arms measure the same hook mode the project's CPU runtime installs.
 			FString HookError;
-			if (!InstallFinishHook(Workspace, OutCosts.FinishParallelTasks, HookError))
+			if (!InstallFinishHook(Workspace, bParallelDecode, OutCosts.FinishParallelTasks, HookError))
 			{
 				OutError = HookError;
 				return false;
@@ -358,18 +484,18 @@ namespace
 			TArray<int32> Tokens;
 			Tokens.Init(PromptToken, kSetupChunk);
 			int64 Filled = 0;
-			DepthBlobs.SetNum(Depths.Num());
-			for (int32 K = 0; K < Depths.Num(); ++K)
+			DepthBlobs.SetNum(BlobDepths.Num());
+			for (int32 K = 0; K < BlobDepths.Num(); ++K)
 			{
-				while (Filled < Depths[K])
+				while (Filled < BlobDepths[K])
 				{
-					const int32 Count = static_cast<int32>(FMath::Min<int64>(kSetupChunk, Depths[K] - Filled));
+					const int32 Count = static_cast<int32>(FMath::Min<int64>(kSetupChunk, BlobDepths[K] - Filled));
 					int32 Consumed = 0;
 					Status = sslm_prefill(Mapping, Seq, Tokens.GetData(), Count, Count, SSLM_SPAN_PROMPT, Workspace, &Consumed);
 					if (Status != SSLM_OK || Consumed <= 0 || Consumed > Count)
 					{
 						OutError = FString::Printf(TEXT("setup: sslm_prefill toward depth %lld returned %s and consumed %d of %d at depth %lld"),
-							Depths[K], *StatusName(Status), Consumed, Count, Filled);
+							BlobDepths[K], *StatusName(Status), Consumed, Count, Filled);
 						return false;
 					}
 					Filled += Consumed;
@@ -378,10 +504,10 @@ namespace
 				Status = sslm_seq_save(Seq, SaveBuffer, &PayloadBytes);
 				int64 BlobDepth = -1;
 				if (Status != SSLM_OK || PayloadBytes == 0 || PayloadBytes > StateBytes ||
-					!ReadBlobContextLength(static_cast<const uint8*>(SaveBuffer), PayloadBytes, BlobDepth) || BlobDepth != Depths[K])
+					!ReadBlobContextLength(static_cast<const uint8*>(SaveBuffer), PayloadBytes, BlobDepth) || BlobDepth != BlobDepths[K])
 				{
 					OutError = FString::Printf(TEXT("setup: the blob saved at depth %lld returned %s, %llu bytes, context_length %lld"),
-						Depths[K], *StatusName(Status), static_cast<uint64>(PayloadBytes), BlobDepth);
+						BlobDepths[K], *StatusName(Status), static_cast<uint64>(PayloadBytes), BlobDepth);
 					return false;
 				}
 				DepthBlobs[K].SetNumUninitialized(static_cast<int32>(PayloadBytes));
@@ -390,7 +516,7 @@ namespace
 			return true;
 		}
 
-		bool Measure(FMeasuredCosts& OutCosts, FString& OutError)
+		bool Measure(FMeasuredCosts& OutCosts, FString& OutError, int32 Reps = kReps, FPerCallTrace* Trace = nullptr)
 		{
 			auto Fail = [&](const FString& Why)
 			{
@@ -406,7 +532,7 @@ namespace
 
 			// --- Finish (depth-independent) ---
 			TArray<double> FinishSamples;
-			for (int32 Rep = 0; Rep < kReps; ++Rep)
+			for (int32 Rep = 0; Rep < Reps; ++Rep)
 			{
 				Status = sslm_seq_reset(Seq);
 				if (Status != SSLM_OK)
@@ -422,7 +548,9 @@ namespace
 				int32 Token = -9;
 				const double Start = FPlatformTime::Seconds();
 				Status = Decode(Token);
-				const double FinishMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+				const double End = FPlatformTime::Seconds();
+				const double FinishMs = (End - Start) * 1000.0;
+				if (Trace) { Trace->Add(TEXT("finish"), 1, Rep, -1, Start, End); }
 				if (Status != SSLM_OK || Token < 0)
 				{
 					return Fail(FString::Printf(TEXT("finish arm, rep %d: the finish-only decode returned %s and token %d"), Rep, *StatusName(Status), Token));
@@ -438,9 +566,9 @@ namespace
 				const int64 Depth = Depths[K];
 				TArray<double> PromptSamples, LayerSamples;
 				int64 PromptRestored = -1, LayerRestored = -1;
-				for (int32 Rep = 0; Rep < kReps; ++Rep)
+				for (int32 Rep = 0; Rep < Reps; ++Rep)
 				{
-					if (!RestoreAtDepth(K, PromptRestored, OutError))
+					if (!RestoreAtDepth(Depth, PromptRestored, OutError))
 					{
 						OutError = FString::Printf(TEXT("prompt arm, depth %lld, rep %d: %s"), Depth, Rep, *OutError);
 						return false;
@@ -448,16 +576,18 @@ namespace
 					int32 Consumed = 0;
 					const double Start = FPlatformTime::Seconds();
 					Status = sslm_prefill(Mapping, Seq, &PromptToken, 1, 1, SSLM_SPAN_PROMPT, Workspace, &Consumed);
-					const double PromptMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+					const double End = FPlatformTime::Seconds();
+					const double PromptMs = (End - Start) * 1000.0;
+					if (Trace) { Trace->Add(TEXT("prompt_1"), Depth, Rep, -1, Start, End); }
 					if (Status != SSLM_OK || Consumed != 1)
 					{
 						return Fail(FString::Printf(TEXT("prompt arm, depth %lld, rep %d: sslm_prefill returned %s and consumed %d of 1"), Depth, Rep, *StatusName(Status), Consumed));
 					}
 					PromptSamples.Add(PromptMs);
 				}
-				for (int32 Rep = 0; Rep < kReps; ++Rep)
+				for (int32 Rep = 0; Rep < Reps; ++Rep)
 				{
-					if (!RestoreAtDepth(K, LayerRestored, OutError))
+					if (!RestoreAtDepth(Depth, LayerRestored, OutError))
 					{
 						OutError = FString::Printf(TEXT("layer arm, depth %lld, rep %d: %s"), Depth, Rep, *OutError);
 						return false;
@@ -477,7 +607,9 @@ namespace
 					{
 						const double Start = FPlatformTime::Seconds();
 						Status = Decode(Token);
-						const double LayerMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+						const double End = FPlatformTime::Seconds();
+						const double LayerMs = (End - Start) * 1000.0;
+						if (Trace) { Trace->Add(TEXT("layer"), Depth, Rep, LayerIndex, Start, End); }
 						if (Status != SSLM_OK || Token != -1)
 						{
 							return Fail(FString::Printf(TEXT("layer arm, depth %lld, rep %d, layer %d: the one-layer call returned %s and %d (expected -1)"), Depth, Rep, LayerIndex, *StatusName(Status), Token));
@@ -491,10 +623,10 @@ namespace
 							Depth, Rep, *StatusName(Status), Token, NumLayers));
 					}
 				}
-				if (PromptSamples.Num() != kReps || LayerSamples.Num() != kReps * (NumLayers - 2))
+				if (PromptSamples.Num() != Reps || LayerSamples.Num() != Reps * (NumLayers - 2))
 				{
 					return Fail(FString::Printf(TEXT("depth %lld: %d of %d prompt samples and %d of %d layer samples"),
-						Depth, PromptSamples.Num(), kReps, LayerSamples.Num(), kReps * (NumLayers - 2)));
+						Depth, PromptSamples.Num(), Reps, LayerSamples.Num(), Reps * (NumLayers - 2)));
 				}
 				FDepthArmReading& P = OutCosts.PromptArm[K];
 				P.Depth = Depth;
@@ -512,13 +644,79 @@ namespace
 				}
 			}
 
+			// --- Slice 1P: the batched prompt arm (tiled-matmul plan §4A.1 item 3) ---
+			// Per batched depth d and repetition: restore d's blob, assert context_length == d, then
+			// time one sslm_prefill of 8 tokens at chunk budget 8, requiring consumed == 8 on every
+			// repetition: 8 prompt tokens at positions d .. d + 7, the call a chunked prefill job makes.
+			// Timed with the same hook installed as the chunk-1 arm.
+			OutCosts.BatchedArm.Reset();
+			OutCosts.bBatchedArmSkipped = BatchedDepths.IsEmpty();
+			OutCosts.BatchedArmSkipReason = BatchedArmSkipReason;
+			if (OutCosts.bBatchedArmSkipped)
+			{
+				// The named skip (a cap under 33): the defaults, never FMeasuredCosts' -1.
+				BatchedArmSkipValues(OutCosts.BatchedPromptTokenCostMs, OutCosts.BatchedPromptTokenCostPerPositionMs);
+			}
+			else
+			{
+				TArray<int32> BatchedTokens;
+				BatchedTokens.Init(PromptToken, SuperSLMPrefillPlanning::kBatchedArmChunk);
+				for (const int64 Depth : BatchedDepths)
+				{
+					TArray<double> CallSamples;
+					int64 Restored = -1;
+					for (int32 Rep = 0; Rep < Reps; ++Rep)
+					{
+						if (!RestoreAtDepth(Depth, Restored, OutError))
+						{
+							OutError = FString::Printf(TEXT("batched prompt arm, depth %lld, rep %d: %s"), Depth, Rep, *OutError);
+							return false;
+						}
+						int32 Consumed = 0;
+						const double Start = FPlatformTime::Seconds();
+						Status = sslm_prefill(Mapping, Seq, BatchedTokens.GetData(), SuperSLMPrefillPlanning::kBatchedArmChunk,
+							SuperSLMPrefillPlanning::kBatchedArmChunk, SSLM_SPAN_PROMPT, Workspace, &Consumed);
+						const double End = FPlatformTime::Seconds();
+						const double CallMs = (End - Start) * 1000.0;
+						if (Trace) { Trace->Add(TEXT("prompt_8"), Depth, Rep, -1, Start, End); }
+						if (Status != SSLM_OK || Consumed != SuperSLMPrefillPlanning::kBatchedArmChunk)
+						{
+							return Fail(FString::Printf(TEXT("batched prompt arm, depth %lld, rep %d: sslm_prefill returned %s and consumed %d of %d"),
+								Depth, Rep, *StatusName(Status), Consumed, SuperSLMPrefillPlanning::kBatchedArmChunk));
+						}
+						CallSamples.Add(CallMs);
+					}
+					if (CallSamples.Num() != Reps)
+					{
+						return Fail(FString::Printf(TEXT("batched prompt arm, depth %lld: %d of %d samples"), Depth, CallSamples.Num(), Reps));
+					}
+					const FDepthArmReading Reading = MakeBatchedReading(Depth, Restored, Median(CallSamples), CallSamples.Num());
+					if (!IsValidCostMs(Reading.MedianMs))
+					{
+						return Fail(FString::Printf(TEXT("batched prompt arm, depth %lld: the per-token median %.9f ms is not a finite, positive cost"), Depth, Reading.MedianMs));
+					}
+					OutCosts.BatchedArm.Add(Reading);
+				}
+			}
+
 			// --- Reset / Save / Restore (D-SLM7444 pattern) ---
 			TArray<double> ResetSamples, SaveSamples, RestoreSamples;
-			for (int32 Rep = 0; Rep < kReps; ++Rep)
+			for (int32 Rep = 0; Rep < Reps; ++Rep)
 			{
+				// Reset must release the full live page population on EVERY repetition. Empty
+				// or single-page resets can finish inside one clock tick. Restore and verify
+				// the deepest fixture outside the timed interval; the resulting cost includes
+				// releasing all live pages, not setup or the empty fast path.
+				int64 ResetDepth = -1;
+				if (!RestoreAtDepth(Depths.Last(), ResetDepth, OutError))
+				{
+					return false;
+				}
 				double Start = FPlatformTime::Seconds();
 				Status = sslm_seq_reset(Seq);
-				const double ResetMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+				double End = FPlatformTime::Seconds();
+				const double ResetMs = (End - Start) * 1000.0;
+				if (Trace) { Trace->Add(TEXT("reset"), -1, Rep, -1, Start, End); }
 				if (Status != SSLM_OK)
 				{
 					return Fail(FString::Printf(TEXT("reset arm, rep %d: sslm_seq_reset failed (%s)"), Rep, *StatusName(Status)));
@@ -528,17 +726,26 @@ namespace
 				size_t PayloadBytes = StateBytes;
 				Start = FPlatformTime::Seconds();
 				Status = sslm_seq_save(Seq, SaveBuffer, &PayloadBytes);
-				const double SaveMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+				End = FPlatformTime::Seconds();
+				const double SaveMs = (End - Start) * 1000.0;
+				if (Trace) { Trace->Add(TEXT("save"), 0, Rep, -1, Start, End); }
 				if (Status != SSLM_OK || PayloadBytes == 0 || PayloadBytes > StateBytes)
 				{
 					return Fail(FString::Printf(TEXT("save arm, rep %d: sslm_seq_save returned %s with %llu payload bytes"), Rep, *StatusName(Status), static_cast<uint64>(PayloadBytes)));
 				}
 				SaveSamples.Add(SaveMs);
+				int64 ResetContextLength = -1;
+				if (!ReadBlobContextLength(static_cast<const uint8*>(SaveBuffer), PayloadBytes, ResetContextLength) || ResetContextLength != 0)
+				{
+					return Fail(FString::Printf(TEXT("reset arm, rep %d: resetting depth %lld did not leave an empty sequence"), Rep, ResetDepth));
+				}
 
 				sslm_seq Restored = nullptr;
 				Start = FPlatformTime::Seconds();
 				Status = sslm_seq_restore(Mapping, &Pool, SaveBuffer, PayloadBytes, &Restored);
-				const double RestoreMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+				End = FPlatformTime::Seconds();
+				const double RestoreMs = (End - Start) * 1000.0;
+				if (Trace) { Trace->Add(TEXT("restore"), 0, Rep, -1, Start, End); }
 				if (Status != SSLM_OK || Restored == nullptr)
 				{
 					return Fail(FString::Printf(TEXT("restore arm, rep %d: sslm_seq_restore failed (%s)"), Rep, *StatusName(Status)));
@@ -573,7 +780,7 @@ namespace
 				}
 			}
 			TArray<double> AdoptSamples;
-			for (int32 Rep = 0; Rep < kReps; ++Rep)
+			for (int32 Rep = 0; Rep < Reps; ++Rep)
 			{
 				Status = sslm_seq_reset(Seq);
 				if (Status != SSLM_OK)
@@ -582,7 +789,9 @@ namespace
 				}
 				const double Start = FPlatformTime::Seconds();
 				Status = sslm_seq_adopt_prefix(Seq, Prefix);
-				const double AdoptMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+				const double End = FPlatformTime::Seconds();
+				const double AdoptMs = (End - Start) * 1000.0;
+				if (Trace) { Trace->Add(TEXT("adopt"), 1, Rep, -1, Start, End); }
 				if (Status != SSLM_OK)
 				{
 					return Fail(FString::Printf(TEXT("adopt arm, rep %d: sslm_seq_adopt_prefix failed (%s)"), Rep, *StatusName(Status)));
@@ -601,12 +810,14 @@ namespace
 
 			// --- PrefixBegin / PrefixRelease: the two calls DispatchPrefixAdmin makes ---
 			TArray<double> PrefixBeginSamples, PrefixReleaseSamples;
-			for (int32 Rep = 0; Rep < kReps; ++Rep)
+			for (int32 Rep = 0; Rep < Reps; ++Rep)
 			{
 				sslm_prefix RepPrefix = nullptr;
 				double Start = FPlatformTime::Seconds();
 				Status = sslm_prefix_begin(Mapping, &Pool, &RepPrefix);
-				const double BeginMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+				double End = FPlatformTime::Seconds();
+				const double BeginMs = (End - Start) * 1000.0;
+				if (Trace) { Trace->Add(TEXT("prefix_begin"), -1, Rep, -1, Start, End); }
 				if (Status != SSLM_OK || RepPrefix == nullptr)
 				{
 					return Fail(FString::Printf(TEXT("prefix-begin arm, rep %d: sslm_prefix_begin failed (%s)"), Rep, *StatusName(Status)));
@@ -614,7 +825,9 @@ namespace
 				PrefixBeginSamples.Add(BeginMs);
 				Start = FPlatformTime::Seconds();
 				Status = sslm_prefix_release(RepPrefix);
-				const double ReleaseMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+				End = FPlatformTime::Seconds();
+				const double ReleaseMs = (End - Start) * 1000.0;
+				if (Trace) { Trace->Add(TEXT("prefix_release"), -1, Rep, -1, Start, End); }
 				if (Status != SSLM_OK)
 				{
 					return Fail(FString::Printf(TEXT("prefix-release arm, rep %d: sslm_prefix_release failed (%s)"), Rep, *StatusName(Status)));
@@ -636,9 +849,9 @@ namespace
 			};
 			for (FArm& Arm : Arms)
 			{
-				if (Arm.Samples->Num() != kReps)
+				if (Arm.Samples->Num() != Reps)
 				{
-					return Fail(FString::Printf(TEXT("%s has %d of its %d required samples"), Arm.Name, Arm.Samples->Num(), kReps));
+					return Fail(FString::Printf(TEXT("%s has %d of its %d required samples"), Arm.Name, Arm.Samples->Num(), Reps));
 				}
 				*Arm.Out = Median(*Arm.Samples);
 				if (!IsValidCostMs(*Arm.Out))
@@ -649,20 +862,37 @@ namespace
 			// The two depth lines (D-SLM7793/D-SLM7794): intercept and slope, the upper envelope.
 			FitUpperEnvelope(OutCosts.LayerArm, OutCosts.LayerCostMs, OutCosts.LayerCostPerPositionMs);
 			FitUpperEnvelope(OutCosts.PromptArm, OutCosts.PromptTokenCostMs, OutCosts.PromptTokenCostPerPositionMs);
+			// Slice 1P: the batched line, and its check against the chunk-1 intercept. A skip keeps
+			// the defaults Setup wrote.
+			if (!OutCosts.BatchedArm.IsEmpty())
+			{
+				FString BatchedError;
+				if (!FitBatchedArm(OutCosts.BatchedArm, OutCosts.PromptTokenCostMs, OutCosts.BatchedPromptTokenCostMs,
+						OutCosts.BatchedPromptTokenCostPerPositionMs, BatchedError))
+				{
+					return Fail(BatchedError);
+				}
+			}
 			return true;
 		}
 
 	private:
 		// Restores depth K's blob into a fresh sequence, releases the one it replaces, and asserts the
 		// restored context_length by saving it back and reading the blob (Layer 1 exposes no getter).
-		bool RestoreAtDepth(int32 K, int64& OutRestoredContextLength, FString& OutError)
+		bool RestoreAtDepth(int64 Depth, int64& OutRestoredContextLength, FString& OutError)
 		{
+			const int32 K = BlobDepths.IndexOfByKey(Depth);
+			if (K == INDEX_NONE)
+			{
+				OutError = FString::Printf(TEXT("no blob was saved at depth %lld"), Depth);
+				return false;
+			}
 			const TArray<uint8>& Blob = DepthBlobs[K];
 			sslm_seq Restored = nullptr;
 			sslm_status Status = sslm_seq_restore(Mapping, &Pool, Blob.GetData(), static_cast<size_t>(Blob.Num()), &Restored);
 			if (Status != SSLM_OK || Restored == nullptr)
 			{
-				OutError = FString::Printf(TEXT("sslm_seq_restore of the depth-%lld blob failed (%s)"), Depths[K], *StatusName(Status));
+				OutError = FString::Printf(TEXT("sslm_seq_restore of the depth-%lld blob failed (%s)"), BlobDepths[K], *StatusName(Status));
 				return false;
 			}
 			Status = sslm_seq_release(Seq);
@@ -675,10 +905,10 @@ namespace
 			size_t PayloadBytes = StateBytes;
 			Status = sslm_seq_save(Seq, SaveBuffer, &PayloadBytes);
 			int64 ContextLength = -1;
-			if (Status != SSLM_OK || !ReadBlobContextLength(static_cast<const uint8*>(SaveBuffer), PayloadBytes, ContextLength) || ContextLength != Depths[K])
+			if (Status != SSLM_OK || !ReadBlobContextLength(static_cast<const uint8*>(SaveBuffer), PayloadBytes, ContextLength) || ContextLength != BlobDepths[K])
 			{
 				OutError = FString::Printf(TEXT("the restored sequence's context_length reads %lld (save %s), not the depth %lld"),
-					ContextLength, *StatusName(Status), Depths[K]);
+					ContextLength, *StatusName(Status), BlobDepths[K]);
 				return false;
 			}
 			OutRestoredContextLength = ContextLength;
@@ -702,6 +932,9 @@ namespace
 		sslm_model Mapping = nullptr;
 		int32 NumLayers = 0;
 		TArray<int64> Depths;
+		TArray<int64> BatchedDepths; // slice 1P: empty when the batched arm is a named skip
+		FString BatchedArmSkipReason; // slice 1P: why, when it is
+		TArray<int64> BlobDepths;    // Depths and BatchedDepths, ascending and distinct; DepthBlobs follows it
 		TArray<TArray<uint8>> DepthBlobs;
 		size_t BlockBytes = 0;
 		size_t StateBytes = 0;
@@ -1000,12 +1233,16 @@ namespace
 		virtual uint32 Run() override
 		{
 #if PLATFORM_WINDOWS
+			FILETIME ThreadCreation, ThreadExit, ThreadKernel, ThreadUser;
+			const bool bCpuStart = ::GetThreadTimes(::GetCurrentThread(), &ThreadCreation, &ThreadExit, &ThreadKernel, &ThreadUser) != 0;
+			const uint64 CpuStart = bCpuStart ? FileTimeToU64(ThreadKernel) + FileTimeToU64(ThreadUser) : 0;
 			FTimesReading Prev = ReadTimes();
 			if (!Prev.bOk)
 			{
 				bFailed = true;
 				return 0;
 			}
+			double PrevSeconds = FPlatformTime::Seconds() - Origin;
 			InitialSnapshot = SnapshotProcesses(Names);
 			bool bStopping = false;
 			while (!bStopping)
@@ -1024,6 +1261,7 @@ namespace
 				const uint64 Busy = Capacity > Idle ? Capacity - Idle : 0;
 				const uint64 Own = Now.Process - Prev.Process;
 				FSuperSLMIdlenessSample Sample;
+				Sample.StartSeconds = PrevSeconds;
 				Sample.EndSeconds = FPlatformTime::Seconds() - Origin;
 				Sample.Phase = static_cast<ESuperSLMCalibrationPhase>(Phase.load(std::memory_order_acquire));
 				if (Capacity > 0)
@@ -1036,6 +1274,11 @@ namespace
 				Samples.Add(Sample);
 				Snapshots.Add(SnapshotProcesses(Names));
 				Prev = Now;
+				PrevSeconds = Sample.EndSeconds;
+			}
+			if (bCpuStart && ::GetThreadTimes(::GetCurrentThread(), &ThreadCreation, &ThreadExit, &ThreadKernel, &ThreadUser) != 0)
+			{
+				CpuMs = static_cast<double>(FileTimeToU64(ThreadKernel) + FileTimeToU64(ThreadUser) - CpuStart) / 10000.0;
 			}
 #endif
 			return 0;
@@ -1044,6 +1287,7 @@ namespace
 		// Written only by the sampler thread; read only after StopAndJoin().
 		TArray<FSuperSLMIdlenessSample> Samples;
 		bool bFailed = false;
+		double CpuMs = -1.0; // sampler-thread CPU, including process snapshots, on a successful run
 #if PLATFORM_WINDOWS
 		FProcessSnapshot InitialSnapshot;
 		TArray<FProcessSnapshot> Snapshots; // Snapshots[i] taken at Samples[i]'s end
@@ -1327,31 +1571,44 @@ namespace
 			UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM.CalibrateCosts: prompt arm timed at depth %lld (restored context_length %lld): median %.6f ms over %d samples%s."),
 				R.Depth, R.RestoredContextLength, R.MedianMs, R.Samples, *Label);
 		}
-		UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM.CalibrateCosts: values%s: LayerCostMs=%.6f LayerCostPerPositionMs=%.9f PromptTokenCostMs=%.6f PromptTokenCostPerPositionMs=%.9f FinishCostMs=%.6f ResetCostMs=%.6f AdoptCostMs=%.6f SaveCostMs=%.6f RestoreCostMs=%.6f PrefixBeginCostMs=%.6f PrefixReleaseCostMs=%.6f FinishParallelTasks=%d"),
+		// Slice 1P: the batched arm and pair, on lines of their own (the values line keeps its eleven
+		// keys and its FinishParallelTasks tail, which existing readers parse).
+		for (const FDepthArmReading& R : Costs.BatchedArm)
+		{
+			UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM.CalibrateCosts: batched arm (chunk %d) timed from depth %lld (restored context_length %lld) at position %.1f: per-token median %.6f ms over %d calls%s."),
+				SuperSLMPrefillPlanning::kBatchedArmChunk, R.Depth, R.RestoredContextLength, R.PositionMean, R.MedianMs, R.Samples, *Label);
+		}
+		UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM.CalibrateCosts: batched prompt pair%s: BatchedPromptTokenCostMs=%.6f BatchedPromptTokenCostPerPositionMs=%.9f (%s)"),
+			*Label, Costs.BatchedPromptTokenCostMs, Costs.BatchedPromptTokenCostPerPositionMs,
+			Costs.bBatchedArmSkipped ? *FString::Printf(TEXT("named skip, defaults: %s"), *Costs.BatchedArmSkipReason) : TEXT("fitted from the chunk-8 arm"));
+		UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM.CalibrateCosts: values%s: LayerCostMs=%.6f LayerCostPerPositionMs=%.9f PromptTokenCostMs=%.6f PromptTokenCostPerPositionMs=%.9f FinishCostMs=%.6f ResetCostMs=%.6f AdoptCostMs=%.6f SaveCostMs=%.6f RestoreCostMs=%.6f PrefixBeginCostMs=%.6f PrefixReleaseCostMs=%.6f bParallelDecode=%d FinishParallelTasks=%d"),
 			*Label, Costs.LayerCostMs, Costs.LayerCostPerPositionMs, Costs.PromptTokenCostMs, Costs.PromptTokenCostPerPositionMs,
 			Costs.FinishCostMs, Costs.ResetCostMs, Costs.AdoptCostMs, Costs.SaveCostMs, Costs.RestoreCostMs,
-			Costs.PrefixBeginCostMs, Costs.PrefixReleaseCostMs, Costs.FinishParallelTasks);
+			Costs.PrefixBeginCostMs, Costs.PrefixReleaseCostMs, Costs.bMeasuredDecodeMode ? 1 : 0, Costs.FinishParallelTasks);
 	}
 
 	// Diagnostic only: the most recent run's outcome, read by SuperSLMCalibrateCostsCommand::
 	// GetLastOutcome(). Game-thread (console commands run there).
 	SuperSLMCalibrateCostsCommand::EOutcome GLastOutcome = SuperSLMCalibrateCostsCommand::EOutcome::NotRun;
 
-	void RunCalibrateCostsCommand(const TArray<FString>& Args)
+	[[maybe_unused]] void RunCalibrateCostsCommand(const TArray<FString>& Args)
 	{
 		GLastOutcome = SuperSLMCalibrateCostsCommand::EOutcome::MeasurementFailed;
 		GLastIdlenessReport = FSuperSLMCalibrationIdlenessReport();
-		if (Args.Num() < 1)
+		if (Args.Num() < 1 || Args.Num() > 2 || (Args.Num() == 2 && Args[1] != TEXT("0") && Args[1] != TEXT("1")))
 		{
-			UE_LOG(LogSuperSLM, Error, TEXT("SuperSLM.CalibrateCosts <ArtifactPath.sslm> -- measures the eleven static per-unit scheduling costs and writes them into Saved/SuperSLM/CalibratedCosts.ini, only when the machine is otherwise idle."));
+			UE_LOG(LogSuperSLM, Error, TEXT("Usage: SuperSLM.CalibrateCosts <ArtifactPath.sslm> [bParallelDecode: 0|1]. Pass 1 when the project's CPU FSuperSLMRuntimeConfig.bParallelDecode is enabled; omitted means 0. Writes Saved/SuperSLM/CalibratedCosts.ini only when the machine is otherwise idle."));
 			return;
 		}
 		const FString ArtifactPath = Args[0];
+		const bool bParallelDecode = Args.Num() == 2 && Args[1] == TEXT("1");
 
-		UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM.CalibrateCosts: starting against '%s'."), *ArtifactPath);
+		UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM.CalibrateCosts: starting against '%s' with bParallelDecode=%d (hook reserved=0x%x)."),
+			*ArtifactPath, bParallelDecode ? 1 : 0, bParallelDecode ? SSLM_PARALLEL_FOR_MATVEC : 0);
 		LogNamedProcessDiagnostic();
 
 		FMeasuredCosts Costs;
+		Costs.bMeasuredDecodeMode = bParallelDecode;
 		FString Error;
 		bool bRanOk = false;
 		double RunSeconds = 0.0;
@@ -1371,7 +1628,7 @@ namespace
 		if (!bSynthetic)
 		{
 			const double SetupStart = FPlatformTime::Seconds();
-			const bool bSetupOk = Session.Setup(ArtifactPath, Costs, Error);
+			const bool bSetupOk = Session.Setup(ArtifactPath, bParallelDecode, Costs, Error);
 			UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM.CalibrateCosts: setup (the prefill to each depth and its blob) took %.2f s, before the pre-window."),
 				FPlatformTime::Seconds() - SetupStart);
 			if (!bSetupOk)
@@ -1396,6 +1653,7 @@ namespace
 			int64 WarmUpCalls = static_cast<int64>(7) * kReps; // finish, reset, save, restore, adopt, prefix begin, prefix release
 			for (const FDepthArmReading& R : WarmUp.PromptArm) { WarmUpCalls += R.Samples; }
 			for (const FDepthArmReading& R : WarmUp.LayerArm) { WarmUpCalls += R.Samples; }
+			for (const FDepthArmReading& R : WarmUp.BatchedArm) { WarmUpCalls += R.Samples; }
 			UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM.CalibrateCosts: warm-up pass: %lld calls, discarded."), WarmUpCalls);
 		}
 		else
@@ -1483,6 +1741,7 @@ namespace
 				{ TEXT("AdoptCostMs"), Costs.AdoptCostMs }, { TEXT("SaveCostMs"), Costs.SaveCostMs },
 				{ TEXT("RestoreCostMs"), Costs.RestoreCostMs }, { TEXT("PrefixBeginCostMs"), Costs.PrefixBeginCostMs },
 				{ TEXT("PrefixReleaseCostMs"), Costs.PrefixReleaseCostMs },
+				{ TEXT("BatchedPromptTokenCostMs"), Costs.BatchedPromptTokenCostMs },
 			};
 			for (const TPair<const TCHAR*, double>& Cost : Written)
 			{
@@ -1496,6 +1755,7 @@ namespace
 			const TPair<const TCHAR*, double> Slopes[] = {
 				{ TEXT("LayerCostPerPositionMs"), Costs.LayerCostPerPositionMs },
 				{ TEXT("PromptTokenCostPerPositionMs"), Costs.PromptTokenCostPerPositionMs },
+				{ TEXT("BatchedPromptTokenCostPerPositionMs"), Costs.BatchedPromptTokenCostPerPositionMs },
 			};
 			for (const TPair<const TCHAR*, double>& Slope : Slopes)
 			{
@@ -1516,12 +1776,22 @@ namespace
 			DepthLines += FString::Printf(TEXT("LayerMedianMsAtDepth%lld=%.6f\nPromptTokenMedianMsAtDepth%lld=%.6f\n"),
 				Costs.LayerArm[K].Depth, Costs.LayerArm[K].MedianMs, Costs.PromptArm[K].Depth, Costs.PromptArm[K].MedianMs);
 		}
+		for (const FDepthArmReading& R : Costs.BatchedArm)
+		{
+			DepthLines += FString::Printf(TEXT("BatchedPromptTokenMedianMsAtPosition%.1f=%.6f\n"), R.PositionMean, R.MedianMs);
+		}
+		const FString BatchedNote = Costs.bBatchedArmSkipped
+			? FString::Printf(TEXT("; The batched prompt arm was skipped (%s): the two Batched fields are FSuperSLMRuntimeConfig's defaults\n"), *Costs.BatchedArmSkipReason)
+			: FString(TEXT("; The batched prompt arm (slice 1P) timed one 8-token call from depths 1, C/4, C/2, 3C/4 and C - 8, each reading at the chunk's mean position d + 3.5\n"));
 		const FString OutText = FString::Printf(TEXT(
 			"; SuperSLM.CalibrateCosts output -- the plan §5 item 2, §10.2 item 10, §10.3.1 items 5a.1 and 5b\n"
 			"; Artifact: %s\n"
+			"; Calibration CPU decode mode: bParallelDecode=%d (must match the project's FSuperSLMRuntimeConfig.bParallelDecode when copying these costs)\n"
 			"; Idleness criterion (D-SLM7778) met: %d samples, ceiling %.4f%% (N = %d)\n"
 			"; Cap C = %lld; the layer and prompt arms were timed at depths 1, C/4, C/2, 3C/4 and C - 1 (D-SLM7793/D-SLM7794)\n"
+			"%s"
 			"[SuperSLM.CalibratedCosts]\n"
+			"bParallelDecode=%d\n"
 			"LayerCostMs=%.6f\n"
 			"LayerCostPerPositionMs=%.9f\n"
 			"FinishCostMs=%.6f\n"
@@ -1533,18 +1803,22 @@ namespace
 			"RestoreCostMs=%.6f\n"
 			"PrefixBeginCostMs=%.6f\n"
 			"PrefixReleaseCostMs=%.6f\n"
+			"BatchedPromptTokenCostMs=%.6f\n"
+			"BatchedPromptTokenCostPerPositionMs=%.9f\n"
 			"[SuperSLM.CalibratedCosts.Depths]\n"
 			"CapTokens=%lld\n"
 			"%s"),
-			*ArtifactPath, Report.Samples.Num(), Report.CeilingPercent, Report.LogicalProcessors, Costs.CapTokens,
+			*ArtifactPath, Costs.bMeasuredDecodeMode ? 1 : 0, Report.Samples.Num(), Report.CeilingPercent, Report.LogicalProcessors, Costs.CapTokens, *BatchedNote,
+			Costs.bMeasuredDecodeMode ? 1 : 0,
 			Costs.LayerCostMs, Costs.LayerCostPerPositionMs, Costs.FinishCostMs,
 			Costs.PromptTokenCostMs, Costs.PromptTokenCostPerPositionMs,
 			Costs.ResetCostMs, Costs.AdoptCostMs, Costs.SaveCostMs, Costs.RestoreCostMs,
-			Costs.PrefixBeginCostMs, Costs.PrefixReleaseCostMs, Costs.CapTokens, *DepthLines);
+			Costs.PrefixBeginCostMs, Costs.PrefixReleaseCostMs,
+			Costs.BatchedPromptTokenCostMs, Costs.BatchedPromptTokenCostPerPositionMs, Costs.CapTokens, *DepthLines);
 		if (FFileHelper::SaveStringToFile(OutText, *OutPath))
 		{
 			GLastOutcome = SuperSLMCalibrateCostsCommand::EOutcome::Written;
-			UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM.CalibrateCosts: wrote %s. A project reads this file (or its own equivalent config surface) and copies these eleven values into FSuperSLMRuntimeConfig before Configure()."), *OutPath);
+			UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM.CalibrateCosts: wrote %s with bParallelDecode=%d. A project must match that mode to FSuperSLMRuntimeConfig.bParallelDecode when copying the thirteen costs before Configure()."), *OutPath, Costs.bMeasuredDecodeMode ? 1 : 0);
 		}
 		else
 		{
@@ -1553,19 +1827,196 @@ namespace
 		}
 	}
 
-	static FAutoConsoleCommand GSuperSLMCalibrateCostsCommand(
-		TEXT("SuperSLM.CalibrateCosts"),
-		TEXT("SuperSLM.CalibrateCosts <ArtifactPath.sslm> -- measures the eleven static per-unit scheduling costs (the layer and prompt arms at five depths from the artifact's cap) on this machine against the given artifact, and writes them to Saved/SuperSLM/CalibratedCosts.ini only when the idleness criterion is met: the foreign CPU share, sampled every 250 ms across a 2 s pre-window, the workload and a 2 s post-window, stays at or under 50/N percent in every 1 s window, and the build lock (SUPERSLM_BUILD_LOCK, when set) is never held by a foreign owner. Editor and packaged."),
-		FConsoleCommandWithArgsDelegate::CreateStatic(&RunCalibrateCostsCommand));
+	// T-3050d: evidence collection only. This command neither grades a timing value nor writes
+	// CalibratedCosts.ini. It reuses the real A-EX session and the existing foreign-load sampler.
+	[[maybe_unused]] void RunCaptureCallTimesCommand(const TArray<FString>& Args)
+	{
+		if (Args.Num() != 4 || (Args[1] != TEXT("0") && Args[1] != TEXT("1")))
+		{
+			UE_LOG(LogSuperSLM, Error, TEXT("Usage: SuperSLM.CaptureCallTimes <ArtifactPath.sslm> <bParallelDecode:0|1> <BlockId> <OutputDirectory>"));
+			return;
+		}
+		const FString ArtifactPath = Args[0];
+		const bool bParallelDecode = Args[1] == TEXT("1");
+		const FString Block = Args[2];
+		for (TCHAR Ch : Block)
+		{
+			if (!((Ch >= TEXT('a') && Ch <= TEXT('z')) || (Ch >= TEXT('A') && Ch <= TEXT('Z')) ||
+				(Ch >= TEXT('0') && Ch <= TEXT('9')) || Ch == TEXT('-') || Ch == TEXT('_')))
+			{
+				UE_LOG(LogSuperSLM, Error, TEXT("SuperSLM.CaptureCallTimes: BlockId must contain only ASCII letters, digits, '-' or '_'."));
+				return;
+			}
+		}
+		if (Block.IsEmpty())
+		{
+			UE_LOG(LogSuperSLM, Error, TEXT("SuperSLM.CaptureCallTimes: BlockId is empty."));
+			return;
+		}
+		constexpr int32 WarmupReps = 5;
+		constexpr int32 CaptureReps = 12;
+		const int32 Mode = bParallelDecode ? 1 : 0;
+		const FString StartedUtc = FDateTime::UtcNow().ToIso8601();
+		FMeasuredCosts Costs;
+		FCalibrationSession Session;
+		FString Error;
+		const double SetupStart = FPlatformTime::Seconds();
+		if (!Session.Setup(ArtifactPath, bParallelDecode, Costs, Error))
+		{
+			UE_LOG(LogSuperSLM, Error, TEXT("SuperSLM.CaptureCallTimes: setup failed: %s"), *Error);
+			return;
+		}
+		const double SetupSeconds = FPlatformTime::Seconds() - SetupStart;
+		FMeasuredCosts Warmup;
+		const double WarmupStart = FPlatformTime::Seconds();
+		if (!Session.Measure(Warmup, Error, WarmupReps))
+		{
+			UE_LOG(LogSuperSLM, Error, TEXT("SuperSLM.CaptureCallTimes: warm-up failed: %s"), *Error);
+			return;
+		}
+		const double WarmupSeconds = FPlatformTime::Seconds() - WarmupStart;
+
+		// Clock reads already bracket every ABI call in Measure. The only incremental per-call work
+		// is a pre-reserved append after End. Benchmark it and the clock pair before the sampled run.
+		TArray<double> ClockPairNs;
+		ClockPairNs.Reserve(10000);
+		for (int32 I = 0; I < 10000; ++I)
+		{
+			const double A = FPlatformTime::Seconds();
+			const double B = FPlatformTime::Seconds();
+			ClockPairNs.Add((B - A) * 1.0e9);
+		}
+		ClockPairNs.Sort();
+		const double ClockP50Ns = ClockPairNs[ClockPairNs.Num() / 2];
+		const double ClockP95Ns = ClockPairNs[(ClockPairNs.Num() * 95) / 100];
+		double AppendNsSum = 0.0, AppendNsMax = 0.0;
+		for (int32 Batch = 0; Batch < 5; ++Batch)
+		{
+			FPerCallTrace Bench;
+			Bench.Calls.Reserve(100000);
+			const double Begin = FPlatformTime::Seconds();
+			for (int32 I = 0; I < 100000; ++I)
+			{
+				Bench.Add(TEXT("overhead"), 1, I, -1, Begin, Begin);
+			}
+			const double Ns = (FPlatformTime::Seconds() - Begin) * 1.0e9 / 100000.0;
+			AppendNsSum += Ns;
+			AppendNsMax = FMath::Max(AppendNsMax, Ns);
+		}
+		FPerCallTrace Trace;
+		const int32 ExpectedCalls = Session.ExpectedTimedCallCount(CaptureReps);
+		Trace.Calls.Reserve(ExpectedCalls);
+		std::atomic<uint8> Phase{ static_cast<uint8>(ESuperSLMCalibrationPhase::PreWindow) };
+		const FString OriginUtc = FDateTime::UtcNow().ToIso8601();
+		Trace.Origin = FPlatformTime::Seconds();
+		FIdlenessSampler Sampler(Phase, Trace.Origin, BuildLockPath(), FPlatformMisc::GetEnvironmentVariable(TEXT("SSU_BUILD_LOCK_TOKEN")));
+		if (!Sampler.Start())
+		{
+			UE_LOG(LogSuperSLM, Error, TEXT("SuperSLM.CaptureCallTimes: foreign-load sampler could not start."));
+			return;
+		}
+		UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM.CaptureCallTimes: block=%s mode=%d setup_s=%.3f warmup_s=%.3f expected_calls=%d; sampler pre-window started."),
+			*Block, Mode, SetupSeconds, WarmupSeconds, ExpectedCalls);
+		FPlatformProcess::Sleep(static_cast<float>(kPreWindowSeconds));
+		Phase.store(static_cast<uint8>(ESuperSLMCalibrationPhase::Workload), std::memory_order_release);
+		const double TimedStart = FPlatformTime::Seconds();
+		const bool bMeasured = Session.Measure(Costs, Error, CaptureReps, &Trace);
+		const double TimedSeconds = FPlatformTime::Seconds() - TimedStart;
+		Phase.store(static_cast<uint8>(ESuperSLMCalibrationPhase::PostWindow), std::memory_order_release);
+		FPlatformProcess::Sleep(static_cast<float>(kPostWindowSeconds));
+		Sampler.StopAndJoin();
+		if (!bMeasured || Sampler.bFailed || Sampler.Samples.IsEmpty() || Trace.Calls.Num() != ExpectedCalls)
+		{
+			UE_LOG(LogSuperSLM, Error, TEXT("SuperSLM.CaptureCallTimes: incomplete block=%s mode=%d calls=%d/%d samples=%d sampler_failed=%d: %s"),
+				*Block, Mode, Trace.Calls.Num(), ExpectedCalls, Sampler.Samples.Num(), Sampler.bFailed ? 1 : 0, *Error);
+			return;
+		}
+
+		FString CallsCsv = TEXT("call_id,block,mode,arm,depth,rep,layer,start_s,end_s,elapsed_ms,foreign_pct,foreign_peak_pct,foreign_coverage,first_sample,last_sample\n");
+		int32 Uncovered = 0;
+		for (int32 I = 0; I < Trace.Calls.Num(); ++I)
+		{
+			const FCallTiming& C = Trace.Calls[I];
+			double Covered = 0.0, Weighted = 0.0, Peak = 0.0;
+			int32 First = -1, Last = -1;
+			for (int32 J = 0; J < Sampler.Samples.Num(); ++J)
+			{
+				const FSuperSLMIdlenessSample& S = Sampler.Samples[J];
+				const double Overlap = FMath::Max(0.0, FMath::Min(C.EndSeconds, S.EndSeconds) - FMath::Max(C.StartSeconds, S.StartSeconds));
+				if (Overlap > 0.0)
+				{
+					if (First < 0) { First = J; }
+					Last = J;
+					Covered += Overlap;
+					Weighted += Overlap * S.ForeignSharePercent;
+					Peak = FMath::Max(Peak, S.ForeignSharePercent);
+				}
+			}
+			const double Duration = C.EndSeconds - C.StartSeconds;
+			const double Coverage = Duration > 0.0 ? Covered / Duration : 0.0;
+			if (Coverage < 0.999) { ++Uncovered; }
+			CallsCsv += FString::Printf(TEXT("%d,%s,%d,%s,%lld,%d,%d,%.9f,%.9f,%.9f,%.6f,%.6f,%.6f,%d,%d\n"),
+				I, *Block, Mode, C.Arm, C.Depth, C.Rep, C.Layer, C.StartSeconds, C.EndSeconds, Duration * 1000.0,
+				Covered > 0.0 ? Weighted / Covered : -1.0, Peak, Coverage, First, Last);
+		}
+		FString SamplesCsv = TEXT("sample_id,block,mode,start_s,end_s,phase,box_pct,own_pct,foreign_pct,lock_state\n");
+		for (int32 I = 0; I < Sampler.Samples.Num(); ++I)
+		{
+			const FSuperSLMIdlenessSample& S = Sampler.Samples[I];
+			SamplesCsv += FString::Printf(TEXT("%d,%s,%d,%.9f,%.9f,%s,%.6f,%.6f,%.6f,%s\n"),
+				I, *Block, Mode, S.StartSeconds, S.EndSeconds, PhaseName(S.Phase), S.BoxSharePercent,
+				S.OwnSharePercent, S.ForeignSharePercent, LockStateName(S.LockState));
+		}
+		// These are the sampler's existing process snapshots; serialization adds no work to
+		// the sampled interval. They identify which desktop processes were active per block.
+		FString ProcessesCsv = TEXT("sample_id,block,mode,pid,name,cpu_ms\n");
+#if PLATFORM_WINDOWS
+		for (int32 I = 0; I < Sampler.Snapshots.Num(); ++I)
+		{
+			const FProcessSnapshot& Before = I == 0 ? Sampler.InitialSnapshot : Sampler.Snapshots[I - 1];
+			for (const TPair<uint32, uint64>& Entry : Sampler.Snapshots[I].CpuTime)
+			{
+				const uint64* Previous = Before.CpuTime.Find(Entry.Key);
+				if (Previous && Entry.Value >= *Previous)
+				{
+					const FString* Name = Sampler.Names.Find(Entry.Key);
+					ProcessesCsv += FString::Printf(TEXT("%d,%s,%d,%u,%s,%.6f\n"), I, *Block, Mode, Entry.Key,
+						Name ? **Name : TEXT("unknown"), static_cast<double>(Entry.Value - *Previous) / 10000.0);
+				}
+			}
+		}
+#endif
+		const FString Meta = FString::Printf(TEXT(
+			"format=t3050d-per-call-v1\nstarted_utc=%s\norigin_utc=%s\nblock=%s\nmode=%d\nartifact=%s\nreps=%d\nwarmup_reps=%d\nexpected_calls=%d\nactual_calls=%d\nsamples=%d\nuncovered_calls=%d\n"
+			"logical_processors=%d\nsetup_s=%.6f\nwarmup_s=%.6f\ntimed_s=%.6f\nclock_pair_p50_ns=%.3f\nclock_pair_p95_ns=%.3f\n"
+			"append_mean_ns=%.3f\nappend_max_ns=%.3f\nsampler_cpu_ms=%.6f\nsampler_cpu_ms_per_sample=%.6f\n"
+			"foreign_join=overlap_weighted_250ms_sample_share\nforeign_resolution_s=0.25\ncalibration_verdict=not_requested\n"),
+			*StartedUtc, *OriginUtc, *Block, Mode, *ArtifactPath, CaptureReps, WarmupReps, ExpectedCalls, Trace.Calls.Num(), Sampler.Samples.Num(), Uncovered,
+			BoxLogicalProcessors(), SetupSeconds, WarmupSeconds, TimedSeconds, ClockP50Ns, ClockP95Ns,
+			AppendNsSum / 5.0, AppendNsMax, Sampler.CpuMs, Sampler.CpuMs / Sampler.Samples.Num());
+		IFileManager::Get().MakeDirectory(*Args[3], true);
+		const FString Prefix = FPaths::Combine(Args[3], Block);
+		const bool bCallsSaved = FFileHelper::SaveStringToFile(CallsCsv, *(Prefix + TEXT(".calls.csv")));
+		const bool bSamplesSaved = FFileHelper::SaveStringToFile(SamplesCsv, *(Prefix + TEXT(".samples.csv")));
+		const bool bProcessesSaved = FFileHelper::SaveStringToFile(ProcessesCsv, *(Prefix + TEXT(".processes.csv")));
+		const bool bMetaSaved = FFileHelper::SaveStringToFile(Meta, *(Prefix + TEXT(".meta.txt")));
+		UE_LOG(LogSuperSLM, Display,
+			TEXT("SuperSLM.CaptureCallTimes: block=%s mode=%d calls=%d samples=%d uncovered=%d setup_s=%.3f warmup_s=%.3f timed_s=%.3f clock_p95_ns=%.1f append_mean_ns=%.1f sampler_cpu_ms=%.3f files=%s.{calls.csv,samples.csv,processes.csv,meta.txt} saved=%d"),
+			*Block, Mode, Trace.Calls.Num(), Sampler.Samples.Num(), Uncovered, SetupSeconds, WarmupSeconds, TimedSeconds,
+			ClockP95Ns, AppendNsSum / 5.0, Sampler.CpuMs, *Prefix, bCallsSaved && bSamplesSaved && bProcessesSaved && bMetaSaved ? 1 : 0);
+		if (!bCallsSaved || !bSamplesSaved || !bProcessesSaved || !bMetaSaved || Uncovered != 0)
+		{
+			UE_LOG(LogSuperSLM, Error, TEXT("SuperSLM.CaptureCallTimes: incomplete output for block %s; no calibration verdict is available."), *Block);
+		}
+	}
+
 }
 
 namespace SuperSLMCalibrateCostsCommand
 {
 	void Register()
 	{
-		// FAutoConsoleCommand above self-registers at static-init time; this function exists so
-		// SuperSLMUnrealModule.cpp can force this translation unit to link (a console command
-		// defined only in an otherwise-unreferenced .cpp can be stripped by the linker).
+		// Retain the regression instrument's translation unit; public registration is retired.
 	}
 
 	EOutcome GetLastOutcome()
@@ -1575,6 +2026,20 @@ namespace SuperSLMCalibrateCostsCommand
 }
 
 #if WITH_DEV_AUTOMATION_TESTS
+FSuperSLMLegacyCalibrationScope::FSuperSLMLegacyCalibrationScope()
+{
+	check(IsInGameThread());
+	check(IConsoleManager::Get().FindConsoleObject(TEXT("SuperSLM.CalibrateCosts")) == nullptr);
+	Command = IConsoleManager::Get().RegisterConsoleCommand(TEXT("SuperSLM.CalibrateCosts"),
+		TEXT("Scoped legacy calibration regression instrument; unchanged idleness and positive-cost checks."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&RunCalibrateCostsCommand));
+}
+
+FSuperSLMLegacyCalibrationScope::~FSuperSLMLegacyCalibrationScope()
+{
+	IConsoleManager::Get().UnregisterConsoleObject(Command, false);
+}
+
 void FSuperSLMCalibrationTestAccess::SetPhaseHook(TFunction<void(ESuperSLMCalibrationEvent)> Hook)
 {
 	GTestPhaseHook = MoveTemp(Hook);
@@ -1606,5 +2071,51 @@ void FSuperSLMCalibrationTestAccess::ClearOverrides()
 const FSuperSLMCalibrationIdlenessReport& FSuperSLMCalibrationTestAccess::GetLastIdlenessReport()
 {
 	return GLastIdlenessReport;
+}
+
+bool FSuperSLMCalibrationTestAccess::FitBatchedArmFromSyntheticTimings(const TArray<int64>& Depths, const TArray<double>& MedianCallMs,
+	double Chunk1TokenMs, double& OutTokenMs, double& OutPerPositionMs, TArray<double>& OutPositions, TArray<double>& OutPerTokenMs, FString& OutError)
+{
+	OutPositions.Reset();
+	OutPerTokenMs.Reset();
+	if (Depths.Num() == 0 || Depths.Num() != MedianCallMs.Num())
+	{
+		OutError = TEXT("synthetic batched arm: one median call time per depth is required");
+		return false;
+	}
+	TArray<FDepthArmReading> Arm;
+	for (int32 I = 0; I < Depths.Num(); ++I)
+	{
+		// The timed arm's own reading path, with the restore's context_length taken as the depth.
+		Arm.Add(MakeBatchedReading(Depths[I], Depths[I], MedianCallMs[I], 1));
+		OutPositions.Add(Arm.Last().PositionMean);
+		OutPerTokenMs.Add(Arm.Last().MedianMs);
+	}
+	return FitBatchedArm(Arm, Chunk1TokenMs, OutTokenMs, OutPerPositionMs, OutError);
+}
+
+bool FSuperSLMCalibrationTestAccess::BatchedArmDepthsForCap(int64 Cap, TArray<int64>& OutDepths)
+{
+	int64 Values[5] = {};
+	OutDepths.Reset();
+	if (!SuperSLMPrefillPlanning::BatchedArmDepths(Cap, Values))
+	{
+		return false;
+	}
+	OutDepths.Append(Values, 5);
+	return true;
+}
+
+void FSuperSLMCalibrationTestAccess::BatchedArmSkipValues(double& OutTokenMs, double& OutPerPositionMs)
+{
+	::BatchedArmSkipValues(OutTokenMs, OutPerPositionMs);
+}
+
+void FSuperSLMCalibrationTestAccess::BatchedArmSkipValues(bool bParallelDecode, double& OutTokenMs, double& OutPerPositionMs)
+{
+	FSuperSLMResolvedCpuConfig Defaults;
+	SuperSLMRuntimeResolve::ApplyModeProfile(bParallelDecode, Defaults);
+	OutTokenMs = Defaults.BatchedPromptTokenCostMs;
+	OutPerPositionMs = Defaults.BatchedPromptTokenCostPerPositionMs;
 }
 #endif // WITH_DEV_AUTOMATION_TESTS

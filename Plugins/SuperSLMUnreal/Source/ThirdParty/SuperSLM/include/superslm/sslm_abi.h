@@ -63,7 +63,7 @@ typedef struct sslm_detok_state {
 } sslm_detok_state;
 
 /* status enum -- FULL-REGISTRY MIRROR, design Sec6's own single-authority complete ordinal
- * registry, 29 entries (0-28) plus one auto-valued sentinel (design Sec6 GOVERNANCE RULING,
+ * registry, 30 entries (0-29) plus one auto-valued sentinel (design Sec6 GOVERNANCE RULING,
  * design commit 4f4eb23896; symmetric-mirroring FOLD RULING on the third confirmation pass's F1,
  * design commit dated 2026-08-17).
  *
@@ -80,7 +80,7 @@ typedef struct sslm_detok_state {
  * only which header's enum body carries which NAMES changed.
  *
  * SSLM_STATUS_NEXT_FREE -- the enum's final member, auto-valued (no explicit numeric value:
- * the compiler assigns one past the current final real status, i.e. 29). This is the fold's OTHER
+ * the compiler assigns one past the current final real status, i.e. 30). This is the fold's OTHER
  * ruling: a plain #define "top" macro (SSLM_STATUS_BASE_MAX, retired this fold -- no design
  * record, no consumer beyond one test tool, F1 collateral) cannot move itself
  * when a header appends a new enumerator, so F1's four compiled mutations proved it silently
@@ -173,7 +173,16 @@ typedef struct sslm_detok_state {
      * per-sequence numeric rejection: retrying with the same deployment cannot succeed.
      * Rebuild/redeploy the matching shader set, then retry. Appended at the END so every
      * already-published ordinal remains stable. */ \
-    X(SSLM_GPU_SHADER_BINARY_STALE) /* 28 */
+    X(SSLM_GPU_SHADER_BINARY_STALE) /* 28 */ \
+    /* Paged-KV plan Sec3.6: a write by a budget-mode holder (sslm_seq_create_budgeted,
+     * sslm_prefix_begin_budgeted, sslm_prefix_begin_from, or a restore of a budget-mode 'SSB6')
+     * would land at a position >= its limit = min(origin + budget, cap), and that limit is below
+     * the cap. Prefill consumes the tokens below the limit and stops; decode refuses at the token
+     * boundary with no row written (the ready token still emits). At limit == cap the existing
+     * SSLM_CONTEXT_CAP_EXCEEDED is returned instead, so a holder made by a no-budget verb never
+     * sees this status. Reset or adopt to continue. Appended at the END: every published ordinal
+     * stays stable. */ \
+    X(SSLM_KV_BUDGET_EXCEEDED) /* 29 */
 
 typedef enum sslm_status {
 #define SSLM_STATUS_ENUM_VALUE_(name) name,
@@ -258,6 +267,7 @@ typedef struct sslm_stats_out {
      * forced_token_count, so the count transplanted is exactly what a fresh sequence would read,
      * never the prefix's -- stated here rather than left implicit, T-2917 folding TE-370 M2. */
     int64_t forced_token_count;
+    /* Always 1. Since 1.12.0 a sequence's K/V pages are reported by sslm_seq_kv_stats. */
     int32_t kv_blocks_resident;
     /* (design Sec14.1): 1 iff a schema is bound AND the sequence's current dfa_walk_state is a
      * member of that schema's accept set (accepting_le/accepting_count, design Sec13.2); 0 when it
@@ -265,6 +275,44 @@ typedef struct sslm_stats_out {
      * must be distinguished. */
     int32_t schema_accepting;
 } sslm_stats_out;
+
+/* Paged-KV plan Sec3.6: the paged KV surface (budget holders, shared prefixes, page pools) is
+ * declared by this header. Defined together with the two stats structs below and
+ * SSLM_KV_BUDGET_EXCEEDED, so a consumer can test for the whole surface at once. */
+#define SSLM_HAS_PAGED_KV_ABI 1
+
+/* sslm_kv_pool_stats' output. The caller sets struct_size = sizeof(sslm_kv_pool_stats_out); any
+ * other value is SSLM_INVALID_ARGUMENT. shared_pages is the number of distinct pages that at least
+ * one live holder maps as *shared* -- entered its table by a budget adopt, sslm_prefix_begin_from or
+ * a sharing restore -- never a reading of reference counts. Diagnostic: a host reads free_pages to
+ * size its admissions. */
+typedef struct sslm_kv_pool_stats_out {
+    uint32_t struct_size;
+    uint32_t page_count;
+    uint32_t free_pages;
+    uint32_t shared_pages;
+    int64_t page_positions; /* B, sslm_kv_page_positions */
+} sslm_kv_pool_stats_out;
+
+/* sslm_seq_kv_stats' output. The caller sets struct_size = sizeof(sslm_seq_kv_stats_out). mode: 0
+ * whole_reserve (a no-budget verb, or a restore of a no-budget blob), 1 budget. limit =
+ * min(origin + budget, cap) for a budget holder, the cap for a whole_reserve one. The holder's
+ * reservation is reserve_pages + mapped_private_pages; mapped_private_pages includes the
+ * materialized ones (pages a restore without a matching prefix drew for the prefix span, returned
+ * to the pool at the first reset, adopt or release). reserved0 is written 0. */
+typedef struct sslm_seq_kv_stats_out {
+    uint32_t struct_size;
+    uint32_t mode;
+    int64_t origin;
+    int32_t budget;
+    int32_t reserved0;
+    int64_t limit;
+    int64_t context_length;
+    uint32_t mapped_private_pages;
+    uint32_t shared_pages;
+    uint32_t reserve_pages;
+    uint32_t materialized_pages;
+} sslm_seq_kv_stats_out;
 
 /* The alignment sslm_workspace_create and
  * sslm_kv_pool_create both require of their caller-supplied `buf`, on pain of

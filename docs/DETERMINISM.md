@@ -112,8 +112,8 @@ the CPU verdict with its scope, and withholds the GPU verdict, as every surface 
   stays responsive.
 - **In a game, including a packaged build:** the Blueprint node **Run Determinism Self-Check**
   (see [BLUEPRINT_API.md](BLUEPRINT_API.md#the-blueprint-surface)), on a model configured on both
-  backends. The plugin adds no console command for the self-check (its one console command is
-  `SuperSLM.CalibrateCosts`); a game that wants one adds it, as the example project does with
+  backends. The plugin adds no console command for the self-check (its console commands are the
+  cost estimate and the decode settings); a game that wants one adds it, as the example project does with
   `SuperSLMExample.SelfCheck`.
 - **From C++:** `FSuperSLMSelfCheckRun` steps it a bounded amount per call, and
   `SuperSLMDeterminismSelfCheck::Run()` runs it to completion and blocks, for tests and

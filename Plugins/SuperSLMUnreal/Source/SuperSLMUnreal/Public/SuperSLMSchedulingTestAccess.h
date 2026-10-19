@@ -6,6 +6,7 @@ class USuperSLMSubsystem;
 
 #if WITH_DEV_AUTOMATION_TESTS
 #include "superslm/sslm_abi.h" // sslm_status, for SetNextResetStatusOverride()
+#include "SuperSLMRuntimeConfig.h"
 
 // Test-only access to the CPU scheduler's numeric domain (plan §5 "The scheduler's numeric
 // domain", plan §10.3.1 item 5a.3, D-SLM7799). Compiled only under WITH_DEV_AUTOMATION_TESTS; it
@@ -25,6 +26,22 @@ struct SUPERSLMUNREAL_API FSuperSLMSchedulingTestAccess
 	// failure the out value is left unchanged.
 	static bool TryComputeK(double PlannedJobMs, double TickBudgetMs, int32& OutK);
 	static bool TryCommitTick(int32 TickIndex, int32 K, int32& OutTick);
+
+	// Slice 1P (SuperSLM tiled-matmul plan §4A.1, rev 11.1 audit F5 and F8): the production planner,
+	// price and overrun predicate themselves, the functions both prefill sites, every continuation
+	// and Apply call.
+	//  - PlanPrefillChunk: the chunk a prefill job carries, where MaxChunk is min(MaxPrefillChunkBudget,
+	//    the prompt tokens left), StartDepth the chunk's first position and ShareMs TickBudgetMs x
+	//    BudgetHeadroom. The largest C whose pair-selected price fits ShareMs, raised to
+	//    min(Config.MinPrefillChunk, MaxChunk).
+	//  - PrefillChunkCostMs: the planned cost of Chunk tokens from StartDepth, priced with the batched
+	//    pair at Chunk >= TiledMinTokens() and the chunk-1 pair below it.
+	//  - IsWorkerOverrun: WorkerCallMs > K x TickBudgetMs, the rule Apply sets bWorkerOverran by.
+	//  - TiledMinTokens: 8, where the pair switches and the Configure() warning starts.
+	static int32 PlanPrefillChunk(int32 MaxChunk, int64 StartDepth, double ShareMs, const FSuperSLMRuntimeConfig& Config);
+	static double PrefillChunkCostMs(int32 Chunk, int64 StartDepth, const FSuperSLMRuntimeConfig& Config);
+	static bool IsWorkerOverrun(double WorkerCallMs, int32 K, double TickBudgetMs);
+	static int32 TiledMinTokens();
 
 	// Sets the configured subsystem's tick counter (cell TickHorizonFaults: horizon - 2). Returns
 	// false when the subsystem is not configured. Jobs already posted keep their ticks. It does not

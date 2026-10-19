@@ -2,6 +2,8 @@
 
 #include "Dom/JsonObject.h"
 #include "HAL/PlatformTime.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "SuperSLMGpuDigestBridge.h"
@@ -171,7 +173,7 @@ namespace SuperSLMExample
 	FString SettingsDescription(const FSuperSLMExampleSettings& S)
 	{
 		const FString Budget = S.Backend == ESuperSLMExampleBackend::CPU
-			? FString::Printf(TEXT("layer budget %d"), S.FrameBudgetLayers)
+			? FString::Printf(TEXT("layer budget %d%s"), S.CpuLayerBudget, S.CpuLayerBudget >= NumHiddenLayers ? TEXT(" (whole token)") : TEXT(""))
 			: (S.IsWholeToken() ? FString(TEXT("whole token (one-call path)")) : FString::Printf(TEXT("%d layers per slice"), S.FrameBudgetLayers));
 		return FString::Printf(TEXT("%s, %s, %d concurrent"),
 			S.Backend == ESuperSLMExampleBackend::CPU ? TEXT("CPU") : TEXT("GPU"), *Budget, S.ConcurrentQueries);
@@ -216,6 +218,9 @@ FSuperSLMRuntimeConfig FSuperSLMExampleDemo::CpuConfig()
 	Config.BlockCount = SuperSLMExample::MaxConcurrentQueries;
 	Config.SequenceLifecycleBudgetMs = 1000.0;
 	Config.TickBudgetMs = SuperSLMExample::CpuTickBudgetMs;
+	// 1.1: the worker goes straight from one job to the next (the default). The switch restores
+	// 1.0's hand-off at each frame, so the packaged check can measure the difference in one build.
+	Config.bWorkerContinuation = !FParse::Param(FCommandLine::Get(), TEXT("SuperSLMExampleNoContinuation"));
 	return Config;
 }
 
@@ -519,6 +524,7 @@ bool FSuperSLMExampleDemo::Start(const FSuperSLMExampleSettings& InSettings, FSt
 
 	FSuperSLMExampleSettings Settings = InSettings;
 	Settings.FrameBudgetLayers = FMath::Clamp(Settings.FrameBudgetLayers, 1, SuperSLMExample::NumHiddenLayers);
+	Settings.CpuLayerBudget = FMath::Clamp(Settings.CpuLayerBudget, 1, SuperSLMExample::NumHiddenLayers);
 	Settings.ConcurrentQueries = FMath::Clamp(Settings.ConcurrentQueries, 1, SuperSLMExample::MaxConcurrentQueries);
 	Settings.RequestedK = FMath::Max(Settings.RequestedK, 1);
 	Settings.Utterance.TrimStartAndEndInline();
@@ -647,7 +653,7 @@ bool FSuperSLMExampleDemo::TryStartExtraction(FQuery& Query)
 			return false;
 		}
 		Query.CpuSequence = Sequence;
-		Cpu.SetLayerBudget(Sequence, Readout.Settings.FrameBudgetLayers);
+		Cpu.SetLayerBudget(Sequence, Readout.Settings.CpuLayerBudget);
 		if (!Cpu.SetSchema(Sequence, CpuSchema, Error) || !Cpu.BeginGeneration(Sequence, Request, Error))
 		{
 			Query.Stage = EStage::Failed;
@@ -714,7 +720,7 @@ bool FSuperSLMExampleDemo::TryStartReply(FQuery& Query)
 			return false;
 		}
 		Query.CpuSequence = Sequence;
-		Cpu.SetLayerBudget(Sequence, Readout.Settings.FrameBudgetLayers);
+		Cpu.SetLayerBudget(Sequence, Readout.Settings.CpuLayerBudget);
 		if (!Cpu.BeginGeneration(Sequence, Request, Error))
 		{
 			Query.Stage = EStage::Failed;
@@ -931,6 +937,10 @@ void FSuperSLMExampleDemo::ReadCpuHistory(bool bFinal)
 		{
 			CpuWorkerMs.Add(Job->WorkerCallMs);
 			CpuKs.Add(static_cast<double>(Job->K));
+			if (Job->DecodeLayers > 0)
+			{
+				Readout.CpuMaxDecodeLayersPerJob = FMath::Max(Readout.CpuMaxDecodeLayersPerJob, Job->DecodeLayers);
+			}
 		}
 	}
 }
@@ -1009,6 +1019,8 @@ void FSuperSLMExampleDemo::FinishRun()
 			TEXT("USuperSLMSubsystem::GetJobLedger(): WorkerCallMs of this run's decode and prefill jobs") });
 		F.Add({ TEXT("K in ticks (median / max)"), FString::Printf(TEXT("%.0f / %.0f"), Median(CpuKs), MaxOf(CpuKs)),
 			TEXT("USuperSLMSubsystem::GetJobLedger(): K of the same jobs") });
+		F.Add({ TEXT("Decode layers per job (max)"), FString::Printf(TEXT("%d at layer budget %d"), Readout.CpuMaxDecodeLayersPerJob, Readout.Settings.CpuLayerBudget),
+			TEXT("USuperSLMSubsystem::GetJobLedger(): DecodeLayers of the same jobs; the layer budget bounds it per sequence") });
 		F.Add({ TEXT("Finish ms per token"), FString::Printf(TEXT("%.2f"), Cpu.GetLastFinishMs()), TEXT("USuperSLMSubsystem::GetLastFinishMs()") });
 		F.Add({ TEXT("Prefill ms per prompt token"), FString::Printf(TEXT("%.2f"), Cpu.GetLastPrefillMsPerToken()), TEXT("USuperSLMSubsystem::GetLastPrefillMsPerToken()") });
 		F.Add({ TEXT("Tokens per second"), FString::Printf(TEXT("%.1f"), CpuTokensPerSecondLast), TEXT("USuperSLMSubsystem::GetTokensPerSecond(), 1 s window, last nonzero reading") });

@@ -19,7 +19,7 @@
 //  (d) GPU schedule restore (review R2-W3): the query runs at Frame Budget 2 and k 1 against a
 //      subsystem configured at 24 layers per tick and K 24. The readout reports the schedule it ran
 //      at; once its pool has drained, GetLayersPerTick() and GetConfiguredK() read their values from
-//      before the query. Red until the implementation's restore lands.
+//      before the query.
 //  (e) The context-cap refusal: a query whose prompt plus MaxNewTokens exceeds context_cap is
 //      refused at BeginQuery() naming context_cap, with nothing left running. This is why the
 //      context-cap stop branch is unreachable from a query (SuperSLML2S3StopReasonTests.cpp).

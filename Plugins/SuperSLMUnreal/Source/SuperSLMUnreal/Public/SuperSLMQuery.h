@@ -165,7 +165,7 @@ struct SUPERSLMUNREAL_API FSuperSLMQueryReadout
 	UPROPERTY(BlueprintReadOnly, Category = "SuperSLM|Query")
 	double PromptTimeMs = 0.0;
 
-	/** GPU: the last slice's GPU time, in milliseconds (USuperSLMGpuSubsystem::GetLastGpuBusyMs()). 0 on the CPU. */
+	/** GPU: the last completed slice time published by USuperSLMGpuSubsystem::GetGpuTimingSnapshot(), in milliseconds. 0 on the CPU. */
 	UPROPERTY(BlueprintReadOnly, Category = "SuperSLM|Query")
 	double GpuMsPerSliceMs = 0.0;
 
@@ -185,7 +185,8 @@ struct SUPERSLMUNREAL_API FSuperSLMQueryReadout
 	// of any of this query's sequences, from the job ledger (plan §5 "What counts as a hitch"). Neither is game-thread
 	// time: a late job is one delivered after its planned tick when the worker had K x TickBudgetMs
 	// of wall time and still needed more (bHitch); an over-budget job is one whose own worker call
-	// measured over TickBudgetMs (bWorkerOverran). HitchCount is the subsystem-wide delta over the
+	// took longer than its own planned K ticks, K x TickBudgetMs (bWorkerOverran; slice 1P, so a job
+	// planned for K ticks is not over budget at tick 2). HitchCount is the subsystem-wide delta over the
 	// query, so it can exceed their sum by lifecycle-op jobs, and by other clients' jobs on the
 	// shared subsystem, that were delivered while the query ran.
 
@@ -193,7 +194,7 @@ struct SUPERSLMUNREAL_API FSuperSLMQueryReadout
 	UPROPERTY(BlueprintReadOnly, Category = "SuperSLM|Query")
 	int32 CpuLateJobs = 0;
 
-	/** CPU: this query's jobs whose worker call alone took longer than TickBudgetMs. Not game-thread time. 0 on the GPU. */
+	/** CPU: this query's jobs whose worker call alone took longer than their own K x TickBudgetMs. Not game-thread time. 0 on the GPU. */
 	UPROPERTY(BlueprintReadOnly, Category = "SuperSLM|Query")
 	int32 CpuOverBudgetJobs = 0;
 

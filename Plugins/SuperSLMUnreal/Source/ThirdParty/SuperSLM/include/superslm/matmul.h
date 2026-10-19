@@ -60,9 +60,82 @@ void GemmInt8AccumulateRow(const int8_t* activations, const int8_t* weights,
 // elements, row-major -- output row t occupies out_acc[t*out_channels ..
 // (t+1)*out_channels) and equals GemmInt8AccumulateRow on activation row t alone
 // (design §3).
+//
+// On the AVX2 and AVX-512BW tiers a call with num_tokens >= 8 runs a register-tiled kernel over
+// weights packed per call (the tiled-matmul plan's slice 1): the same vpmaddwd instruction and the
+// same per-lane flush bound as the one-cell-at-a-time loop, with only the lane-to-cell assignment
+// changed, so every output is bit-identical to the scalar reference. That path allocates two
+// scratch buffers on the calling thread (the int16-widened activations and one packed weight
+// panel group) and can therefore throw std::bad_alloc; the call sites already run inside the
+// ABI's allocation-failure boundary.
 void GemmInt8Accumulate(const int8_t* activations, const int8_t* weights,
                          size_t num_tokens, size_t in_channels, size_t out_channels,
                          int64_t* out_acc);
+
+// Internal: not part of the public contract, and no consumer outside the engine and its tests may
+// call it. The tiled-matmul plan's slice 1 (§4.3, §4.7) lands it so slice 2 can split the output
+// columns across tasks without touching matmul.cpp.
+namespace detail {
+
+// Column-range entry. Writes exactly columns [j_begin, j_end) of the row-major
+// [num_tokens][out_channels] output, and never writes any other element of `out_acc`.
+// GemmInt8Accumulate is GemmInt8AccumulateCols(..., 0, out_channels, out_acc).
+// Caller ensures: j_begin <= j_end <= out_channels, plus GemmInt8Accumulate's own contract.
+void GemmInt8AccumulateCols(const int8_t* activations, const int8_t* weights, size_t num_tokens,
+                            size_t in_channels, size_t out_channels, size_t j_begin, size_t j_end,
+                            int64_t* out_acc);
+
+// The pre-widened sibling: `activations16` holds num_tokens rows of `widened_stride` int16 values,
+// row t being activation row t widened exactly (int8 -> int16) and ZERO past in_channels, with
+// widened_stride = in_channels rounded up to even. That zero pad is part of the specification:
+// it is what makes the packed weights' own K pad harmless. Same output contract as
+// GemmInt8AccumulateCols. Slice 2 widens once per call and hands every task this buffer.
+void GemmInt8AccumulateColsWidened(const int16_t* activations16, size_t widened_stride,
+                                   const int8_t* weights, size_t num_tokens, size_t in_channels,
+                                   size_t out_channels, size_t j_begin, size_t j_end,
+                                   int64_t* out_acc);
+
+// The tier GemmInt8AccumulateCols dispatches on. On x64 it is the cached CPUID tier (or the
+// forced one); on any other target it is kScalar.
+enum class GemmTier : int { kScalar = 0, kSse2 = 1, kAvx2 = 2, kAvx512 = 3 };
+enum class GemmPath : int { kDotRowLoop = 0, kTiled = 1 };
+
+// The call count at which the tiled path starts (the plan's kTiledMinTokens, 8, unless a test
+// build overrides it with SUPERSLM_TEST_TILED_MIN_TOKENS).
+size_t TiledMinTokens();
+
+// The pure path selector (cell 4.7(a)), compiled into every build and testable with any
+// arguments on any runner: the tiled path is chosen only on the AVX2 and AVX-512 tiers, only at
+// num_tokens >= TiledMinTokens(), and, on the AVX-512 tier of an MSVC or clang-cl build
+// (`is_msvc_build`), only when `msvc_avx512_switch` is nonzero (plan §4.5: off until an MSVC
+// AVX-512 build has executed the tiled kernel).
+GemmPath SelectGemmPath(GemmTier tier, size_t num_tokens, int msvc_avx512_switch,
+                        bool is_msvc_build);
+
+// The call-site wiring: SelectGemmPath with this build's own switch value and compiler identity.
+// GemmInt8AccumulateCols and its widened sibling decide their path through this function and
+// nothing else, so a test on any runner can observe what a given tier would dispatch to.
+GemmPath DispatchGemmPath(GemmTier tier, size_t num_tokens);
+
+// The tier this process's GEMM dispatches on (see GemmTier).
+GemmTier ActiveGemmTier();
+
+// Attention and per-row sites plan (rev 3.1, §3.2, cell 11.2): which body the attention kernels of
+// slices S2-S6 run. kShipped is the v1.9.0 code; kAvx2 and kAvx512 are the new SIMD bodies.
+enum class SitesKernel : int { kShipped = 0, kAvx2 = 1, kAvx512 = 2 };
+
+// The pure selector, compiled into every build and testable with any arguments on any runner: the
+// new kernels run only on the AVX2 and AVX-512 tiers, and on the AVX-512 tier of an MSVC or clang-cl
+// build (`is_msvc_build`) only when `msvc_avx512_switch` is nonzero (§3.2: SUPERSLM_SITES_AVX512_MSVC,
+// default 0, independent of the tiled GEMM's switch).
+SitesKernel SelectSitesKernel(GemmTier tier, int msvc_avx512_switch, bool is_msvc_build);
+
+// The call-site wiring: SelectSitesKernel with this build's own switch value and compiler identity.
+// Every S2-S6 dispatch decides through this function and nothing else. SitesKernel and both selectors
+// are internal C++ declarations like the GemmPath ones above: not exported, not part of the C API.
+SitesKernel DispatchSitesKernel(GemmTier tier);
+
+}  // namespace detail
 
 // C17 -- narrow one accumulator row to int32 AFTER a conversion-time proof (design §4,
 // §8) that this tensor's declared MatmulAccumWidth is Int32 (i.e. in_channels is within
@@ -132,12 +205,30 @@ int DetectBestDotRowTierForCpu();
 // exact int64 products are exactly associative and commutative, so any
 // traversal order must produce the bit-identical `out_ctx`.
 //
+// Attention and per-row sites plan, slice S2 (§4.2, §5.2): on the AVX2 and AVX-512BW tiers a call
+// whose head_dim is a multiple of 16 and whose row passes the int16 condition (every p in
+// [0, 32767] and Sum p <= 2^15, checked by the function itself in one pass) accumulates p_k*v_k[d] +
+// p_{k+1}*v_{k+1}[d] with vpmaddwd into one int32 lane per output dimension, then widens to int64.
+// Every lane's running sum is bounded by 128 * Sum p <= 2^22, so each output equals the int64 sum
+// exactly; any other row takes the shipped loop. No allocation, no new status, same contract.
+//
 // Caller ensures (contract, not runtime-checked -- the same convention as
 // GemmInt8AccumulateRow above): `probs` has `width` elements; `values` has
 // `width * head_dim` elements, row-major (`values[k*head_dim + d]` is key
 // k's value-vector element d); `out_ctx` has `head_dim` elements.
 void GemmProbQ15Accumulate(const int64_t* probs, const int8_t* values, size_t width,
                             size_t head_dim, int64_t* out_ctx);
+
+// Paged-KV plan §3.2 item 3: GemmProbQ15Accumulate without the zeroing -- `out_ctx[d] += Sum_k
+// probs[k] * values[k*head_dim + d]`, through the same tiered accumulate-into core (the same SIMD
+// guard and bodies, the same scalar loop), so every tier's result is bit-identical to the one-call
+// form's. Per-page attention zeroes `out_ctx` once and then calls this once per page run (the
+// values of one page run are contiguous; consecutive runs are not). Exactness of the chain: the
+// same int64 terms are summed, integer addition is associative, and the bound above is
+// width-independent, so no intermediate overflows (cell 6.2). Same caller-ensures contract as
+// GemmProbQ15Accumulate.
+void GemmProbQ15AccumulateInto(const int64_t* probs, const int8_t* values, size_t width,
+                               size_t head_dim, int64_t* out_ctx);
 
 }  // namespace superslm
 

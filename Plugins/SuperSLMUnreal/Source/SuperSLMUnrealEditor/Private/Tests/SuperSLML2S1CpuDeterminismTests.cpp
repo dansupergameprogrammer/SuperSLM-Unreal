@@ -81,7 +81,7 @@ namespace
 		Config.MaxPrefillChunkBudget = 64;   // every fixture prompt is well under this (longest: 24 tokens)
 		Config.MaxLayerBudget = ACpuNumHiddenLayers;
 		Config.BlockCount = BlockCount;
-		Config.FinishParallelTasks = FinishParallelTasks;
+		SuperSLMConfigAccess::SetTasks(Config, FinishParallelTasks);
 		Config.SequenceLifecycleBudgetMs = 1000.0; // generous; R-S1e is where this is calibrated for real
 		Config.TickBudgetMs = 1000.0;
 

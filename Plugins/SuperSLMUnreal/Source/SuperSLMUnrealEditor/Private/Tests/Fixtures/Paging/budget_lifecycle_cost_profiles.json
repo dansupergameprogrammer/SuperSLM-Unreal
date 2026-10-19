@@ -1,0 +1,236 @@
+{
+  "schema": 1,
+  "scope": "Measured host scheduling defaults; not certified costs, latency bounds or accuracy verdicts.",
+  "method": "Conventional median of 50 timed calls in each of three sequential blocks, then median of block medians; ceil(x*1000-1e-9)/1000 (D-SLM8113). No cross-artifact pooling.",
+  "profiles": {
+    "4096": {
+      "0": {
+        "AdoptCostMs": 0.009,
+        "RestoreCostMs": 3.576,
+        "PrefixBeginCostMs": 0.001
+      },
+      "1": {
+        "AdoptCostMs": 0.008,
+        "RestoreCostMs": 3.558,
+        "PrefixBeginCostMs": 0.001
+      }
+    },
+    "32768": {
+      "0": {
+        "AdoptCostMs": 0.02,
+        "RestoreCostMs": 90.795,
+        "PrefixBeginCostMs": 0.002
+      },
+      "1": {
+        "AdoptCostMs": 0.02,
+        "RestoreCostMs": 90.442,
+        "PrefixBeginCostMs": 0.002
+      }
+    }
+  },
+  "evidence": {
+    "4096": {
+      "metadata": {
+        "artifact_path": "qwen2.5-0.5b-instruct-cap4096-aex-pr.sslm",
+        "artifact_hash": "83e96aa46e1404c824e2bfea22e1511a528298a2edd32299e69a77f414e2007a",
+        "cap": 4096,
+        "tasks": 4,
+        "blocks_per_mode": 3,
+        "block_scope": "Three sequential measurement blocks per mode in one process; actual full-context setup is prepared once per mode. No independence or accuracy bound is claimed.",
+        "warmup_per_arm_mode": 50,
+        "timed_per_arm_mode": 50,
+        "timer_ms_per_cycle": 9.999999999999999e-05,
+        "elapsed_s": 204.0666809976101,
+        "whole_run_box_busy_pct": 12.121197619691383,
+        "whole_run_own_pct": 3.1811623505427957,
+        "whole_run_foreign_pct": 8.940035269148588,
+        "load_scope": "Whole-run interval averages including actual full-context preparation; not per-call load, not an idle-box verdict or an accuracy bound.",
+        "observations": "observed_* are actual ABI sequence stats: the adopter, restored sequence, or an adopter of the newly frozen empty Begin prefix. call_budget is the target's pre-existing adopt budget or the restore/Begin budget."
+      },
+      "inputs": [
+        {
+          "path": "Plugins/SuperSLMUnreal/Source/SuperSLMUnrealEditor/Private/Tests/Fixtures/Paging/LifecyclePricing/05b/metadata.json",
+          "bytes": 1052,
+          "sha256": "f01885bc91f9bb4d6c69f3fe2d639e61d902ef9eecbb6fc356004ccb95e6584b"
+        },
+        {
+          "path": "Plugins/SuperSLMUnreal/Source/SuperSLMUnrealEditor/Private/Tests/Fixtures/Paging/LifecyclePricing/05b/calls.csv",
+          "bytes": 121256,
+          "sha256": "eb2b071f9bb623282a198bc8ed95b870c4a88882f4209c038d471a763d73d71e"
+        }
+      ],
+      "summaries": [
+        {
+          "mode": 0,
+          "field": "AdoptCostMs",
+          "block_medians_ms": [
+            0.008098781,
+            0.008098781,
+            0.008098781
+          ],
+          "median_of_block_medians_ms": 0.008098781,
+          "rounded_ms": 0.009
+        },
+        {
+          "mode": 0,
+          "field": "RestoreCostMs",
+          "block_medians_ms": [
+            3.5752002149999997,
+            3.518002108,
+            3.6975517865
+          ],
+          "median_of_block_medians_ms": 3.5752002149999997,
+          "rounded_ms": 3.576
+        },
+        {
+          "mode": 0,
+          "field": "PrefixBeginCostMs",
+          "block_medians_ms": [
+            0.000398606,
+            0.000398606,
+            0.000398606
+          ],
+          "median_of_block_medians_ms": 0.000398606,
+          "rounded_ms": 0.001
+        },
+        {
+          "mode": 1,
+          "field": "AdoptCostMs",
+          "block_medians_ms": [
+            0.007998198,
+            0.007998198,
+            0.007998198
+          ],
+          "median_of_block_medians_ms": 0.007998198,
+          "rounded_ms": 0.008
+        },
+        {
+          "mode": 1,
+          "field": "RestoreCostMs",
+          "block_medians_ms": [
+            3.5413522275,
+            3.5743992775,
+            3.557899967
+          ],
+          "median_of_block_medians_ms": 3.557899967,
+          "rounded_ms": 3.558
+        },
+        {
+          "mode": 1,
+          "field": "PrefixBeginCostMs",
+          "block_medians_ms": [
+            0.000398606,
+            0.000398606,
+            0.000398606
+          ],
+          "median_of_block_medians_ms": 0.000398606,
+          "rounded_ms": 0.001
+        }
+      ]
+    },
+    "32768": {
+      "metadata": {
+        "artifact_path": "qwen2.5-1.5b-instruct.sslm",
+        "artifact_hash": "811978f69bdb3aab7e9c89e03becd399c8549990c817465e596e1046d6cc113e",
+        "cap": 32768,
+        "tasks": 4,
+        "blocks_per_mode": 3,
+        "block_scope": "Three sequential measurement blocks per mode in one process; actual full-context setup is prepared once per mode. No independence or accuracy bound is claimed.",
+        "warmup_per_arm_mode": 50,
+        "timed_per_arm_mode": 50,
+        "timer_ms_per_cycle": 9.999999999999999e-05,
+        "elapsed_s": 13992.021683800966,
+        "whole_run_box_busy_pct": 13.493095504493036,
+        "whole_run_own_pct": 3.1412657554289938,
+        "whole_run_foreign_pct": 10.351829749064041,
+        "load_scope": "Whole-run interval averages including actual full-context preparation; not per-call load, not an idle-box verdict or an accuracy bound.",
+        "observations": "observed_* are actual ABI sequence stats: the adopter, restored sequence, or an adopter of the newly frozen empty Begin prefix. call_budget is the target's pre-existing adopt budget or the restore/Begin budget."
+      },
+      "inputs": [
+        {
+          "path": "Plugins/SuperSLMUnreal/Source/SuperSLMUnrealEditor/Private/Tests/Fixtures/Paging/LifecyclePricing/15b/metadata.json",
+          "bytes": 1038,
+          "sha256": "7acb02949197f9ac16fcc950905cd3e58230453709ad58a0045cfaf17df1711c"
+        },
+        {
+          "path": "Plugins/SuperSLMUnreal/Source/SuperSLMUnrealEditor/Private/Tests/Fixtures/Paging/LifecyclePricing/15b/calls.csv",
+          "bytes": 126723,
+          "sha256": "d74979c76e3ab2f39e1cccbcfc8cc84cf81c246469782f3f8eb282004eeb43ef"
+        }
+      ],
+      "summaries": [
+        {
+          "mode": 0,
+          "field": "AdoptCostMs",
+          "block_medians_ms": [
+            0.019598752,
+            0.020999461,
+            0.019401312
+          ],
+          "median_of_block_medians_ms": 0.019598752,
+          "rounded_ms": 0.02
+        },
+        {
+          "mode": 0,
+          "field": "RestoreCostMs",
+          "block_medians_ms": [
+            92.0636523515,
+            90.7944999635,
+            89.499147609
+          ],
+          "median_of_block_medians_ms": 90.7944999635,
+          "rounded_ms": 90.795
+        },
+        {
+          "mode": 0,
+          "field": "PrefixBeginCostMs",
+          "block_medians_ms": [
+            0.001400709,
+            0.001400709,
+            0.001400709
+          ],
+          "median_of_block_medians_ms": 0.001400709,
+          "rounded_ms": 0.002
+        },
+        {
+          "mode": 1,
+          "field": "AdoptCostMs",
+          "block_medians_ms": [
+            0.019401312,
+            0.019598752,
+            0.019397587
+          ],
+          "median_of_block_medians_ms": 0.019401312,
+          "rounded_ms": 0.02
+        },
+        {
+          "mode": 1,
+          "field": "RestoreCostMs",
+          "block_medians_ms": [
+            90.147100389,
+            90.441249311,
+            90.456349775
+          ],
+          "median_of_block_medians_ms": 90.441249311,
+          "rounded_ms": 90.442
+        },
+        {
+          "mode": 1,
+          "field": "PrefixBeginCostMs",
+          "block_medians_ms": [
+            0.001400709,
+            0.001400709,
+            0.001400709
+          ],
+          "median_of_block_medians_ms": 0.001400709,
+          "rounded_ms": 0.002
+        }
+      ]
+    }
+  },
+  "equivalent_complete_15b_input": {
+    "native_hash": "a578c83bbbfbd3a2742868935f69a102bd9e4cfc5e86692a5df3b1fe91fae90d",
+    "sha256": "bf4bef5aa557a714f17470d983bb31cdc749f7f173ea11950d3d42949e2c2631",
+    "scope": "Every original model section byte-identical to the measured artifact; only tokenizer, chat-template and Unicode sections added. Original/complete plus correctly bound adapters have exact eight-row native logits parity."
+  }
+}

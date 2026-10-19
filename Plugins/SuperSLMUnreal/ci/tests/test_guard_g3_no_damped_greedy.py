@@ -43,8 +43,8 @@ def _run_checker(source_root: Path):
         # The checker is L2-S0's own deliverable (§9 dim 11 G3), not this suite's -- the test suite
         # never implements the guard it is commissioning ("Do not implement").
         # Failing with a clear, explicit reason (rather than letting subprocess raise
-        # FileNotFoundError uncaught) is what keeps this a red-unimplemented result rather
-        # than a red-mis-stated-assertion result.
+        # FileNotFoundError uncaught) is what keeps this a missing-checker result rather
+        # than a mis-stated-assertion result.
         return None, "ci/check_no_damped_greedy_calls.py does not exist yet (L2-S0 deliverable)"
     proc = subprocess.run(
         [sys.executable, str(CHECKER), "--source-root", str(source_root)],

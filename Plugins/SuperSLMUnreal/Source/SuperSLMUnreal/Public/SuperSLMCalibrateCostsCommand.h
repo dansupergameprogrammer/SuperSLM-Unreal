@@ -3,9 +3,8 @@
 #include "CoreMinimal.h"
 
 // §10.2 item 10 (plan §5 item 2, D-SLM7414/D-SLM7422/D-SLM7430/D-SLM7444/D-SLM7450): the
-// "SuperSLM.CalibrateCosts" console command. See SuperSLMCalibrateCostsCommand.cpp for the full
-// spec this command realizes. Registration happens at static-init time (FAutoConsoleCommand);
-// Register() exists only to force the implementation file to link.
+// Historical calibration instrument retained for regression validation. D4 replaces the public
+// command with EstimateCosts; tests explicitly register this original command for their scope.
 namespace SuperSLMCalibrateCostsCommand
 {
 	void Register();
@@ -30,3 +29,16 @@ namespace SuperSLMCalibrateCostsCommand
 	};
 	SUPERSLMUNREAL_API EOutcome GetLastOutcome();
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+class IConsoleObject;
+struct SUPERSLMUNREAL_API FSuperSLMLegacyCalibrationScope
+{
+	FSuperSLMLegacyCalibrationScope();
+	~FSuperSLMLegacyCalibrationScope();
+	FSuperSLMLegacyCalibrationScope(const FSuperSLMLegacyCalibrationScope&) = delete;
+	FSuperSLMLegacyCalibrationScope& operator=(const FSuperSLMLegacyCalibrationScope&) = delete;
+private:
+	IConsoleObject* Command = nullptr;
+};
+#endif

@@ -14,6 +14,7 @@
 // USuperSLMSubsystem::GetGeneratedTokens() with no conversion step ("tokens equal the CPU
 // backend's for the same session").
 #include "SuperSLMSequenceTypes.h"
+#include "SuperSLMPagedKvTypes.h" // ESuperSLMPrefixResult, FSuperSLMKvPageStats (plugin paging plan §3.6)
 #include "SuperSLMSaveRestoreTypes.h"
 #include "SuperSLMSlotGates.h"
 #include "SuperSLMGpuSubsystem.generated.h"
@@ -40,6 +41,15 @@ struct FSuperSLMGpuConfigureFlight;
 // directly, matching USuperSLMSubsystem's own established convention
 // (SuperFAISSSwarmSubsystem::Step()-in-a-loop, not a real per-frame Tick callback) --
 // see SuperSLML2S2Fixtures.h's own RunGpuGenerationToCompletion() helper.
+
+// One completed GPU timing observation, published together on the game thread at Tick().
+// Dispatches identifies the completed submission population whose latest drain supplied GpuBusyMs.
+// It is deliberately distinct from the live submission counter, which can advance before a drain.
+struct FSuperSLMGpuTimingSnapshot
+{
+	int64 Dispatches = 0;
+	double GpuBusyMs = 0.0;
+};
 
 /** The GPU (D3D12) inference backend, one per GameInstance. Windows x64 only; elsewhere it is not created. */
 UCLASS()
@@ -429,7 +439,7 @@ public:
 	FSuperSLMLifecycleOpHandle RequestBeginGeneration(const FSuperSLMGpuSequence& Sequence, const FSuperSLMGenerationRequest& Request);
 
 	// D-SLM7457 ruling (1): Layer 1's GPU ABI has no prefix-adopt verb of any kind (v1.5.0, and
-	// unchanged at the 1.7.0 and 1.9.0 pins)
+	// unchanged at the 1.7.0, 1.9.0 and 1.11.0 pins)
 	// (grepped ThirdParty/SuperSLM/include/superslm/gpu_1p0.h and gpu_port.h for "prefix";
 	// sslm_seq_adopt_prefix, sslm_abi_functions_g5_comparable.inc:79, takes an sslm_seq, the
 	// CPU-only handle type). This request queues and admits in the sequence's own strict
@@ -467,6 +477,51 @@ public:
 	// (SSLM_GPU_ALLOCATION_FAILED): the save is intact and the restore may be retried later. A lost
 	// device still reads Malformed. ResidualLost is CPU-only and never returned here.
 	FSuperSLMLifecycleOpHandle RequestRestoreSequence(const TArray<uint8>& Blob, USuperSLMModel* ExpectedModel);
+
+	// --- Paged KV, pooled mode (plugin paging plan §3.4, §3.5, §3.6; declared at step K5, built at
+	// K6 and K7). Additive; pooled mode is opted into by FSuperSLMGpuRuntimeConfig::SequenceBudget
+	// > 0. K6 built pooled Configure, GetKvPageStats() and the dedicated-mode refusals; K7 built the
+	// pooled prefix verbs, the build seat, the pooled adopt and the pooled and hinted restore. ---
+
+	// A shared prompt prefix (§3.4 "Prefixes"), built on the submission thread one whole token per
+	// build turn (UP-11). Pooled mode only: UnsupportedOnGpu in dedicated mode. Admitted by count
+	// (PrefixBlockCount live prefixes and nested children) and by pages: charged R(max(L, 1)) on P
+	// before its job is enqueued, refused KvPagesExhausted when P cannot take it. More than
+	// ContextCap tokens is Malformed, before any charge. Ids come from the CPU subsystem's shared
+	// counter, so a handle of the other backend is unknown here.
+	ESuperSLMPrefixResult CreatePrefix(const TArray<int32>& Tokens, FSuperSLMPrefix& OutPrefix, FString* OutError = nullptr);
+
+	// A prefix whose walk is bound to Schema (sslm_gpu_prefix_set_schema) before its tokens are fed
+	// as SpanKind (cell 8.2). Otherwise as above.
+	ESuperSLMPrefixResult CreatePrefix(const TArray<int32>& Tokens, const FSuperSLMGpuSchemaHandle& Schema, ESuperSLMSpanKind SpanKind,
+		FSuperSLMPrefix& OutPrefix, FString* OutError = nullptr);
+
+	// A nested prefix (sslm_gpu_prefix_begin_from), as the CPU's (§3.3): pooled mode only
+	// (UnsupportedOnGpu when dedicated, before any other check, as both CreatePrefix overloads:
+	// plan rev 1.9 ruling 2); the parent live and frozen (ParentNotUsable otherwise);
+	// parent length + Tokens.Num() above ContextCap is Malformed before any charge.
+	ESuperSLMPrefixResult CreatePrefixFrom(const FSuperSLMPrefix& Parent, const TArray<int32>& Tokens, FSuperSLMPrefix& OutPrefix, FString* OutError = nullptr);
+
+	// sslm_gpu_prefix_release. Refused while an adopt, a nested build or a hinted restore of the
+	// prefix is queued (§3.3 "Concurrency"). A released prefix with dependents stays charged on P as
+	// a ghost (§3.2).
+	bool ReleasePrefix(const FSuperSLMPrefix& Prefix, FString& OutError);
+
+	ESuperSLMPrefixPhase GetPrefixPhase(const FSuperSLMPrefix& Prefix) const;
+	int32 GetLivePrefixCount() const;
+
+	// Adopts Prefix (sslm_gpu_seq_adopt_prefix) on the submission thread; draws nothing (§3.4
+	// "Adopt"). Dedicated mode: resolves UnsupportedOnGpu with the reason, like the overload above.
+	// SetSchema() after a successful adopt is refused by name.
+	FSuperSLMLifecycleOpHandle RequestAdoptPrefix(const FSuperSLMGpuSequence& Sequence, const FSuperSLMPrefix& Prefix);
+
+	// RequestRestoreSequence() with a sharing hint (sslm_gpu_seq_restore_into_pool's prefix_or_null,
+	// UP-10). An invalid Hint is the overload above.
+	FSuperSLMLifecycleOpHandle RequestRestoreSequence(const TArray<uint8>& Blob, USuperSLMModel* ExpectedModel, const FSuperSLMPrefix& Hint);
+
+	// The page ledger's regions and counters, and the last applied job's sslm_gpu_kv_pool_stats
+	// snapshot (§3.2). Game-thread data only. bPagedMode is false in dedicated mode.
+	FSuperSLMKvPageStats GetKvPageStats() const;
 
 	// Pending until the operation's own committed tick has come; then the named result
 	// (ESuperSLMRestoreResult, SuperSLMSaveRestoreTypes.h) -- Success, or whichever named
@@ -549,6 +604,10 @@ public:
 	// without the example scene rendering.
 	double GetLastGpuBusyMs() const;
 
+	// Game thread: the coherent completed timing published by the most recent Tick(). Repeated
+	// observers between ticks see exactly the same pair even while the worker finishes new work.
+	FSuperSLMGpuTimingSnapshot GetGpuTimingSnapshot() const;
+
 	// The wall time of SslmGpuSeqFinishTokenForG5Bridge on the submission thread, once per
 	// token: final norm, the logits row, narrowing, mask and argmax (plan §5, §5.1; R-S2f
 	// measures it here). With the device-resident head (the default) the logits run as their own
@@ -585,7 +644,9 @@ public:
 	// The plugin's own DECLARED GPU residency accounting: the device-local (DEFAULT-heap)
 	// buffers Layer 1 allocates for the model (the packed layer weights, the two RoPE tables and
 	// the SCM1 mask pages), the device-resident head while it is active, and every pooled
-	// sequence's K/V buffer, plus the mapped adapters -- a lower bound on what the driver
+	// sequence's K/V buffer (in pooled mode, the page pool's device buffer, once:
+	// GetKvPageStats().PoolPages x PageBytes; its host mirror, of the same size, is system RAM and
+	// is not counted here -- plan §3.2/§3.4 rev 1.10), plus the mapped adapters -- a lower bound on what the driver
 	// occupies, never a ceiling (plan §2.5 row 3, D-SLM7679/D-SLM7683/D-SLM7684), and never a
 	// live device memory query. D-SLM7335
 	// (answering Q_R-S2d, T-2816 §8) settles that this figure is a MECHANISM CHECK
@@ -633,6 +694,7 @@ public:
 private:
 	friend struct FSuperSLMSelfCheckAccess;
 	friend struct FSuperSLMGpuTestAccess; // test-only access (SuperSLMGpuTestAccess.h, U1 round 3)
+	friend struct FSuperSLMPagedGpuTestSeam; // paged-KV test seams (SuperSLMPagedGpuTestSeam.h, plan §3.9)
 
 	// Every Layer-1 GPU handle, the submission thread, the slot table and the scheduler
 	// figures (SuperSLMGpuSubsystem.cpp). Held by pointer so this reflected header includes no
@@ -668,6 +730,22 @@ private:
 	// load in flight at exit neither leaks its state nor leaves its submission thread running
 	// into module unload. Game thread.
 	TArray<TSharedPtr<FSuperSLMGpuConfigureFlight, ESPMode::ThreadSafe>> InFlightConfigures;
+
+	// Plugin paging plan §3.5 (K6): the ids of lifecycle-op handles a pooled teardown left Pending.
+	// Each reads NotConfigured until ReleaseLifecycleOpHandle() erases it, and its id is never
+	// minted again while it stands (FirstHandleIdAfterTombstones()). Kept on the subsystem, since
+	// the per-Configure state is gone. Dedicated mode adds none. Game thread.
+	TSet<int64> LifecycleTombstones;
+	int64 FirstHandleIdAfterTombstones() const;
+
+	// Plan §3.7: the ledger faults of every ended state, so GetKvPageStats().LedgerFaults is
+	// cumulative across re-Configure(). Game thread.
+	uint64 PriorLedgerFaults = 0;
+
+	// Plan §3.9's Configure seams (FSuperSLMPagedGpuTestSeam): they arm the NEXT Configure() or
+	// BeginConfigure(), which spends them. 0 is unarmed. Only the seam writes them. Game thread.
+	int32 NextConfigurePageCountPerturbation = 0;
+	uint32 NextPoolCreateStatusOverride = 0;
 
 	void TearDown();
 };

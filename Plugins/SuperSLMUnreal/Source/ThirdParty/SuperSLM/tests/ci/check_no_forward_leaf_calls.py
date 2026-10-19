@@ -98,7 +98,10 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
 _INCLUDE_DIR = os.path.join(_REPO_ROOT, "include")
 
 # The eight funnel leaves named at Sec7.3, verbatim: the forward-leaf caller-ensures
-# set the funnel exists to keep off every call site but its own.
+# set the funnel exists to keep off every call site but its own. Plus a ninth: the
+# attention and per-row sites plan's slice S3 (rev 3.1, Sec3.4, cell 11.4) moves the
+# funnel's element loop into the row leaf RequantRowWide (intmath.h), whose contract
+# is the funnel's preflight, so only the funnel may call it.
 BANNED_LEAVES = (
     "MaxAbsReduce",
     "MaxAbsReduceWide",
@@ -107,6 +110,7 @@ BANNED_LEAVES = (
     "DynamicScaleReciprocal",
     "RequantTokenCode",
     "RequantTokenCodeWide",
+    "RequantRowWide",
     "NarrowAccumulatorToI32",
 )
 
@@ -133,6 +137,10 @@ _DEFAULT_FORWARD_GLOBS = (
 _EXPECTED_REAL_FORWARD_FILES = (
     "src/forward/checked_chain_funnel.cpp",
     "src/forward/forward_sites.cpp",
+    # Decode-threading plan rev 1.2, step D0: the shared split and exactly-once runner the
+    # logits step and the one-row projection groups use. It calls no banned leaf.
+    "src/forward/parallel_split.cpp",
+    "src/forward/parallel_split.h",
 )
 
 # Relative-to-repo-root paths permitted to name a banned leaf directly. Only a
@@ -700,7 +708,7 @@ def check_door_count(
     expected: tuple[str, ...] = _EXPECTED_DOOR_FUNCTIONS,
 ) -> list[str]:
     """Significant 9 (Poirot e4b398c review, T-1357/D-SLM433): `scan_files` above
-    holds every OTHER forward TU off the eight banned leaves; nothing holds the
+    holds every OTHER forward TU off the nine banned leaves; nothing holds the
     DOOR COUNT itself inside the funnel's own file. Asserts the exact,
     named set of functions in `funnel_path` that forward a banned leaf to an
     outside caller equals `expected` -- a second door opened alongside

@@ -1,6 +1,7 @@
 """T-2226 -- L2-S0 red suite. §9 dim 4 (Shape and platform), the M5 cells the plan
 names as L2-S0's own build-sequencing content (§10 L2-S0). This file checks that Layer 1 is
-vendored at v1.9.0 (commit d870d27863) into the plugin's own ThirdParty tree and built from
+vendored at the v1.13.1 release into the plugin's
+own ThirdParty tree and built from
 source with the engine toolchain (D-SLM3812) on Windows x64, the only platform SuperSLM-Unreal
 1.0 claims (D-SLM7226). The U1 re-pin is specified by
 the plan §10.3.1.
@@ -43,9 +44,10 @@ from pathlib import Path
 PLUGIN_ROOT = Path(__file__).resolve().parents[1].parent  # .../Plugins/SuperSLMUnreal
 THIRDPARTY_ROOT = PLUGIN_ROOT / "Source" / "ThirdParty" / "SuperSLM"
 
-EXPECTED_TAG = "v1.9.0"
-EXPECTED_COMMIT_PREFIX = "d870d27863"
-EXPECTED_FILE_COUNT = 892  # upstream files excluding .github/ and vendoring metadata
+EXPECTED_TAG = "v1.13.1"
+EXPECTED_COMMIT_PREFIX = "d697927f6d"
+EXPECTED_BASE_RELEASE_COMMIT = "d697927f6d5ce5fa73ecbb8660020a425518b923"
+EXPECTED_FILE_COUNT = 1459  # release files excluding .github/ and vendoring metadata
 
 _RUNTIME_BUILD_CS_NAME = "SuperSLMUnreal.Build.cs"
 
@@ -110,6 +112,10 @@ def test_a_vendored_tree_exists_and_pinned():
         f"VENDORED_VERSION.txt must record commit prefix {EXPECTED_COMMIT_PREFIX} "
         f"on its Commit line; got: {text!r}"
     )
+    assert re.search(
+        rf"(?m)^Base release commit:[ \t]*{EXPECTED_BASE_RELEASE_COMMIT}[ \t]*$", text
+    ), "the release must name its tagged commit as its base release commit"
+    assert "Release status: published release v1.13.1" in text
     vendored_files = [
         path for path in THIRDPARTY_ROOT.rglob("*")
         if path.is_file()

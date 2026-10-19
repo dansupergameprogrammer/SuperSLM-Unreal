@@ -1,0 +1,9 @@
+{
+  "_measurement": "Approximate seconds derived from log timestamps in the atomic Clang 18 coverage job, GitHub run 38806240499, 2026-10-15; log buffering can shift time between neighboring cells. These 13 cells each exceeded 90 reported seconds. Shared-work dependents reuse those computations and move with them. All remain in the complete uninstrumented suite. Numeric coverage floors are unchanged.",
+  "_shared_work": {"c2": {"6.1/C2": ["4.1/C2", "4.6/C2"]}},
+  "r0": {},
+  "c2": {"4.1/C2": 92.813, "4.6/C2": 447.366},
+  "c3": {},
+  "c4": {"4.6/C4": 99.006, "6.1/C4": 109.902, "9.5/C4": 354.691, "9.14/C4": 433.733},
+  "c5": {"3.1/C5": 126.802, "3.7/C5": 140.021, "3.9/C5": 116.706, "8.7": 178.017, "9.5/C5": 350.439, "9.9": 363.908, "9.14/C5": 1861.420}
+}

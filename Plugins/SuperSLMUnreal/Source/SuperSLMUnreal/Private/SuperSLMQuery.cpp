@@ -126,7 +126,7 @@ struct FSuperSLMQueryRunner::FActiveQuery
 			}
 			MaxK = FMath::Max(MaxK, Job->K);
 			LateJobs += Job->bHitch ? 1 : 0;
-			OverBudgetJobs += Job->bWorkerOverran ? 1 : 0;
+			OverBudgetJobs += Job->bWorkerOverran ? 1 : 0; // over the job's own K x TickBudgetMs (slice 1P, IsWorkerOverrun)
 			if (Job->WorkerCallMs >= 0.0)
 			{
 				WorkerMs += Job->WorkerCallMs;
@@ -458,7 +458,7 @@ bool FSuperSLMQueryRunner::VendOnGpu(const FSuperSLMModelShapeFacts& Shape, FStr
 	Q.LayersPerSlice = Path == ESuperSLMGpuDecodePath::Composed ? GpuSubsystem->GetLayersPerSlice(Q.GpuSequences[0]) : 0;
 	Q.bGpuWasActive = true;
 	Q.HitchesAtStart = GpuSubsystem->GetHitchCount();
-	Q.DispatchesSeen = GpuSubsystem->GetGpuDispatchCount();
+	Q.DispatchesSeen = GpuSubsystem->GetGpuTimingSnapshot().Dispatches;
 	return true;
 }
 
@@ -609,12 +609,13 @@ bool FSuperSLMQueryRunner::TickQueryImpl(float DeltaSeconds, bool bDirectTick, b
 			return false;
 		}
 
-		// Plan §9 R-S3f: a slice's own gpu_busy_ms, read whenever this tick issued GPU work.
-		const int64 Dispatches = GpuSubsystem->GetGpuDispatchCount();
-		if (Dispatches != Q.DispatchesSeen)
+		// Plan §9 R-S3f: observe this tick's published completed timing. The worker's live
+		// submission counter can advance before its drain supplies a timing and between readers.
+		const FSuperSLMGpuTimingSnapshot Timing = GpuSubsystem->GetGpuTimingSnapshot();
+		if (Timing.Dispatches != Q.DispatchesSeen)
 		{
-			Q.DispatchesSeen = Dispatches;
-			Q.GpuBusySamples.Add(GpuSubsystem->GetLastGpuBusyMs());
+			Q.DispatchesSeen = Timing.Dispatches;
+			Q.GpuBusySamples.Add(Timing.GpuBusyMs);
 		}
 		for (const FSuperSLMGpuSequence& Seq : Q.GpuSequences)
 		{
