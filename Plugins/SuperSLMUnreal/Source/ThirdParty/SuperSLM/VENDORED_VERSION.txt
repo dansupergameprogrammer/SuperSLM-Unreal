@@ -24,7 +24,14 @@ Raw blobs were read through git ls-tree and git cat-file --batch. The complete S
 records every file and is checked by ci/check_vendored_tree_matches_manifest.py. The five local
 T-3050 witness/tool adaptations to SuperSLMFinishHook::Make are retained unchanged:
 route_p_hook_witness.cpp, route_p_run_count.cpp, run_route_p_hook_witness.sh, run_merge_acceptance.sh,
-and shim/CoreMinimal.h under tools/consumer_reach/route_p_hook/. Their hashes remain explicit.
+and shim/CoreMinimal.h under tools/consumer_reach/route_p_hook/. Their hashes remain explicit. The
+coherence check (.github/scripts/check_vendored_against_tag.py) reads these Repaired lines: a listed
+file may differ from the tag, must still be present, and must actually differ; any other difference fails.
+Repaired: tools/consumer_reach/route_p_hook/route_p_hook_witness.cpp
+Repaired: tools/consumer_reach/route_p_hook/route_p_run_count.cpp
+Repaired: tools/consumer_reach/route_p_hook/run_route_p_hook_witness.sh
+Repaired: tools/consumer_reach/route_p_hook/run_merge_acceptance.sh
+Repaired: tools/consumer_reach/route_p_hook/shim/CoreMinimal.h
 
 History: v1.13.0 was re-vendored from v1.11.0 on 2026-10-15, skipping v1.12.0; its 1452 files added the
 paged-K/V sources, suites and headers. The 1.13.1 candidates 002094a6 and 2efa82d3 were vendored on

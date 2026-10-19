@@ -164,18 +164,21 @@ downloaded at build time and no prebuilt library is used. For the runtime's inte
 
 ## Performance today
 
-Measured in a packaged Development build of the example on one machine (AMD Ryzen 9 3950X,
-NVIDIA RTX 2080 SUPER), with the 0.5B example model and the frame rate capped at 60:
+Measured with 1.2 in a packaged Development build of the example on one machine (AMD Ryzen 9
+3950X, NVIDIA RTX 2080 SUPER), with the 0.5B example model and the frame rate capped at 60, over
+three runs:
 
 | | CPU backend | GPU backend, 4 layers per frame |
 |---|---|---|
-| Potion-shop query (order plus reply), start to answer | about 9.6 s (579 frames) | about 15.8 s (946 frames) |
-| Generation rate | about 7 tokens per second | |
-| GPU time per 4-layer slice, nothing else on the GPU | | 1.36 ms median |
+| Potion-shop query (order plus reply), start to answer | about 4.1 s (238 to 256 frames) | about 15.8 s (946 to 949 frames) |
+| Reading the two prompts (order, then reply) | about 0.9 s and 1.7 s | about 4.2 s and 8.3 s |
 
-The game thread's own cost stays small throughout: the CPU backend's per-frame bookkeeping stays
-under 1 ms, which the example's test checks on every tick. Most of the answer time is spent reading the prompt (about 44 ms per prompt token
-on the CPU), and speeding that up is the current work. Every figure, with its conditions, is in
+The answers are the same tokens as 1.0 gave. On the CPU the query takes well under half of 1.0's
+9.6 s, mostly because the prompts are read in chunks of 8 tokens: the two prompts took about 6.2 s
+in 1.0. The GPU backend's answer time is set by its pacing, 4 layers per frame at 60 frames per
+second, so it has not changed. The game thread's own cost stays small throughout: the CPU backend's
+per-frame bookkeeping stays under 1 ms, which the example's test checks on every tick (at most
+0.07 ms in these runs). Every figure, with its conditions, is in
 [What 1.0 covers](docs/STATUS.md#measured).
 
 ## Known limitations

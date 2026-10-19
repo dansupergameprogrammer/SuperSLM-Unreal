@@ -9,7 +9,10 @@ cannot make a correct tree look wrong or a wrong one look right:
   1. VENDORED_VERSION.txt names a tag and a commit, and the upstream tag resolves to that commit.
   2. Every file of the upstream tag (except `.github/`, which is upstream CI and not vendored) is
      present in the vendored directory with the identical blob id, and the vendored directory
-     holds nothing else apart from VENDORED_VERSION.txt and VENDORED_MANIFEST.sha256.
+     holds nothing else apart from VENDORED_VERSION.txt and VENDORED_MANIFEST.sha256. The one
+     exception is a local repair VENDORED_VERSION.txt discloses on a `Repaired: <path>` line: that
+     file may differ from the tag. A listed file must still exist in both trees and must actually
+     differ (a stale listing fails), and its bytes are still held to the manifest by check 3.
   3. The vendored tree, exported raw from git, matches its own VENDORED_MANIFEST.sha256
      (the plugin's own checker, run against the export).
 
@@ -42,13 +45,16 @@ def git(*args, cwd=None, binary=False):
 def read_pin(vendored_dir: str):
     text = git("show", f"HEAD:{vendored_dir}/VENDORED_VERSION.txt")
     tag = commit = None
+    repaired = set()
     for line in text.splitlines():
         s = line.strip()
         if tag is None and s.startswith("Tag:"):
             tag = s[4:].strip()
         elif commit is None and s.startswith("Commit:"):
             commit = s[7:].strip()
-    return tag, commit
+        elif s.startswith("Repaired:"):
+            repaired.add(s[9:].strip())
+    return tag, commit, repaired
 
 
 def ls_tree(treeish: str, prefix: str = "", cwd=None):
@@ -90,7 +96,7 @@ def main():
     vdir = a.vendored_dir.rstrip("/")
 
     problems = []
-    tag, commit = read_pin(vdir)
+    tag, commit, repaired = read_pin(vdir)
     if not tag or not commit:
         print(f"FAIL: could not read 'Tag:' and 'Commit:' from {vdir}/VENDORED_VERSION.txt")
         return 1
@@ -116,9 +122,17 @@ def main():
         for p in sorted(set(vendored) - set(upstream)):
             problems.append(f"NOT IN {tag}: {p}")
         for p in sorted(set(upstream) & set(vendored)):
-            if upstream[p] != vendored[p]:
+            if upstream[p] != vendored[p] and p not in repaired:
                 problems.append(f"DIFFERS from {tag}: {p} (tag {upstream[p]}, vendored {vendored[p]})")
-        print(f"{tag} ({commit}): {len(upstream)} upstream files, {len(vendored)} vendored files compared")
+        for p in sorted(repaired):
+            if p not in upstream or p not in vendored:
+                problems.append(f"Repaired line names {p}, which is not in both {tag} and the vendored tree")
+            elif upstream[p] == vendored[p]:
+                problems.append(f"Repaired line names {p}, which is identical to {tag}: remove the line")
+            else:
+                print(f"disclosed local repair: {p} (tag {upstream[p]}, vendored {vendored[p]})")
+        print(f"{tag} ({commit}): {len(upstream)} upstream files, {len(vendored)} vendored files compared, "
+              f"{len(repaired)} disclosed repair(s)")
 
         if a.manifest_checker:
             export = Path(tmp) / "export"
@@ -134,7 +148,8 @@ def main():
     for p in problems:
         print(f"FAIL: {p}")
     if not problems:
-        print("OK: the vendored tree is the pinned tag, byte for byte, and matches its manifest")
+        print("OK: the vendored tree is the pinned tag, byte for byte apart from its disclosed repairs, "
+              "and matches its manifest")
     return 1 if problems else 0
 
 

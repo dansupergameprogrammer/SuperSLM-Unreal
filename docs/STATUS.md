@@ -150,18 +150,25 @@ Every figure here is a measurement, or computed where marked, with the machine i
 
 | What | Result | Where |
 |---|---|---|
-| Determinism self-check, CPU | *Verified* at SuperSLM `v1.9.0`, in a packaged Windows Development build of the example | AMD Ryzen 9 3950X CPU, Windows x64 |
+| Determinism self-check, CPU | *Verified* at SuperSLM `v1.9.0` (1.0) and at `v1.13.1` (1.2), in a packaged Windows Development build of the example | AMD Ryzen 9 3950X CPU, Windows x64 |
 | Determinism self-check, GPU | Withheld: in 1.0 the GPU verdict is always withheld (recorded in the report, shown as *Not Yet Run*); a later release shows it | |
 | GPU device-resident head, VRAM per mapped 0.5B model | 137,353,728 B requested buffers (a lower bound on what the driver occupies) | Computed from the model's shape (not a measurement); SuperSLM measured 137,433,088 B on the RTX 2080 SUPER |
 | GPU time per slice, 4 layers per slice | Below the table | NVIDIA RTX 2080 SUPER, 0.5B example model |
 | Cooked-load heap growth for a memory-mapped model, packaged Windows build | 108,418 bytes peak net allocation while mapping the 510,316,184-byte example model (0.02 %) | Packaged Windows Development build of the example, AMD Ryzen 9 3950X |
-| Example query (extraction plus reply), start to answer, CPU backend, 60 fps cap | 579 frames, 9,649 ms; about 7.0 tokens per second; prompt reading about 43.6 ms per prompt token | Packaged Windows Development build of the example, AMD Ryzen 9 3950X |
-| Example query (extraction plus reply), start to answer, GPU backend at 4 layers per slice, 60 fps cap | 946 frames, about 15,766 ms | Packaged Windows Development build of the example, NVIDIA RTX 2080 SUPER |
+| Example query (extraction plus reply), start to answer, CPU backend, 60 fps cap, 1.2 | 238, 250 and 256 frames; 3,966, 4,166 and 4,266 ms over three runs. Prompt time (generation start to first token): extraction 883 to 900 ms, reply 1,583 to 1,767 ms. Game-thread tick at most 0.067 ms | Packaged Windows Development build of the example, AMD Ryzen 9 3950X |
+| Example query, CPU backend, 60 fps cap, 1.0 | 579 frames, 9,649 ms; prompt reading about 43.6 ms per prompt token (2,083 ms extraction, 4,133 ms reply) | Same machine and build type |
+| Example query (extraction plus reply), start to answer, GPU backend at 4 layers per slice, 60 fps cap | 946 to 949 frames, 15,766 to 15,816 ms over three runs at 1.2; 946 frames, about 15,766 ms at 1.0 | Packaged Windows Development build of the example, NVIDIA RTX 2080 SUPER |
+
+The tokens are identical at 1.0 and 1.2 (token digest `f4c2c2a9…2e64c1` in every run). 1.0's table
+also gave "about 7.0 tokens per second"; that reading is withdrawn. It is the last value of a
+one-second window, and the reply decodes in under a second, so it is roughly the reply's token
+count, not a rate.
 
 **GPU time per slice.** Measured on one RTX 2080 SUPER at 4 layers per slice (the example
 project's setting): the
-median GPU slice takes 1.36 ms with nothing else on the GPU. With the example scene
-rendering at 60 frames per second, the measured slice span has a median of 5.38 ms.
+median GPU slice takes 1.36 ms with nothing else on the GPU (1.0). With the example scene
+rendering at 60 frames per second, the measured slice span has a median of 5.38 ms at 1.0 and
+3.35 to 3.67 ms at 1.2 (three runs).
 That span includes time the GPU spent on the scene's own rendering while the slice ran, so it is an
 upper bound on the slice's own cost. In the editor, with its viewport rendering, the median at 4
 layers was 1.98 ms.
