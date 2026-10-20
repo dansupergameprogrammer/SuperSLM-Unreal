@@ -169,12 +169,12 @@ Measured with 1.2 in a packaged Development build of the example on one machine 
 three runs. The query reads 123 prompt tokens (41 for the order, 82 for the reply, which includes
 the order) and generates 35 (a 28-token JSON order, then a 7-token reply).
 
-| | CPU backend | GPU, 4 layers per frame | GPU, 8 layers per frame | GPU, 12 layers per frame | GPU, whole token (24 layers) per frame |
-|---|---|---|---|---|---|
-| Potion-shop query (order plus reply), start to answer | about 4.1 s (238 to 256 frames) | about 15.8 s (946 to 949 frames) | about 8.0 s (481 frames) | about 5.4 s (326 frames) | about 2.8 s (171 frames) |
-| Reading the 123 prompt tokens, to each first token | about 2.6 s, about 47 tokens per second | about 12.5 s, about 10 tokens per second | about 6.4 s, about 19 tokens per second | about 4.3 s, about 28 tokens per second | about 2.3 s, about 54 tokens per second |
-| Generating the other 33 tokens | about 1.5 s, about 22 tokens per second | about 3.3 s, about 10 tokens per second | about 1.6 s, about 20 tokens per second | about 1.1 s, about 30 tokens per second | about 0.6 s, about 58 tokens per second |
-| GPU time per frame, scene rendering | | about 3.4 ms | about 3.9 ms | about 4.2 to 4.9 ms | about 6.6 ms |
+| | CPU backend | CPU backend, threaded generation | GPU, 4 layers per frame | GPU, 8 layers per frame | GPU, 12 layers per frame | GPU, whole token (24 layers) per frame |
+|---|---|---|---|---|---|---|
+| Potion-shop query (order plus reply), start to answer | about 4.1 s (238 to 256 frames) | about 3.6 s (217 to 218 frames) | about 15.8 s (946 to 949 frames) | about 8.0 s (481 frames) | about 5.4 s (326 frames) | about 2.8 s (171 frames) |
+| Reading the 123 prompt tokens, to each first token | about 2.6 s, about 47 tokens per second | about 2.5 s, about 50 tokens per second | about 12.5 s, about 10 tokens per second | about 6.4 s, about 19 tokens per second | about 4.3 s, about 28 tokens per second | about 2.3 s, about 54 tokens per second |
+| Generating the other 33 tokens | about 1.5 s, about 22 tokens per second | about 1.2 s, about 28 tokens per second | about 3.3 s, about 10 tokens per second | about 1.6 s, about 20 tokens per second | about 1.1 s, about 30 tokens per second | about 0.6 s, about 58 tokens per second |
+| GPU time per frame, scene rendering | | | about 3.4 ms | about 3.9 ms | about 4.2 to 4.9 ms | about 6.6 ms |
 
 The answers are the same tokens in every column, and the same as 1.0 gave. These rates are set by
 the frame rate as much as by the hardware. The GPU backend runs one slice per frame, so at 60 frames
@@ -182,7 +182,11 @@ per second it handles at most 60 × layers per frame ÷ 24 tokens per second: 10
 4, 8, 12 and 24 layers, which is what it reached in generation. The example's Thinking/Frame Budget control trades GPU time
 per frame for that rate. On the CPU, prompts are read in chunks of 8 tokens (the two prompts took
 about 6.2 s in 1.0, against 9.6 s for the whole query), and each generated token's job takes about
-three frames. The GPU times include the scene's own rendering while the slice ran, so they are an
+three frames. Threaded generation (`bParallelDecode` in the runtime config, or
+`SuperSLM.SetDecodeMode 1 --save`) splits each generated token's work across four cores, which
+made generation about a fifth faster here (about two frames per token) and left prompt reading as
+it was. It is off by default because it also takes memory bandwidth from the rest of the game, so
+measure it in your own scene before turning it on. The GPU times include the scene's own rendering while the slice ran, so they are an
 upper bound on SuperSLM's share. The game thread's own cost stays small throughout: the CPU
 backend's per-frame bookkeeping stays under 1 ms, which the example's test checks on every tick (at
 most 0.07 ms in these runs). Every figure, with its conditions, is in
