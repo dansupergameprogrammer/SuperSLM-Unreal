@@ -7,7 +7,7 @@ Exit 0 means every check held, 1 means at least one failed (each failure is prin
 the inputs could not be read.
 
 Subcommands
-  report     Structure of one estimate run in a log: the label first, 22 arm/depth rows and 13
+  report     Structure of one estimate run in a log: the label first, 52 arm/depth rows and 13
              suggestions per mode, the four load summaries, coverage, lock, files, status and the
              disclosures; no verified/idleness/refusal wording. --min-workload-foreign PCT also
              requires both workload load medians to reach PCT (the elevated-load cells).
@@ -93,11 +93,21 @@ class Checks:
         return 1 if self.failures else 0
 
 
-def expected_groups() -> list[tuple[str, int]]:
+def t3050d_groups() -> list[tuple[str, int]]:
+    """The 22 arm/depth groups the T-3050d capture blocks hold (the provenance subcommand's input)."""
     groups = [(arm, depth) for arm, depth in SCALAR_ARMS.values()]
     for d in CHUNK1_DEPTHS:
         groups += [("prompt_1", d), ("layer", d)]
     groups += [("prompt_8", d) for d in BATCHED_DEPTHS]
+    return groups
+
+
+def expected_groups() -> list[tuple[str, int]]:
+    """One estimate run's groups per mode: the 22, and (schema fast-decode plan rev 1.3.6, P1.1) the
+    C = 2..7 arms at the batched depths, 30 more: 52."""
+    groups = t3050d_groups()
+    for c in range(2, 8):
+        groups += [(f"prompt_{c}", d) for d in BATCHED_DEPTHS]
     return groups
 
 
@@ -369,7 +379,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     c.that("not a confidence interval" in joined, "IQR disclosure present")
     c.that("250 ms interval averages" in joined, "foreign-load disclosure present")
     for mode in (0, 1):
-        c.that(sum(1 for key in run["rows"] if key[0] == mode) == len(expected_groups()), f"mode {mode} has exactly 22 rows")
+        c.that(sum(1 for key in run["rows"] if key[0] == mode) == len(expected_groups()), f"mode {mode} has exactly {len(expected_groups())} rows")
         for arm, depth in expected_groups():
             row = run["rows"].get((mode, arm, depth))
             ok = row is not None and row.get("calls") == str(expected_calls(arm))
@@ -431,7 +441,7 @@ def cmd_recompute(args: argparse.Namespace) -> int:
         c.that(all(math.isfinite(float(r["elapsed_ms"])) and float(r["elapsed_ms"]) > 0 for r in calls),
                f"every retained mode-{mode} call has a finite positive duration")
         groups = group_calls(calls)
-        c.that(set(groups) == set(expected_groups()), f"mode {mode} CSV holds exactly the 22 arm/depth groups")
+        c.that(set(groups) == set(expected_groups()), f"mode {mode} CSV holds exactly the {len(expected_groups())} arm/depth groups")
         medians: dict[tuple[str, int], float] = {}
         for arm, depth in expected_groups():
             values = groups.get((arm, depth), [])
@@ -532,12 +542,12 @@ def cmd_provenance(args: argparse.Namespace) -> int:
     for mode, names in BLOCKS.items():
         per_block = {name: group_calls(blocks[name]) for name in names}
         medians: dict[tuple[str, int], float] = {}
-        for key in expected_groups():
+        for key in t3050d_groups():
             block_medians = [statistics.median(per_block[name][key]) for name in names if per_block[name].get(key)]
             c.that(len(block_medians) == 3, f"mode {mode} {key[0]}@{key[1]} has a median in each of the three blocks")
             if block_medians:
                 medians[key] = statistics.median(block_medians)
-        if len(medians) != len(expected_groups()):
+        if len(medians) != len(t3050d_groups()):
             continue
         exact = profile_from_medians(medians)
         for field in FIELDS:

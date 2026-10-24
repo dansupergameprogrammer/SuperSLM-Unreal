@@ -21,13 +21,30 @@ option(PAGE_LEDGER_UBSAN_TRAP "UndefinedBehaviorSanitizer in trap mode (no sanit
 
 set(CORE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../Source/SuperSLMUnreal/Private/Core)
 
-set(WARN -Wall -Wextra -Werror -Wshadow -Wconversion -Wsign-conversion)
-set(TEST_WARN -Wall -Wextra -Werror)
+# MSVC (a standing Windows check, box 2026-10-22): /W4 /WX, and the core and the tests without RTTI or exceptions
+# (/GR- /EHs-c-, _HAS_EXCEPTIONS=0 as Unreal builds them; the tests use neither). GNU and clang: unchanged.
+if(MSVC)
+  if(PAGE_LEDGER_SANITIZE OR PAGE_LEDGER_UBSAN_TRAP)
+    message(FATAL_ERROR "PAGE_LEDGER_SANITIZE and PAGE_LEDGER_UBSAN_TRAP are for GNU and clang builds")
+  endif()
+  string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  string(REPLACE "/GR" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  set(CORE_FLAGS /W4 /WX /GR- /EHs-c-)
+  set(TEST_FLAGS /W4 /WX /GR- /EHs-c-)
+  set(NOEXC_DEFS _HAS_EXCEPTIONS=0)
+else()
+  set(WARN -Wall -Wextra -Werror -Wshadow -Wconversion -Wsign-conversion)
+  set(TEST_WARN -Wall -Wextra -Werror)
+  set(CORE_FLAGS ${WARN} -fno-exceptions -fno-rtti)
+  set(TEST_FLAGS ${TEST_WARN} -fno-rtti)
+  set(NOEXC_DEFS "")
+endif()
 
 add_library(page_ledger_core STATIC ${CORE_DIR}/SuperSLMPageLedgerCore.cpp)
 target_include_directories(page_ledger_core PUBLIC ${CORE_DIR})
 target_compile_definitions(page_ledger_core PUBLIC SUPERSLM_PAGE_LEDGER_TEST_HOOKS=1)
-target_compile_options(page_ledger_core PRIVATE ${WARN} -fno-exceptions -fno-rtti)
+target_compile_options(page_ledger_core PRIVATE ${CORE_FLAGS})
+target_compile_definitions(page_ledger_core PRIVATE ${NOEXC_DEFS})
 
 add_executable(page_ledger_tests
   main.cpp
@@ -37,7 +54,8 @@ add_executable(page_ledger_tests
   test_lifecycle.cpp
   test_two_cap.cpp)
 target_link_libraries(page_ledger_tests PRIVATE page_ledger_core)
-target_compile_options(page_ledger_tests PRIVATE ${TEST_WARN} -fno-rtti)
+target_compile_options(page_ledger_tests PRIVATE ${TEST_FLAGS})
+target_compile_definitions(page_ledger_tests PRIVATE ${NOEXC_DEFS})
 
 if(PAGE_LEDGER_SANITIZE)
   foreach(T page_ledger_core page_ledger_tests)

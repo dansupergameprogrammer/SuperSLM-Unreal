@@ -202,4 +202,132 @@ namespace SuperSLMPrefillPlanning
 	{
 		return BatchedTokenMs <= Chunk1TokenMs;
 	}
+
+	// --- Schema fast-decode plan rev 1.3.5, slice P1 (§6 "Pricing", §16 Q8 A; cell P1.1) ---
+	// A chunk of C tokens is priced with the chunk-1 pair at C = 1, with its own pair from the per-C
+	// table at C = 2..7, and with the batched pair at C >= 8, each in the existing form
+	// C x TokenMs + PerPositionMs x (C x d + C x (C - 1) / 2). Span jobs and prompt chunks of 2..7
+	// tokens are both priced this way (they have the same physical cost, §16 Q8). The table's form is
+	// one pair per C until B5f calibrates it (§6 P1, rev 1.3.5); every reader goes through these
+	// functions, so every pricing reader sees the same figure.
+
+	// The per-C pairs, indexed by C. Entries 0, 1 and 8 are unused.
+	struct FPerChunkPromptPrices
+	{
+		FPromptPrice ByChunk[kTiledMinTokens + 1];
+	};
+
+	// The table's default (§6 P1, rev 1.3.6: "until B5f fills the field, it defaults to the chunk-1
+	// price"): every C in 2..7 at the chunk-1 pair. The scheduler reads the resolved configuration's
+	// per-C field (SuperSLMRuntimeResolve::PerChunkPromptPrices), which the C = 2..7 calibration arms
+	// (FitSmallChunkArm, SuperSLM.EstimateCosts) or a caller fill; unset, it holds these figures.
+	inline FPerChunkPromptPrices UncalibratedPerChunkPromptPrices(const FPromptPrice& Chunk1)
+	{
+		FPerChunkPromptPrices Out;
+		for (int32 C = 2; C < kTiledMinTokens; ++C)
+		{
+			Out.ByChunk[C] = Chunk1;
+		}
+		return Out;
+	}
+
+	// Rev 1.3.6, §6 P1 "Where the prices come from" (review finding 2; cell P1.1; mutant XD9): the
+	// C = 2..7 calibration arm's fit, beside the chunk-1 arm, so B5f has something to run. A reading
+	// is the median time MedianCallMs[i] of one sslm_prefill of Chunk tokens from Depths[i] (N
+	// readings, depths ascending). It stands for the per-token time MedianCallMs[i] / Chunk at the
+	// chunk's mean position Depths[i] + (Chunk - 1) / 2, so a price exactly of the form
+	// PromptPriceMs(Chunk, d, P) gives back P. The pair shipped is the upper envelope of the readings,
+	// as both existing arms ship theirs: no reading's per-token time lies above
+	// TokenMs + PerPositionMs x position. Returns false, Out unchanged, for Chunk outside 2..7, N < 1,
+	// depths not ascending, or a reading that is not finite and positive.
+	// The fit is FitBatchedUpperEnvelope's, over (Depths[i] + (Chunk - 1) / 2, MedianCallMs[i] / Chunk).
+	inline bool FitSmallChunkArm(int32 Chunk, const int64* Depths, const double* MedianCallMs, int32 N, FPromptPrice& Out)
+	{
+		if (Chunk < 2 || Chunk >= kTiledMinTokens || N < 1 || Depths == nullptr || MedianCallMs == nullptr || N > 64)
+		{
+			return false;
+		}
+		double Positions[64];
+		double PerToken[64];
+		for (int32 I = 0; I < N; ++I)
+		{
+			const double Call = MedianCallMs[I];
+			if (!(Call > 0.0) || !FMath::IsFinite(Call) || Depths[I] < 0 || (I > 0 && Depths[I] <= Depths[I - 1]))
+			{
+				return false;
+			}
+			Positions[I] = static_cast<double>(Depths[I]) + 0.5 * static_cast<double>(Chunk - 1);
+			PerToken[I] = Call / static_cast<double>(Chunk);
+		}
+		double Intercept = 0.0;
+		double Slope = 0.0;
+		FitBatchedUpperEnvelope(Positions, PerToken, N, Intercept, Slope);
+		Out.TokenMs = Intercept;
+		Out.PerPositionMs = Slope;
+		return true;
+	}
+
+	// The pair a chunk of C tokens is priced with.
+	inline const FPromptPrice& SelectPromptPriceWithTable(int32 Chunk, const FPromptPrice& Chunk1,
+		const FPerChunkPromptPrices& PerChunk, const FPromptPrice& Batched)
+	{
+		if (Chunk >= kTiledMinTokens)
+		{
+			return Batched;
+		}
+		return Chunk >= 2 ? PerChunk.ByChunk[Chunk] : Chunk1;
+	}
+
+	// The planned cost of one chunk (a prompt chunk or a span job of C rows) starting at depth d.
+	inline double PrefillChunkCostMsWithTable(int32 Chunk, int64 StartDepth, const FPromptPrice& Chunk1,
+		const FPerChunkPromptPrices& PerChunk, const FPromptPrice& Batched)
+	{
+		return PromptPriceMs(Chunk, StartDepth, SelectPromptPriceWithTable(Chunk, Chunk1, PerChunk, Batched));
+	}
+
+	// PlanPrefillChunk, with chunks of 2..7 priced from the per-C table. The scan is PlanPrefillChunk's:
+	// the small segment up from C = 2 to its first misfit, then the batched segment from
+	// kTiledMinTokens to its first misfit, then the MinPrefillChunk floor.
+	inline int32 PlanPrefillChunkWithTable(int32 MaxChunk, int64 StartDepth, double ShareMs, int32 MinPrefillChunk,
+		const FPromptPrice& Chunk1, const FPerChunkPromptPrices& PerChunk, const FPromptPrice& Batched)
+	{
+		(void)Chunk1; // C = 1 is the planner's floor and is never priced, as in PlanPrefillChunk
+		int32 Chunk = 1;
+		const int32 SmallLast = FMath::Min(MaxChunk, kTiledMinTokens - 1);
+		for (int32 C = 2; C <= SmallLast; ++C)
+		{
+			if (PromptPriceMs(C, StartDepth, PerChunk.ByChunk[C]) > ShareMs)
+			{
+				break;
+			}
+			Chunk = C;
+		}
+		for (int32 C = kTiledMinTokens; C <= MaxChunk; ++C)
+		{
+			if (PromptPriceMs(C, StartDepth, Batched) > ShareMs)
+			{
+				break;
+			}
+			Chunk = C;
+		}
+		return FMath::Max(Chunk, FMath::Min(MinPrefillChunk, MaxChunk));
+	}
+
+	// Configure()'s bound for chunks below kTiledMinTokens, using the table up to C = 7: the largest
+	// of the bounds of C tokens ending at D over C = 1 .. min(P, 7), each with its own pair; finite only
+	// when every one is.
+	inline FPrefillBound SmallChunkPrefillBoundMsWithTable(int64 P, int64 D, const FPromptPrice& Chunk1,
+		const FPerChunkPromptPrices& PerChunk)
+	{
+		FPrefillBound Out;
+		const int64 Last = FMath::Min<int64>(P, kTiledMinTokens - 1);
+		for (int64 C = 1; C <= Last; ++C)
+		{
+			const FPromptPrice& Pair = C == 1 ? Chunk1 : PerChunk.ByChunk[C];
+			const FPrefillBound B = PrefillPriceBoundMs(static_cast<double>(C), static_cast<double>(D), Pair);
+			Out.bFinite = Out.bFinite && B.bFinite;
+			Out.Ms = B.Ms > Out.Ms ? B.Ms : Out.Ms;
+		}
+		return Out;
+	}
 }

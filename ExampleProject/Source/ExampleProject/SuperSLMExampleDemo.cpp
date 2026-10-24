@@ -2,6 +2,8 @@
 
 #include "Dom/JsonObject.h"
 #include "HAL/PlatformTime.h"
+#include "HAL/IConsoleManager.h"
+#include "Misc/App.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 #include "Serialization/JsonReader.h"
@@ -188,6 +190,82 @@ namespace SuperSLMExample
 		case ESuperSLMSelfCheckVerdict::NotYetRun: return TEXT("Not Yet Run");
 		}
 		return TEXT("Unknown");
+	}
+
+	FFrameTimeSummary SummarizeFrameTimes(const TArray<double>& FrameMs, double CapPeriodMs)
+	{
+		FFrameTimeSummary Summary;
+		Summary.CapPeriodMs = CapPeriodMs;
+		Summary.Frames = FrameMs.Num();
+		if (Summary.Frames == 0)
+		{
+			return Summary;
+		}
+		TArray<double> Sorted = FrameMs;
+		Sorted.Sort();
+		// Nearest rank: the smallest sample at or above the given share of the frames.
+		auto Rank = [&Sorted](double Share)
+		{
+			const int32 Index = FMath::Clamp(FMath::CeilToInt(Share * Sorted.Num()) - 1, 0, Sorted.Num() - 1);
+			return Sorted[Index];
+		};
+		Summary.P50Ms = Rank(0.50);
+		Summary.P95Ms = Rank(0.95);
+		Summary.P99Ms = Rank(0.99);
+		Summary.MaxMs = Sorted.Last();
+		for (double V : Sorted)
+		{
+			Summary.MissedFrames += V > CapPeriodMs + MissedFrameToleranceMs ? 1 : 0;
+			Summary.FramesOverLongFrame += V > LongFrameMs ? 1 : 0;
+		}
+		return Summary;
+	}
+
+	double ActiveCapPeriodMs()
+	{
+		const IConsoleVariable* MaxFps = IConsoleManager::Get().FindConsoleVariable(TEXT("t.MaxFPS"));
+		const float Fps = MaxFps != nullptr ? MaxFps->GetFloat() : 0.0f;
+		return Fps > 0.0f ? 1000.0 / Fps : FrameMsAt60Fps;
+	}
+
+	bool FrameBudgetLayersFromCommandLine(int32& OutLayers)
+	{
+		FString Text;
+		if (!FParse::Value(FCommandLine::Get(), TEXT("SuperSLMExampleLayers="), Text))
+		{
+			return false;
+		}
+		// FParse's integer form reads junk as 0, a whole token; only digits are accepted here.
+		bool bDigits = !Text.IsEmpty() && Text.Len() <= 3;
+		for (TCHAR C : Text)
+		{
+			bDigits &= FChar::IsDigit(C);
+		}
+		const int32 Layers = bDigits ? FCString::Atoi(*Text) : -1;
+		if (!bDigits || Layers > NumHiddenLayers)
+		{
+			UE_LOG(LogSuperSLMExampleDemo, Warning, TEXT("-SuperSLMExampleLayers=\"%s\" is not a whole number from 0 to %d; the default Frame Budget (%d) is kept."),
+				*Text, NumHiddenLayers, DefaultFrameBudgetLayers);
+			return false;
+		}
+		OutLayers = Layers == 0 ? NumHiddenLayers : Layers; // 0 is a whole token, as in FSuperSLMQueryConfig
+		return true;
+	}
+
+	bool SchemaJumpForwardFromCommandLine(const TCHAR* CommandLine, ESuperSLMSchemaJumpForward& InOutMode)
+	{
+		FString Text;
+		if (CommandLine == nullptr || !FParse::Value(CommandLine, TEXT("SuperSLMExampleJumpForward="), Text))
+		{
+			return false; // absent: the mode stays as it was, and nothing is logged
+		}
+		if (!ParseSuperSLMSchemaJumpForwardSwitch(Text, InOutMode))
+		{
+			UE_LOG(LogSuperSLMExampleDemo, Warning, TEXT("-SuperSLMExampleJumpForward=\"%s\" is not one of 0, 1, off, exact or canonical, so the schema jump-forward mode is unchanged."),
+				*Text);
+			return false;
+		}
+		return true;
 	}
 }
 
@@ -616,6 +694,7 @@ bool FSuperSLMExampleDemo::BeginRun(const FSuperSLMExampleSettings& Settings, FS
 	CpuTokensPerSecondLast = 0.0;
 	GpuBusySamples.Reset();
 	LastHostFinishMs = 0.0;
+	FrameMsSamples.Reset();
 	if (Gpu != nullptr && Settings.Backend == ESuperSLMExampleBackend::GPU)
 	{
 		GpuHitchesAtStart = Gpu->GetHitchCount();
@@ -636,6 +715,8 @@ bool FSuperSLMExampleDemo::TryStartExtraction(FQuery& Query)
 	Request.PromptTokens = ExtractionPromptTokens;
 	Request.MaxNewTokens = SuperSLMExample::ExtractionMaxNewTokens;
 	Request.StopTokenIds = SuperSLMExample::StopTokenIds();
+	// -SuperSLMExampleJumpForward (plan P1.9). The CPU reads it; a GPU sequence ignores it until P2.
+	Request.SchemaJumpForward = Readout.Settings.SchemaJumpForward;
 	FString Error;
 
 	if (Readout.Settings.Backend == ESuperSLMExampleBackend::CPU)
@@ -677,6 +758,7 @@ bool FSuperSLMExampleDemo::TryStartExtraction(FQuery& Query)
 			return false;
 		}
 		Query.GpuSequence = Sequence;
+		(Gpu->GetDecodePath(Sequence) == ESuperSLMGpuDecodePath::OneCall ? Readout.GpuOneCallSequences : Readout.GpuComposedSequences) += 1;
 		if (!Gpu->SetSchema(Sequence, GpuSchema, Error))
 		{
 			Query.Stage = EStage::Failed;
@@ -744,6 +826,7 @@ bool FSuperSLMExampleDemo::TryStartReply(FQuery& Query)
 			return false;
 		}
 		Query.GpuSequence = Sequence;
+		(Gpu->GetDecodePath(Sequence) == ESuperSLMGpuDecodePath::OneCall ? Readout.GpuOneCallSequences : Readout.GpuComposedSequences) += 1;
 		Query.GpuBeginHandle = Gpu->RequestBeginGeneration(Sequence, Request);
 		if (!Query.GpuBeginHandle.IsValid())
 		{
@@ -950,6 +1033,7 @@ void FSuperSLMExampleDemo::Tick()
 	if (Readout.State == ESuperSLMExampleRunState::Running)
 	{
 		++FramesElapsed;
+		FrameMsSamples.Add(FApp::GetDeltaTime() * 1000.0);
 		SampleCostFigures();
 
 		bool bAllFinished = true;
@@ -990,6 +1074,8 @@ void FSuperSLMExampleDemo::FinishRun()
 	Readout.WallMsToAnswer = (FPlatformTime::Seconds() - StartSeconds) * 1000.0;
 	Readout.ExtractionTokens = First.ExtractionTokens;
 	Readout.ReplyTokens = First.ReplyTokens;
+	Readout.FrameMsSamples = FrameMsSamples;
+	Readout.FrameTime = SuperSLMExample::SummarizeFrameTimes(FrameMsSamples, SuperSLMExample::ActiveCapPeriodMs());
 
 	TArray<int32> All = First.ExtractionTokens;
 	All.Append(First.ReplyTokens);
@@ -1006,6 +1092,14 @@ void FSuperSLMExampleDemo::FinishRun()
 	TArray<FSuperSLMExampleFigure>& F = Readout.Figures;
 	F.Add({ TEXT("Frames to answer"), FString::FromInt(Readout.FramesToAnswer), TEXT("example: frames from Ask to the last query's final token") });
 	F.Add({ TEXT("Wall time to answer"), FString::Printf(TEXT("%.0f ms"), Readout.WallMsToAnswer), TEXT("example: FPlatformTime from Ask to the last query's final token") });
+	{
+		const SuperSLMExample::FFrameTimeSummary& T = Readout.FrameTime;
+		F.Add({ TEXT("Frame ms (p50 / p95 / p99 / max)"),
+			FString::Printf(TEXT("%.2f / %.2f / %.2f / %.2f over %d frames; %d missed the cap (over %.2f ms), %d over %.0f ms"),
+				T.P50Ms, T.P95Ms, T.P99Ms, T.MaxMs, T.Frames, T.MissedFrames, T.CapPeriodMs + SuperSLMExample::MissedFrameToleranceMs,
+				T.FramesOverLongFrame, SuperSLMExample::LongFrameMs),
+			TEXT("example: FApp::GetDeltaTime() of every frame from Ask to the answer; the cap is t.MaxFPS, or 60") });
+	}
 	F.Add({ TEXT("Prompt time, extraction"), FString::Printf(TEXT("%.1f ms"), First.ExtractionTimeToFirstTokenMs),
 		TEXT("GetTimeToFirstTokenMs(): generation start to first token, prompt included") });
 	F.Add({ TEXT("Prompt time, reply"), FString::Printf(TEXT("%.1f ms"), First.ReplyTimeToFirstTokenMs),
@@ -1050,7 +1144,7 @@ void FSuperSLMExampleDemo::FinishRun()
 		F.Add({ TEXT("Host finish ms per token"), FString::Printf(TEXT("%.2f"), LastHostFinishMs), TEXT("USuperSLMGpuSubsystem::GetLastHostFinishMs(), the finish call's wall time") });
 		F.Add({ TEXT("Tokens per second"), FString::Printf(TEXT("%.1f"), WallSeconds > 0.0 ? TotalTokens / WallSeconds : 0.0),
 			TEXT("example: tokens generated by every query / wall seconds from Ask, prompts included") });
-		F.Add({ TEXT("Hitches"), FString::FromInt(Gpu->GetHitchCount() - GpuHitchesAtStart), TEXT("USuperSLMGpuSubsystem::GetHitchCount() over this run (T+K misses, and slices whose gpu_busy_ms span is over 2 ms; under rendering that span can include the renderer's GPU time)") });
+		F.Add({ TEXT("Hitches"), FString::FromInt(Gpu->GetHitchCount() - GpuHitchesAtStart), TEXT("USuperSLMGpuSubsystem::GetHitchCount() over this run (T+K misses, and slices whose gpu_busy_ms span is over one 60 fps frame; under rendering that span can include the renderer's GPU time)") });
 		F.Add({ TEXT("K (effective / minimum)"), FString::Printf(TEXT("%d / %d"), Readout.EffectiveK, Readout.MinimumK), TEXT("USuperSLMGpuSubsystem::Configure() report") });
 		F.Add({ TEXT("Logits head"), Readout.GpuDeviceHeadStatus, TEXT("USuperSLMGpuSubsystem::GetDeviceHeadStatus()") });
 		F.Add({ TEXT("GPU dispatches this run"), FString::Printf(TEXT("%lld"), Readout.GpuDispatches), TEXT("USuperSLMGpuSubsystem::GetGpuDispatchCount()") });
@@ -1084,6 +1178,11 @@ void FSuperSLMExampleDemo::FinishRun()
 		}
 	}
 
+	UE_LOG(LogSuperSLMExampleDemo, Display, TEXT("Query frame times (%s): %d frames, %.0f ms, frame ms p50 %.2f p95 %.2f p99 %.2f max %.2f, %d missed the cap (over %.2f ms), %d over %.0f ms"),
+		*SuperSLMExample::SettingsDescription(Readout.Settings), Readout.FramesToAnswer, Readout.WallMsToAnswer,
+		Readout.FrameTime.P50Ms, Readout.FrameTime.P95Ms, Readout.FrameTime.P99Ms, Readout.FrameTime.MaxMs,
+		Readout.FrameTime.MissedFrames, Readout.FrameTime.CapPeriodMs + SuperSLMExample::MissedFrameToleranceMs,
+		Readout.FrameTime.FramesOverLongFrame, SuperSLMExample::LongFrameMs);
 	UE_LOG(LogSuperSLMExampleDemo, Display, TEXT("Query done (%s): %d frames, digest %s, %d/%d queries identical, extraction %s [%s], reply \"%s\""),
 		*SuperSLMExample::SettingsDescription(Readout.Settings), Readout.FramesToAnswer, *Readout.TokenDigestHex,
 		Readout.QueriesMatchingDigest, Readout.QueryCount, *Readout.ExtractionText,

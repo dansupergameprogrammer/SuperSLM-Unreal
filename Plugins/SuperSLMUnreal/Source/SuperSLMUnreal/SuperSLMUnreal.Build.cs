@@ -107,6 +107,21 @@ public class SuperSLMUnreal : ModuleRules
 		{
 			throw new BuildException("SuperSLMUnreal: could not read 'Tag:' and 'Commit:' from " + VendoredVersionPath);
 		}
+		// The save wrapper stores the tag in a fixed 16-byte field and the commit in a fixed 40-byte one
+		// (SuperSLMSaveBlob.cpp, kTagBytes and kCommitBytes). A longer tag is truncated in every blob and then
+		// never equals the compiled tag again, so every sequence restore is refused Layer1Mismatch (box
+		// 2026-10-21: a 51-character placeholder tag failed Cpu.SaveRestoreAdopter and Cpu.LeaseAsRestoreHint).
+		// Refuse such a pin at build time instead. Counted in UTF-8 bytes, as the wrapper writes it (PutFixedAscii
+		// encodes UTF-8): Encoding.ASCII counts one byte per character, so a short non-ASCII tag passed and was
+		// truncated (box 2026-10-21 review, finding 6).
+		if (System.Text.Encoding.UTF8.GetByteCount(Layer1Tag) > 16)
+		{
+			throw new BuildException("SuperSLMUnreal: the Layer-1 tag '" + Layer1Tag + "' in " + VendoredVersionPath + " is longer than the save wrapper's 16-byte tag field");
+		}
+		if (Layer1Commit.Length != 40)
+		{
+			throw new BuildException("SuperSLMUnreal: the Layer-1 commit '" + Layer1Commit + "' in " + VendoredVersionPath + " is not a 40-character commit id");
+		}
 		PrivateDefinitions.Add("SUPERSLM_LAYER1_TAG=\"" + Layer1Tag + "\"");
 		PrivateDefinitions.Add("SUPERSLM_LAYER1_COMMIT=\"" + Layer1Commit + "\"");
 
@@ -145,6 +160,14 @@ public class SuperSLMUnreal : ModuleRules
 		{
 			PublicDefinitions.Add("SUPERSLMUNREAL_WITH_GPU=0");
 		}
+
+		// Precache plan step U2: the prefix cache, after the Layer-1 re-pin to 1.14.0 (step U0).
+		PublicDefinitions.Add("SUPERSLM_WITH_PREFIX_CACHE=1");
+		// Schema fast-decode plan section 6, P1: schema skip-ahead, on a vendored engine that carries the jump-forward verbs (1.15.0).
+		PublicDefinitions.Add("SUPERSLM_WITH_SCHEMA_JUMP_FORWARD=1");
+		// Precache step U6: the GPU cache instance keys by the RHI adapter ids (GRHIVendorId and
+		// GRHIDeviceId read GRHIGlobals, RHI_API). UBT links only a module's direct dependencies.
+		PrivateDependencyModuleNames.Add("RHI");
 	}
 
 	private string ThirdPartyRoot()

@@ -156,6 +156,18 @@ struct SUPERSLMUNREAL_API FSuperSLMRuntimeConfig
 	TOptional<double> BatchedPromptTokenCostMs;
 	TOptional<double> BatchedPromptTokenCostPerPositionMs;
 
+	// Schema fast-decode plan rev 1.3.6, §6 P1 "Where the prices come from" (cell P1.1; mutant XD9):
+	// the per-C prompt prices, one pair per chunk size C = 2..7, indexed by C (entries 0, 1 unused).
+	// A chunk of C tokens starting at depth d (a prompt chunk, or a span job of C rows) costs
+	//   C x PerChunkPromptTokenCostMs[C] + PerChunkPromptTokenCostPerPositionMs[C] x (C x d + C x (C - 1) / 2).
+	// An unset entry resolves from a matching saved estimate (the C = 2..7 calibration arms of
+	// SuperSLM.EstimateCosts, keys PromptChunk<C>TokenCostMs and PromptChunk<C>TokenCostPerPositionMs
+	// in CalibratedCosts.ini), else to the chunk-1 pair (PromptTokenCostMs and
+	// PromptTokenCostPerPositionMs), which is mutant X15's figure: no exact-mode timing gain is
+	// claimed before B5f fills them.
+	TOptional<double> PerChunkPromptTokenCostMs[8];
+	TOptional<double> PerChunkPromptTokenCostPerPositionMs[8];
+
 	// D-SLM7422/D-SLM7430/D-SLM7444 (plan §5 item 2, §10.2 item 10, T-2805 round 9): the static
 	// per-unit cost of each of the four queued lifecycle operations -- a job whose Kind is
 	// Reset/Adopt/Save/Restore is priced by exactly one of these, never by the decode/prefill
@@ -214,6 +226,49 @@ struct SUPERSLMUNREAL_API FSuperSLMRuntimeConfig
 	// Budget mode with a prefix cache configured: region A, in blocks (plan §3.2). The paging
 	// release has no cache, so this is accepted and ignored.
 	int32 CacheGhostBlocks = 1;
+
+	// --- The prefix cache (precache plan §5.4, §5.6, §5.7). Read only by a build with
+	// SUPERSLM_WITH_PREFIX_CACHE on; elsewhere accepted and ignored. ---
+
+	// The cache's budget. 0 (the default) is no cache. In budget mode the cache's ledger is the
+	// page ledger's region C, ceil(PrefixCacheBudgetBytes / block bytes) blocks; in legacy mode the
+	// pool gains that many blocks and the cache charges bytes against this figure.
+	int64 PrefixCacheBudgetBytes = 0;
+
+	// The disk tier (§5.7): off by default. PrefixDiskCacheDirectory empty is
+	// <ProjectSaved>/SuperSLM/PrefixCache. The directory is trimmed to PrefixDiskCacheMaxBytes,
+	// oldest first, at Configure() and after writes.
+	bool bPrefixDiskCacheEnabled = false;
+	FString PrefixDiskCacheDirectory;
+	int64 PrefixDiskCacheMaxBytes = 256ll * 1024 * 1024;
+
+	// Precache plan §5.5, risk R5 (step U4): a cache restore's cost per MiB of its payload, on top of
+	// RestoreCostMs per restore, so a large restore is planned across ticks like a long prefill. Not one of
+	// the thirteen: unset resolves to a matching saved estimate's RestoreCostPerMiBMs when that profile is
+	// used and carries the key, else 0 (a flat price, as before U4). SuperSLM.EstimateCosts measures it.
+	// Configure() refuses a non-finite or negative value. Priced only by the prefix cache's restores;
+	// sequence restores keep RestoreCostMs alone.
+	TOptional<double> RestoreCostPerMiBMs;
+
+	// Precache plan rev 1.18.11 (§15.31, cell 5.9 (d)): the cache chunk's own price pair. A sliced CPU cache build's
+	// chunk (one sslm_prefix_prefill call of 8 tokens or more) is planned and priced with this pair, of the prompt
+	// price's form (C x TokenMs + PerPositionMs x (C x d + C x (C - 1) / 2)), in place of the batched pair; chunks
+	// under 8 tokens keep the chunk-1 pair, and CreatePrefix keeps the batched pair. Not two of the thirteen: set both
+	// or neither. Unset, they resolve to a matching saved estimate's PrefixPrefillTokenCostMs and
+	// PrefixPrefillTokenCostPerPositionMs when that profile is used and carries both (SuperSLM.EstimateCosts'
+	// prefix_prefill arm measures them), else to nothing, and the batched pair prices the cache chunk as before.
+	// Configure() refuses one without the other, a non-finite or non-positive TokenMs and a non-finite or negative
+	// slope.
+	TOptional<double> PrefixPrefillTokenCostMs;
+	TOptional<double> PrefixPrefillTokenCostPerPositionMs;
+};
+
+// Where a resolved configuration's cache chunk price pair came from (precache plan rev 1.18.11, §15.31).
+enum class ESuperSLMPrefixPrefillPriceSource : uint8
+{
+	BatchedFallback, // no pair: the cache chunk is priced with the batched pair
+	Caller,          // FSuperSLMRuntimeConfig::PrefixPrefillTokenCostMs and ...PerPositionMs
+	SavedEstimate,   // a matching SuperSLM.EstimateCosts profile's prefix_prefill pair
 };
 
 // Which source supplied a resolved configuration's cost fields (plan §10.3.1 item 5b, D-SLM8165).
@@ -247,6 +302,11 @@ struct SUPERSLMUNREAL_API FSuperSLMResolvedCpuConfig
 	double PromptTokenCostPerPositionMs = 0.0;
 	double BatchedPromptTokenCostMs = 0.0;
 	double BatchedPromptTokenCostPerPositionMs = 0.0;
+	// Schema fast-decode plan rev 1.3.6 (cell P1.1): the resolved per-C pairs, indexed by C = 2..7
+	// (FSuperSLMRuntimeConfig::PerChunkPromptTokenCostMs). Every reader of a chunk of 2..7 tokens'
+	// price reads these. Not among the thirteen cost fields below.
+	double PerChunkPromptTokenCostMs[8] = {};
+	double PerChunkPromptTokenCostPerPositionMs[8] = {};
 	double FinishCostMs = 0.0;
 	double ResetCostMs = 0.0;
 	double AdoptCostMs = 0.0;
@@ -259,6 +319,17 @@ struct SUPERSLMUNREAL_API FSuperSLMResolvedCpuConfig
 	// (0-13). CostProfile reads Caller only when CallerCostFields is 13.
 	ESuperSLMCostProfile CostProfile = ESuperSLMCostProfile::ModeDefault;
 	int32 CallerCostFields = 0;
+
+	// FSuperSLMRuntimeConfig::RestoreCostPerMiBMs, resolved: the caller's, else the saved estimate's when
+	// that profile is used and carries it, else 0. Not counted in CallerCostFields.
+	double RestoreCostPerMiBMs = 0.0;
+
+	// The cache chunk's price pair, resolved (FSuperSLMRuntimeConfig::PrefixPrefillTokenCostMs): the caller's, else
+	// the used saved estimate's when it carries both keys, else none (PrefixPrefillPriceSource BatchedFallback, and
+	// the two values are 0). Not counted in CallerCostFields.
+	ESuperSLMPrefixPrefillPriceSource PrefixPrefillPriceSource = ESuperSLMPrefixPrefillPriceSource::BatchedFallback;
+	double PrefixPrefillTokenCostMs = 0.0;
+	double PrefixPrefillTokenCostPerPositionMs = 0.0;
 };
 
 enum class ESuperSLMConfigureResult : uint8
@@ -298,4 +369,21 @@ struct SUPERSLMUNREAL_API FSuperSLMConfigureReport
 	// The configuration this call resolved (D-SLM8165), set whenever resolution ran, a refused
 	// configuration included: read what was configured here, not from the struct that was passed.
 	TOptional<FSuperSLMResolvedCpuConfig> Resolved;
+};
+
+// Precache plan rev 1.18.12 (§15.32): what USuperSLMSubsystem::WriteInSituPrefixPrefillPrice read, fitted and wrote.
+struct SUPERSLMUNREAL_API FSuperSLMInSituPrefixPrefillPrice
+{
+	// The build's chunk rows the fit read: DecodeOrPrefill rows of no sequence, delivered, of 8 tokens or more,
+	// with a measured worker time; and the median of their worker ms per token.
+	int32 ChunkRows = 0;
+	double MedianWorkerMsPerToken = 0.0;
+	// The fitted pair, exact, and as written (rounded up to 3 and 6 decimals, as SuperSLM.EstimateCosts rounds).
+	double TokenCostMs = 0.0;
+	double TokenCostPerPositionMs = 0.0;
+	FString TokenCostText;
+	FString TokenCostPerPositionText;
+	// The CalibratedCosts.ini written, and the header of the profile in it.
+	FString Path;
+	FString Profile;
 };

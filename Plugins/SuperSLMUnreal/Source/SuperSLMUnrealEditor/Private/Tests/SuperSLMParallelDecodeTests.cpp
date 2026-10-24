@@ -319,7 +319,9 @@ bool FSuperSLMParallelDecodeSettingAndMakeTest::RunTest(const FString& Parameter
 	const FSuperSLMRuntimeConfig Default;
 	bool bOk = TestTrue(TEXT("CPU FSuperSLMRuntimeConfig declares bParallelDecode"),
 		THasParallelDecodeSetting<FSuperSLMRuntimeConfig>::value);
-	bOk &= TestFalse(TEXT("bParallelDecode ships off"), IsParallelDecodeOn(Default));
+	// The fixture oracle only; the runtime's own resolved fallback is asserted, and compared with this
+	// oracle, by SuperSLM.D4.Settings.ModeAppliesAtNextConfigure's shipped-mode arm.
+	bOk &= TestFalse(TEXT("the expected-resolution oracle reads an unset bParallelDecode as off"), IsParallelDecodeOn(Default));
 	bOk &= TestTrue(TEXT("SuperSLMFinishHook::Make accepts Tasks and uint32 Bits"), THasBitsMake<uint32>::value);
 	return bOk;
 }

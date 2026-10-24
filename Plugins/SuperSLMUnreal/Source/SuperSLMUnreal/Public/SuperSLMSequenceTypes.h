@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "SuperSLMSchemaJumpTypes.h"
 #include "SuperSLMSlotGates.h"
 
 // L2-S1 (the plan §5, §10.2; Coverage Model §9, cells R-S1a-R-S1f;
@@ -94,6 +95,13 @@ struct SUPERSLMUNREAL_API FSuperSLMGenerationRequest
 	// tokenizer adds no BOS/EOS markers (tokenizer.h, sslm_generate.cpp). Qwen2.5-Instruct's
 	// ids are 151645 (<|im_end|>) and 151643 (<|endoftext|>). Empty: generate MaxNewTokens.
 	TArray<int32> StopTokenIds;
+
+	// Schema fast-decode plan rev 1.3.5, §6 P1 and P1-X (SuperSLMSchemaJumpTypes.h): jump-forward for
+	// this generation, default Off. The CPU subsystem reads it at the generation's activation, and
+	// only when a schema is bound; the GPU subsystem ignores it. Forced tokens count toward
+	// MaxNewTokens (§16 Q12). With SUPERSLM_WITH_SCHEMA_JUMP_FORWARD 0 (an older vendored engine) the
+	// verbs are the plugin's stubs, so every setting runs Off's loop.
+	ESuperSLMSchemaJumpForward SchemaJumpForward = ESuperSLMSchemaJumpForward::Off;
 };
 
 // A shared prompt prefix (D-SLM7342, plan §5 item 4): prefilled once into its own pool block,

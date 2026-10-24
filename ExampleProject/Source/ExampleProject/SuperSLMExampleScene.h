@@ -42,6 +42,11 @@ class FSuperSLMPagingCertification;
 //   -SuperSLMExampleSkipLoad              load nothing; for the plugin's packaged memory-mapping test,
 //                                         which must be the first to load the model package
 //   -SuperSLMExamplePackagedCheck         run the packaged check after the self-check, write its report, exit
+//   -SuperSLMExampleLayers=<N>            start the GPU Frame Budget at N layers per slice (1 to 24), or 0
+//                                         for a whole token (the default); the packaged check runs at it
+//   -SuperSLMExamplePrefixCacheCheck=<Leg> run one leg of the packaged prefix-cache check instead of the demo,
+//                                         write its report, exit (SuperSLMPrefixCacheCheck.h lists the legs and
+//                                         their switches); needs a plugin built with the prefix cache
 UCLASS()
 class ASuperSLMExampleScene : public AActor
 {
@@ -120,6 +125,7 @@ private:
 	bool bInputConfigured = false;
 	bool bSetBuilt = false;
 	bool bEnded = false;
+	int32 LayersOverride = 0; // -SuperSLMExampleLayers, as layers per slice; 0 when absent
 
 	EPackagedCheckStep PackagedCheckStep = EPackagedCheckStep::Off;
 	bool bPackagedCheckExitWhenDone = false;
@@ -135,4 +141,6 @@ private:
 	void AdvanceLoad();
 	void AdvancePackagedCheck();
 	void FinishPackagedCheck();
+	FSuperSLMExampleSettings PackagedCheckSettings() const;
+	bool IsAtDefaultLayers() const;
 };

@@ -2,6 +2,10 @@
 
 #include "SuperSLMGpuSchemaHandle.h"
 #include "SuperSLMGpuSelfCheckAccess.h"
+#include "SuperSLMPrefixCacheTypes.h" // defines SUPERSLM_WITH_PREFIX_CACHE (0 unless Build.cs sets it)
+#if SUPERSLM_WITH_PREFIX_CACHE
+#include "Core/SuperSLMSaveCompatCore.h"
+#endif
 #include "SuperSLMGpuTestAccess.h"
 #include "SuperSLMLog.h"
 #include "SuperSLMModel.h"
@@ -111,6 +115,9 @@
 #include "superslm/layer_marshal.h"
 #include "superslm/model.h"
 #include "superslm/schema_masks.h"
+#if SUPERSLM_WITH_PREFIX_CACHE
+#include "SuperSLMGpuSubsystemPrefixCache.h" // precache U6 glue; wiring edit 1 (the state member) and 5 (the .inl) only
+#endif
 
 #include "Windows/WindowsHWrapper.h"
 #include "Windows/AllowWindowsPlatformTypes.h"
@@ -843,6 +850,11 @@ namespace
 
 struct FSuperSLMGpuSubsystemState : public FRunnable
 {
+#if SUPERSLM_WITH_PREFIX_CACHE
+	// Precache U6 wiring edit 1 (SuperSLMGpuSubsystemPrefixCache.h), the member only: nothing installs a host
+	// until edits 2-4 land, so the cache methods refuse NotConfigured.
+	SuperSLMGpuPrefixCacheGlue::FState PrefixCache;
+#endif
 	// --- Configuration (immutable after Configure) ---
 	// Config.K alone is re-set after Configure(), by SetFixedTickLatency() while the pool is drained.
 	FSuperSLMGpuRuntimeConfig Config;
@@ -5117,7 +5129,14 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		// the refusal is an invalid handle with the result named here). Saves do not carry across a
 		// change of pin (plan §4, §12 decision 13).
 		const FString CompiledTag = SuperSLMSaveBlob::CompiledLayer1Tag();
+#if SUPERSLM_WITH_PREFIX_CACHE
+		// Precache plan §5.8: the shipped compatibility table admits a named predecessor's saves.
+		if (SuperSLMCore::CheckSaveLayer1(std::string(TCHAR_TO_UTF8(*CompiledTag)), std::string(TCHAR_TO_UTF8(*Contents.Layer1Tag)),
+				std::string(TCHAR_TO_UTF8(*Contents.Layer1Commit)), Payload, PayloadBytes > 0 ? static_cast<size_t>(PayloadBytes) : 0)
+			== SuperSLMCore::ESaveLayer1Check::Layer1Mismatch)
+#else
 		if (Contents.Layer1Tag != CompiledTag)
+#endif
 		{
 			LastLifecycleRequestError = FString::Printf(
 				TEXT("Layer1Mismatch: the blob was saved by a build pinned to Layer 1 %s, and this build is pinned to Layer 1 %s; saves do not carry across a change of pin"),
@@ -8939,9 +8958,14 @@ bool FSuperSLMSelfCheckAccess::BeginGeneration(USuperSLMGpuSubsystem& Gpu, ESupe
 		OutError = Gpu.GetLastLifecycleRequestError();
 		return false;
 	}
-	// Enough ticks for the finest slicing, a whole K of latency per token, and every token.
+	// Enough ticks for the finest slicing, a whole K of latency per token, and every token, prompt
+	// tokens included: the composed path slices each prompt token like a decode token, so at one
+	// layer per slice a prompt token costs NumHiddenLayers ticks too. The prompt term was missing
+	// before, and a small K hid the gap only while K's own slack covered the prompt: at K = 1 (a
+	// whole-token configuration) the one-layer run ran out of ticks before it finished.
 	// D-SLM7803 (T-3006 N5): every term summed in int64, so no int32 sum over K or MaxNewTokens can overflow.
-	OutMaxTicks = (static_cast<int64>(MaxNewTokens) + 2) * (static_cast<int64>(Gpu.State->NumHiddenLayers) + static_cast<int64>(Gpu.State->Config.K) + 2) + 64;
+	OutMaxTicks = (static_cast<int64>(Prompt.Num()) + static_cast<int64>(MaxNewTokens) + 2)
+		* (static_cast<int64>(Gpu.State->NumHiddenLayers) + static_cast<int64>(Gpu.State->Config.K) + 2) + 64;
 	OutSequence = Seq;
 	bKeep = true;
 	return true;
@@ -10166,3 +10190,8 @@ ESuperSLMRestoreResult FSuperSLMPagedGpuTestSeam::RestoreFailureResult(SslmGpuSt
 	return SuperSLMGpuStatusMapping::ToRestoreFailureResult(Status, bPooled, bSchemaCrossCheckFailed);
 }
 #endif // WITH_DEV_AUTOMATION_TESTS
+
+#if SUPERSLM_WITH_PREFIX_CACHE
+// Precache U6 wiring edit 5: the GPU prefix-cache method bodies, after the GPU guard (SuperSLMGpuSubsystemPrefixCache.h).
+#include "SuperSLMGpuSubsystemPrefixCache.inl"
+#endif

@@ -8,8 +8,11 @@ the game thread, and gives the same answer to the same prompt every time.
 It needs no server, API key or internet connection. The model ships with your game as an Unreal
 asset, and the plugin schedules its work around your frame.
 
-> **Status: 1.2.** Released; built and tested on Windows x64. 1.2 adds an optional shared page pool
-> for sequence memory, off unless you turn it on ([Paging](docs/PAGING.md)). Performance tuning is the
+> **Status: 1.3.** Released; built and tested on Windows x64. 1.3 adds a prefix cache with cooked prefix
+> sets ([The prefix cache](docs/ARCHITECTURE.md#the-prefix-cache)) and skip-ahead for schema-bound
+> generations ([Skip-ahead](docs/ARCHITECTURE.md#skip-ahead-for-schema-bound-generations)), both on the CPU
+> backend and off unless you turn them on. 1.2 added an optional shared page pool for sequence memory
+> ([Paging](docs/PAGING.md)). Performance tuning is the
 > current focus: expect generation to take many frames, and measure on your own target hardware before
 > you design around it. What 1.0 covers and does not cover is in [What 1.0 covers](docs/STATUS.md);
 > the [changelog](CHANGELOG.md) has what changed since.
@@ -56,7 +59,7 @@ adapter merged in. A LoRA merged into its own `.sslm` file is also supported. Se
 The **CPU backend** runs inference on the plugin's own worker threads and sizes each job to a time
 budget you set. The **GPU backend** (D3D12, Windows) splits each token into slices of whole
 transformer layers and issues a set number of layers per frame, so you decide how much GPU work a
-frame carries. Neither backend runs inference on the game thread.
+frame carries. By default it runs a whole token per frame. Neither backend runs inference on the game thread.
 
 ### Deterministic
 
@@ -118,7 +121,7 @@ Query = USuperSLMQuery::CreateQuery(this, Model, Error);   // keep Query in a UP
 
 FSuperSLMQueryConfig Config;
 Config.Backend = ESuperSLMBackendBP::GPU;      // or CPU
-Config.FrameBudgetLayers = 4;                  // layers of work per frame
+Config.FrameBudgetLayers = 0;                  // 0 (the default): a whole token per frame
 Config.StopTokenIds = { 151645, 151643 };      // end of turn / end of text for Qwen2.5
 
 Query->BeginQuery(TEXT("<|im_start|>user\nWhat do you sell?<|im_end|>\n<|im_start|>assistant\n"),
@@ -132,6 +135,8 @@ if (Query->TickQuery(DeltaSeconds, bSucceeded, Readout, Error) && bSucceeded)
     ShowSpeechBubble(Readout.VoicedReply);
 }
 ```
+
+Heavier scenes can set `FrameBudgetLayers` to 4 to 12 layers per frame, to spend less GPU time per frame.
 
 [Getting Started](docs/GETTING_STARTED.md) covers the full setup and the lower-level API
 (sequences, schemas, adapters, save and restore).
@@ -158,7 +163,7 @@ model. See [Assets and Import](docs/ASSETS_AND_IMPORT.md).
 
 SuperSLM is the engine-independent runtime: the `.sslm` format, the converter, the inference kernels,
 constrained decoding and the determinism guarantee. This plugin builds SuperSLM's sources, vendored
-unmodified at a pinned release tag (currently `v1.9.0`), with the engine's own toolchain. Nothing is
+unmodified at a pinned release tag (currently `v1.15.0`), with the engine's own toolchain. Nothing is
 downloaded at build time and no prebuilt library is used. For the runtime's internals, see the
 [SuperSLM repository](https://github.com/dansupergameprogrammer/SuperSLM).
 
@@ -169,7 +174,7 @@ Measured with 1.2 in a packaged Development build of the example on one machine 
 three runs. The query reads 123 prompt tokens (41 for the order, 82 for the reply, which includes
 the order) and generates 35 (a 28-token JSON order, then a 7-token reply).
 
-| | CPU backend | CPU backend, threaded generation | GPU, 4 layers per frame | GPU, 8 layers per frame | GPU, 12 layers per frame | GPU, whole token (24 layers) per frame |
+| | CPU backend | CPU backend, threaded generation (opt-in) | GPU, 4 layers per frame | GPU, 8 layers per frame | GPU, 12 layers per frame | GPU, whole token (24 layers) per frame |
 |---|---|---|---|---|---|---|
 | Potion-shop query (order plus reply), start to answer | about 4.1 s (238 to 256 frames) | about 3.6 s (217 to 218 frames) | about 15.8 s (946 to 949 frames) | about 8.0 s (481 frames) | about 5.4 s (326 frames) | about 2.8 s (171 frames) |
 | Reading the 123 prompt tokens, to each first token | about 2.6 s, about 47 tokens per second | about 2.5 s, about 50 tokens per second | about 12.5 s, about 10 tokens per second | about 6.4 s, about 19 tokens per second | about 4.3 s, about 28 tokens per second | about 2.3 s, about 54 tokens per second |
@@ -179,7 +184,10 @@ the order) and generates 35 (a 28-token JSON order, then a 7-token reply).
 The answers are the same tokens in every column, and the same as 1.0 gave. These rates are set by
 the frame rate as much as by the hardware. The GPU backend runs one slice per frame, so at 60 frames
 per second it handles at most 60 × layers per frame ÷ 24 tokens per second: 10, 20, 30 and 60 at
-4, 8, 12 and 24 layers, which is what it reached in generation. The example's Thinking/Frame Budget control trades GPU time
+4, 8, 12 and 24 layers, which is what it reached in generation. The example project now runs a
+whole token per frame by default (the last column): on this machine it answered in about 2.8 s,
+171 frames in 2,834 ms, which is the 60 fps cap's rate on average. Per-frame times were not recorded
+in these runs. The example's Thinking/Frame Budget control trades GPU time
 per frame for that rate. On the CPU, prompts are read in chunks of 8 tokens (the two prompts took
 about 6.2 s in 1.0, against 9.6 s for the whole query), and each generated token's job takes about
 three frames. Threaded generation (`bParallelDecode` in the runtime config, or

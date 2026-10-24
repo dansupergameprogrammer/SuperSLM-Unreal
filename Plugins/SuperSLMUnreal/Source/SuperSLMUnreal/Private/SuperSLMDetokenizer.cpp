@@ -3,6 +3,7 @@
 #include "SuperSLMModel.h"
 #include "SuperSLMRuntimeRegistry.h"
 #include "SuperSLMStatusMapping.h"
+#include "SuperSLMTokenizeTestSeam.h"
 
 #include "superslm/sslm_abi.h"
 
@@ -88,10 +89,16 @@ bool SuperSLM::TokenizeText(
 	int32 Count = Utf8.Length() + 16;
 	OutTokens.SetNumUninitialized(Count);
 	const char* Text = reinterpret_cast<const char*>(Utf8.Get());
+#if WITH_DEV_AUTOMATION_TESTS
+	SuperSLMTokenizeTestSeam::CountCall(SuperSLMTokenizeTestSeam::ESite::TokenizeText); // cell 7.20's counter
+#endif
 	sslm_status Status = sslm_tokenize(Mapping, Text, OutTokens.GetData(), &Count);
 	if (Status == SSLM_BUFFER_TOO_SMALL)
 	{
 		OutTokens.SetNumUninitialized(Count);
+#if WITH_DEV_AUTOMATION_TESTS
+		SuperSLMTokenizeTestSeam::CountCall(SuperSLMTokenizeTestSeam::ESite::TokenizeText);
+#endif
 		Status = sslm_tokenize(Mapping, Text, OutTokens.GetData(), &Count);
 	}
 	SuperSLMRuntime::ReleaseModelMapping(Mapping);

@@ -14,6 +14,7 @@
 // USuperSLMSubsystem::GetGeneratedTokens() with no conversion step ("tokens equal the CPU
 // backend's for the same session").
 #include "SuperSLMSequenceTypes.h"
+#include "SuperSLMPrefixCacheTypes.h" // the prefix cache's types (forward-declared unless the switch is on)
 #include "SuperSLMPagedKvTypes.h" // ESuperSLMPrefixResult, FSuperSLMKvPageStats (plugin paging plan §3.6)
 #include "SuperSLMSaveRestoreTypes.h"
 #include "SuperSLMSlotGates.h"
@@ -510,6 +511,20 @@ public:
 	ESuperSLMPrefixPhase GetPrefixPhase(const FSuperSLMPrefix& Prefix) const;
 	int32 GetLivePrefixCount() const;
 
+	// --- The prefix cache's GPU instance: declared for plugin 1.4.0, NOT available in 1.3.0. Every call below refuses
+	// NotConfigured in 1.3.0 (RequestPrefix says why; the others read Invalid, false or an unconfigured snapshot), and
+	// ConfigurePrefixCache() has no effect. In 1.3.0 the prefix cache is CPU-only (USuperSLMSubsystem). The calls exist
+	// only in a build with SUPERSLM_WITH_PREFIX_CACHE on (SuperSLMPrefixCacheTypes.h; SuperSLMGpuSubsystemPrefixCache.inl).
+	// In 1.4.0 they are to serve pooled sequences, keyed by the adapter's vendor and device. ---
+
+	// 1.4.0: applied at the next Configure(); BudgetBytes 0 (the default) configures no cache. 1.3.0: no effect.
+	void ConfigurePrefixCache(const FSuperSLMGpuPrefixCacheSettings& Settings);
+	bool RequestPrefix(const FSuperSLMPrefixSpec& Spec, FSuperSLMPrefix& OutPrefix, FString& OutError);
+	bool ReturnPrefix(const FSuperSLMPrefix& Prefix);
+	ESuperSLMPrefixSource GetPrefixSource(const FSuperSLMPrefix& Prefix) const;
+	ESuperSLMPrefixLeaseState GetPrefixLeaseState(const FSuperSLMPrefix& Prefix) const;
+	FSuperSLMPrefixCacheStats GetPrefixCacheStats() const;
+
 	// Adopts Prefix (sslm_gpu_seq_adopt_prefix) on the submission thread; draws nothing (§3.4
 	// "Adopt"). Dedicated mode: resolves UnsupportedOnGpu with the reason, like the overload above.
 	// SetSchema() after a successful adopt is refused by name.
@@ -703,6 +718,9 @@ private:
 	uint64 LastTickFrame = MAX_uint64;
 
 	FSuperSLMGpuSubsystemState* State = nullptr;
+	// ConfigurePrefixCache()'s settings, read at Configure() (step U6; null until set).
+	TSharedPtr<FSuperSLMGpuPrefixCacheSettings> PendingPrefixCacheSettings;
+	friend class FSuperSLMPrefixCacheTestSeam;
 
 	// SetFixedTickLatency()'s and SetLayersPerTick()'s shared gate: no sequence vended (a deferred
 	// return included) and no restore queued. What names the constant in OutError. Game thread.

@@ -33,6 +33,8 @@ it:
 | Lifecycle operations, queued | `ResetSequence`, `SaveSequence`, `RestoreSequence`, `AdoptPrefix`, each returning a handle |
 | Read a queued operation's result, then release its handle | `GetLifecycleOpResult`, `GetSaveResult` (which also returns the blob), `ReleaseLifecycleOpHandle` |
 | Shared prefixes | `CreatePrefix`, `GetPrefixPhase`, `IsPrefixReady`, `AdoptPrefix`, `ReleasePrefix` |
+| The prefix cache (configured by `PrefixCacheBudgetBytes`) | `RequestPrefix`, `ReturnPrefix`, `GetPrefixSource`, `GetPrefixLeaseState`, `GetPrefixCacheStats`; `WarmPrefix`, `DropPrefix`, `GetPrefixOpResult`; `RegisterPrefixSet`, `UnregisterPrefixSet` |
+| Skip-ahead for a schema-bound generation | `FSuperSLMGenerationRequest::SchemaJumpForward` (`Off`, `Exact`, `Canonical`) on `BeginGeneration` |
 | Diagnostics (timings, tick reports, pool and memory counts) | `GetLastTickReport`, `GetTickHistory`, `GetJobLedger`, `GetTokensPerSecond`, `GetTimeToFirstTokenMs`, `GetPoolFreeCount` and the other `Get*` readers in the header |
 
 The GPU subsystem follows the same shape, with its own configuration
@@ -64,12 +66,27 @@ The GPU subsystem also has calls the CPU one does not:
 | Adapters and the device | `MapAdapter`, `UnmapAdapter`, `ProbeContextUsable`, `IsGpuBackendActive`, `IsDeviceHeadActive` |
 | Diagnostics | `GetLastGpuBusyMs`, `GetLastHostFinishMs`, `GetHitchCount`, `GetGpuDispatchCount` and the other `Get*` readers in the header |
 
+The GPU subsystem declares the prefix cache's calls (`ConfigurePrefixCache`, `RequestPrefix`, `ReturnPrefix`,
+`GetPrefixSource`, `GetPrefixLeaseState`, `GetPrefixCacheStats`), but in 1.3.0 they are not connected to its
+scheduler and refuse `NotConfigured`: the cache is CPU-only (see
+[ARCHITECTURE.md](ARCHITECTURE.md#the-prefix-cache)). The GPU subsystem ignores `SchemaJumpForward`.
+
 The headers in `Plugins/SuperSLMUnreal/Source/SuperSLMUnreal/Public/` are the reference for exact
 signatures.
 
 **A shared prefix** is a context (for example a common system prompt) prefilled once and then
 copied into any number of sequences, instead of being prefilled again for each one. Pool space for
 prefixes is reserved with `PrefixBlockCount`.
+
+**The prefix cache** keeps such prefixes for you, keyed by their tokens and schema. `RequestPrefix` returns a lease
+that adopts like a shared prefix once `GetPrefixPhase` reads Ready. The lease is served from memory, a cooked prefix
+set or disk, or is built by prefill, with the same tokens whichever served it. `ReturnPrefix` ends the lease and the
+prefix stays cached until it is evicted. Adopting a lease that was returned, or whose entry was evicted, is
+refused `PrefixLeaseEnded`. See [ARCHITECTURE.md](ARCHITECTURE.md#the-prefix-cache).
+
+**Skip-ahead** writes the stretches a bound schema forces in batched passes instead of one decode per token. `Exact`
+keeps the tokens and the save of `Off`; `Canonical` writes fewer, different tokens. It is per generation and CPU-only.
+See [ARCHITECTURE.md](ARCHITECTURE.md#skip-ahead-for-schema-bound-generations).
 
 ## The Blueprint surface
 
@@ -115,6 +132,9 @@ tokens match the CPU's (GPU determinism is per device; see [DETERMINISM.md](DETE
 | `ResetSequence`, `SaveSequence`, `RestoreSequence` | Queued lifecycle operations, each returning a handle. |
 | `GetLifecycleOpResult`, `GetSaveResult`, `ReleaseLifecycleOpHandle` | Read a queued operation's result (and a save's blob), then release its handle. The subsystem keeps each result until its handle is released. |
 | `CreatePrefix`, `GetPrefixPhase`, `IsPrefixReady`, `AdoptPrefix`, `ReleasePrefix` | Shared prefixes (category *SuperSLM | Prefix*). |
+| `RequestPrefix`, `ReturnPrefix`, `GetPrefixSource` | The prefix cache (category *SuperSLM | Prefix Cache*): lease a cached prefix by its tokens and schema name, end the lease, and read which tier served it (*Memory*, *Cooked*, *Disk* or *Recomputed*). `GetPrefixPhase` reads the lease's readiness, and `AdoptPrefix` adopts it. |
+| `WarmPrefix`, `DropPrefix`, `GetPrefixOpResult` | Make a prefix resident without a lease, or evict it (*Memory*, or *Memory And Disk*), for a level's load and exit. Each returns an op that resolves on a later tick. |
+| `RegisterPrefixSet`, `UnregisterPrefixSet` | Add a cooked prefix set's entries to the cache, or remove them. |
 | `GetLastTickDurationMs`, `GetHitchCount`, `GetPoolFreeCount`, `GetPoolOccupiedCount`, `GetKvPoolReservedBytes`, `GetWorkspaceReservedBytes` | Diagnostics (category *SuperSLM | Diagnostics*). |
 
 **The self-check: the Run Determinism Self-Check node** (category *SuperSLM | Diagnostics*,
@@ -133,6 +153,9 @@ Rules the surface keeps:
   the two enums keep the same numbering; no Blueprint node returns them (see the C++ results
   below).
 - **The decoding mode is not exposed**; the plugin uses greedy decoding.
+- **The prefix cache's budget and skip-ahead are C++ settings in 1.3.0.** The **Load SuperSLM Model** node has no
+  cache input, so the cache nodes work once C++ has configured the cache; no Blueprint request carries
+  `SchemaJumpForward`.
 - **No Blueprint text states GPU determinism.** In 1.0 the GPU verdict is always withheld: it
   reads *Not Yet Run*, and its scope text says it is withheld (see
   [DETERMINISM.md](DETERMINISM.md)).

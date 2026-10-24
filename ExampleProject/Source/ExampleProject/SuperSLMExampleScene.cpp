@@ -32,6 +32,7 @@
 #include "SuperSLMModel.h"
 #include "SuperSLMSubsystem.h"
 #include "SuperSLMPagingCertification.h"
+#include "SuperSLMPrefixCacheCheck.h"
 #include "UObject/SoftObjectPath.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogSuperSLMExample, Log, All);
@@ -71,7 +72,30 @@ void ASuperSLMExampleScene::BeginPlay()
 	{
 		ModelPath = GetDefaultModelPath();
 	}
+	int32 RequestedLayers = 0; // not "Layers": AActor::Layers would be hidden (C4458, a build error here)
+	if (SuperSLMExample::FrameBudgetLayersFromCommandLine(RequestedLayers))
+	{
+		LayersOverride = RequestedLayers;
+		Settings.FrameBudgetLayers = RequestedLayers;
+		UE_LOG(LogSuperSLMExample, Display, TEXT("-SuperSLMExampleLayers: the GPU Frame Budget starts at %d layers%s."),
+			RequestedLayers, RequestedLayers >= SuperSLMExample::NumHiddenLayers ? TEXT(" (whole token)") : TEXT(""));
+	}
 
+	if (SuperSLMExample::SchemaJumpForwardFromCommandLine(FCommandLine::Get(), Settings.SchemaJumpForward))
+	{
+		UE_LOG(LogSuperSLMExample, Display, TEXT("-SuperSLMExampleJumpForward: the extraction's schema jump-forward mode is %s."),
+			Settings.SchemaJumpForward == ESuperSLMSchemaJumpForward::Exact ? TEXT("exact")
+			: Settings.SchemaJumpForward == ESuperSLMSchemaJumpForward::Canonical ? TEXT("canonical") : TEXT("off"));
+	}
+
+	if (FSuperSLMPrefixCacheCheck::Active() != nullptr)
+	{
+		// The prefix-cache check's Budget leg re-entered the level: the running check keeps the model and the
+		// configured subsystem, and this scene only ticks it.
+		LoadState = ELoadState::Ready;
+		Status = TEXT("Running the packaged prefix-cache check (the level re-entered).");
+		return;
+	}
 	if (FParse::Param(FCommandLine::Get(), TEXT("SuperSLMExampleSkipLoad")))
 	{
 		LoadState = ELoadState::Skipped;
@@ -113,7 +137,9 @@ void ASuperSLMExampleScene::OnModelPackageLoaded(EAsyncLoadingResult::Type Resul
 		Status = FString::Printf(TEXT("No model asset at %s. Import the release's example .sslm there (see GETTING_STARTED.md, \"The example project\")."), *ModelPath);
 		UE_LOG(LogSuperSLMExample, Error, TEXT("%s"), *Status);
 		FString PagingBackend;
-		if (FParse::Value(FCommandLine::Get(), TEXT("SuperSLMPagingCertification="), PagingBackend)) { FPlatformMisc::RequestExitWithStatus(false, 1); }
+		FString PrefixLeg;
+		if (FParse::Value(FCommandLine::Get(), TEXT("SuperSLMPagingCertification="), PagingBackend)
+			|| FSuperSLMPrefixCacheCheck::IsRequested(PrefixLeg)) { FPlatformMisc::RequestExitWithStatus(false, 1); }
 		return;
 	}
 	UGameInstance* GameInstance = GetGameInstance();
@@ -124,6 +150,17 @@ void ASuperSLMExampleScene::OnModelPackageLoaded(EAsyncLoadingResult::Type Resul
 		LoadState = ELoadState::Failed;
 		Status = TEXT("The SuperSLM CPU subsystem is missing; is the SuperSLMUnreal plugin enabled?");
 		UE_LOG(LogSuperSLMExample, Error, TEXT("%s"), *Status);
+		FString PrefixLeg;
+		if (FSuperSLMPrefixCacheCheck::IsRequested(PrefixLeg)) { FPlatformMisc::RequestExitWithStatus(false, 1); }
+		return;
+	}
+	FString PrefixLeg;
+	if (FSuperSLMPrefixCacheCheck::IsRequested(PrefixLeg))
+	{
+		// The packaged prefix-cache check configures the CPU subsystem itself; the demo does not start.
+		FSuperSLMPrefixCacheCheck::Start(*Model, *Cpu, PrefixLeg, ModelPath);
+		LoadState = ELoadState::Ready;
+		Status = FString::Printf(TEXT("Running the packaged prefix-cache check, leg %s."), *PrefixLeg);
 		return;
 	}
 	FString PagingBackend;
@@ -259,15 +296,22 @@ bool ASuperSLMExampleScene::RequestSelfCheck()
 void ASuperSLMExampleScene::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
+	// Before the check and certification modes take the tick: they show the same scene, and without the camera
+	// as the view target the window renders black behind the status text.
+	if (!bInputConfigured)
+	{
+		ConfigureInput();
+	}
+
+	if (FSuperSLMPrefixCacheCheck* PrefixCacheCheck = FSuperSLMPrefixCacheCheck::Active())
+	{
+		PrefixCacheCheck->Tick(GetWorld(), DeltaSeconds);
+		return;
+	}
 	if (PagingCertification.IsValid())
 	{
 		PagingCertification->Tick(DeltaSeconds);
 		return;
-	}
-
-	if (!bInputConfigured)
-	{
-		ConfigureInput();
 	}
 
 	if (Demo.IsValid())
@@ -357,7 +401,7 @@ void ASuperSLMExampleScene::AdvancePackagedCheck()
 		return;
 	}
 
-	FSuperSLMExampleSettings Defaults; // the check runs at the default settings
+	FSuperSLMExampleSettings Defaults = PackagedCheckSettings(); // the default settings, or -SuperSLMExampleLayers
 	FString Error;
 	switch (PackagedCheckStep)
 	{
@@ -532,10 +576,22 @@ void ASuperSLMExampleScene::FinishPackagedCheck()
 		AddCheck(TEXT("d.gpu_busy_ms_per_slice_reported"), bSamplesValid,
 			FString::Printf(TEXT("%d samples, one per frame that issued GPU work"), GpuRun->GpuBusyMsSamples.Num()));
 		AddCheck(TEXT("d.host_finish_ms_reported"), GpuRun->HostFinishMs > 0.0, FString::Printf(TEXT("%.3f ms"), GpuRun->HostFinishMs));
-		const FSuperSLMExampleSettings Defaults;
-		AddCheck(TEXT("d.at_default_setting"), GpuRun->Settings.FrameBudgetLayers == Defaults.FrameBudgetLayers
-				&& GpuRun->Settings.ConcurrentQueries == Defaults.ConcurrentQueries && GpuRun->Settings.RequestedK == Defaults.RequestedK,
-			SuperSLMExample::SettingsDescription(GpuRun->Settings));
+		// With -SuperSLMExampleLayers the run is not at the default: d.at_default_setting is replaced by
+		// d.at_requested_setting, and the report's at_default_setting is false.
+		const FSuperSLMExampleSettings Requested = PackagedCheckSettings();
+		const bool bAtRequested = GpuRun->Settings.FrameBudgetLayers == Requested.FrameBudgetLayers
+			&& GpuRun->Settings.ConcurrentQueries == Requested.ConcurrentQueries && GpuRun->Settings.RequestedK == Requested.RequestedK;
+		// -SuperSLMExampleLayers=0 or =24 asks for the default itself, and reports as the default.
+		const bool bAtDefault = IsAtDefaultLayers();
+		FString Note;
+		if (LayersOverride > 0)
+		{
+			Note = bAtDefault
+				? FString(TEXT(" (-SuperSLMExampleLayers: the default, a whole token)"))
+				: FString::Printf(TEXT(" (-SuperSLMExampleLayers=%d; not the default, a whole token)"), LayersOverride);
+		}
+		AddCheck(bAtDefault ? TEXT("d.at_default_setting") : TEXT("d.at_requested_setting"), bAtRequested,
+			SuperSLMExample::SettingsDescription(GpuRun->Settings) + Note);
 		AddCheck(TEXT("d.scene_rendering"), FApp::CanEverRender() && bSetBuilt && GEngine != nullptr && GEngine->GameViewport != nullptr,
 			FApp::CanEverRender() ? TEXT("rendering, example set built, game viewport present") : TEXT("this process cannot render (-nullrhi or a server)"));
 	}
@@ -559,6 +615,16 @@ void ASuperSLMExampleScene::FinishPackagedCheck()
 	Root->SetStringField(TEXT("build_configuration"), LexToString(FApp::GetBuildConfiguration()));
 	Root->SetBoolField(TEXT("cooked"), FPlatformProperties::RequiresCookedData());
 	Root->SetStringField(TEXT("model_path"), ModelPath);
+	Root->SetNumberField(TEXT("frame_budget_layers_default"), SuperSLMExample::DefaultFrameBudgetLayers);
+	Root->SetBoolField(TEXT("at_default_setting"), IsAtDefaultLayers());
+	if (LayersOverride > 0)
+	{
+		Root->SetNumberField(TEXT("frame_budget_layers_override"), LayersOverride);
+	}
+	if (IConsoleVariable* MaxFps = IConsoleManager::Get().FindConsoleVariable(TEXT("t.MaxFPS")))
+	{
+		Root->SetNumberField(TEXT("max_fps"), MaxFps->GetFloat());
+	}
 	if (Model != nullptr)
 	{
 		Root->SetNumberField(TEXT("model_bytes"), static_cast<double>(Model->GetMappedArtifactSize()));
@@ -608,6 +674,27 @@ void ASuperSLMExampleScene::FinishPackagedCheck()
 			Samples.Add(MakeShared<FJsonValueNumber>(V));
 		}
 		O->SetArrayField(TEXT("gpu_busy_ms_samples"), Samples);
+		{
+			// The engine's frame time over the query: every frame from Ask to the answer.
+			const SuperSLMExample::FFrameTimeSummary& T = Run.FrameTime;
+			TSharedRef<FJsonObject> FT = MakeShared<FJsonObject>();
+			FT->SetNumberField(TEXT("frames"), T.Frames);
+			FT->SetNumberField(TEXT("p50"), T.P50Ms);
+			FT->SetNumberField(TEXT("p95"), T.P95Ms);
+			FT->SetNumberField(TEXT("p99"), T.P99Ms);
+			FT->SetNumberField(TEXT("max"), T.MaxMs);
+			FT->SetNumberField(TEXT("cap_period_ms"), T.CapPeriodMs);
+			FT->SetNumberField(TEXT("missed_frames"), T.MissedFrames);
+			FT->SetNumberField(TEXT("missed_frame_threshold_ms"), T.CapPeriodMs + SuperSLMExample::MissedFrameToleranceMs);
+			FT->SetNumberField(TEXT("frames_over_20_ms"), T.FramesOverLongFrame);
+			O->SetObjectField(TEXT("frame_ms"), FT);
+			TArray<TSharedPtr<FJsonValue>> FrameSamples;
+			for (double V : Run.FrameMsSamples)
+			{
+				FrameSamples.Add(MakeShared<FJsonValueNumber>(V));
+			}
+			O->SetArrayField(TEXT("frame_ms_samples"), FrameSamples);
+		}
 		TArray<TSharedPtr<FJsonValue>> Figures;
 		for (const FSuperSLMExampleFigure& F : Run.Figures)
 		{
@@ -634,4 +721,19 @@ void ASuperSLMExampleScene::FinishPackagedCheck()
 	{
 		FPlatformMisc::RequestExitWithStatus(false, bPass ? 0 : 1, TEXT("SuperSLMExample.PackagedCheck"));
 	}
+}
+
+FSuperSLMExampleSettings ASuperSLMExampleScene::PackagedCheckSettings() const
+{
+	FSuperSLMExampleSettings Out;
+	if (LayersOverride > 0)
+	{
+		Out.FrameBudgetLayers = LayersOverride;
+	}
+	return Out;
+}
+
+bool ASuperSLMExampleScene::IsAtDefaultLayers() const
+{
+	return LayersOverride <= 0 || LayersOverride == SuperSLMExample::DefaultFrameBudgetLayers;
 }

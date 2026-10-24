@@ -8,6 +8,10 @@
 #include "Framework/Docking/TabManager.h"
 #include "SSuperSLMQueryWindow.h"
 #include "SuperSLMEditorRuntimeHost.h"
+#include "SuperSLMPrefixCacheTypes.h"
+#if SUPERSLM_WITH_PREFIX_CACHE
+#include "SuperSLMPrefixSetEditor.h"
+#endif
 #include "Widgets/Docking/SDockTab.h"
 #include "WorkspaceMenuStructure.h"
 #include "WorkspaceMenuStructureModule.h"
@@ -40,6 +44,10 @@ public:
 		TSharedRef<FAssetTypeActions_SuperSLMModel> Actions = MakeShared<FAssetTypeActions_SuperSLMModel>(RuntimeHost);
 		AssetTools.RegisterAssetTypeActions(Actions);
 		RegisteredAssetTypeActions = Actions;
+#if SUPERSLM_WITH_PREFIX_CACHE
+		// Precache plan §5.8: the prefix set's asset type, its Build Prefixes action and the cook hook.
+		SuperSLMPrefixSetEditor::Register();
+#endif
 
 		FGlobalTabmanager::Get()->RegisterNomadTabSpawner(kSuperSLMQueryWindowTabId,
 				FOnSpawnTab::CreateRaw(this, &FSuperSLMUnrealEditorModule::SpawnQueryWindowTab))
@@ -55,6 +63,9 @@ public:
 			FGlobalTabmanager::Get()->UnregisterNomadTabSpawner(kSuperSLMQueryWindowTabId);
 		}
 		RuntimeHost.Reset(); // an open window keeps its own reference; the last one unloads
+#if SUPERSLM_WITH_PREFIX_CACHE
+		SuperSLMPrefixSetEditor::Unregister();
+#endif
 		if (FModuleManager::Get().IsModuleLoaded("AssetTools"))
 		{
 			IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get();

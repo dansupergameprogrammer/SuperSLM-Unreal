@@ -115,10 +115,10 @@ def test_local_tool_delta_is_manifested_and_disclosed():
         committed_contents[rel] = contents
         assert hashlib.sha256(contents).hexdigest() == entries[rel], rel
         assert name in version, f"local tool repair is not disclosed: {name}"
-    assert "Commit: d697927f6d5ce5fa73ecbb8660020a425518b923" in version
-    assert "Base release commit: d697927f6d5ce5fa73ecbb8660020a425518b923" in version
-    assert "Release status: published release v1.13.1" in version
-    assert "sslm_gpu_kv_pool_max_page_count" in version
+    assert "Commit: 165962acafe901753dfe37153d7116b132a18b5a" in version
+    assert "Base release commit: 165962acafe901753dfe37153d7116b132a18b5a" in version
+    assert "Release status: published release v1.15.0" in version
+    assert "sslm_seq_jump_forward" in version
     architecture = (REPO / "RepoDrafts" / "SuperSLMUnreal" / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
     assert "Five route-P witness tool files carry" in architecture
     assert "a tracked hook-API adaptation" in architecture
@@ -167,10 +167,18 @@ _ESTIMATE_STALE = ("otherwise idle", "refuses to report", "verified-idle", "[bPa
 _EXEC_CMDS = re.compile(r'"-ExecCmds=([^"]*)"')
 
 
-def _changelog_top_section(changelog: str) -> str:
-    """The topmost release section: from the first '## ' heading to the next one (D-SLM8168)."""
-    parts = re.split(r"(?m)^## ", changelog)
-    return parts[1].split("\n## ", 1)[0] if len(parts) > 1 else ""
+# D-SLM8168 read the topmost release section because D4 was to ride the next, then unnumbered,
+# release. It shipped as 1.2.0, so the pin reads that section; a later section on top of it
+# (an Unreleased section) no longer moves what is pinned.
+_D4_RELEASE = "1.2.0"
+
+
+def _changelog_d4_section(changelog: str) -> str:
+    """The release section D4 shipped in: from its '## 1.2.0' heading to the next '## ' heading."""
+    for part in re.split(r"(?m)^## ", changelog)[1:]:
+        if part.split(None, 1)[0] == _D4_RELEASE:
+            return part.split("\n## ", 1)[0]
+    return ""
 
 
 def _estimate_docs_problems(guides: dict[str, str], changelog: str) -> list[str]:
@@ -200,10 +208,10 @@ def _estimate_docs_problems(guides: dict[str, str], changelog: str) -> list[str]
             problems.append("TOOLING.md's -ExecCmds artifact path uses unsupported apostrophe quoting")
         if ";" in body or ",Quit" in body or not body.rstrip().endswith(",QUIT_EDITOR"):
             problems.append(f"TOOLING.md's -ExecCmds example must separate commands with ',' and end ',QUIT_EDITOR': {body}")
-    top = _changelog_top_section(changelog)
+    top = _changelog_d4_section(changelog)
     for text in ("SuperSLM.CalibrateCosts", "SuperSLM.EstimateCosts", "15.023"):
         if text not in top:
-            problems.append(f"CHANGELOG.md's topmost release section lacks {text!r}")
+            problems.append(f"CHANGELOG.md's {_D4_RELEASE} release section lacks {text!r}")
     return problems
 
 
@@ -231,7 +239,8 @@ def test_estimate_docs_check_refuses_each_stale_or_missing_claim():
         "docs/STATUS.md": "Per-mode LayerCostMs 1.397 and 0.906.\n",
         "CONTRIBUTING.md": "| `SUPERSLM_BUILD_LOCK` | the estimate reports the lock's state |\n",
     }
-    changelog = ("# Changelog\n\n## Unreleased\n\n- Removed `SuperSLM.CalibrateCosts`; added `SuperSLM.EstimateCosts`. "
+    changelog = ("# Changelog\n\n## Unreleased\n\n- `--save` writes only the chosen setting.\n\n"
+                 "## 1.2.0 - 2026-10-19\n\n- Removed `SuperSLM.CalibrateCosts`; added `SuperSLM.EstimateCosts`. "
                  "Mode-0 BatchedPromptTokenCostMs 15.023.\n\n## 1.0.0\n\n- `SuperSLM.CalibrateCosts`\n")
     assert _estimate_docs_problems(guides, changelog) == []
 
@@ -260,6 +269,7 @@ def test_estimate_docs_check_refuses_each_stale_or_missing_claim():
         "CHANGELOG lacks the removal": (guides, changelog.replace("Removed `SuperSLM.CalibrateCosts`; ", "")),
         "CHANGELOG lacks the estimate": (guides, changelog.replace("added `SuperSLM.EstimateCosts`. ", "")),
         "CHANGELOG lacks 15.023": (guides, changelog.replace("15.023", "15.025")),
+        "CHANGELOG has no 1.2.0 section": (guides, changelog.replace("## 1.2.0 - ", "## 1.2.1 - ")),
     }
     for name, (mutant_guides, mutant_changelog) in mutants.items():
         assert _estimate_docs_problems(mutant_guides, mutant_changelog), f"the docs check accepted the {name} mutant"

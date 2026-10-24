@@ -281,14 +281,24 @@ bool FSuperSLMSlice1PFloorSeamTest::RunTest(const FString& Parameters)
 		bOk &= TestEqual(TEXT("1000 ms, depth 0, cheaper batched pair: the largest C whose batched price fits"),
 			FSuperSLMSchedulingTestAccess::PlanPrefillChunk(64, 0, Share, Cheap), Expected);
 		// Preserve the S1P-C regression with its actual input pair. D4's measured mode-0
-		// profile is a different input and must independently stop at 46.
+		// profile is a different input and must independently stop at 46, and the mode-1 profile (the
+		// opt-in threaded mode's) at 44. Mode and task count are set explicitly, so a saved
+		// RuntimeSettings.ini or a process selection cannot move either arm.
 		FSuperSLMRuntimeConfig S1PC = Default;
 		SuperSLMConfigAccess::SetCost(S1PC, TEXT("BatchedPromptTokenCostMs"), 15.75);
 		SuperSLMConfigAccess::SetCost(S1PC, TEXT("BatchedPromptTokenCostPerPositionMs"), 0.0046);
 		bOk &= TestEqual(TEXT("1000 ms, depth 0, S1P-C pairs: 44"),
 			FSuperSLMSchedulingTestAccess::PlanPrefillChunk(64, 0, Share, S1PC), 44);
+		FSuperSLMRuntimeConfig ModeOff = Default;
+		SuperSLMConfigAccess::SetMode(ModeOff, false);
+		SuperSLMConfigAccess::SetTasks(ModeOff, 4);
 		bOk &= TestEqual(TEXT("1000 ms, depth 0, D4 mode-0 pairs: 46"),
-			FSuperSLMSchedulingTestAccess::PlanPrefillChunk(64, 0, Share, Default), 46);
+			FSuperSLMSchedulingTestAccess::PlanPrefillChunk(64, 0, Share, ModeOff), 46);
+		FSuperSLMRuntimeConfig ModeOn = Default;
+		SuperSLMConfigAccess::SetMode(ModeOn, true);
+		SuperSLMConfigAccess::SetTasks(ModeOn, 4); // effective mode 1 needs more than one task
+		bOk &= TestEqual(TEXT("1000 ms, depth 0, D4 mode-1 pairs: 44"),
+			FSuperSLMSchedulingTestAccess::PlanPrefillChunk(64, 0, Share, ModeOn), 44);
 	}
 
 	// Left below 8: the floor is min(MinPrefillChunk, MaxChunk).

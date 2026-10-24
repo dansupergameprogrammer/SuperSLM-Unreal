@@ -1,8 +1,9 @@
 #include "SuperSLMResidencyCore.h"
 
 #include <algorithm>
-#include <deque>
 #include <map>
+#include <set>
+#include <utility>
 
 namespace SuperSLMCore
 {
@@ -16,10 +17,39 @@ namespace SuperSLMCore
 			bool bKeyed = false;
 			EResidencyState State = EResidencyState::Unadmitted;
 			uint64_t ChargedBytes = 0;  // InFlight, Resident, Releasing
-			uint64_t WaitingBytes = 0;  // Waiting: the peak it is owed
 			uint64_t LastTouch = 0;     // larger is more recent
 			std::array<uint32_t, kResidencyPinCount> Pins{};
 			std::vector<int64_t> Leases; // Live leases attached to it
+
+			// Waiting: the peak it is owed, the free charge it took, its arrival, and its claims
+			// (pending refund's entry, bytes).
+			uint64_t PeakBytes = 0;
+			uint64_t WaitHeldBytes = 0;
+			uint64_t Arrival = 0;
+			std::vector<std::pair<uint64_t, uint64_t>> ClaimsOn; // (refund serial, bytes)
+
+			// Nested entries: the parent whose full pages it shares (kept after its release is
+			// reported while descendants' releases are still pending: the family needs the ancestry),
+			// and the parent its charge decision pinned (ChildOp) until it settles or returns.
+			FResidencyEntryId Parent = kInvalidResidencyEntry;
+			FResidencyEntryId PinnedParent = kInvalidResidencyEntry;
+			bool bGhost = false;    // holds a ghost charge (Releasing or Ghost)
+			uint64_t GhostBytes = 0;
+			bool bMarked = false;   // a deferred drop's mark (inert here)
+		};
+
+		// One pending refund (precache plan §5.11 (a)): an evicted entry's own charge, or an ended
+		// ghost's. It completes when Family -- the pending releases among its entry's own handle and its
+		// descendants' handles -- is empty, and stays claimable until then.
+		struct FRefund
+		{
+			FResidencyKind Kind = 0;
+			FResidencyLedgerId LedgerId = kResidencyLedgerHostRam;
+			uint64_t Bytes = 0;
+			uint64_t UnclaimedBytes = 0;
+			std::vector<std::pair<FResidencyEntryId, uint64_t>> Claims; // (waiter, bytes)
+			std::set<FResidencyEntryId> Family;                         // releases not yet reported
+			bool bGhostRefund = false;                                  // an ended ghost's charge
 		};
 
 		struct FLease
@@ -31,8 +61,6 @@ namespace SuperSLMCore
 		struct FLedgerState
 		{
 			FResidencyLedger Ledger;
-			std::deque<FResidencyEntryId> Waiting; // FIFO
-			uint64_t OwedBytes = 0;                // the Waiting entries' peaks
 		};
 
 		uint32_t KindCount;
@@ -41,14 +69,18 @@ namespace SuperSLMCore
 		std::map<FResidencyEntryId, FEntry> Entries;
 		std::map<std::pair<FResidencyKind, FResidencyKey>, FResidencyEntryId> ByKey;
 		std::map<int64_t, FLease> Leases;
+		std::map<uint64_t, FRefund> Refunds; // by serial: oldest decision first
 		std::vector<FResidencyEntryId> Evicted;
 		std::vector<FResidencyEntryId> Admitted;
 		FResidencyEntryId NextEntryId = 1; // never reset, so an id is never reused
 		uint64_t TouchSerial = 0;
+		uint64_t RefundSerial = 0;
+		uint64_t ArrivalSerial = 0;
 		uint64_t Evictions = 0;
 		uint64_t BudgetExhausted = 0;
 		uint64_t Deferred = 0;
 		uint64_t LeasesMinted = 0;
+		uint64_t GhostEndings = 0;
 
 		FImpl(uint32_t InKindCount, const FResidencyHandleCounter& InCounter)
 			: KindCount(InKindCount), HandleCounter(InCounter)
@@ -135,16 +167,222 @@ namespace SuperSLMCore
 			return Ids;
 		}
 
+		// --- Nested entries --------------------------------------------------------------------------
+
+		// True when Ancestor is reached walking Id's parent links (Id itself excluded).
+		bool IsDescendant(FResidencyEntryId Id, FResidencyEntryId Ancestor) const
+		{
+			size_t Hops = 0;
+			for (auto It = Entries.find(Id); It != Entries.end() && Hops <= Entries.size(); ++Hops)
+			{
+				const FResidencyEntryId Up = It->second.Parent;
+				if (Up == kInvalidResidencyEntry)
+				{
+					return false;
+				}
+				if (Up == Ancestor)
+				{
+					return true;
+				}
+				It = Entries.find(Up);
+			}
+			return false;
+		}
+
+		// A Resident entry still shares Id's pages (§5.4: a grandchild holds the grandparent's too).
+		bool HasCachedDescendant(FResidencyEntryId Id) const
+		{
+			for (const auto& Pair : Entries)
+			{
+				if (Pair.first != Id && Pair.second.State == EResidencyState::Resident && IsDescendant(Pair.first, Id))
+				{
+					return true;
+				}
+			}
+			return false;
+		}
+
+		// Every pending release among Id's own handle and its descendants' handles.
+		std::set<FResidencyEntryId> FamilyOf(FResidencyEntryId Id) const
+		{
+			std::set<FResidencyEntryId> Family;
+			for (const auto& Pair : Entries)
+			{
+				if (Pair.second.State == EResidencyState::Releasing && (Pair.first == Id || IsDescendant(Pair.first, Id)))
+				{
+					Family.insert(Pair.first);
+				}
+			}
+			return Family;
+		}
+
+		void AddRefund(const FEntry& Entry, uint64_t Bytes, std::set<FResidencyEntryId> Family)
+		{
+			FRefund& R = Refunds[++RefundSerial];
+			R.Kind = Entry.Kind;
+			R.LedgerId = Entry.LedgerId;
+			R.Bytes = Bytes;
+			R.UnclaimedBytes = Bytes;
+			R.Family = std::move(Family);
+			FResidencyLedger& L = LedgerOf(Entry).Ledger;
+			L.ReleasingBytes += Bytes;
+			L.ReleasingEntries += 1;
+		}
+
+		// Erases an entry; children that still name it are linked to its parent, so the ancestry a
+		// pending family needs survives the release of an entry in the middle of a chain.
+		void EraseEntry(FResidencyEntryId Id)
+		{
+			const auto It = Entries.find(Id);
+			if (It == Entries.end())
+			{
+				return;
+			}
+			const FResidencyEntryId Up = It->second.Parent;
+			for (auto& Pair : Entries)
+			{
+				if (Pair.second.Parent == Id)
+				{
+					Pair.second.Parent = Up;
+				}
+			}
+			Entries.erase(It);
+		}
+
+		// The ghost of P ends (its last cached descendant was just evicted): its charge becomes a pending
+		// refund of its own, whose family is P's own release (if pending) and its descendants'.
+		void EndGhost(FResidencyEntryId P)
+		{
+			FEntry& Ghost = Entries[P];
+			FResidencyLedger& L = LedgerOf(Ghost).Ledger;
+			L.GhostBytes -= Ghost.GhostBytes;
+			L.GhostEntries -= 1;
+			const uint64_t Bytes = Ghost.GhostBytes;
+			Ghost.bGhost = false;
+			Ghost.GhostBytes = 0;
+			++GhostEndings;
+			AddRefund(Ghost, Bytes, FamilyOf(P));
+			Refunds[RefundSerial].bGhostRefund = true;
+			if (Ghost.State == EResidencyState::Ghost)
+			{
+				EraseEntry(P); // its own release was already reported: nothing of it remains
+			}
+		}
+
 		void ToReleasing(FResidencyEntryId Id, FEntry& Entry)
 		{
 			FResidencyLedger& L = LedgerOf(Entry).Ledger;
 			L.ResidentBytes -= Entry.ChargedBytes;
 			L.ResidentEntries -= 1;
-			L.ReleasingBytes += Entry.ChargedBytes;
-			L.ReleasingEntries += 1;
 			Entry.State = EResidencyState::Releasing;
 			Unkey(Entry);
 			Evicted.push_back(Id);
+			if (HasCachedDescendant(Id))
+			{
+				// §5.4: its pages stay, held by cached descendants; its whole charge stays as a ghost.
+				Entry.bGhost = true;
+				Entry.GhostBytes = Entry.ChargedBytes;
+				L.GhostBytes += Entry.ChargedBytes;
+				L.GhostEntries += 1;
+				return;
+			}
+			AddRefund(Entry, Entry.ChargedBytes, FamilyOf(Id));
+			// A descendant leaving the cache may end ghosts above it, nearest first.
+			FResidencyEntryId Up = Entry.Parent;
+			for (size_t Hops = 0; Up != kInvalidResidencyEntry && Hops <= Entries.size(); ++Hops)
+			{
+				const auto It = Entries.find(Up);
+				if (It == Entries.end())
+				{
+					break;
+				}
+				const FResidencyEntryId Next = It->second.Parent;
+				if (It->second.bGhost && !HasCachedDescendant(Up))
+				{
+					EndGhost(Up);
+				}
+				Up = Next;
+			}
+		}
+
+		// Claims up to Lack bytes of a pending refund for Waiter; returns what it took.
+		uint64_t Claim(uint64_t Serial, FResidencyEntryId Waiter, uint64_t Lack, std::vector<std::pair<uint64_t, uint64_t>>& OutClaims)
+		{
+			FRefund& R = Refunds[Serial];
+			const uint64_t Amount = (std::min)(R.UnclaimedBytes, Lack);
+			if (Amount != 0)
+			{
+				R.UnclaimedBytes -= Amount;
+				R.Claims.push_back({Waiter, Amount});
+				OutClaims.push_back({Serial, Amount});
+			}
+			return Amount;
+		}
+
+		void Unclaim(uint64_t Serial, FResidencyEntryId Waiter, uint64_t Amount)
+		{
+			const auto It = Refunds.find(Serial);
+			if (It == Refunds.end())
+			{
+				return;
+			}
+			FRefund& R = It->second;
+			R.UnclaimedBytes += Amount;
+			for (size_t I = 0; I < R.Claims.size(); ++I)
+			{
+				if (R.Claims[I].first == Waiter)
+				{
+					R.Claims.erase(R.Claims.begin() + static_cast<std::ptrdiff_t>(I));
+					break;
+				}
+			}
+		}
+
+		// Claims from every pending refund of the ledger with a serial above After, oldest first, until
+		// Lack is covered; returns what is still lacking.
+		uint64_t ClaimFrom(FResidencyKind Kind, FResidencyLedgerId Ledger, uint64_t After, FResidencyEntryId Waiter, uint64_t Lack,
+			std::vector<std::pair<uint64_t, uint64_t>>& OutClaims)
+		{
+			std::vector<uint64_t> Serials;
+			for (auto It = Refunds.upper_bound(After); It != Refunds.end(); ++It)
+			{
+				if (It->second.Kind == Kind && It->second.LedgerId == Ledger)
+				{
+					Serials.push_back(It->first);
+				}
+			}
+			for (uint64_t Serial : Serials)
+			{
+				if (Lack == 0)
+				{
+					break;
+				}
+				Lack -= Claim(Serial, Waiter, Lack, OutClaims);
+			}
+			return Lack;
+		}
+
+		void PinParent(FEntry& Entry)
+		{
+			if (Entry.Parent != kInvalidResidencyEntry)
+			{
+				++Entries[Entry.Parent].Pins[static_cast<uint32_t>(EResidencyPin::ChildOp)];
+				Entry.PinnedParent = Entry.Parent;
+			}
+		}
+
+		void UnpinParent(FEntry& Entry)
+		{
+			if (Entry.PinnedParent == kInvalidResidencyEntry)
+			{
+				return;
+			}
+			const auto It = Entries.find(Entry.PinnedParent);
+			if (It != Entries.end() && It->second.Pins[static_cast<uint32_t>(EResidencyPin::ChildOp)] != 0)
+			{
+				--It->second.Pins[static_cast<uint32_t>(EResidencyPin::ChildOp)];
+			}
+			Entry.PinnedParent = kInvalidResidencyEntry;
 		}
 
 		void ChargeNow(FEntry& Entry, uint64_t Bytes)
@@ -155,35 +393,53 @@ namespace SuperSLMCore
 			L.InFlightEntries += 1;
 			Entry.ChargedBytes = Bytes;
 			Entry.State = EResidencyState::InFlight;
+			PinParent(Entry);
 		}
 
-		// Admits Waiting entries, FIFO, while the head fits.
-		void AdmitWaiting(FLedgerState& S)
+		// A pending refund whose family is empty completes: each claimed part passes to its waiter's
+		// charge, the unclaimed rest returns to free charge. Waiters left with no claim are collected.
+		void CompleteRefund(uint64_t Serial, std::vector<std::pair<uint64_t, FResidencyEntryId>>& Ready)
 		{
-			while (!S.Waiting.empty())
+			const FRefund R = Refunds[Serial];
+			Refunds.erase(Serial);
+			FResidencyLedger& L = LedgerOf(R.Kind, R.LedgerId)->Ledger;
+			L.ReleasingBytes -= R.Bytes;
+			L.ReleasingEntries -= 1;
+			L.ChargedBytes -= R.UnclaimedBytes;
+			for (const auto& Claimed : R.Claims)
 			{
-				const FResidencyEntryId Id = S.Waiting.front();
-				FEntry& Entry = Entries[Id];
-				if (Entry.WaitingBytes > FreeBytes(S.Ledger))
+				FEntry& Waiter = Entries[Claimed.first];
+				L.ClaimedRefundBytes -= Claimed.second;
+				L.WaitingBytes += Claimed.second;
+				Waiter.WaitHeldBytes += Claimed.second;
+				for (size_t I = 0; I < Waiter.ClaimsOn.size(); ++I)
 				{
-					return;
+					if (Waiter.ClaimsOn[I].first == Serial)
+					{
+						Waiter.ClaimsOn.erase(Waiter.ClaimsOn.begin() + static_cast<std::ptrdiff_t>(I));
+						break;
+					}
 				}
-				S.Waiting.pop_front();
-				S.OwedBytes -= Entry.WaitingBytes;
-				S.Ledger.WaitingEntries -= 1;
-				const uint64_t Bytes = Entry.WaitingBytes;
-				Entry.WaitingBytes = 0;
-				ChargeNow(Entry, Bytes);
-				Admitted.push_back(Id);
+				if (Waiter.ClaimsOn.empty())
+				{
+					Ready.push_back({Waiter.Arrival, Claimed.first});
+				}
 			}
 		}
 
-		void RemoveWaiting(FLedgerState& S, FResidencyEntryId Id, FEntry& Entry)
+		// A waiter whose last claim has passed to it: InFlight with its whole peak charged.
+		void AdmitWaiter(FResidencyEntryId Id)
 		{
-			S.Waiting.erase(std::find(S.Waiting.begin(), S.Waiting.end(), Id));
-			S.OwedBytes -= Entry.WaitingBytes;
-			S.Ledger.WaitingEntries -= 1;
-			Entry.WaitingBytes = 0;
+			FEntry& Entry = Entries[Id];
+			FResidencyLedger& L = LedgerOf(Entry).Ledger;
+			L.WaitingBytes -= Entry.WaitHeldBytes;
+			L.WaitingEntries -= 1;
+			L.InFlightBytes += Entry.PeakBytes;
+			L.InFlightEntries += 1;
+			Entry.ChargedBytes = Entry.PeakBytes;
+			Entry.WaitHeldBytes = 0;
+			Entry.State = EResidencyState::InFlight;
+			Admitted.push_back(Id);
 		}
 	};
 
@@ -221,7 +477,6 @@ namespace SuperSLMCore
 		if (FImpl::FLedgerState* S = Impl->LedgerOf(Kind, Ledger))
 		{
 			S->Ledger.BudgetBytes = Bytes;
-			Impl->AdmitWaiting(*S);
 		}
 	}
 
@@ -269,61 +524,139 @@ namespace SuperSLMCore
 		return Entry != nullptr ? Entry->ChargedBytes : 0;
 	}
 
-	EChargeOutcome FSuperSLMResidencyCore::Charge(FResidencyEntryId Id, uint64_t PeakBytes)
+	EChargeOutcome FSuperSLMResidencyCore::Charge(FResidencyEntryId Id, uint64_t PeakBytes, bool bParentRequired)
 	{
 		FImpl::FEntry* Entry = Impl->Find(Id);
 		if (Entry == nullptr || Entry->State != EResidencyState::Unadmitted)
 		{
 			return EChargeOutcome::BudgetExhausted; // a broken precondition, not a refusal to count
 		}
-		FImpl::FLedgerState& S = Impl->LedgerOf(*Entry);
-		FResidencyLedger& L = S.Ledger;
+		const FResidencyKind Kind = Entry->Kind;
+		const FResidencyLedgerId LedgerId = Entry->LedgerId;
+		FResidencyLedger& L = Impl->LedgerOf(Kind, LedgerId)->Ledger;
 
-		// Fits now, and no earlier admission is waiting ahead of it.
-		if (S.Waiting.empty() && PeakBytes <= FImpl::FreeBytes(L))
+		// A nested request touches its parent first (§5.4: parents age more slowly than their children).
+		const FResidencyEntryId Parent = Entry->Parent;
+		if (Parent != kInvalidResidencyEntry)
+		{
+			if (GetState(Parent) == EResidencyState::Resident)
+			{
+				Touch(Parent);
+			}
+			else
+			{
+				Entry->Parent = kInvalidResidencyEntry; // gone before the decision: private
+			}
+		}
+
+		// 1. The free charge alone covers it: admitted now.
+		const uint64_t Free = FImpl::FreeBytes(L);
+		if (PeakBytes <= Free)
 		{
 			Impl->ChargeNow(*Entry, PeakBytes);
 			return EChargeOutcome::Charged;
 		}
+		std::vector<std::pair<uint64_t, uint64_t>> Claims;
 
-		// What it can have once every Releasing byte has come back and every earlier Waiting admission
-		// has been served. Resident and InFlight bytes stay unless evicted.
-		const uint64_t Held = L.ResidentBytes + L.InFlightBytes + S.OwedBytes;
-		const uint64_t Available = L.BudgetBytes > Held ? L.BudgetBytes - Held : 0;
-		std::vector<FResidencyEntryId> ToEvict;
-		if (PeakBytes > Available)
+		// 2. Unclaimed pending refunds, oldest first.
+		uint64_t Lack = Impl->ClaimFrom(Kind, LedgerId, 0, Id, PeakBytes - Free, Claims);
+
+		// 3. New evictions, least recently used first, each claimed up to what is still lacking: the
+		// eviction's own refund, then any ghost it ended. A required parent is never evicted here.
+		if (Lack != 0)
 		{
-			// Evict least-recently-used unpinned entries, but only if that makes it fit.
-			uint64_t Freed = 0;
-			for (FResidencyEntryId Candidate : Impl->LruOrder(Entry->Kind, Entry->LedgerId))
+			for (FResidencyEntryId Candidate : Impl->LruOrder(Kind, LedgerId))
 			{
-				if (Available + Freed >= PeakBytes)
+				if (Lack == 0)
 				{
 					break;
 				}
-				ToEvict.push_back(Candidate);
-				Freed += Impl->Entries[Candidate].ChargedBytes;
+				if (Candidate == Impl->Entries[Id].Parent && bParentRequired)
+				{
+					continue;
+				}
+				const uint64_t Before = Impl->RefundSerial;
+				Impl->ToReleasing(Candidate, Impl->Entries[Candidate]);
+				++Impl->Evictions;
+				Lack = Impl->ClaimFrom(Kind, LedgerId, Before, Id, Lack, Claims);
 			}
-			if (Available + Freed < PeakBytes)
-			{
-				++Impl->BudgetExhausted;
-				return EChargeOutcome::BudgetExhausted;
-			}
-		}
-		for (FResidencyEntryId Victim : ToEvict)
-		{
-			Impl->ToReleasing(Victim, Impl->Entries[Victim]);
-			++Impl->Evictions;
 		}
 
-		// Evicted bytes stay charged until their release completes, so it waits for them.
+		// Not covered: refused by name. Its claims go back; the evictions it decided stand.
+		if (Lack != 0)
+		{
+			for (const auto& Claimed : Claims)
+			{
+				Impl->Unclaim(Claimed.first, Id, Claimed.second);
+			}
+			++Impl->BudgetExhausted;
+			return EChargeOutcome::BudgetExhausted;
+		}
+
+		// A hint-only parent evicted by this very loop: the load runs private (§5.4, rev 1.17 R2).
+		Entry = Impl->Find(Id);
+		if (Entry->Parent != kInvalidResidencyEntry && GetState(Entry->Parent) != EResidencyState::Resident)
+		{
+			Entry->Parent = kInvalidResidencyEntry;
+		}
+
+		// Covered with claims: a waiter. It takes the free charge now, draws nothing, and pins its
+		// parent from this decision (§5.11 (a), rev 1.16 F1).
 		Entry->State = EResidencyState::Waiting;
-		Entry->WaitingBytes = PeakBytes;
-		S.Waiting.push_back(Id);
-		S.OwedBytes += PeakBytes;
+		Entry->PeakBytes = PeakBytes;
+		Entry->WaitHeldBytes = Free;
+		Entry->Arrival = ++Impl->ArrivalSerial;
+		Entry->ClaimsOn = Claims;
+		Impl->PinParent(*Entry);
+		L.ChargedBytes += Free;
+		L.WaitingBytes += Free;
 		L.WaitingEntries += 1;
+		for (const auto& Claimed : Claims)
+		{
+			L.ClaimedRefundBytes += Claimed.second;
+		}
 		++Impl->Deferred;
 		return EChargeOutcome::Deferred;
+	}
+
+	bool FSuperSLMResidencyCore::SetParent(FResidencyEntryId Id, FResidencyEntryId Parent)
+	{
+		FImpl::FEntry* Entry = Impl->Find(Id);
+		const FImpl::FEntry* Up = Impl->Find(Parent);
+		if (Entry == nullptr || Up == nullptr || Id == Parent || Up->State != EResidencyState::Resident ||
+			(Entry->State != EResidencyState::Unadmitted && Entry->State != EResidencyState::Resident) ||
+			Up->Kind != Entry->Kind || Up->LedgerId != Entry->LedgerId || Impl->IsDescendant(Parent, Id))
+		{
+			return false;
+		}
+		Entry->Parent = Parent;
+		return true;
+	}
+
+	FResidencyEntryId FSuperSLMResidencyCore::GetParent(FResidencyEntryId Id) const
+	{
+		const FImpl::FEntry* Entry = Impl->Find(Id);
+		return Entry != nullptr ? Entry->Parent : kInvalidResidencyEntry;
+	}
+
+	void FSuperSLMResidencyCore::DetachParent(FResidencyEntryId Id)
+	{
+		if (FImpl::FEntry* Entry = Impl->Find(Id))
+		{
+			Entry->Parent = kInvalidResidencyEntry;
+		}
+	}
+
+	bool FSuperSLMResidencyCore::IsGhost(FResidencyEntryId Id) const
+	{
+		const FImpl::FEntry* Entry = Impl->Find(Id);
+		return Entry != nullptr && Entry->bGhost;
+	}
+
+	uint64_t FSuperSLMResidencyCore::GetGhostBytes(FResidencyEntryId Id) const
+	{
+		const FImpl::FEntry* Entry = Impl->Find(Id);
+		return Entry != nullptr ? Entry->GhostBytes : 0;
 	}
 
 	void FSuperSLMResidencyCore::Settle(FResidencyEntryId Id, uint64_t SteadyBytes)
@@ -343,7 +676,7 @@ namespace SuperSLMCore
 		Entry->ChargedBytes = Steady;
 		Entry->State = EResidencyState::Resident;
 		Entry->LastTouch = ++Impl->TouchSerial;
-		Impl->AdmitWaiting(S);
+		Impl->UnpinParent(*Entry); // the child's job is applied: its parent pin ends with it
 	}
 
 	void FSuperSLMResidencyCore::ReturnCharge(FResidencyEntryId Id)
@@ -356,7 +689,17 @@ namespace SuperSLMCore
 		FImpl::FLedgerState& S = Impl->LedgerOf(*Entry);
 		if (Entry->State == EResidencyState::Waiting)
 		{
-			Impl->RemoveWaiting(S, Id, *Entry);
+			for (const auto& Claimed : Entry->ClaimsOn)
+			{
+				Impl->Unclaim(Claimed.first, Id, Claimed.second);
+				S.Ledger.ClaimedRefundBytes -= Claimed.second;
+			}
+			Entry->ClaimsOn.clear();
+			S.Ledger.WaitingBytes -= Entry->WaitHeldBytes;
+			S.Ledger.ChargedBytes -= Entry->WaitHeldBytes;
+			S.Ledger.WaitingEntries -= 1;
+			Entry->WaitHeldBytes = 0;
+			Entry->PeakBytes = 0;
 		}
 		else if (Entry->State == EResidencyState::InFlight)
 		{
@@ -369,8 +712,8 @@ namespace SuperSLMCore
 		{
 			return;
 		}
+		Impl->UnpinParent(*Entry);
 		Entry->State = EResidencyState::Unadmitted;
-		Impl->AdmitWaiting(S);
 	}
 
 	bool FSuperSLMResidencyCore::Destroy(FResidencyEntryId Id)
@@ -382,7 +725,7 @@ namespace SuperSLMCore
 		}
 		Impl->Unkey(*Entry);
 		Impl->DetachAll(*Entry);
-		Impl->Entries.erase(Id);
+		Impl->EraseEntry(Id);
 		return true;
 	}
 
@@ -411,6 +754,35 @@ namespace SuperSLMCore
 		return true;
 	}
 
+	bool FSuperSLMResidencyCore::EvictUnpinned(FResidencyEntryId Id)
+	{
+		FImpl::FEntry* Entry = Impl->Find(Id);
+		if (Entry == nullptr || Entry->State != EResidencyState::Resident || FImpl::IsPinned(*Entry))
+		{
+			return false;
+		}
+		Entry->bMarked = false;
+		Impl->ToReleasing(Id, *Entry);
+		return true;
+	}
+
+	bool FSuperSLMResidencyCore::SetMarked(FResidencyEntryId Id, bool bMarked)
+	{
+		FImpl::FEntry* Entry = Impl->Find(Id);
+		if (Entry == nullptr)
+		{
+			return false;
+		}
+		Entry->bMarked = bMarked;
+		return true;
+	}
+
+	bool FSuperSLMResidencyCore::IsMarked(FResidencyEntryId Id) const
+	{
+		const FImpl::FEntry* Entry = Impl->Find(Id);
+		return Entry != nullptr && Entry->bMarked;
+	}
+
 	bool FSuperSLMResidencyCore::ReleaseCompleted(FResidencyEntryId Id)
 	{
 		FImpl::FEntry* Entry = Impl->Find(Id);
@@ -418,13 +790,36 @@ namespace SuperSLMCore
 		{
 			return false;
 		}
-		FImpl::FLedgerState& S = Impl->LedgerOf(*Entry);
-		S.Ledger.ReleasingBytes -= Entry->ChargedBytes;
-		S.Ledger.ReleasingEntries -= 1;
-		S.Ledger.ChargedBytes -= Entry->ChargedBytes;
+		// This release leaves every family it is in; each refund whose family is now empty completes.
+		std::vector<uint64_t> Done;
+		for (auto& Pair : Impl->Refunds)
+		{
+			Pair.second.Family.erase(Id);
+			if (Pair.second.Family.empty())
+			{
+				Done.push_back(Pair.first);
+			}
+		}
+		std::vector<std::pair<uint64_t, FResidencyEntryId>> Ready;
+		for (uint64_t Serial : Done)
+		{
+			Impl->CompleteRefund(Serial, Ready);
+		}
+		Entry = Impl->Find(Id);
 		Impl->DetachAll(*Entry);
-		Impl->Entries.erase(Id);
-		Impl->AdmitWaiting(S);
+		if (Entry->bGhost)
+		{
+			Entry->State = EResidencyState::Ghost; // only its ghost charge remains
+		}
+		else
+		{
+			Impl->EraseEntry(Id);
+		}
+		std::sort(Ready.begin(), Ready.end());
+		for (const auto& Pair : Ready)
+		{
+			Impl->AdmitWaiter(Pair.second);
+		}
 		return true;
 	}
 
@@ -440,6 +835,38 @@ namespace SuperSLMCore
 		std::vector<FResidencyEntryId> Out;
 		Out.swap(Impl->Admitted);
 		return Out;
+	}
+
+	uint64_t FSuperSLMResidencyCore::GetArrival(FResidencyEntryId Id) const
+	{
+		const FImpl::FEntry* Entry = Impl->Find(Id);
+		return Entry != nullptr ? Entry->Arrival : 0;
+	}
+
+	uint64_t FSuperSLMResidencyCore::GetWaitingHeldBytes(FResidencyEntryId Id) const
+	{
+		const FImpl::FEntry* Entry = Impl->Find(Id);
+		return Entry != nullptr && Entry->State == EResidencyState::Waiting ? Entry->WaitHeldBytes : 0;
+	}
+
+	uint64_t FSuperSLMResidencyCore::GetClaimedBytes(FResidencyEntryId Id) const
+	{
+		const FImpl::FEntry* Entry = Impl->Find(Id);
+		uint64_t Sum = 0;
+		if (Entry != nullptr)
+		{
+			for (const auto& Claimed : Entry->ClaimsOn)
+			{
+				Sum += Claimed.second;
+			}
+		}
+		return Sum;
+	}
+
+	uint32_t FSuperSLMResidencyCore::GetPendingRefundCount(FResidencyKind Kind, FResidencyLedgerId Ledger) const
+	{
+		const FImpl::FLedgerState* S = Impl->LedgerOf(Kind, Ledger);
+		return S != nullptr ? S->Ledger.ReleasingEntries : 0;
 	}
 
 	void FSuperSLMResidencyCore::Touch(FResidencyEntryId Id)
@@ -563,6 +990,7 @@ namespace SuperSLMCore
 		Snap.BudgetExhausted = Impl->BudgetExhausted;
 		Snap.Deferred = Impl->Deferred;
 		Snap.LeasesMinted = Impl->LeasesMinted;
+		Snap.GhostEndings = Impl->GhostEndings;
 		return Snap;
 	}
 }

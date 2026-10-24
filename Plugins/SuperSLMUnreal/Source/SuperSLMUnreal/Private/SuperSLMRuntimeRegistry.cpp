@@ -148,6 +148,43 @@ namespace SuperSLMRuntime
 		return ReadModelShape(CaptureModelBytes(Model), OutShape, OutError);
 	}
 
+	bool FindArtifactSection(const FModelBytes& Model, uint32 SectionType, const uint8*& OutData, uint64& OutSize)
+	{
+		OutData = nullptr;
+		OutSize = 0;
+		const uint8* Data = Model.Data;
+		const int64 Size = Model.Size;
+		if (Data == nullptr || Size < static_cast<int64>(superslm::kHeaderBytes))
+		{
+			return false;
+		}
+		constexpr int64 RowBytes = 40;
+		const uint32 SectionCount = ReadLE32(Data + 12);
+		const int64 TableEnd = static_cast<int64>(superslm::kHeaderBytes) + static_cast<int64>(SectionCount) * RowBytes;
+		if (TableEnd > Size)
+		{
+			return false;
+		}
+		for (uint32 Row = 0; Row < SectionCount; ++Row)
+		{
+			const uint8* P = Data + superslm::kHeaderBytes + static_cast<int64>(Row) * RowBytes;
+			if (ReadLE32(P) != SectionType)
+			{
+				continue;
+			}
+			const uint64 Offset = ReadLE64(P + 8);
+			const uint64 ByteSize = ReadLE64(P + 16);
+			if (Offset > static_cast<uint64>(Size) || ByteSize > static_cast<uint64>(Size) - Offset)
+			{
+				return false;
+			}
+			OutData = Data + Offset;
+			OutSize = ByteSize;
+			return true;
+		}
+		return false;
+	}
+
 	bool ReadModelShape(const FModelBytes& Model, FModelShape& OutShape, FString& OutError)
 	{
 		const uint8* Data = Model.Data;

@@ -10,7 +10,9 @@
 //   - trimming keeps the directory's cache files at or under the limit, removing the OLDEST first by
 //     modification time -- which the cache sets itself on every write and every hit it serves, never
 //     the file system's access time. Only "<64 hex>.slup" files are counted or removed; any other
-//     file in the directory (a temporary in progress, a file the cache did not write) is left alone.
+//     file in the directory (a temporary in progress, a file the cache did not write) is left alone;
+//   - a write's temporary that a crash left behind is removed once it is stale (RemoveStalePrefixDiskTemps),
+//     with every trim.
 //
 // All of this is pool-thread work in the plugin; none of it touches cache state.
 
@@ -78,4 +80,13 @@ namespace SuperSLMCore
 
 	// Lists Dir, plans the trim, removes. Returns how many files it removed.
 	uint32_t TrimPrefixDiskDirectory(IPrefixFileOps& Files, const std::string& Dir, uint64_t MaxBytes);
+
+	// True for a write's temporary, "<64 hex>.<instance>.<write serial>.tmp" exactly.
+	bool IsPrefixDiskTempFileName(const std::string& Name);
+
+	// A crash between a write and its rename leaves its temporary behind, which no trim counts or removes. This
+	// removes every temporary in Dir whose ModifiedTime is at least MaxAge older than Now (both in the file layer's
+	// unit): far older than any write in progress, so another instance's live temporary is kept. Other files are
+	// left alone. Returns how many it removed. The cache runs it with every trim, at Configure() and after writes.
+	uint32_t RemoveStalePrefixDiskTemps(IPrefixFileOps& Files, const std::string& Dir, int64_t Now, int64_t MaxAge);
 }

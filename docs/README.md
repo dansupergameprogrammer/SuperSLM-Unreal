@@ -11,7 +11,8 @@ Start with the repository [README](../README.md) for what the plugin does, and
 1. [GETTING_STARTED.md](GETTING_STARTED.md): install the plugin, import a model, make a first
    request.
 2. [ARCHITECTURE.md](ARCHITECTURE.md): the modules, the two backends and their schedulers,
-   memory, and how SuperSLM is built in.
+   memory, how SuperSLM is built in, the prefix cache and cooked prefix sets, and skip-ahead for
+   schema-bound generations.
 3. [BLUEPRINT_API.md](BLUEPRINT_API.md): the C++ API and the Blueprint surface.
 
 ## Reference

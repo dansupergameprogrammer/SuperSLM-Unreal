@@ -5,6 +5,7 @@
 #include "Trace/Trace.h"
 #include "SuperSLMAdapterHandle.h"
 #include "SuperSLMPagedKvTypes.h"
+#include "SuperSLMPrefixCacheTypes.h"
 #include "SuperSLMRuntimeConfig.h"
 #include "SuperSLMSaveRestoreTypes.h"
 #include "SuperSLMSchemaHandle.h"
@@ -13,6 +14,7 @@
 #include "SuperSLMSubsystem.generated.h"
 
 class USuperSLMModel;
+class USuperSLMPrefixSet; // the U3 reflected patch defines it; declared here whatever the switch
 struct FSuperSLMSubsystemState;
 struct FSuperSLMCpuConfigureFlight;
 
@@ -97,6 +99,19 @@ public:
 	// subsystem is not configured (a BeginConfigure() still pending included). The pointer is
 	// valid until the next Configure(), BeginConfigure() or Deinitialize().
 	const FSuperSLMResolvedCpuConfig* GetResolvedConfig() const;
+
+	// Precache plan rev 1.18.12 (§15.32): the in-situ prefix_prefill arm's fit and write. BuildRows are the job
+	// ledger's rows (GetJobLedger()) of one cache build this subsystem ran under the conditions the pair prices: its
+	// begin and chunk jobs on a worker lane, at this configuration's decode mode, task count and threads, with the
+	// game ticking and a generation interleaved on the build's lane. Its chunk rows (FSuperSLMInSituPrefixPrefillPrice)
+	// are fitted to the cache chunk's pair (Core/SuperSLMInSituPrefixPrefill.h; the pair is an upper envelope of the
+	// worker-time medians across the build's depth, with no margin factor), and the pair, rounded up, is written as
+	// PrefixPrefillTokenCostMs and PrefixPrefillTokenCostPerPositionMs into the Saved/SuperSLM/CalibratedCosts.ini
+	// profile that matches this configuration's artifact, effective decode mode and task count, which
+	// SuperSLM.EstimateCosts --write-ini writes first. The next Configure() prices cache chunks with it. False, with
+	// OutError and the file unchanged, with no configured model, no matching profile, or fewer chunk rows than the fit
+	// needs. Game thread.
+	bool WriteInSituPrefixPrefillPrice(const TArray<FSuperSLMWorkerJobReport>& BuildRows, FSuperSLMInSituPrefixPrefillPrice& Out, FString& OutError);
 
 	// --- Sequence vend/return (§4, §5) ---
 
@@ -311,6 +326,45 @@ public:
 	bool ReleasePrefix(const FSuperSLMPrefix& Prefix, FString& OutError);
 	bool ReleasePrefix(const FSuperSLMPrefix& Prefix);
 
+	// --- The prefix cache (precache plan §5.6). Exists only in a build with
+	// SUPERSLM_WITH_PREFIX_CACHE on (SuperSLMPrefixCacheTypes.h); declared always, defined only then.
+	// Configured by FSuperSLMRuntimeConfig::PrefixCacheBudgetBytes > 0. ---
+
+	// Leases a cached prefix for Spec: memory, then disk, then a recompute (§5.3). Returns a handle
+	// of its own (one per lease) whose phase moves to Ready at a later tick; refused here only for
+	// a malformed spec (as CreatePrefix refuses; for a nested spec also a parent that is not a live
+	// Ready lease of this cache, a schema of its own, or parent plus suffix above the cap) and, in
+	// legacy mode, any nested spec (NestedRequiresBudgetMode; nested cache entries are budget mode's,
+	// step U6). Every other outcome resolves by name: GetPrefixLeaseState().
+	// AdoptPrefix() accepts a Ready lease unchanged.
+	bool RequestPrefix(const FSuperSLMPrefixSpec& Spec, FSuperSLMPrefix& OutPrefix, FString& OutError);
+	// Ends the lease; the prefix stays cached until evicted. False for a handle it ends no lease on.
+	bool ReturnPrefix(const FSuperSLMPrefix& Prefix);
+	// The tier that served a lease (diagnostic), and the lease's state by name.
+	ESuperSLMPrefixSource GetPrefixSource(const FSuperSLMPrefix& Prefix) const;
+	ESuperSLMPrefixLeaseState GetPrefixLeaseState(const FSuperSLMPrefix& Prefix) const;
+	FSuperSLMPrefixCacheStats GetPrefixCacheStats() const;
+	// Explicit residency control (§5.6, rev 1.18, PC-16 (a)). Neither can end, invalidate or reach through a
+	// lease. WarmPrefix: a request that takes no lease, refused here exactly where RequestPrefix is; resolved,
+	// the entry is resident and unpinned (evictable like any unleased entry). DropPrefix: refused here only for
+	// a malformed spec; at the apply pass that receives its key, a resident unpinned entry is evicted (Dropped),
+	// a pinned, in-flight or waiting one is marked (DropDeferred) and goes when it is next resident and unpinned
+	// unless a later request or warm clears the mark; MemoryAndDisk also deletes the key's disk file, after any
+	// write-back or read of that key. Never touches the cooked tier.
+	bool WarmPrefix(const FSuperSLMPrefixSpec& Spec, FSuperSLMPrefixOp& OutOp, FString& OutError);
+	bool DropPrefix(const FSuperSLMPrefixSpec& Spec, ESuperSLMPrefixDropScope Scope, FSuperSLMPrefixOp& OutOp, FString& OutError);
+	// False for an op this subsystem never issued. A resolved op keeps its result across a re-Configure() until
+	// it leaves the ring of the last 1,024 resolved ops (then Expired); a Pending op never expires.
+	bool GetPrefixOpResult(const FSuperSLMPrefixOp& Op, FSuperSLMPrefixOpResult& Out) const;
+	// The cooked tier (§5.3 item 2, §5.8; step U3): registers a cooked prefix set's CPU entries, so a
+	// request whose key one of them carries restores it instead of recomputing. Registering the same
+	// set again replaces its entries (after a rebuild). Registrations outlive a Configure() of the same model; a Configure() of
+	// another model unregisters the sets built for a different one (logged PrefixSetModelMismatch, once), so register them
+	// again after configuring their model. A set with
+	// no CPU build, or an entry its build left empty, registers nothing and those requests recompute.
+	void RegisterPrefixSet(USuperSLMPrefixSet* Set);
+	void UnregisterPrefixSet(USuperSLMPrefixSet* Set);
+
 	// --- Paged KV (plugin paging plan §3.3, §3.5, §3.6). Additive; budget mode is opted into by
 	// FSuperSLMRuntimeConfig::SequenceBudget > 0. ---
 
@@ -466,6 +520,22 @@ private:
 	// Test-only (WITH_DEV_AUTOMATION_TESTS): the paged-KV seams of plugin paging plan §3.9
 	// (SuperSLMPagedTestSeam.h).
 	friend struct FSuperSLMPagedTestSeam;
+
+	// Test-only: the prefix cache's seams (SuperSLMPrefixCacheTestSeam.h).
+	friend class FSuperSLMPrefixCacheTestSeam;
+
+	// The prefix cache (precache plan §5): owned here, not by the per-Configure state, so it lives
+	// across re-Configure() and a release that completes after one is dropped as stale (§5.11 (a)).
+	// Null unless SUPERSLM_WITH_PREFIX_CACHE is on and a Configure() asked for a cache.
+	FSuperSLMPrefixCacheHost* PrefixCacheHost = nullptr;
+	void InstallPrefixCache();
+	// Test-only (WITH_DEV_AUTOMATION_TESTS): the schema jump-forward seam of the schema fast-decode
+	// plan rev 1.3.5, §6 P1 and P1-X (SuperSLMSchemaJumpTestSeam.h).
+	friend struct FSuperSLMSchemaJumpTestAccess;
+
+	// Test-only (WITH_DEV_AUTOMATION_TESTS): the rev 1.3.6 review seam (§17.12;
+	// SuperSLMSchemaJumpReviewTestAccess.h).
+	friend struct FSuperSLMSchemaJumpReviewTestAccess;
 
 	// Every Layer-1 handle, buffer, slot, and scheduler figure (SuperSLMSubsystem.cpp). Owned
 	// here and freed by Deinitialize()/BeginDestroy(); held by pointer so this reflected header

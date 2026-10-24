@@ -128,6 +128,27 @@ HOST_TEST(disk_read_vanished_is_not_found, "§5.7 (a vanished or mid-rename file
 	EXPECT_EQ(ReadPrefixFile(Fs, "d", KeyN(1), Read), EPrefixIoStatus::Error);
 }
 
+HOST_TEST(disk_stale_temporaries_removed, "1.3.0 review item 7: a crash mid-write leaves a temporary; a stale one is removed")
+{
+	FMemFs Fs;
+	const std::string Stale = "d/" + PrefixDiskTempFileName(KeyN(1), 9, 1);
+	const std::string Live = "d/" + PrefixDiskTempFileName(KeyN(2), 9, 2);
+	const std::string Cached = "d/" + PrefixDiskFileName(KeyN(3));
+	Fs.Files[Stale] = {std::vector<uint8_t>(100, 1), 10};
+	Fs.Files[Live] = {std::vector<uint8_t>(100, 1), 950};
+	Fs.Files[Cached] = {std::vector<uint8_t>(100, 1), 5};
+	Fs.Files["d/notes.tmp"] = {std::vector<uint8_t>(10, 0), 0};
+	Fs.Files["d/" + PrefixKeyToHex(KeyN(4)) + ".tmp"] = {std::vector<uint8_t>(10, 0), 0}; // not a write's name
+	EXPECT_EQ(IsPrefixDiskTempFileName(PrefixDiskTempFileName(KeyN(1), 9, 1)), true);
+	EXPECT_EQ(IsPrefixDiskTempFileName(PrefixDiskFileName(KeyN(1))), false);
+	EXPECT_EQ(IsPrefixDiskTempFileName("notes.tmp"), false);
+	EXPECT_EQ(RemoveStalePrefixDiskTemps(Fs, "d", 1000, 100), 1u);
+	EXPECT_EQ(Fs.Exists(Stale), false);
+	EXPECT_EQ(Fs.Exists(Live), true);
+	EXPECT_EQ(Fs.Exists(Cached), true);
+	EXPECT_EQ(Fs.Exists("d/notes.tmp"), true);
+}
+
 HOST_TEST(disk_trim_directory_removes_oldest, "7.14 (file half)")
 {
 	FMemFs Fs;

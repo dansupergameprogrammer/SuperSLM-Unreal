@@ -10,6 +10,8 @@
 #include "SuperSLMSlotGates.h"
 #include "SuperSLMBlueprintLibrary.generated.h"
 
+class USuperSLMPrefixSet;
+
 // L2-S3's slot gate is retired (SuperSLMSlotGates.h): the slot is built, and UnrealHeaderTool
 // rejects a reflected type inside an #if it does not know, so its files carry no gate.
 
@@ -160,6 +162,40 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "SuperSLM|Prefix")
 	static bool ReleasePrefix(USuperSLMSubsystem* Subsystem, const FSuperSLMPrefixBP& Prefix, FString& OutError);
+
+	// --- The prefix cache (precache plan §5.6) ---
+
+	// Leases a cached prefix for Tokens under SchemaName (None = no schema); the lease adopts like a
+	// prefix once Ready (Get Prefix Phase reads it).
+	UFUNCTION(BlueprintCallable, Category = "SuperSLM|Prefix Cache")
+	static bool RequestPrefix(USuperSLMSubsystem* Subsystem, const TArray<int32>& Tokens, FName SchemaName, FSuperSLMPrefixBP& OutPrefix, FString& OutError);
+
+	UFUNCTION(BlueprintCallable, Category = "SuperSLM|Prefix Cache")
+	static bool ReturnPrefix(USuperSLMSubsystem* Subsystem, const FSuperSLMPrefixBP& Prefix);
+
+	UFUNCTION(BlueprintPure, Category = "SuperSLM|Prefix Cache")
+	static ESuperSLMPrefixSourceBP GetPrefixSource(const USuperSLMSubsystem* Subsystem, const FSuperSLMPrefixBP& Prefix);
+
+	// Precache plan §5.6 (step U3): the cooked tier. Registers a cooked prefix set's CPU entries with
+	// the subsystem's prefix cache; registering it again replaces them.
+	UFUNCTION(BlueprintCallable, Category = "SuperSLM|Prefix Cache")
+	static void RegisterPrefixSet(USuperSLMSubsystem* Subsystem, USuperSLMPrefixSet* PrefixSet);
+
+	UFUNCTION(BlueprintCallable, Category = "SuperSLM|Prefix Cache")
+	static void UnregisterPrefixSet(USuperSLMSubsystem* Subsystem, USuperSLMPrefixSet* PrefixSet);
+
+	// Explicit residency control (§5.6, rev 1.18): a warm is a request that takes no lease; a drop evicts the
+	// prefix now when nothing pins it, otherwise when the last pin goes. Both resolve at a later tick: read
+	// Get Prefix Op Result.
+	UFUNCTION(BlueprintCallable, Category = "SuperSLM|Prefix Cache")
+	static bool WarmPrefix(USuperSLMSubsystem* Subsystem, const TArray<int32>& Tokens, FName SchemaName, FSuperSLMPrefixOpBP& OutOp, FString& OutError);
+
+	UFUNCTION(BlueprintCallable, Category = "SuperSLM|Prefix Cache")
+	static bool DropPrefix(USuperSLMSubsystem* Subsystem, const TArray<int32>& Tokens, FName SchemaName, ESuperSLMPrefixDropScopeBP Scope, FSuperSLMPrefixOpBP& OutOp, FString& OutError);
+
+	// False for an op the subsystem never issued.
+	UFUNCTION(BlueprintPure, Category = "SuperSLM|Prefix Cache")
+	static bool GetPrefixOpResult(const USuperSLMSubsystem* Subsystem, const FSuperSLMPrefixOpBP& Op, ESuperSLMPrefixOpResultBP& OutResult, ESuperSLMPrefixDropDiskBP& OutDisk);
 
 	// --- Determinism self-check (plan §6, §7 item 11) ---
 

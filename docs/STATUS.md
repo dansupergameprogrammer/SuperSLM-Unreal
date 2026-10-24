@@ -27,8 +27,8 @@ What 1.0 provides:
    worker threads, never on the game thread; each token's finish is spread over the engine's task
    workers (`FinishParallelTasks`, default 4). The GPU backend (D3D12) slices each token into a
    caller-set number of whole layers per tick: at 4 layers on an RTX 2080 SUPER with the 0.5B
-   model, a slice measured about 2 ms (see [Measured](#measured)). The Load node and a default
-   query run a whole token per tick.
+   model, a slice measured about 2 ms (see [Measured](#measured)). The Load node, a default
+   query and the example project run a whole token per tick.
 4. **Specialization by adapter.** A base model stays resident and a sequence is re-pointed to a
    different adapter between requests. A specialist merged into its own `.sslm` file is the
    supported alternative, and the plugin loads either form.
@@ -144,13 +144,25 @@ them as an estimate that is not verified; with `--write-ini` the next `Configure
 matching model, decode mode and task count. An under-priced cost makes jobs overrun their CPU
 budget; an over-priced one only lowers throughput.
 
+**Known item: the mode-1 `LayerCostMs` reads optimistic in a running game.** This affects a game
+that turns threaded decode on. In the example query's in-game timing (packaged Development build,
+the AMD Ryzen 9 3950X, 60 fps cap, three threading-off and three threading-on runs interleaved),
+the worker's decode jobs had a median of about 33.5 ms with threaded decode on, against about 42 to
+44 ms off, and the jobs delivered later than planned rose from 34 to about 66 per answer, while the
+frame rate held at 60. A late job is counted as a hitch and applied on the first later frame at
+which it exists; nothing is reordered. The mode-1 `LayerCostMs` is to be re-measured on that
+machine at its next calibration; no replacement value exists yet. A project can measure its own
+with `SuperSLM.EstimateCosts`.
+
 ## Measured
 
 Every figure here is a measurement, or computed where marked, with the machine it came from.
 
 | What | Result | Where |
 |---|---|---|
-| Determinism self-check, CPU | *Verified* at SuperSLM `v1.9.0` (1.0) and at `v1.13.1` (1.2), in a packaged Windows Development build of the example | AMD Ryzen 9 3950X CPU, Windows x64 |
+| Determinism self-check, CPU | *Verified* at SuperSLM `v1.9.0` (1.0), at `v1.13.1` (1.2) and at `v1.15.0` (1.3, with the prefix cache off and again with it serving a cooked set), in a packaged Windows Development build of the example | AMD Ryzen 9 3950X CPU, Windows x64 |
+| Prefix cache, restore of a cooked 128-token prefix, 1.3 | 0.92 to 1.01 ms of worker time (10 restores); the prefix holds 768 KiB. Building it by prefill instead: about 15.5 ms per token timed alone | Packaged Windows Development build of the example, AMD Ryzen 9 3950X, at SuperSLM 1.14.0's engine (1.15.0 does not change prefill or prefix restore) |
+| Prefix cache, game-thread tick while 10 cooked prefixes load, 1.3 | at most 0.24 ms (3,828 ticks) | Packaged Windows Development build of the example, AMD Ryzen 9 3950X |
 | Determinism self-check, GPU | Withheld: in 1.0 the GPU verdict is always withheld (recorded in the report, shown as *Not Yet Run*); a later release shows it | |
 | GPU device-resident head, VRAM per mapped 0.5B model | 137,353,728 B requested buffers (a lower bound on what the driver occupies) | Computed from the model's shape (not a measurement); SuperSLM measured 137,433,088 B on the RTX 2080 SUPER |
 | GPU time per slice, 4 layers per slice | Below the table | NVIDIA RTX 2080 SUPER, 0.5B example model |
@@ -166,7 +178,7 @@ one-second window, and the reply decodes in under a second, so it is roughly the
 count, not a rate.
 
 **GPU time per slice.** Measured on one RTX 2080 SUPER at 4 layers per slice (the example
-project's setting): the
+project's setting at 1.2): the
 median GPU slice takes 1.36 ms with nothing else on the GPU (1.0). With the example scene
 rendering at 60 frames per second, the measured slice span has a median of 5.38 ms at 1.0 and
 3.35 to 3.67 ms at 1.2 (three runs).
@@ -179,10 +191,10 @@ in every run:
 
 | Layers per frame | Frames to answer | Start to answer | Slice span median, scene rendering |
 |---|---|---|---|
-| 4 (the example's setting) | 946 to 949 | 15,766 to 15,816 ms | 3.35 to 3.67 ms |
+| 4 (the example's setting at 1.2) | 946 to 949 | 15,766 to 15,816 ms | 3.35 to 3.67 ms |
 | 8 | 481 | 8,001 to 9,171 ms | 3.84 to 3.88 ms |
 | 12 | 326 | 5,417 ms | 4.23 to 4.94 ms |
-| 24, whole token (one call per frame) | 171 | 2,834 ms | 6.56 to 6.58 ms |
+| 24, whole token (one call per frame; the example's setting after 1.2, Unreleased) | 171 | 2,834 ms | 6.56 to 6.58 ms |
 
 The GPU backend issues one slice per frame, so frames to answer scale with 24 divided by the layers
 per frame, and at 60 frames per second it handles at most 60 × layers ÷ 24 tokens per second: 10, 20,
@@ -192,6 +204,8 @@ upper bound on the slice's own cost. In the editor, with its viewport rendering,
 layers was 1.98 ms.
 
 A caller who configures the GPU backend directly sets the slice size (`DispatchBudget` is
-required). The Blueprint Load node and a default query run a whole token per tick, and 4 layers
-per slice is the example project's setting.
+required). The Blueprint Load node, a default query and the example project run a whole token per
+tick. At that setting the example answered in 2,834 ms, 171 frames, which is the 60 fps cap's rate
+over the query; per-frame times were not recorded in those runs. Heavier scenes can set 4 to 12
+layers per slice.
 

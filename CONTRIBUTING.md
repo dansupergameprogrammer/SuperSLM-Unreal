@@ -73,7 +73,8 @@ the example test to the run above:
 - The GPU tests need a D3D12 GPU. They run under `-nullrhi`, because the GPU backend creates its
   own D3D12 device.
 - Some tests hold the plugin to figures from the maintainer's machine (AMD Ryzen 9 3950X, NVIDIA
-  RTX 2080 SUPER): the example test's median GPU slice of at most 2.0 ms at 4 layers per slice and
+  RTX 2080 SUPER): the example test's median GPU slice of at most one 60 fps frame (16.7 ms) at its
+  default whole-token setting and
   its CPU game-thread `Tick()` under 1 ms, and GPU tests that compare the GPU backend's tokens with a
   recorded SuperSLM run (`SuperSLM.L2S2.SliceInvariance.AgainstSslmGenerateAnchor`). GPU
   determinism is per device, and SuperSLM certifies only the RTX 2080 SUPER and the AMD Radeon RX

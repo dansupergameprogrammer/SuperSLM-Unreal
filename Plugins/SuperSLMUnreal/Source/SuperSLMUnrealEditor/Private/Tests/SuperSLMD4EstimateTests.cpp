@@ -484,7 +484,113 @@ namespace SuperSLMD4EstimateTests
 		if (!ConfigureObserved(*this, *Cpu, *Model, ShapeOnlyCpuConfig(), Hooks, TEXT("Configure() after a task-count-2 estimate"))) { return false; }
 		bOk &= CheckConfigureLine(*this, Log, 0, 2, TEXT("saved-estimate"), 0, TEXT("Configure() after a task-count-2 estimate"));
 		bOk &= TestEqual(TEXT("task count 2 installs a hook on both lanes"), Hooks.Makes, 2);
+		bOk &= TestEqual(TEXT("the shipped mode 0 installs zero-bit hooks on both lanes"), Hooks.ZeroBits, 2);
 		bOk &= TestTrue(TEXT("CalibratedCosts.ini restored"), Costs.Restore());
+		return bOk;
+	}
+
+	// Schema fast-decode plan rev 1.3.6, P1.1's price source (review round 1, finding 2; mutant XD9):
+	// the estimate carries the C = 2..7 calibration arms beside the chunk-1 arm (B5f runs them). Each
+	// mode reports rows for arm=prompt_2 .. prompt_7; --write-ini writes each mode profile's per-C
+	// pair as PromptChunk<C>TokenCostMs and PromptChunk<C>TokenCostPerPositionMs (finite; the token cost above 0, the per-position cost at least 0);
+	// and the next Configure() with no caller costs resolves each per-C pair to the written figure.
+	// The pair is NOT one of the report's thirteen "suggested" fields (that contract is D4's and is
+	// unchanged here): the field names and where the report prints them are the implementer's, and
+	// this cell reads only the INI keys the runtime configuration documents. Red until the arms land.
+	IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMD4EstimatePerChunkArmsTest,
+		"SuperSLM.D4.Estimate.PerChunkArms", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+	bool FSuperSLMD4EstimatePerChunkArmsTest::RunTest(const FString& Parameters)
+	{
+		FString Artifact, Hash;
+		if (!ArtifactAndHash(*this, Artifact, Hash)) { return false; }
+		FFileBytesGuard Costs(CalibratedCostsPath());
+		FFileBytesGuard Settings(RuntimeSettingsPath());
+		if (!TestTrue(TEXT("prior INI files captured"), Costs.Capture() && Settings.Capture() && Costs.Seed(SentinelText) && Settings.Remove())) { return false; }
+		FProcessSettingsReset ProcessSettings;
+		FEstimateReport R;
+		bool bOk = true;
+		{
+			FSuperSLMLogCapture Log;
+			FHookReading Hooks;
+			int32 Runs = 0;
+			bOk &= RunEstimate(*this, EstimateCommand(Artifact, TEXT(" --write-ini")), Hooks, Runs);
+			R = ParseEstimateReport(Log.Snapshot());
+		}
+		for (int32 Mode = 0; Mode < 2; ++Mode)
+		{
+			for (int32 C = 2; C <= 7; ++C)
+			{
+				const FString Arm = FString::Printf(TEXT("prompt_%d"), C);
+				int32 Rows = 0;
+				for (const FEstimateRow& Row : R.Rows) { Rows += (Row.Mode == Mode && Row.Arm == Arm && Row.Calls > 0) ? 1 : 0; }
+				bOk &= TestTrue(*FString::Printf(TEXT("mode %d reports timed rows for arm=%s (%d)"), Mode, *Arm, Rows), Rows > 0);
+			}
+		}
+
+		FString Text;
+		if (!TestTrue(TEXT("written CalibratedCosts.ini is readable"), FFileHelper::LoadFileToString(Text, *CalibratedCostsPath()))) { Costs.Restore(); Settings.Restore(); return false; }
+		TArray<FString> Lines;
+		const TArray<FIniSection> Sections = ParseIniSections(Text, Lines);
+		double Written[2][8][2];
+		for (auto& PerMode : Written) { for (auto& PerC : PerMode) { PerC[0] = PerC[1] = -1.0; } } // absent reads as -1, never as a passing 0
+		bool bSeen[2] = {};
+		for (const FIniSection* S : SectionsWithKey(Sections, TEXT("bParallelDecode")))
+		{
+			if (S->Keys.FindRef(TEXT("ArtifactHash")).ToLower() != Hash) { continue; }
+			const FString ModeText = S->Keys.FindRef(TEXT("bParallelDecode"));
+			const int32 Mode = ModeText == TEXT("1") ? 1 : (ModeText == TEXT("0") ? 0 : -1);
+			if (Mode < 0) { continue; }
+			bSeen[Mode] = true;
+			for (int32 C = 2; C <= 7; ++C)
+			{
+				const FString Keys[2] = { FString::Printf(TEXT("PromptChunk%dTokenCostMs"), C), FString::Printf(TEXT("PromptChunk%dTokenCostPerPositionMs"), C) };
+				for (int32 K = 0; K < 2; ++K)
+				{
+					const FString* Value = S->Keys.Find(Keys[K]);
+					// A token cost is above 0; a per-position cost is at least 0 (Configure() accepts 0, and a
+					// flat fit writes it).
+					double V = -1.0;
+					bOk &= TestTrue(*FString::Printf(TEXT("mode %d profile writes %s, finite and %s (%s)"), Mode, *Keys[K], K == 0 ? TEXT("above 0") : TEXT("at least 0"), Value ? **Value : TEXT("absent")),
+						Value && ParseDouble(*Value, V) && FMath::IsFinite(V) && (K == 0 ? V > 0.0 : V >= 0.0));
+					Written[Mode][C][K] = V;
+				}
+			}
+		}
+		bOk &= TestTrue(TEXT("both mode profiles for this artifact were written"), bSeen[0] && bSeen[1]);
+
+		FTestWorldWrapper World;
+		if (!World.CreateTestWorld(EWorldType::Game)) { Costs.Restore(); Settings.Restore(); return false; }
+		USuperSLMModel* Model = nullptr;
+		USuperSLMSubsystem* Cpu = nullptr;
+		if (ImportAEx(*this, Model)) { Cpu = SuperSLML2S1Fixtures::GetSubsystem(World.GetTestWorld()); }
+		if (Model && TestNotNull(TEXT("CPU subsystem"), Cpu))
+		{
+			for (int32 Mode = 0; Mode < 2; ++Mode)
+			{
+				FSuperSLMRuntimeConfig Config = ShapeOnlyCpuConfig();
+				SuperSLMConfigAccess::SetMode(Config, Mode == 1);
+				FHookReading Hooks;
+				FSuperSLMConfigureReport Report;
+				const FString Label = FString::Printf(TEXT("mode %d Configure() over the saved per-C pairs"), Mode);
+				if (!ConfigureObserved(*this, *Cpu, *Model, Config, Hooks, *Label, &Report) || !TestTrue(*(Label + TEXT(" reports its resolution")), Report.Resolved.IsSet()))
+				{
+					bOk = false;
+					continue;
+				}
+				for (int32 C = 2; C <= 7; ++C)
+				{
+					bOk &= TestTrue(*FString::Printf(TEXT("mode %d resolves PerChunkPromptTokenCostMs[%d] to the written %.9g (got %.9g)"), Mode, C, Written[Mode][C][0], Report.Resolved->PerChunkPromptTokenCostMs[C]),
+						Written[Mode][C][0] > 0.0 && FMath::IsNearlyEqual(Report.Resolved->PerChunkPromptTokenCostMs[C], Written[Mode][C][0], 1e-9 * (1.0 + Written[Mode][C][0])));
+					bOk &= TestTrue(*FString::Printf(TEXT("mode %d resolves PerChunkPromptTokenCostPerPositionMs[%d] to the written %.9g (got %.9g)"), Mode, C, Written[Mode][C][1], Report.Resolved->PerChunkPromptTokenCostPerPositionMs[C]),
+						Written[Mode][C][1] >= 0.0 && FMath::IsNearlyEqual(Report.Resolved->PerChunkPromptTokenCostPerPositionMs[C], Written[Mode][C][1], 1e-9 * (1.0 + Written[Mode][C][1])));
+				}
+			}
+		}
+		else
+		{
+			bOk = false;
+		}
+		bOk &= TestTrue(TEXT("INI files restored"), Costs.Restore() && Settings.Restore());
 		return bOk;
 	}
 

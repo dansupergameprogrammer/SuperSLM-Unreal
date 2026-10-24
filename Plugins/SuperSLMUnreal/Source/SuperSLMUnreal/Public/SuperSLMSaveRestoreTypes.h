@@ -117,6 +117,10 @@ enum class ESuperSLMRestoreResult : uint8
 	// GPU pooled mode: a valid 'SLM6' whose budget, origin or context_length is within the
 	// model's cap but above the subsystem's ContextCap. The CPU never returns it.
 	ContextCapMismatch,
+
+	// AdoptPrefix() on a prefix-cache lease (RequestPrefix) that was returned, or whose entry was
+	// evicted or ended with its configuration. Appended last so every earlier ordinal is unchanged.
+	PrefixLeaseEnded,
 };
 
 namespace SuperSLM

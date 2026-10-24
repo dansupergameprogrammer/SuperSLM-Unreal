@@ -196,3 +196,37 @@ HOST_TEST(cache_ended_leases_hold_no_spec, "§5.6 (RequestPrefix copies the spec
 	EXPECT_EQ(Cache.GetLeaseState(Handles[199]), EPrefixLeaseState::Ended);
 	EXPECT_EQ(Cache.GetSource(Handles[199]), EPrefixSource::Memory);
 }
+
+HOST_TEST(cache_adopt_reports_an_entry_id_that_is_never_reused, "§5.11 (b): BeginAdopt names the entry by its residency id, which a later entry never shares even when the engine hands it the same handle (the paging ledger's cache-entry key)")
+{
+	FCacheFixture F(1, false);
+	REQUIRE_TRUE(F.bConfigured);
+	const int64_t A = F.RequestReady(FixtureSpec(1));
+	REQUIRE_NE(A, 0);
+	uint64_t EngineA = 0;
+	uint64_t Token = 0;
+	uint64_t EntryA = 7;
+	REQUIRE_EQ(F.Cache.BeginAdopt(A, EngineA, Token, &EntryA), EPrefixAdoptCheck::Adoptable);
+	EXPECT_EQ(EntryA, F.Cache.Residency().GetLeaseEntry(A));
+	EXPECT_NE(EntryA, kInvalidResidencyEntry);
+	EXPECT_TRUE(F.Cache.EndAdopt(Token));
+	REQUIRE_TRUE(F.Cache.Return(A));
+
+	// A is evicted and released; the engine then hands its handle to the next entry.
+	F.Sim->NextEngineHandle = EngineA;
+	const int64_t B = F.RequestReady(FixtureSpec(2));
+	REQUIRE_NE(B, 0);
+	EXPECT_EQ(F.Sim->CountHistory(EPrefixCommandKind::Release), static_cast<size_t>(1));
+	uint64_t EngineB = 0;
+	uint64_t EntryB = 0;
+	REQUIRE_EQ(F.Cache.BeginAdopt(B, EngineB, Token, &EntryB), EPrefixAdoptCheck::Adoptable);
+	EXPECT_EQ(EngineB, EngineA); // the same engine handle ...
+	EXPECT_NE(EntryB, EntryA);   // ... but a different entry id
+	EXPECT_NE(EntryB, kInvalidResidencyEntry);
+	EXPECT_TRUE(F.Cache.EndAdopt(Token));
+
+	uint64_t EntryX = 7;
+	EXPECT_EQ(F.Cache.BeginAdopt(A, EngineB, Token, &EntryX), EPrefixAdoptCheck::PrefixLeaseEnded);
+	EXPECT_EQ(EntryX, kInvalidResidencyEntry);
+	EXPECT_TRUE(F.Sim->Violations.empty());
+}

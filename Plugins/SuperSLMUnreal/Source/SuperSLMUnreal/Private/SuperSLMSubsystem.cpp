@@ -1,6 +1,10 @@
 #include "SuperSLMSubsystem.h"
 
+#include "Core/SuperSLMBuildSlicing.h"
+#include "Core/SuperSLMCacheChunkPricing.h"
+#include "Core/SuperSLMInSituPrefixPrefill.h"
 #include "Core/SuperSLMPageLedgerCore.h"
+#include "Core/SuperSLMSchemaJumpCore.h"
 #include "SuperSLMFinishHook.h"
 #include "SuperSLMLog.h"
 #include "SuperSLMModel.h"
@@ -11,8 +15,16 @@
 #include "SuperSLMSchedulingTestAccess.h"
 #include "SuperSLMConfigureTestAccess.h"
 #include "SuperSLMSaveBlob.h"
+#include "SuperSLMSchemaJumpAbi.h"
+#include "SuperSLMSchemaJumpReviewTestAccess.h"
+#include "SuperSLMSchemaJumpTestSeam.h"
+#include "SuperSLMSchemaJumpTypes.h"
 #include "SuperSLMSequenceLifecycleBudget.h"
 #include "SuperSLMStatusMapping.h"
+#include "SuperSLMTokenizeTestSeam.h"
+#if SUPERSLM_WITH_PREFIX_CACHE
+#include "SuperSLMSubsystemPrefixCache.h"
+#endif
 
 #include "Async/Async.h"
 #include "HAL/CriticalSection.h"
@@ -33,10 +45,14 @@
 #include "Trace/Trace.h"
 #include "UObject/StrongObjectPtr.h"
 
+#include "superslm/model.h"
+#include "superslm/schema_masks.h"
 #include "superslm/sslm_abi.h"
 
 #include <atomic>
 #include <cmath>
+#include <string>
+#include <vector>
 
 // D-SLM7407 (plan §5): the async worker tick, T-2850 fold 8, T-2805 round 9. This file replaces
 // the synchronous, game-thread-executing scheduler T-2815 built: Tick() is now Apply-then-Plan bookkeeping only, and every Layer-1 call runs on a
@@ -189,6 +205,11 @@ namespace
 		int64 RestoreOrigin = 0;
 		int64 RestoreContextLength = 0;
 		int64 RestoreHintPrefixId = 0;
+#if SUPERSLM_WITH_PREFIX_CACHE
+		// Precache plan §5.11 (b) *Adopt and hint* (rev 1.18, PC-15 Q5): a leased cache handle as the hint. Its
+		// entry is adopt-pinned from the call until the job delivers or the op is refused (Token 0: none).
+		SuperSLMPrefixCacheGlue::FCacheRestoreHint RestoreHintCache;
+#endif
 	};
 
 	// A small, per-prefix administrative op (D-SLM7342, priced by D-SLM7504): PrefixBegin (the
@@ -347,6 +368,34 @@ namespace
 	};
 	using FContinuationTicketPtr = TSharedPtr<FContinuationTicket, ESPMode::ThreadSafe>;
 
+	// Schema fast-decode plan rev 1.3.5, §6 P1 and P1-X: one CPU generation's schema jump-forward
+	// state, set at activation (BeginJumpGeneration) and updated at each of its jobs' delivery.
+	// Caller-owned: it lives in FSlotUser, so a release resets it with the rest of the generation.
+	struct FJumpGeneration
+	{
+		// A schema-bound generation: its jobs read forcedness (when bReads) and it may take span jobs
+		// (Mode Exact or Canonical). False for an unbound generation, which runs today's loop.
+		bool bActive = false;
+		SuperSLMCore::ESchemaJumpMode Mode = SuperSLMCore::ESchemaJumpMode::Off;
+		int32 SchemaIndex = INDEX_NONE; // the schema's index in the model's SCM1 section
+		bool bReads = false;            // the generation's jobs read sslm_seq_forced_tokens (cap 0)
+
+		// The walk the plugin tracks itself (§6 P1-X "The walk": the ABI has no walk-state query).
+		// Known only for a generation that starts from the schema's start state: a fresh or reset
+		// sequence (no context, no adopted prefix). Otherwise the generation drafts nothing and feeds
+		// nothing (timing only, never tokens, C13).
+		bool bWalkKnown = false;
+		uint32 WalkState = 0;
+		uint32 StartState = 0; // the walk state before the first generated token
+
+		// FJumpSequenceFacts' inputs (SuperSLMCore::NextJob).
+		bool bPendingToken = false;
+		int32 ForcedChainLength = 0;
+		bool bLastJobWasSpan = false;
+		bool bLastSpanFailed = false;
+		bool bSpanOutstanding = false;
+	};
+
 	// Plan §2.5 row 20 rule 1 (D-SLM7701, D-SLM7706): every caller-owned field of a slot, in one
 	// struct. FSlot inherits it, and ReleaseUser() -- the only code that ends a hold -- resets it
 	// by value, so a field added here later is reset without anyone listing it. Vend and a
@@ -402,6 +451,10 @@ namespace
 		bool bHasDeferredRefusal = false;
 		FString DeferredRefusal;
 
+		// Schema fast-decode plan rev 1.3.5, §6 P1 and P1-X: the active generation's jump-forward
+		// state (default: none).
+		FJumpGeneration Jump;
+
 		// A new request activates (Generate) on a sequence that may hold an adopted prefix.
 		void ClearForBegin()
 		{
@@ -419,6 +472,7 @@ namespace
 			ActiveGenerateOrdinal = 0;
 			bGenerateFirstJobPosted = false;
 			Gate.Reset(); // activation follows every earlier delivery, so no job holds the old one
+			Jump = FJumpGeneration();
 		}
 
 		bool IsGenerating() const
@@ -545,6 +599,13 @@ namespace
 		// continuation.
 		int32 SpeculativeFinishesQueued = 0;
 		bool bAdopted = false;         // holds an adopted prefix's context
+		// Schema fast-decode plan rev 1.3.6, §6 P1 "When the walk is known": the adopted prefix was
+		// prompt-only (every CPU prefix is: CreatePrefix prefills on the unbound base model with
+		// prompt spans), so the engine's walk is still at state 0 while ContextUsed equals its
+		// length. Set only by an adoption's delivery; a restore, a reset and a drained recycle clear
+		// it with bAdopted.
+		bool bAdoptedPromptOnlyPrefix = false;
+		int64 AdoptedPrefixLength = 0;
 
 		// True once a queued Restore has reserved this (otherwise-free) slot but the worker has
 		// not yet delivered the restore -- excluded from vend/due processing until it delivers.
@@ -612,6 +673,8 @@ namespace
 				LayersDoneInToken = 0;
 				bReadyForLogits = false;
 				bAdopted = false;
+				bAdoptedPromptOnlyPrefix = false;
+				AdoptedPrefixLength = 0;
 				SpeculativeFinishesQueued = 0;
 			}
 		}
@@ -784,12 +847,21 @@ namespace
 		return { Costs.BatchedPromptTokenCostMs, Costs.BatchedPromptTokenCostPerPositionMs };
 	}
 
-	// A prefill chunk of Chunk tokens starting at depth d costs
-	// Chunk x TokenMs + PerPositionMs x (Chunk x d + Chunk x (Chunk - 1) / 2), with the pair the
-	// chunk's own size selects (SuperSLMPrefillPlanning::SelectPromptPrice).
+	// Schema fast-decode plan rev 1.3.5/1.3.6, §6 P1 "Pricing": the per-C table for chunks of 2..7
+	// tokens, the resolved configuration's field (rev 1.3.6, P1.1): the caller's or a saved
+	// estimate's C = 2..7 arms, else the chunk-1 pair until B5f fills it.
+	SuperSLMPrefillPlanning::FPerChunkPromptPrices PerChunkPromptPrices(const FSuperSLMResolvedCpuConfig& Costs)
+	{
+		return SuperSLMRuntimeResolve::PerChunkPromptPrices(Costs);
+	}
+
+	// A prefill chunk -- or a span job of Chunk rows (plan rev 1.3.5, §6) -- of Chunk tokens starting
+	// at depth d costs Chunk x TokenMs + PerPositionMs x (Chunk x d + Chunk x (Chunk - 1) / 2), with
+	// the pair the chunk's own size selects: the chunk-1 pair at 1, the per-C table at 2..7, the
+	// batched pair from 8 (SuperSLMPrefillPlanning::SelectPromptPriceWithTable).
 	double PrefillChunkCostMs(int32 Chunk, int64 StartDepth, const FSuperSLMResolvedCpuConfig& Costs)
 	{
-		return SuperSLMPrefillPlanning::PrefillChunkCostMs(Chunk, StartDepth, Chunk1PromptPrice(Costs), BatchedPromptPrice(Costs));
+		return SuperSLMPrefillPlanning::PrefillChunkCostMsWithTable(Chunk, StartDepth, Chunk1PromptPrice(Costs), PerChunkPromptPrices(Costs), BatchedPromptPrice(Costs));
 	}
 
 	// The chunk one prefill job carries (at least 1, at most MaxChunk): the largest whose
@@ -799,8 +871,8 @@ namespace
 	// sites), and so does every continuation of a sequence prefill (1.1, PlanContinuations).
 	int32 PlanPrefillChunk(int32 MaxChunk, int64 StartDepth, double ShareMs, int32 MinPrefillChunk, const FSuperSLMResolvedCpuConfig& Costs)
 	{
-		return SuperSLMPrefillPlanning::PlanPrefillChunk(MaxChunk, StartDepth, ShareMs, MinPrefillChunk,
-			Chunk1PromptPrice(Costs), BatchedPromptPrice(Costs));
+		return SuperSLMPrefillPlanning::PlanPrefillChunkWithTable(MaxChunk, StartDepth, ShareMs, MinPrefillChunk,
+			Chunk1PromptPrice(Costs), PerChunkPromptPrices(Costs), BatchedPromptPrice(Costs));
 	}
 
 	// D-SLM7414 (plan §5): "the Plan step picks the largest composition whose planned cost fits
@@ -998,6 +1070,11 @@ namespace
 
 		FEvent* WakeEvent = nullptr;
 		std::atomic<bool> bStopRequested{false};
+#if WITH_DEV_AUTOMATION_TESTS
+		// Precache plan §8 (rev 1.18), the prefix cache's build hold: the cache builds posted to this lane while the
+		// hold was armed and not yet past it. While above 0 the lane is not free for planning (FLane::IsFreeForPlanning).
+		std::atomic<int32> TestBuildHolds{0};
+#endif
 		FCriticalSection QueueCS;
 		TArray<FQueuedWorkerJobPtr> Queue; // guarded by QueueCS; the worker pops the front,
 		                                     // the game thread only ever appends to the back
@@ -1028,6 +1105,9 @@ namespace
 		// none). Apply leaves this job undelivered while it holds; later entries on its lane, which
 		// belong to other entities, deliver past it (K3).
 		int64 ApplyHoldId = 0;
+		// Schema fast-decode plan rev 1.3.5, §6: a span job (one sslm_seq_jump_forward call). It has
+		// no ledger row (LedgerRow INDEX_NONE) and is never a continuation's predecessor.
+		bool bSpanJob = false;
 	};
 
 	struct FLane
@@ -1053,7 +1133,45 @@ namespace
 		// worker has actually finished." A lane with nothing pending is available immediately.
 		bool IsFreeForPlanning(int32 TickIndex) const
 		{
+#if WITH_DEV_AUTOMATION_TESTS
+			// Precache plan §8 (rev 1.18): a lane holding a cache build at the test-only build hold takes no new job,
+			// since a job queued behind the held one could not run until the hold is cleared. Test seams only: the
+			// counter is 0 unless a cell arms the hold.
+			if (Runnable != nullptr && Runnable->TestBuildHolds.load(std::memory_order_acquire) > 0)
+			{
+				return false;
+			}
+#endif
+			// Precache plan rev 1.18.10 (§15.29, code review S1): a lane held for a cache build's waiting chunk takes no
+			// other new job (SuperSLMCore::LaneHeldForChunk); the chunk itself is posted through IsFreeForChunk.
+			if (IsHeldForChunk())
+			{
+				return false;
+			}
 			return Pending.Num() == 0 || TickIndex >= Pending.Last().CommittedDeliveryTick;
+		}
+
+		// Precache plan rev 1.18.10 (§15.29): IsFreeForPlanning without the chunk hold, for the waiting chunk itself.
+		bool IsFreeForChunk(int32 TickIndex) const
+		{
+#if WITH_DEV_AUTOMATION_TESTS
+			if (Runnable != nullptr && Runnable->TestBuildHolds.load(std::memory_order_acquire) > 0)
+			{
+				return false;
+			}
+#endif
+			return Pending.Num() == 0 || TickIndex >= Pending.Last().CommittedDeliveryTick;
+		}
+
+		// Precache plan rev 1.18.10 (§15.29, code review S1): the alternation on a sliced cache build's lane. The id of
+		// the last job posted here, and, while a build's next chunk waits for this lane, the id of that build's
+		// previous job here (0 when no chunk waits; the prefix-cache glue sets it at each plan step). Once the lane has
+		// taken one job since that previous job, it is held for the chunk.
+		int64 LastPostedJobId = 0;
+		int64 ChunkWaitingAfterJobId = 0;
+		bool IsHeldForChunk() const
+		{
+			return SuperSLMCore::LaneHeldForChunk(LastPostedJobId, ChunkWaitingAfterJobId);
 		}
 
 		void Post(FQueuedWorkerJobRef WorkerJob, TFunction<void(double)> Deliver, int64 LedgerRow, const FSuperSLMWorkerJobReport& Job)
@@ -1068,6 +1186,7 @@ namespace
 			Entry.K = Job.K;
 			Entry.ChainedWaitTicks = Job.ChainedWaitTicks;
 			Pending.Add(MoveTemp(Entry));
+			LastPostedJobId = Job.JobId;
 			Runnable->Enqueue(MoveTemp(WorkerJob));
 		}
 	};
@@ -1242,6 +1361,30 @@ int64 SuperSLMMintPrefixId()
 	return GNextPrefixId++;
 }
 
+// Schema fast-decode plan rev 1.3.6, review finding 1: the walk table, parsed over the pinned artifact
+// bytes. SchemaMasksTable::Parse keeps pointers INTO the section, so Pin must outlive Schemas, which
+// it does by being this struct's first member (destroyed last).
+struct FSchemaWalkTable
+{
+	FSuperSLMArtifactBytesPin Pin;
+	superslm::SchemaMasksTable Schemas;
+};
+using FSchemaWalkTableRef = TSharedPtr<const FSchemaWalkTable, ESPMode::ThreadSafe>;
+
+// One walk-table load's output, written by the pool task and read by the game thread once bDone is
+// set (release/acquire). The task owns its own copy of the captured bytes, so a state destroyed
+// while it runs leaves it nothing dangling.
+struct FSchemaWalkLoad
+{
+	std::atomic<bool> bDone{false};
+	TSharedPtr<FSchemaWalkTable, ESPMode::ThreadSafe> Table; // null when the load failed or found no section
+	FString Warning;                                          // logged at publish when non-empty
+	bool bAnyOnGameThread = false;
+	int64 SectionBytes = -1;
+	int64 ArtifactBytes = -1;
+};
+using FSchemaWalkLoadRef = TSharedPtr<FSchemaWalkLoad, ESPMode::ThreadSafe>;
+
 struct FSuperSLMSubsystemState
 {
 	sslm_model Model = nullptr;
@@ -1309,6 +1452,111 @@ struct FSuperSLMSubsystemState
 	sslm_status TestNextResetStatus = SSLM_OK;
 #endif
 
+	// ---- Schema fast-decode plan rev 1.3.5, §6 slices P1 and P1-X: schema jump-forward ----------
+	//
+	// The walk table: the model's SCM1 section, parsed in place (§6 P1-X "The walk"; the ABI has no
+	// walk-state query). Rev 1.3.6 (review finding 1, §6 P1 *Lazy*): Configure() only keeps the
+	// captured artifact bytes (WalkArtifact, which pins them); the first generation that is both
+	// schema-bound and in a jump mode other than Off asks for the table (RequestSchemaWalkLoad), a
+	// pool thread finds the section through the artifact's own section table and parses it over the
+	// pinned bytes (no re-hash, no copy, no whole-model load), and the game thread publishes it at
+	// the next Tick. Until then the walk is unknown. A configuration whose generations are all Off
+	// never loads it.
+	SuperSLMRuntime::FModelBytes WalkArtifact;
+	FSchemaWalkTableRef WalkTable;            // null until published (or when the load failed)
+	FSchemaWalkLoadRef WalkLoadInFlight;       // the pool task's output, until published
+	bool bWalkLoadRequested = false;           // once per state: a failed load is not retried
+#if WITH_DEV_AUTOMATION_TESTS
+	// FSuperSLMSchemaJumpReviewTestAccess: the loads since this state began, the hold, and whether a
+	// held load waits for its release.
+	TArray<FSuperSLMSchemaWalkLoadRecord> WalkLoadRecords;
+	bool bHoldWalkLoad = false;
+	bool bWalkLoadPending = false;
+	// The forcedness reads made since StartRecording(), and the ground-truth counter of Canonical
+	// decode jobs planned while the engine reported a chain (review finding 4).
+	TArray<FSuperSLMForcednessReadRecord> ForcednessReadRecords;
+	int32 CanonicalOpenChainDecodes = 0;
+#endif
+
+	// The walk table's schemas; an empty table (every ByIndex/ByName misses) until it is ready.
+	const superslm::SchemaMasksTable& WalkSchemas() const
+	{
+		static const superslm::SchemaMasksTable Empty;
+		return WalkTable.IsValid() ? WalkTable->Schemas : Empty;
+	}
+	// The learned drafts (D2-online), per (this mapping, schema): immutable snapshots, merged and
+	// swapped here on the game thread, dropped with this state (the model's unmap, P1X.11).
+	SuperSLMCore::FDraftTableStore DraftTables;
+	// Per schema index: the forced flags read so far (sslm_seq_forced_tokens, cap 0) and drafted
+	// through, and the snapshot version, which rises at every swap of that schema's table (P1X.8).
+	TMap<int32, SuperSLMCore::FForcednessObservations> ForcedObservations;
+	TMap<int32, int64> DraftSnapshotVersions;
+	// FSuperSLMSchemaJumpTestAccess::SetForcednessReadsEnabled(): on unless a test turns it off.
+	bool bForcednessReadsEnabled = true;
+	// The forcedness reads made since the last StartRecording() (or this state's creation).
+	int64 ForcednessReadCount = 0;
+	// The tick Apply is delivering in (a span job's DeliveredAtTick).
+	int32 CurrentTickIndex = 0;
+#if WITH_DEV_AUTOMATION_TESTS
+	// FSuperSLMSchemaJumpTestAccess: the span jobs recorded since StartRecording(), and the status
+	// the next span job returns instead of calling the verb (0: unset).
+	bool bRecordSpanJobs = false;
+	TArray<FSuperSLMSpanJobRecord> SpanJobRecords;
+	int32 TestNextSpanStatus = 0;
+	// FSuperSLMSchemaJumpTestAccess::SetJobHold: per vended sequence (its VendedId), where its next job stops and
+	// whether it is stopped there now. ReturnSequence removes the sequence's entry.
+	struct FTestJobHold { ESuperSLMJobHoldPoint Point = ESuperSLMJobHoldPoint::None; bool bHeld = false; };
+	TMap<int64, FTestJobHold> TestJobHolds;
+#endif
+
+	// The table key for a schema of this state's mapping.
+	SuperSLMCore::FDraftTableKey DraftKey(int32 SchemaIndex) const
+	{
+		SuperSLMCore::FDraftTableKey Key;
+		Key.Model = static_cast<uint64_t>(reinterpret_cast<UPTRINT>(Model));
+		Key.Schema = static_cast<uint32_t>(SchemaIndex);
+		return Key;
+	}
+
+	// The schema's SCM1 index by name; false when the section does not hold it.
+	bool FindSchemaIndex(const FString& SchemaName, int32& OutIndex) const
+	{
+		const FTCHARToUTF8 Utf8(*SchemaName);
+		size_t Index = 0;
+		if (WalkSchemas().ByName(std::string_view(Utf8.Get(), static_cast<size_t>(Utf8.Length())), &Index) == nullptr)
+		{
+			return false;
+		}
+		OutIndex = static_cast<int32>(Index);
+		return true;
+	}
+
+	// Installs Table (null drops it) as SchemaIndex's snapshot; a different pointer is a swap.
+	void SwapDraftTable(int32 SchemaIndex, SuperSLMCore::FDraftTableRef Table)
+	{
+		const SuperSLMCore::FDraftTableKey Key = DraftKey(SchemaIndex);
+		if (DraftTables.Snapshot(Key) == Table)
+		{
+			return;
+		}
+		DraftTables.Seed(Key, Table);
+		if (Table)
+		{
+			++DraftSnapshotVersions.FindOrAdd(SchemaIndex, -1);
+		}
+	}
+
+	// The version of the snapshot SchemaIndex's table holds now; -1 with no table.
+	int64 DraftSnapshotVersion(int32 SchemaIndex) const
+	{
+		if (!DraftTables.Snapshot(DraftKey(SchemaIndex)))
+		{
+			return -1;
+		}
+		const int64* Version = DraftSnapshotVersions.Find(SchemaIndex);
+		return Version ? *Version : -1;
+	}
+
 	// ---- Plugin paging plan, step K2: CPU budget mode -----------------------------------------
 	//
 	// The page ledger (Core/SuperSLMPageLedgerCore.h), configured only when
@@ -1336,6 +1584,10 @@ struct FSuperSLMSubsystemState
 
 	// The HoldApply() hold the next PostLedgerJob() attaches to the job it posts; consumed there.
 	int64 NextPostApplyHoldId = 0;
+#if SUPERSLM_WITH_PREFIX_CACHE
+	// Precache plan §5.5: this configuration's prefix-cache glue (SuperSLMSubsystemPrefixCache.h).
+	SuperSLMPrefixCacheGlue::FState PrefixCache;
+#endif
 
 	// §3.7: the engine returned KV_POOL_EXHAUSTED to one of this plan's own (admitted) requests,
 	// which a correct ledger never lets happen. Counted, and logged by name as a ledger fault.
@@ -1742,6 +1994,11 @@ void USuperSLMSubsystem::Deinitialize()
 	TearDown();
 	// Plugin paging plan §3.5 (K3): the world's end drops every tombstone.
 	LifecycleTombstones.Empty();
+#if SUPERSLM_WITH_PREFIX_CACHE
+	// Precache plan §5.11 (a): the cache host outlives each configuration, not the subsystem.
+	delete PrefixCacheHost;
+	PrefixCacheHost = nullptr;
+#endif
 	// Review W5: a prepare still running is waited for (its work is bounded: the map, the
 	// bandwidth measurement and the allocations), then its state is freed here, synchronously,
 	// since the pool task that would otherwise free it may not run at exit.
@@ -1760,6 +2017,11 @@ void USuperSLMSubsystem::Deinitialize()
 void USuperSLMSubsystem::BeginDestroy()
 {
 	TearDown();
+#if SUPERSLM_WITH_PREFIX_CACHE
+	// Precache plan §5.11 (a): the cache host outlives each configuration, not the subsystem.
+	delete PrefixCacheHost;
+	PrefixCacheHost = nullptr;
+#endif
 	Super::BeginDestroy();
 }
 
@@ -1771,6 +2033,12 @@ void USuperSLMSubsystem::BeginDestroy()
 static void DestroyCpuStateContents(FSuperSLMSubsystemState& S, TArray<int64>* OutTombstones = nullptr)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.PoolFree", SuperSLMChannel);
+
+#if SUPERSLM_WITH_PREFIX_CACHE
+	// Precache plan §5.6 / cell 1.7: before anything is delivered, the cache marks its Pending leases, so a build
+	// or restore that is running now reads Cancelled after the next Configure() (code review r2 B1).
+	SuperSLMPrefixCacheGlue::TeardownBegins(S);
+#endif
 
 	// Plan §2.5 row 19 (D-SLM7763, U1 round 8): the one place a queued restore op is dropped
 	// without being dispatched is here, with the state -- ReleaseUser() removes only Generate
@@ -1867,6 +2135,12 @@ static void DestroyCpuStateContents(FSuperSLMSubsystemState& S, TArray<int64>* O
 		FSuperSLMSubsystemState::ReleaseHeldPins(Slot.Held);
 	}
 
+#if SUPERSLM_WITH_PREFIX_CACHE
+	// Precache plan §5.11 (a) L1: the cache's lane jobs not yet posted run, and its engine handles
+	// are released, before the subsystem releases its own and destroys the pool.
+	SuperSLMPrefixCacheGlue::BeforeHandleRelease(S);
+#endif
+
 	// Order Layer 1 accepts with sequences still vended and mid-generation: every sequence and
 	// every prefix is released first (sslm_seq_release is legal mid-token and drops its adapter
 	// reference; a prefix holds a model reference), so the pool and the model have no live
@@ -1889,6 +2163,9 @@ static void DestroyCpuStateContents(FSuperSLMSubsystemState& S, TArray<int64>* O
 	{
 		if (Pair.Value.Handle != nullptr)
 		{
+#if SUPERSLM_WITH_PREFIX_CACHE
+			SuperSLMPrefixCacheGlue::NoteRelease(S, Pair.Value.Handle);
+#endif
 			const sslm_status Status = sslm_prefix_release(Pair.Value.Handle);
 			if (Status != SSLM_OK)
 			{
@@ -1910,6 +2187,9 @@ static void DestroyCpuStateContents(FSuperSLMSubsystemState& S, TArray<int64>* O
 	{
 		if (Op.Kind == EPrefixAdminKind::Release && Op.ReleaseHandle != nullptr)
 		{
+#if SUPERSLM_WITH_PREFIX_CACHE
+			SuperSLMPrefixCacheGlue::NoteRelease(S, Op.ReleaseHandle);
+#endif
 			const sslm_status Status = sslm_prefix_release(Op.ReleaseHandle);
 			if (Status != SSLM_OK)
 			{
@@ -1935,7 +2215,13 @@ static void DestroyCpuStateContents(FSuperSLMSubsystemState& S, TArray<int64>* O
 	}
 	if (S.Pool != nullptr)
 	{
+#if SUPERSLM_WITH_PREFIX_CACHE
+		SuperSLMPrefixCacheGlue::BeforePoolDestroy(S);
+#endif
 		const sslm_status Status = sslm_kv_pool_destroy(S.Pool);
+#if SUPERSLM_WITH_PREFIX_CACHE
+		SuperSLMPrefixCacheGlue::AfterPoolDestroy(S, Status);
+#endif
 		if (Status == SSLM_OK)
 		{
 			FMemory::Free(S.KvBuffer);
@@ -1977,6 +2263,12 @@ static void DestroyCpuStateContents(FSuperSLMSubsystemState& S, TArray<int64>* O
 	S.HandleResults.Empty();
 	S.RetainedResultBytes = 0;
 
+	// Schema fast-decode plan rev 1.3.5, §6 P1-X "Lifetime": the learned drafts and the observed
+	// flags are keyed by this mapping's schema indices, so they go with the mapping (P1X.11).
+	S.DraftTables.DropModel(S.DraftKey(0).Model);
+	S.ForcedObservations.Empty();
+	S.DraftSnapshotVersions.Empty();
+
 	// Plugin paging plan §3.5 "Fit and wait", cell 1.11: the page ledger's epoch ends with the
 	// pool. Every job that ran has been delivered above (and applied its ticket); every op still
 	// queued, parked at a test hold or never dispatched, is dropped with this state, and its
@@ -2014,6 +2306,106 @@ void USuperSLMSubsystem::TearDown()
 	delete State;
 	State = nullptr;
 	ConfiguredModel = nullptr;
+}
+
+// Schema fast-decode plan rev 1.3.6, review finding 1 (§6 P1 *Lazy*; P1.10): the walk table's load.
+// It runs on a pool thread, never on the game thread and never inside Configure(): it finds the
+// SchemaMasks section through the captured artifact's own section table (the mapping already
+// validated and hashed the artifact) and parses it in place over the pinned bytes. A section that is
+// absent or does not parse, or an allocation failure, leaves jump-forward without a walk (no learned
+// draft, no learning; tokens are unchanged) and is logged at publish, never a refusal.
+static void BuildSchemaWalkTable(const SuperSLMRuntime::FModelBytes& Artifact, int32 VocabSize, FSchemaWalkLoad& Load)
+{
+	Load.bAnyOnGameThread = IsInGameThread();
+	Load.ArtifactBytes = Artifact.Size;
+	try
+	{
+		const uint8* SectionData = nullptr;
+		uint64 SectionSize = 0;
+		if (!SuperSLMRuntime::FindArtifactSection(Artifact, static_cast<uint32>(superslm::SslmSectionType::SchemaMasks), SectionData, SectionSize))
+		{
+			return; // no compiled schemas
+		}
+		Load.SectionBytes = static_cast<int64>(SectionSize);
+		TSharedPtr<FSchemaWalkTable, ESPMode::ThreadSafe> Table = MakeShared<FSchemaWalkTable, ESPMode::ThreadSafe>();
+		Table->Pin = Artifact.Pin;
+		std::string Err;
+		if (!superslm::SchemaMasksTable::Parse(SectionData, SectionSize, static_cast<uint32_t>(FMath::Max(VocabSize, 0)), Table->Schemas, &Err))
+		{
+			Load.Warning = FString::Printf(TEXT("the SchemaMasks section does not parse here (%s)"), UTF8_TO_TCHAR(Err.c_str()));
+			return;
+		}
+		Load.Table = MoveTemp(Table);
+	}
+	catch (const std::bad_alloc&)
+	{
+		Load.Table.Reset();
+		Load.Warning = TEXT("out of memory while reading the SchemaMasks section");
+	}
+}
+
+// Posts the load to the pool. Game thread; the state keeps the output until PublishSchemaWalkLoad.
+static void DispatchSchemaWalkLoad(FSuperSLMSubsystemState& S)
+{
+	FSchemaWalkLoadRef Load = MakeShared<FSchemaWalkLoad, ESPMode::ThreadSafe>();
+	S.WalkLoadInFlight = Load;
+	SuperSLMRuntime::FModelBytes Artifact = S.WalkArtifact; // the task's own copy: Pin keeps the bytes alive
+	const int32 VocabSize = S.Shape.VocabSize;
+	Async(EAsyncExecution::ThreadPool, [Load, Artifact = MoveTemp(Artifact), VocabSize]()
+	{
+		BuildSchemaWalkTable(Artifact, VocabSize, *Load);
+		Load->bDone.store(true, std::memory_order_release);
+	});
+}
+
+// The first generation that is schema-bound and not Off asks for the table; every later ask is a
+// no-op (one load per state, a failed one included). Game thread.
+static void RequestSchemaWalkLoad(FSuperSLMSubsystemState& S)
+{
+	if (S.bWalkLoadRequested)
+	{
+		return;
+	}
+	S.bWalkLoadRequested = true;
+#if WITH_DEV_AUTOMATION_TESTS
+	if (S.bHoldWalkLoad)
+	{
+		S.bWalkLoadPending = true; // FSuperSLMSchemaJumpReviewTestAccess::HoldSchemaWalkLoad (P1.10 (c))
+		return;
+	}
+#endif
+	DispatchSchemaWalkLoad(S);
+}
+
+// Publishes a finished load at a Tick: the table becomes ready, and the walk is known for the
+// generations that begin from then on. Game thread.
+static void PublishSchemaWalkLoad(FSuperSLMSubsystemState& S, int32 TickIndex)
+{
+	if (!S.WalkLoadInFlight.IsValid() || !S.WalkLoadInFlight->bDone.load(std::memory_order_acquire))
+	{
+		return;
+	}
+	const FSchemaWalkLoadRef Load = MoveTemp(S.WalkLoadInFlight);
+	S.WalkLoadInFlight.Reset();
+	S.WalkTable = Load->Table;
+	if (!Load->Warning.IsEmpty())
+	{
+		UE_LOG(LogSuperSLM, Warning, TEXT("SuperSLM: %s; schema jump-forward will run without a learned draft."), *Load->Warning);
+	}
+#if WITH_DEV_AUTOMATION_TESTS
+	FSuperSLMSchemaWalkLoadRecord& Record = S.WalkLoadRecords.AddDefaulted_GetRef();
+	Record.bAnyOnGameThread = Load->bAnyOnGameThread;
+	Record.bInsideConfigure = false;    // requested only by a generation's activation
+	Record.ArtifactBytesHashed = 0;     // the section table is read; nothing is hashed
+	Record.BytesCopied = 0;             // parsed in place over the pinned bytes
+	Record.SectionBytes = Load->SectionBytes;
+	Record.ArtifactBytes = Load->ArtifactBytes;
+	Record.bWholeModelLoad = false;     // no SslmModel::Load
+	Record.bReady = S.WalkTable.IsValid();
+	Record.ReadyAtTick = Record.bReady ? TickIndex : -1;
+#else
+	(void)TickIndex;
+#endif
 }
 
 // Configure()'s whole body after the teardown (fold-round ruling 1), over captured model bytes
@@ -2146,6 +2538,39 @@ static FSuperSLMConfigureReport PrepareCpuState(const SuperSLMRuntime::FModelByt
 					TEXT("%s must be a finite, non-negative number of milliseconds per position (got %f)"), Slope.Key, Slope.Value));
 			}
 		}
+		// Precache U4 (§5.5): the cache restore's per-MiB term, refused as the slopes are.
+		if (!FMath::IsFinite(Resolved.RestoreCostPerMiBMs) || Resolved.RestoreCostPerMiBMs < 0.0)
+		{
+			return Refuse(ESuperSLMConfigureResult::InvalidCallShape, FString::Printf(
+				TEXT("RestoreCostPerMiBMs must be a finite, non-negative number of milliseconds per MiB (got %f)"), Resolved.RestoreCostPerMiBMs));
+		}
+		// Precache plan rev 1.18.11 (§15.31): the cache chunk's price pair, both or neither, in the prompt price's
+		// domain (a finite, positive cost per token and a finite, non-negative slope).
+		if (Config.PrefixPrefillTokenCostMs.IsSet() != Config.PrefixPrefillTokenCostPerPositionMs.IsSet())
+		{
+			return Refuse(ESuperSLMConfigureResult::InvalidCallShape, FString::Printf(
+				TEXT("PrefixPrefillTokenCostMs and PrefixPrefillTokenCostPerPositionMs are set together or not at all (only %s is set)"),
+				Config.PrefixPrefillTokenCostMs.IsSet() ? TEXT("PrefixPrefillTokenCostMs") : TEXT("PrefixPrefillTokenCostPerPositionMs")));
+		}
+		if (Config.PrefixPrefillTokenCostMs.IsSet() && !SuperSLMCore::IsValidChunkPricePair(SuperSLMCore::FChunkPricePair{
+			Config.PrefixPrefillTokenCostMs.GetValue(), Config.PrefixPrefillTokenCostPerPositionMs.GetValue() }))
+		{
+			return Refuse(ESuperSLMConfigureResult::InvalidCallShape, FString::Printf(
+				TEXT("PrefixPrefillTokenCostMs must be a finite, positive number of milliseconds (got %f) and PrefixPrefillTokenCostPerPositionMs a finite, non-negative number of milliseconds per position (got %f)"),
+				Config.PrefixPrefillTokenCostMs.GetValue(), Config.PrefixPrefillTokenCostPerPositionMs.GetValue()));
+		}
+		// Schema fast-decode plan rev 1.3.6 (P1.1): the per-C pairs are refused as the chunk-1 pair is.
+		for (int32 C = 2; C <= 7; ++C)
+		{
+			const double TokenMs = Resolved.PerChunkPromptTokenCostMs[C];
+			const double SlopeMs = Resolved.PerChunkPromptTokenCostPerPositionMs[C];
+			if (!FMath::IsFinite(TokenMs) || TokenMs <= 0.0 || !FMath::IsFinite(SlopeMs) || SlopeMs < 0.0)
+			{
+				return Refuse(ESuperSLMConfigureResult::InvalidCallShape, FString::Printf(
+					TEXT("PerChunkPromptTokenCostMs[%d] must be a finite, positive number of milliseconds and PerChunkPromptTokenCostPerPositionMs[%d] a finite, non-negative one (got %f, %f)"),
+					C, C, TokenMs, SlopeMs));
+			}
+		}
 	}
 	if (Model == nullptr)
 	{
@@ -2212,6 +2637,8 @@ static FSuperSLMConfigureReport PrepareCpuState(const SuperSLMRuntime::FModelByt
 	FSuperSLMSubsystemState& S = *NewState;
 	auto TearDown = [NewState]() { DestroyCpuState(NewState); };
 
+	S.WalkArtifact = *Model; // the walk table loads lazily, off the game thread (rev 1.3.6, review finding 1)
+
 	// Plugin paging plan §3.2 (step K2): budget mode reads the page geometry from the engine on
 	// this thread (the mapping is held) and sizes the page ledger's regions from it, before the
 	// lifecycle budget, which prices a budget holder's reservation (§3.3 "Lifecycle pricing").
@@ -2231,6 +2658,10 @@ static FSuperSLMConfigureReport PrepareCpuState(const SuperSLMRuntime::FModelByt
 		LedgerConfig.CacheGhostBlocks = Config.CacheGhostBlocks;
 		LedgerConfig.bCacheConfigured = false; // no prefix cache in the paging release: A and C are 0
 		LedgerConfig.CacheRegionPages = 0;
+#if SUPERSLM_WITH_PREFIX_CACHE
+		// Precache plan §5.11 (b): with a cache, region C is its budget in whole blocks of pages.
+		SuperSLMPrefixCacheGlue::ConfigureRegionC(Config, S.Model, S.PagePositions, Shape.ContextCap, LedgerConfig);
+#endif
 		const SuperSLMPaging::ELedgerConfigure LedgerResult = S.Ledger.Configure(LedgerConfig);
 		switch (LedgerResult)
 		{
@@ -2295,7 +2726,12 @@ static FSuperSLMConfigureReport PrepareCpuState(const SuperSLMRuntime::FModelByt
 
 	// The pool holds the warm sequences plus the shared-prefix blocks (D-SLM7342). The sum is
 	// computed in int64; the range check above refused anything past INT32_MAX.
-	const int64 PoolBlocks64 = static_cast<int64>(Config.BlockCount) + static_cast<int64>(Config.PrefixBlockCount);
+	const int64 PoolBlocks64 = static_cast<int64>(Config.BlockCount) + static_cast<int64>(Config.PrefixBlockCount)
+#if SUPERSLM_WITH_PREFIX_CACHE
+		// Precache plan §5.4: in legacy mode the pool gains ceil(budget / block bytes) blocks for the cache.
+		+ (bBudgetMode ? int64(0) : SuperSLMPrefixCacheGlue::LegacyCacheBlocks(Config, S.Model))
+#endif
+		;
 	check(PoolBlocks64 > 0 && PoolBlocks64 <= static_cast<int64>(MAX_int32));
 	const int32 PoolBlocks = static_cast<int32>(PoolBlocks64);
 	const size_t BlockBytes = sslm_kv_block_size(S.Model);
@@ -2482,6 +2918,9 @@ FSuperSLMConfigureReport USuperSLMSubsystem::Configure(USuperSLMModel* Model, co
 		NewState->NextHandleId = FirstHandleIdAfterTombstones(); // plugin paging plan §3.5 (K3)
 		State = NewState;
 		ConfiguredModel = Model;
+#if SUPERSLM_WITH_PREFIX_CACHE
+		InstallPrefixCache();
+#endif
 		UE_LOG(LogSuperSLM, Display, TEXT("%s"), *SuperSLMRuntimeResolve::ConfigureLine(Resolved));
 	}
 	return Report;
@@ -2490,6 +2929,54 @@ FSuperSLMConfigureReport USuperSLMSubsystem::Configure(USuperSLMModel* Model, co
 const FSuperSLMResolvedCpuConfig* USuperSLMSubsystem::GetResolvedConfig() const
 {
 	return State != nullptr ? &State->Resolved : nullptr;
+}
+
+// Precache plan rev 1.18.12 (§15.32): the in-situ prefix_prefill arm (see the declaration).
+bool USuperSLMSubsystem::WriteInSituPrefixPrefillPrice(const TArray<FSuperSLMWorkerJobReport>& BuildRows, FSuperSLMInSituPrefixPrefillPrice& Out, FString& OutError)
+{
+	Out = FSuperSLMInSituPrefixPrefillPrice();
+	if (State == nullptr || ConfiguredModel == nullptr)
+	{
+		OutError = TEXT("WriteInSituPrefixPrefillPrice: no CPU configuration with a model (Configure() first)");
+		return false;
+	}
+	std::vector<SuperSLMCore::FPrefixPrefillReading> Readings;
+	for (const FSuperSLMWorkerJobReport& Row : BuildRows)
+	{
+		if (Row.Kind != ESuperSLMWorkerJobKind::DecodeOrPrefill || Row.MemberSequences.Num() != 0 || Row.DeliveredAtTick < 0)
+		{
+			continue; // not a cache build's chunk, or not delivered
+		}
+		SuperSLMCore::FPrefixPrefillReading Reading;
+		if (SuperSLMCore::ChunkRowReading(Row.PromptTokens, Row.PromptPositionSum, Row.WorkerCallMs, Reading))
+		{
+			Readings.push_back(Reading);
+		}
+	}
+	Out.ChunkRows = static_cast<int32>(Readings.size());
+	Out.MedianWorkerMsPerToken = SuperSLMCore::MedianMsPerToken(Readings.data(), Readings.size());
+	SuperSLMCore::FChunkPricePair Pair;
+	if (!SuperSLMCore::FitInSituPrefixPrefillPair(Readings, Pair))
+	{
+		OutError = FString::Printf(TEXT("WriteInSituPrefixPrefillPrice: the build's %d chunk rows of %d tokens or more give no price pair (the fit needs at least %d)"),
+			Out.ChunkRows, SuperSLMCore::kCacheChunkTiledMinTokens, SuperSLMCore::kPrefixPrefillFitGroups);
+		return false;
+	}
+	Out.TokenCostMs = Pair.TokenMs;
+	Out.TokenCostPerPositionMs = Pair.PerPositionMs;
+	Out.TokenCostText = UTF8_TO_TCHAR(SuperSLMCore::RoundUpDecimalText(Pair.TokenMs, 3).c_str());
+	Out.TokenCostPerPositionText = UTF8_TO_TCHAR(SuperSLMCore::RoundUpDecimalText(Pair.PerPositionMs, 6).c_str());
+	Out.Path = SuperSLMRuntimeResolve::CalibratedCostsPath();
+	if (!SuperSLMRuntimeResolve::WriteSavedPrefixPrefillPair(SuperSLMRuntime::HashToHex(State->ArtifactHash), State->Resolved.bDecodeModeEffective,
+			State->Resolved.ParallelTasks, Out.TokenCostText, Out.TokenCostPerPositionText, Out.Profile, OutError))
+	{
+		OutError = TEXT("WriteInSituPrefixPrefillPrice: ") + OutError;
+		return false;
+	}
+	UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM: in-situ prefix_prefill pair %s=%s %s=%s from %d chunk rows (median worker %.3f ms/token), written to %s in %s; the next Configure() reads it."),
+		SuperSLMRuntimeResolve::PrefixPrefillTokenKey(), *Out.TokenCostText, SuperSLMRuntimeResolve::PrefixPrefillSlopeKey(), *Out.TokenCostPerPositionText,
+		Out.ChunkRows, Out.MedianWorkerMsPerToken, *Out.Profile, *Out.Path);
+	return true;
 }
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -2604,6 +3091,9 @@ void USuperSLMSubsystem::BeginConfigure(USuperSLMModel* Model, const FSuperSLMRu
 						NewState->NextHandleId = Self->FirstHandleIdAfterTombstones(); // plugin paging plan §3.5 (K3)
 						Self->State = NewState;
 						Self->ConfiguredModel = Hold.IsValid() ? Hold->Get() : nullptr;
+#if SUPERSLM_WITH_PREFIX_CACHE
+						Self->InstallPrefixCache();
+#endif
 						UE_LOG(LogSuperSLM, Display, TEXT("%s"), *SuperSLMRuntimeResolve::ConfigureLine(NewState->Resolved));
 					}
 					Hold.Reset();
@@ -2694,6 +3184,9 @@ void USuperSLMSubsystem::ReturnSequence(const FSuperSLMSequence& Sequence)
 	// unbinds the sequence on the worker, after every op the user queued with a handle, in
 	// arrival order (D-SLM7421).
 	S.ReleaseUser(*Found);
+#if WITH_DEV_AUTOMATION_TESTS
+	S.TestJobHolds.Remove(Sequence.Id); // returning the sequence ends its job hold (SetJobHold)
+#endif
 	S.PublishStats(S.LastReport);
 }
 
@@ -2921,10 +3414,14 @@ static ESuperSLMPrefixResult CreatePrefixOnState(FSuperSLMSubsystemState& S, con
 	const bool bBudgetMode = S.IsBudgetMode();
 	if (!bBudgetMode)
 	{
-		if (S.Prefixes.Num() >= S.Config.PrefixBlockCount)
+		int32 LivePrefixes = S.Prefixes.Num();
+#if SUPERSLM_WITH_PREFIX_CACHE
+		LivePrefixes -= SuperSLMPrefixCacheGlue::ShadowCount(S); // precache plan §5.4: cache entries never count
+#endif
+		if (LivePrefixes >= S.Config.PrefixBlockCount)
 		{
 			OutError = FString::Printf(TEXT("PrefixBlockCount (%d) prefixes are already live; release one, or configure more prefix blocks"), S.Config.PrefixBlockCount);
-			TRACE_BOOKMARK(TEXT("SuperSLM: prefix pool refusal (%d live)"), S.Prefixes.Num());
+			TRACE_BOOKMARK(TEXT("SuperSLM: prefix pool refusal (%d live)"), LivePrefixes);
 			return ESuperSLMPrefixResult::PrefixLimit;
 		}
 		if (Tokens.Num() == 0)
@@ -3153,6 +3650,29 @@ ESuperSLMPrefixResult USuperSLMSubsystem::CreatePrefixFrom(const FSuperSLMPrefix
 
 ESuperSLMPrefixPhase USuperSLMSubsystem::GetPrefixPhase(const FSuperSLMPrefix& Prefix) const
 {
+#if SUPERSLM_WITH_PREFIX_CACHE
+	// Precache plan §5.6: a cache lease's phase moves to Ready as a CreatePrefix handle's does. Read
+	// before State->Prefixes, where an adopt's shadow entry would read Ready after the lease ended.
+	if (State != nullptr && State->PrefixCache.Host != nullptr)
+	{
+		switch (State->PrefixCache.Host->GetLeaseState(Prefix))
+		{
+		case ESuperSLMPrefixLeaseState::Invalid:
+			break; // not a cache lease: the subsystem's own prefixes, below
+		case ESuperSLMPrefixLeaseState::Pending:
+			return ESuperSLMPrefixPhase::Pending;
+		case ESuperSLMPrefixLeaseState::Ready:
+			return ESuperSLMPrefixPhase::Ready;
+		case ESuperSLMPrefixLeaseState::BudgetExhausted:
+		case ESuperSLMPrefixLeaseState::PoolExhausted:
+		case ESuperSLMPrefixLeaseState::UnknownSchema:
+		case ESuperSLMPrefixLeaseState::Failed:
+			return ESuperSLMPrefixPhase::Faulted; // GetPrefixLeaseState() names which refusal
+		default:
+			return ESuperSLMPrefixPhase::Invalid; // Cancelled or Ended: no longer a live handle
+		}
+	}
+#endif
 	if (State != nullptr)
 	{
 		if (const FPrefixEntry* Entry = State->Prefixes.Find(Prefix.Id))
@@ -3183,6 +3703,17 @@ ESuperSLMRestoreResult USuperSLMSubsystem::AdoptPrefix(const FSuperSLMSequence& 
 		OutError = FString::Printf(TEXT("this sequence's own queue already holds %d entries (SSLM_SEQUENCE_QUEUE_FULL)"), State->Config.MaxQueuedOperationsPerSequence);
 		return ESuperSLMRestoreResult::SequenceQueueFull;
 	}
+#if SUPERSLM_WITH_PREFIX_CACHE
+	// Precache plan §5.6: a cache lease is adopted through this same path once Ready; a returned or
+	// evicted one is PrefixLeaseEnded.
+	{
+		ESuperSLMRestoreResult CacheResult = ESuperSLMRestoreResult::Success;
+		if (SuperSLMPrefixCacheGlue::StopCacheAdopt(*State, Prefix.Id, CacheResult, OutError))
+		{
+			return CacheResult;
+		}
+	}
+#endif
 	if (!State->Prefixes.Contains(Prefix.Id))
 	{
 		OutError = TEXT("not a live prefix handle");
@@ -3209,6 +3740,13 @@ ESuperSLMRestoreResult USuperSLMSubsystem::AdoptPrefix(const FSuperSLMSequence& 
 
 bool USuperSLMSubsystem::ReleasePrefix(const FSuperSLMPrefix& Prefix, FString& OutError)
 {
+#if SUPERSLM_WITH_PREFIX_CACHE
+	// Precache plan §5.6: a cache-owned handle is returned (ReturnPrefix), never released.
+	if (State != nullptr && SuperSLMPrefixCacheGlue::RefuseRelease(*State, Prefix, OutError))
+	{
+		return false;
+	}
+#endif
 	FPrefixEntry* Entry = State ? State->Prefixes.Find(Prefix.Id) : nullptr;
 	if (Entry == nullptr)
 	{
@@ -3309,6 +3847,9 @@ bool USuperSLMSubsystem::ReleasePrefix(const FSuperSLMPrefix& Prefix, FString& O
 	Op.StartHoldId = State->TakeArmedHold(EPagedJobKind::PrefixRelease, /*bApply*/ false);
 	Op.ApplyHoldId = State->TakeArmedHold(EPagedJobKind::PrefixRelease, /*bApply*/ true);
 	State->PrefixAdminQueue.Add(Op);
+#if SUPERSLM_WITH_PREFIX_CACHE
+	SuperSLMPrefixCacheGlue::NoteRelease(*State, Op.ReleaseHandle);
+#endif
 	// 1.1: keeps its place until the release delivers, and the release waits for a prefill job
 	// still in flight (RetiringPrefixes).
 	FSuperSLMSubsystemState::FRetiringPrefix& Retiring = State->RetiringPrefixes.Add(Prefix.Id);
@@ -3461,10 +4002,16 @@ bool USuperSLMSubsystem::Tokenize(const FString& Utf8Text, TArray<int32>& OutTok
 	int32 Count = Utf8.Length() + 16;
 	OutTokens.SetNumUninitialized(Count);
 	const char* Text = reinterpret_cast<const char*>(Utf8.Get());
+#if WITH_DEV_AUTOMATION_TESTS
+	SuperSLMTokenizeTestSeam::CountCall(SuperSLMTokenizeTestSeam::ESite::SubsystemTokenize); // cell 7.20's counter
+#endif
 	sslm_status Status = sslm_tokenize(State->Model, Text, OutTokens.GetData(), &Count);
 	if (Status == SSLM_BUFFER_TOO_SMALL)
 	{
 		OutTokens.SetNumUninitialized(Count);
+#if WITH_DEV_AUTOMATION_TESTS
+		SuperSLMTokenizeTestSeam::CountCall(SuperSLMTokenizeTestSeam::ESite::SubsystemTokenize);
+#endif
 		Status = sslm_tokenize(State->Model, Text, OutTokens.GetData(), &Count);
 	}
 	if (Status != SSLM_OK)
@@ -3514,6 +4061,18 @@ namespace
 		                                     // the job never reached its head
 		FSuperSLMSequenceStats Stats;
 		bool bStatsValid = false;
+		// sslm_stats_out::context_length at the job's tail (-1 when the read failed). A span job's
+		// delivery takes the sequence's committed positions from it (schema fast-decode plan rev
+		// 1.3.5, §6 P1-X: the verb commits the pending token and the confirmed drafts, a count the
+		// plugin cannot know at post).
+		int64 ContextLength = -1;
+		// Schema fast-decode plan rev 1.3.5, §6 P1-X "Forcedness, observed": the
+		// sslm_seq_forced_tokens (cap 0) read at the job's tail, when the job's sequence reads
+		// forcedness. bForcedRead is true when the call returned SSLM_OK.
+		bool bForcedReadAttempted = false;
+		bool bForcedRead = false;
+		int32 ForcedCount = 0;
+		bool bForcedAccepting = false;
 	};
 
 	// Shared output shape every job kind writes on the worker and reads back on delivery.
@@ -3657,7 +4216,35 @@ namespace
 			Out.Stats.ForcedTokenCount = Raw.forced_token_count;
 			Out.Stats.KvBlocksResident = Raw.kv_blocks_resident;
 			Out.Stats.bSchemaAccepting = Raw.schema_accepting != 0;
+			// The context length is in the sequence's K/V stats, not sslm_stats_out (sslm_abi.h); it stays -1
+			// when that read fails.
+			sslm_seq_kv_stats_out Kv = {};
+			Kv.struct_size = sizeof(Kv);
+			if (sslm_seq_kv_stats(Seq, &Kv) == SSLM_OK)
+			{
+				Out.ContextLength = Kv.context_length;
+			}
 			Out.bStatsValid = true;
+		}
+	}
+
+	// Schema fast-decode plan rev 1.3.5, §6 P1-X: one read-only forcedness query (cap 0) at the
+	// job's tail, on the worker, after the job's Layer-1 call. It changes nothing (§5.3), so it is
+	// made only for a sequence that reads forcedness and is otherwise invisible (P1X.12 (e)).
+	void ReadForcedOnWorker(sslm_model Model, sslm_seq Seq, FSequenceJobResult& Out)
+	{
+		if (Seq == nullptr)
+		{
+			return;
+		}
+		Out.bForcedReadAttempted = true;
+		int32_t Count = 0;
+		int32_t Accepting = 0;
+		if (sslm_seq_forced_tokens(Model, Seq, nullptr, 0, &Count, &Accepting) == SSLM_OK)
+		{
+			Out.bForcedRead = true;
+			Out.ForcedCount = Count;
+			Out.bForcedAccepting = Accepting != 0;
 		}
 	}
 
@@ -3840,7 +4427,7 @@ namespace
 		int32 DecodeLayers, int32 PromptTokens, int32 TokenFinishes, double PlannedJobMs,
 		const FSuperSLMSequence& LifecycleOpSequence, const FSuperSLMLifecycleOpHandle& LifecycleOpHandle,
 		int32 TickIndex, TFunctionRef<TFunction<void()>(int32 LaneIndex)> BuildExecute, TFunction<void(double)> Deliver,
-		int32 ChainBaseTick = INDEX_NONE)
+		int32 ChainBaseTick = INDEX_NONE, bool bAppendLedgerRow = true)
 	{
 		const int32 LaneIndex = ChooseLane(EntityPinnedLane, CandidateLanes);
 		// 1.1 worker continuation (plan §5 item 1a): a continuation's delivery is committed from
@@ -3851,9 +4438,13 @@ namespace
 		const int32 BaseTick = bContinuation ? FMath::Max(TickIndex, ChainBaseTick) : TickIndex;
 
 		// The ring's next row, cleared for reuse: writing it never allocates, because Configure()
-		// sized every row's member list for the largest batch.
-		const int64 LedgerRow = S.JobLedger.AppendedCount();
-		FSuperSLMWorkerJobReport& Job = S.JobLedger.Append();
+		// sized every row's member list for the largest batch. Schema fast-decode plan rev 1.3.5, §6:
+		// a span job (bAppendLedgerRow false) takes its JobId from the same counter but appends no
+		// row, so JobId alone orders it against the rows around it (cells P1.2, P1X.2); its figures
+		// live in a local report and reach the lane's pending entry only.
+		FSuperSLMWorkerJobReport SpanJobReport;
+		const int64 LedgerRow = bAppendLedgerRow ? S.JobLedger.AppendedCount() : static_cast<int64>(INDEX_NONE);
+		FSuperSLMWorkerJobReport& Job = bAppendLedgerRow ? S.JobLedger.Append() : SpanJobReport;
 		ResetJobRow(Job);
 		Job.JobId = S.NextJobId++;
 		Job.Kind = Kind;
@@ -3892,6 +4483,7 @@ namespace
 		// Plugin paging plan §3.9: the HoldApply() hold the dispatcher named for this job, if any.
 		Lane.Pending.Last().ApplyHoldId = S.NextPostApplyHoldId;
 		S.NextPostApplyHoldId = 0;
+		Lane.Pending.Last().bSpanJob = !bAppendLedgerRow;
 		return Job.CommittedDeliveryTick;
 	}
 
@@ -4138,6 +4730,8 @@ namespace
 				// §18: the Layer-1 mirrors settle to a sane, non-adopted, zero-context default.
 				Slot.ContextUsed = 0;
 				Slot.bAdopted = false;
+				Slot.bAdoptedPromptOnlyPrefix = false;
+				Slot.AdoptedPrefixLength = 0;
 				if (bUnbind)
 				{
 					S.WithholdSlot(SlotIndex, FString::Printf(TEXT("the recycle's %s was refused (%s)"),
@@ -4169,6 +4763,8 @@ namespace
 			Slot.bReadyForLogits = false;
 			Slot.ContextUsed = 0;
 			Slot.bAdopted = false;
+			Slot.bAdoptedPromptOnlyPrefix = false;
+			Slot.AdoptedPrefixLength = 0;
 			if (Out->bBoolFlag)
 			{
 				Slot.PinnedLane = INDEX_NONE; // D-SLM7530: the same reset path as VendSequence()
@@ -4278,6 +4874,9 @@ namespace
 			{
 				Prefix->PendingAdopts = FMath::Max(0, Prefix->PendingAdopts - 1);
 			}
+#if SUPERSLM_WITH_PREFIX_CACHE
+			SuperSLMPrefixCacheGlue::OnAdoptDelivered(S, PrefixIdCap); // precache plan §5.6
+#endif
 			// Plugin paging plan §3.3 (UP-14): the adopt's admission applies with its outcome. Success
 			// drops the slot's previous dependency (which may refund a ghost), registers it on the
 			// prefix, returns its materialized pages and sets its origin to the prefix's length, which
@@ -4307,6 +4906,8 @@ namespace
 			// computed state, so the next decode call finishes that token when the prefix
 			// prefilled at least one.
 			Slot.bAdopted = true;
+			Slot.bAdoptedPromptOnlyPrefix = true; // every CPU prefix is prompt-only (§6 P1)
+			Slot.AdoptedPrefixLength = PrefixConsumedSnapshot;
 			Slot.ContextUsed = PrefixConsumedSnapshot;
 			Slot.bReadyForLogits = PrefixConsumedSnapshot > 0;
 			Slot.LayersDoneInToken = 0;
@@ -4589,7 +5190,13 @@ namespace
 		const bool bBudgetMode = S.IsBudgetMode();
 		const int64 HintPrefixId = Op.RestoreHintPrefixId;
 		const FPrefixEntry* HintEntry = HintPrefixId != 0 ? S.Prefixes.Find(HintPrefixId) : nullptr;
+#if SUPERSLM_WITH_PREFIX_CACHE
+		// Precache plan §5.11 (b): a cache lease's entry, adopt-pinned since the call, so its handle is live here.
+		const uint64 HintCacheToken = Op.RestoreHintCache.Token;
+		const sslm_prefix HintHandle = HintCacheToken != 0 ? Op.RestoreHintCache.Handle : (HintEntry != nullptr ? HintEntry->Handle : nullptr);
+#else
 		const sslm_prefix HintHandle = HintEntry != nullptr ? HintEntry->Handle : nullptr;
+#endif
 		const SuperSLMPaging::FTicket LedgerTicket = Op.LedgerTicket;
 		const int64 HeaderContextLength = Op.RestoreContextLength;
 
@@ -4704,7 +5311,11 @@ namespace
 		const SuperSLMSaveBlob::FContents ContentsCap = Contents;
 
 		auto Deliver = [&S, SlotIndex, HandleId, Owner, Out, bParsed, bModelMatches, bAdapterOk, bAdapterPinned, ParseErrorCap, ContentsCap, AdapterId,
-			bBudgetMode, HintPrefixId, LedgerTicket, HeaderContextLength](double)
+			bBudgetMode, HintPrefixId, LedgerTicket, HeaderContextLength
+#if SUPERSLM_WITH_PREFIX_CACHE
+			, HintCacheToken
+#endif
+			](double)
 		{
 			FSlot& Slot = S.Slots[SlotIndex];
 			// The reservation this restore made ends here -- unless its holder returned the slot
@@ -4722,6 +5333,9 @@ namespace
 			}
 			// §3.5 (K3): the hint's pin from the call ends with the job; the ledger's ends at its apply.
 			UnpinRestoreHint(S, HintPrefixId);
+#if SUPERSLM_WITH_PREFIX_CACHE
+			SuperSLMPrefixCacheGlue::UnpinCacheRestoreHint(S, HintCacheToken); // precache plan §5.11 (b)
+#endif
 			DeliverPoolSnapshot(S, *Out);
 			const bool bOwnerHolds = Owner != 0 && Owner == Slot.VendedId;
 
@@ -4806,6 +5420,9 @@ namespace
 			{
 				S.Ledger.ApplyRestore(LedgerTicket, true, Out->SharedPages);
 			}
+#if SUPERSLM_WITH_PREFIX_CACHE
+			SuperSLMPrefixCacheGlue::NoteSequenceRestoreApplied(S, Out->SharedPages); // precache plan §8, cell 8.15
+#endif
 
 			// Slot-owned: the restored handle and the Layer-1 mirrors, whoever holds the slot.
 			// Budget mode takes the position from the payload header, never the wrapper (§3.5;
@@ -4816,6 +5433,10 @@ namespace
 			Slot.LayersDoneInToken = FMath::Min(ContentsCap.LayersDoneInToken, S.Shape.NumHiddenLayers);
 			Slot.bReadyForLogits = ContentsCap.bReadyForLogits;
 			Slot.bAdopted = ContentsCap.Phase == ESuperSLMSequencePhase::Idle && ContentsCap.ContextUsed > 0;
+			// §6 P1 "When the walk is known": the plugin did not build a restored sequence's contents,
+			// so its walk is unknown whatever the blob holds (P1.11 (b)).
+			Slot.bAdoptedPromptOnlyPrefix = false;
+			Slot.AdoptedPrefixLength = 0;
 			Slot.SpeculativeFinishesQueued = 0;
 
 			if (bOwnerHolds)
@@ -4889,6 +5510,9 @@ namespace
 		Slot.OpQueue.RemoveAt(0, EAllowShrinking::No);
 		UE_LOG(LogSuperSLM, Warning, TEXT("RestoreSequence: %s"), *Message);
 		UnpinRestoreHint(S, Op.RestoreHintPrefixId);
+#if SUPERSLM_WITH_PREFIX_CACHE
+		SuperSLMPrefixCacheGlue::UnpinCacheRestoreHint(S, Op.RestoreHintCache.Token);
+#endif
 		if (Op.HandleId != 0)
 		{
 			S.HandleResults.FindOrAdd(Op.HandleId).Result = Result;
@@ -4976,6 +5600,7 @@ namespace
 				const int64 HandleId = Front.HandleId;
 				const int64 Owner = Front.Owner;
 				const bool bRestore = Front.Kind == ESlotOpKind::Restore;
+				const int64 AdoptPrefixId = Front.Kind == ESlotOpKind::Adopt ? Front.PrefixId : 0;
 				// Plugin paging plan §3.2: an op admitted earlier (a test hold parked it) gives its
 				// admission back, since nothing will run: a reset as refused, an adopt as failed.
 				if (Front.LedgerTicket != SuperSLMPaging::InvalidTicket)
@@ -4996,8 +5621,23 @@ namespace
 				if (bRestore)
 				{
 					UnpinRestoreHint(S, Front.RestoreHintPrefixId);
+#if SUPERSLM_WITH_PREFIX_CACHE
+					SuperSLMPrefixCacheGlue::UnpinCacheRestoreHint(S, Front.RestoreHintCache.Token);
+#endif
 				}
 				Slot.OpQueue.RemoveAt(0, EAllowShrinking::No);
+				if (AdoptPrefixId != 0)
+				{
+					// The dropped adopt never reaches its delivery: its pin on the prefix ends here,
+					// as the refusal arms below end it.
+					if (FPrefixEntry* Pinned = S.Prefixes.Find(AdoptPrefixId))
+					{
+						Pinned->PendingAdopts = FMath::Max(0, Pinned->PendingAdopts - 1);
+					}
+#if SUPERSLM_WITH_PREFIX_CACHE
+					SuperSLMPrefixCacheGlue::OnAdoptDelivered(S, AdoptPrefixId); // precache plan §5.6
+#endif
+				}
 				if (HandleId != 0)
 				{
 					S.HandleResults.FindOrAdd(HandleId).Result = ESuperSLMRestoreResult::Malformed;
@@ -5075,7 +5715,14 @@ namespace
 						const FPrefixEntry* Target = S.Prefixes.Find(Front.PrefixId);
 						if (Target != nullptr && Target->bLedgerBuilt)
 						{
-							const SuperSLMPaging::FAdmission Admission = S.Ledger.AdmitAdoptPrefix(SlotIndex, Target->LedgerNode);
+							SuperSLMPaging::FAdmission Admission;
+#if SUPERSLM_WITH_PREFIX_CACHE
+							// Precache plan §5.11 (b): a cache lease is admitted against its entry (region A).
+							if (!SuperSLMPrefixCacheGlue::AdmitCacheAdopt(S, Front.PrefixId, SlotIndex, Admission))
+#endif
+							{
+								Admission = S.Ledger.AdmitAdoptPrefix(SlotIndex, Target->LedgerNode);
+							}
 							if (Admission.Outcome == SuperSLMPaging::EPageAdmit::Admitted)
 							{
 								Front.LedgerTicket = Admission.Ticket;
@@ -5091,6 +5738,9 @@ namespace
 								{
 									Pinned->PendingAdopts = FMath::Max(0, Pinned->PendingAdopts - 1);
 								}
+#if SUPERSLM_WITH_PREFIX_CACHE
+								SuperSLMPrefixCacheGlue::OnAdoptDelivered(S, PrefixId);
+#endif
 								if (HandleId != 0)
 								{
 									S.HandleResults.FindOrAdd(HandleId).Result = ESuperSLMRestoreResult::KvModeMismatch;
@@ -5112,6 +5762,9 @@ namespace
 								{
 									Pinned->PendingAdopts = FMath::Max(0, Pinned->PendingAdopts - 1);
 								}
+#if SUPERSLM_WITH_PREFIX_CACHE
+								SuperSLMPrefixCacheGlue::OnAdoptDelivered(S, PrefixId);
+#endif
 								if (HandleId != 0)
 								{
 									S.HandleResults.FindOrAdd(HandleId).Result = ESuperSLMRestoreResult::NotConfigured;
@@ -5138,6 +5791,15 @@ namespace
 							Request.Hint = SuperSLMPaging::EHintKind::Prefix;
 							Request.HintNode = Hint->LedgerNode;
 						}
+#if SUPERSLM_WITH_PREFIX_CACHE
+						if (Front.RestoreHintCache.Token != 0)
+						{
+							// Precache plan §5.11 (b): a cache entry hint, keyed by entry, pre-charged as paging §3.2 specifies.
+							Request.Hint = SuperSLMPaging::EHintKind::CacheEntry;
+							Request.HintEntry = Front.RestoreHintCache.EntryKey;
+							Request.HintEntryLength = Front.RestoreHintCache.Length;
+						}
+#endif
 						const SuperSLMPaging::FAdmission Admission = S.Ledger.AdmitRestore(Request);
 						ESuperSLMRestoreResult Refusal = ESuperSLMRestoreResult::Success;
 						FString RefusalText;
@@ -5465,6 +6127,9 @@ namespace
 				else
 				{
 					Prefix->Handle = reinterpret_cast<sslm_prefix>(Out->SeqOut);
+#if SUPERSLM_WITH_PREFIX_CACHE
+					SuperSLMPrefixCacheGlue::NoteLegacyBegin(S, Prefix->Handle);
+#endif
 					Prefix->Phase = ESuperSLMPrefixPhase::Prefilling;
 					if (Out->bFreezeAttempted)
 					{
@@ -5558,6 +6223,662 @@ namespace
 		return Slot.Gate;
 	}
 
+	// ---------------------------------------------------------------------------------------------
+	// Schema jump-forward (schema fast-decode plan rev 1.3.5, §6 slices P1 and P1-X)
+	//
+	// The policy is SuperSLMCore's (Core/SuperSLMSchemaJumpCore.h): the setting, the learned draft,
+	// the observed forcedness and the span-after-decode loop. What lives here is the wiring: the walk
+	// tracked from SCM1, the forcedness reads at job tails, the span job itself (one
+	// sslm_seq_jump_forward call, a JobId from the ledger's counter and no ledger row), and the
+	// table fed at generation end. The GPU subsystem has none of it (P1.6, P1X.4).
+	// ---------------------------------------------------------------------------------------------
+
+	// SCM1's transitions for one schema, as the draft and the learning walk them. StartState is the
+	// state the walked stream starts from; IsForced is never consulted, because
+	// SuperSLMCore::FObservedSchemaAutomaton supplies the observed flag.
+	class FScm1Automaton final : public SuperSLMCore::ISchemaAutomaton
+	{
+	public:
+		FScm1Automaton(const superslm::SchemaMasksTable& InTable, const superslm::SchemaEntry& InEntry, uint32 InStart)
+			: Table(InTable), Entry(InEntry), Start(InStart)
+		{
+		}
+
+		virtual uint32_t StartState() const override
+		{
+			return Start;
+		}
+
+		virtual bool Step(uint32_t State, int32_t Token, uint32_t& OutNext) const override
+		{
+			if (State >= Entry.state_count || Token < 0 || static_cast<uint32_t>(Token) >= Table.VocabSize())
+			{
+				return false;
+			}
+			uint32_t Next = 0;
+			if (!Table.Transition(Entry, State, static_cast<uint32_t>(Token), &Next))
+			{
+				return false;
+			}
+			OutNext = Next;
+			return true;
+		}
+
+		virtual bool IsForced(uint32_t State) const override
+		{
+			(void)State;
+			return false;
+		}
+
+	private:
+		const superslm::SchemaMasksTable& Table;
+		const superslm::SchemaEntry& Entry;
+		uint32 Start = 0;
+	};
+
+	SuperSLMCore::ESchemaJumpMode ToCoreJumpMode(ESuperSLMSchemaJumpForward Mode)
+	{
+		switch (Mode)
+		{
+			case ESuperSLMSchemaJumpForward::Exact: return SuperSLMCore::ESchemaJumpMode::Exact;
+			case ESuperSLMSchemaJumpForward::Canonical: return SuperSLMCore::ESchemaJumpMode::Canonical;
+			case ESuperSLMSchemaJumpForward::Off: break;
+		}
+		return SuperSLMCore::ESchemaJumpMode::Off;
+	}
+
+	ESuperSLMSchemaJumpForward ToPublicJumpMode(SuperSLMCore::ESchemaJumpMode Mode)
+	{
+		switch (Mode)
+		{
+			case SuperSLMCore::ESchemaJumpMode::Exact: return ESuperSLMSchemaJumpForward::Exact;
+			case SuperSLMCore::ESchemaJumpMode::Canonical: return ESuperSLMSchemaJumpForward::Canonical;
+			case SuperSLMCore::ESchemaJumpMode::Off: break;
+		}
+		return ESuperSLMSchemaJumpForward::Off;
+	}
+
+	// Advances the generation's tracked walk by one appended token (the pending token at its
+	// decode's delivery, and each confirmed or forced id at its span job's). A token SCM1 does not
+	// admit there means the plugin's walk no longer matches the engine's, so the walk is dropped:
+	// the generation drafts and learns nothing more (timing only, C13).
+	void AdvanceJumpWalk(const FSuperSLMSubsystemState& S, FSlot& Slot, int32 Token)
+	{
+		FJumpGeneration& J = Slot.Jump;
+		if (!J.bWalkKnown)
+		{
+			return;
+		}
+		const superslm::SchemaEntry* Entry = S.WalkSchemas().ByIndex(static_cast<size_t>(J.SchemaIndex));
+		uint32_t Next = 0;
+		if (Entry == nullptr || !FScm1Automaton(S.WalkSchemas(), *Entry, J.StartState).Step(J.WalkState, Token, Next))
+		{
+			J.bWalkKnown = false;
+			return;
+		}
+		J.WalkState = Next;
+	}
+
+	// ActivateGenerate()'s last step: the generation's jump-forward state. A schema-bound generation
+	// is active: its jobs read forcedness when it can use the reads (canonical mode always, since its
+	// loop needs the chain; off and exact mode when the walk is known, for the table), and its mode is
+	// the request's (§6 P1-X "The setting": per generation, default Off). An unbound one runs today's
+	// loop whatever the request says.
+	void BeginJumpGeneration(FSuperSLMSubsystemState& S, FSlot& Slot, const FSuperSLMGenerationRequest& Request)
+	{
+		FJumpGeneration& J = Slot.Jump;
+		J = FJumpGeneration();
+		const FString SchemaName = Slot.EffectiveSchemaName();
+		if (SchemaName.IsEmpty())
+		{
+			return;
+		}
+		J.bActive = true;
+		J.Mode = ToCoreJumpMode(Request.SchemaJumpForward);
+		if (J.Mode != SuperSLMCore::ESchemaJumpMode::Off)
+		{
+			// Rev 1.3.6 (§6 P1 *Lazy*): the first schema-bound generation in a jump mode asks for the
+			// walk table. Until a pool thread has built it and a Tick has published it, the walk is
+			// unknown (FindSchemaIndex misses on the empty table), so this generation runs without it.
+			RequestSchemaWalkLoad(S);
+		}
+		int32 SchemaIndex = INDEX_NONE;
+		if (S.FindSchemaIndex(SchemaName, SchemaIndex))
+		{
+			J.SchemaIndex = SchemaIndex;
+			// §6 P1 "When the walk is known" (rev 1.3.6): the walk starts at state 0 when the schema
+			// is bound (§6 P1-X "The walk"), and the engine leaves it there in two cases: a fresh or
+			// reset sequence (no context, no adopted prefix), and a sequence over an adopted
+			// prompt-only prefix with nothing after it. A restored sequence, a sequence a generation
+			// already ran on, and anything else leave it unknown. A schema-content prompt walks the
+			// schema as it prefills, so its tokens are walked here.
+			const bool bFresh = Slot.ContextUsed == 0 && !Slot.bAdopted;
+			const bool bOverPromptOnlyPrefix = Slot.bAdopted && Slot.bAdoptedPromptOnlyPrefix && Slot.ContextUsed == Slot.AdoptedPrefixLength;
+			J.bWalkKnown = bFresh || bOverPromptOnlyPrefix;
+			J.WalkState = 0;
+			J.StartState = 0;
+			if (J.bWalkKnown && Slot.SpanKind == ESuperSLMSpanKind::SchemaContent)
+			{
+				for (const int32 Token : Slot.Prompt)
+				{
+					AdvanceJumpWalk(S, Slot, Token);
+				}
+				J.StartState = J.WalkState;
+			}
+		}
+		J.bReads = S.bForcednessReadsEnabled && (J.Mode == SuperSLMCore::ESchemaJumpMode::Canonical || J.bWalkKnown);
+	}
+
+	// Counts a forcedness read a job made (FSuperSLMSchemaJumpTestAccess::GetForcednessReadCount),
+	// whoever holds the slot at its delivery.
+	void CountForcedRead(FSuperSLMSubsystemState& S, const FSequenceJobResult& Result)
+	{
+		if (Result.bForcedReadAttempted)
+		{
+			++S.ForcednessReadCount;
+		}
+	}
+
+	// A job's forcedness read, applied for its owner: the chain length the loop reads next, and the
+	// observed flag of the walk state it was read at (§6 P1-X "Forcedness, observed").
+	// Records one forcedness read for FSuperSLMSchemaJumpReviewTestAccess::GetForcednessReads (dev
+	// only; under recording). JobId is the job the read followed.
+	void NoteForcednessReadRecord(FSuperSLMSubsystemState& S, const FSlot& Slot, int64 JobId, const FSequenceJobResult& Result,
+		bool bRecordedAtWalkState, uint32 WalkState)
+	{
+#if WITH_DEV_AUTOMATION_TESTS
+		if (!S.bRecordSpanJobs)
+		{
+			return;
+		}
+		FSuperSLMForcednessReadRecord& Record = S.ForcednessReadRecords.AddDefaulted_GetRef();
+		Record.Sequence = FSuperSLMSequence{Slot.VendedId};
+		Record.AfterJobId = JobId;
+		Record.ForcedCount = Result.bForcedRead ? Result.ForcedCount : -1;
+		Record.bRecordedAtWalkState = bRecordedAtWalkState;
+		Record.WalkState = WalkState;
+#else
+		(void)S; (void)Slot; (void)JobId; (void)Result; (void)bRecordedAtWalkState; (void)WalkState;
+#endif
+	}
+
+	void ApplyJumpForcedRead(FSuperSLMSubsystemState& S, FSlot& Slot, int64 JobId, const FSequenceJobResult& Result)
+	{
+		FJumpGeneration& J = Slot.Jump;
+		if (!J.bActive || !Result.bForcedReadAttempted)
+		{
+			return;
+		}
+		J.ForcedChainLength = Result.bForcedRead ? Result.ForcedCount : 0;
+		const bool bRecorded = Result.bForcedRead && J.bWalkKnown && J.SchemaIndex != INDEX_NONE;
+		if (bRecorded)
+		{
+			S.ForcedObservations.FindOrAdd(J.SchemaIndex).RecordRead(J.WalkState, Result.ForcedCount > 0);
+		}
+		NoteForcednessReadRecord(S, Slot, JobId, Result, bRecorded, J.WalkState);
+	}
+
+	// A decode job's result for one member, at its delivery (the owner holds, the generation runs):
+	// a produced token is pending (§5.4) and advances the walk; -1 leaves the token mid-layer.
+	void NoteJumpDecodeResult(FSuperSLMSubsystemState& S, FSlot& Slot, int64 JobId, int32 Token, const FSequenceJobResult& Result)
+	{
+		FJumpGeneration& J = Slot.Jump;
+		if (!J.bActive)
+		{
+			return;
+		}
+		J.bLastJobWasSpan = false;
+		J.bLastSpanFailed = false;
+		if (Token >= 0)
+		{
+			AdvanceJumpWalk(S, Slot, Token);
+			J.bPendingToken = true;
+		}
+		else if (Token == -1)
+		{
+			J.bPendingToken = false;
+		}
+		ApplyJumpForcedRead(S, Slot, JobId, Result);
+	}
+
+	// What a due decoding sequence takes next under its mode, and the span job's arguments when it
+	// is a span job.
+	struct FSpanPlan
+	{
+		SuperSLMCore::EJumpNextJob Next = SuperSLMCore::EJumpNextJob::Decode;
+		int32 ChunkBudget = 0;
+		TArray<int32> Draft;          // exact mode: the learned draft, at least one token
+		int64 SnapshotVersion = -1;   // the table snapshot the draft was read from
+		// Exact mode, for the span job record (SuperSLMSchemaJumpTestSeam.h): the draft's length with the whole
+		// allowance (read only while recording), and after the allowance clip, before the stop cut.
+		int32 DraftLengthBeforeAllowanceClip = -1;
+		int32 DraftLengthBeforeStopCut = -1;
+	};
+
+	FSpanPlan PlanJumpNextJob(const FSuperSLMSubsystemState& S, int32 SlotIndex)
+	{
+		FSpanPlan Plan;
+		const FSlot& Slot = S.Slots[SlotIndex];
+		const FJumpGeneration& J = Slot.Jump;
+		if (!J.bActive || J.Mode == SuperSLMCore::ESchemaJumpMode::Off)
+		{
+			return Plan;
+		}
+		// The verb refuses a sequence mid-layer (§5.3). A held request is carried by the
+		// generation's next decode job (plan §2.5 row 20 rule 4), which a span job ahead of it
+		// would reorder, so it takes that decode job first.
+		if (Slot.LayersDoneInToken > 0 || !Slot.Held.IsEmpty())
+		{
+			return Plan;
+		}
+		// The rows a span may admit: the context cap and, in budget mode, the holder's generation
+		// limit, less the committed positions. The verb clips to the same headroom itself (§5.5,
+		// §5.10.3); clipping here keeps the job's price and its draft to what it can admit.
+		int64 LimitPositions = S.Shape.ContextCap;
+		if (S.IsBudgetMode())
+		{
+			LimitPositions = FMath::Min<int64>(LimitPositions, static_cast<int64>(S.Ledger.SlotLimit(SlotIndex)));
+		}
+		const int64 Headroom = LimitPositions - Slot.ContextUsed;
+		const int32 Budget = static_cast<int32>(FMath::Clamp<int64>(Headroom, 0, S.Config.MaxPrefillChunkBudget));
+		if (Budget < 1)
+		{
+			return Plan;
+		}
+
+		SuperSLMCore::FJumpSequenceFacts Facts;
+		Facts.Mode = J.Mode;
+		Facts.bGpu = false;
+		Facts.bSchemaBound = true;
+		Facts.bPendingToken = J.bPendingToken;
+		Facts.ForcedChainLength = J.ForcedChainLength;
+		Facts.bLastJobWasSpan = J.bLastJobWasSpan;
+		Facts.bLastSpanFailed = J.bLastSpanFailed;
+		Facts.bSpanJobOutstanding = J.bSpanOutstanding;
+		Facts.RemainingAllowance = Slot.MaxNewTokens - Slot.Generated.Num();
+
+		std::vector<int32_t> Draft;
+		if (J.Mode == SuperSLMCore::ESchemaJumpMode::Exact && J.bPendingToken && J.ForcedChainLength > 0 && !J.bLastJobWasSpan
+			&& J.bWalkKnown && J.SchemaIndex != INDEX_NONE)
+		{
+			const superslm::SchemaEntry* Entry = S.WalkSchemas().ByIndex(static_cast<size_t>(J.SchemaIndex));
+			const SuperSLMCore::FDraftTableRef Snapshot = S.DraftTables.Snapshot(S.DraftKey(J.SchemaIndex));
+			const SuperSLMCore::FForcednessObservations* Observed = S.ForcedObservations.Find(J.SchemaIndex);
+			if (Entry != nullptr && Snapshot && Observed != nullptr)
+			{
+				const FScm1Automaton Transitions(S.WalkSchemas(), *Entry, J.StartState);
+				const SuperSLMCore::FObservedSchemaAutomaton Automaton(Transitions, *Observed);
+				SuperSLMCore::FDraftLimits Limits;
+				Limits.MaxPrefillChunkBudget = Budget;
+				// One less than the allowance: a span never admits the generation's last allowed token, so a
+				// MaxNewTokens cut leaves it pending, as off's decode does, and the saved state equals off's
+				// (P1.11 (f): context, ready flag and current token). The last token comes from a decode.
+				Limits.RemainingAllowance = Facts.RemainingAllowance - 1;
+				Limits.bThreadedDecodeEffective = S.Resolved.bDecodeModeEffective; // §5.10.6, P1X.7
+				Draft = SuperSLMCore::BuildDraft(Snapshot.get(), Automaton, J.WalkState, Limits);
+#if WITH_DEV_AUTOMATION_TESTS
+				if (S.bRecordSpanJobs)
+				{
+					SuperSLMCore::FDraftLimits Whole = Limits;
+					Whole.RemainingAllowance = Facts.RemainingAllowance;
+					Plan.DraftLengthBeforeAllowanceClip = static_cast<int32>(SuperSLMCore::BuildDraft(Snapshot.get(), Automaton, J.WalkState, Whole).size());
+				}
+#endif
+				Plan.DraftLengthBeforeStopCut = static_cast<int32>(Draft.size());
+				// A draft never carries a stop token: the generation ends at it, so admitting it (and the ids after
+				// it) would leave a state off never has. Cut before the first one; the stop token then comes from a
+				// decode, which leaves it pending as off's does, and the saved state equals off's.
+				for (size_t K = 0; K < Draft.size(); ++K)
+				{
+					if (Slot.StopTokenIds.Contains(Draft[K])) { Draft.resize(K); break; }
+				}
+			}
+		}
+		Facts.DraftLength = static_cast<int32_t>(Draft.size());
+
+		Plan.Next = SuperSLMCore::NextJob(Facts);
+		if (Plan.Next != SuperSLMCore::EJumpNextJob::Span)
+		{
+			return Plan;
+		}
+		if (J.Mode == SuperSLMCore::ESchemaJumpMode::Exact)
+		{
+			// Priced at its full drafted M: the pending token and the draft (§6 P1-X "Pricing").
+			Plan.ChunkBudget = 1 + Facts.DraftLength;
+			Plan.Draft.Append(Draft.data(), static_cast<int32>(Draft.size()));
+		}
+		else
+		{
+			Plan.ChunkBudget = SuperSLMCore::CanonicalSpanChunkBudget(Facts, Budget);
+			if (Plan.ChunkBudget <= 0)
+			{
+				Plan.Next = SuperSLMCore::EJumpNextJob::Decode;
+				return Plan;
+			}
+		}
+		Plan.SnapshotVersion = J.SchemaIndex != INDEX_NONE ? S.DraftSnapshotVersion(J.SchemaIndex) : -1;
+		return Plan;
+	}
+
+	// One span job's output, written on the worker and read at delivery.
+	struct FSpanJobOutput
+	{
+		sslm_status Status = SSLM_OK;
+		TArray<int32> ForcedIds;      // out_forced: the forced (canonical) or confirmed (exact) ids
+		FSequenceJobResult Result;    // stats and the forcedness read at the job's tail
+	};
+	using FSpanJobOutputRef = TSharedRef<FSpanJobOutput, ESPMode::ThreadSafe>;
+
+#if WITH_DEV_AUTOMATION_TESTS
+	FSuperSLMSpanJobRecord* FindSpanJobRecord(FSuperSLMSubsystemState& S, int64 JobId)
+	{
+		for (int32 I = S.SpanJobRecords.Num() - 1; I >= 0; --I)
+		{
+			if (S.SpanJobRecords[I].JobId == JobId)
+			{
+				return &S.SpanJobRecords[I];
+			}
+		}
+		return nullptr;
+	}
+#endif
+
+	// A span job's delivery for its owner, the generation still running: the ids reach the output
+	// once, in order (listeners, P1.5), each walked and counted toward MaxNewTokens; the committed
+	// rows are the engine's own count; the next job is a decode (or, in canonical mode, the rest of
+	// the chain). A status other than SSLM_OK ends the span job only: the sequence goes on to its
+	// decode job, which ends the generation exactly as off's would (§6 P1-X "Statuses").
+	void ApplySpanResult(FSuperSLMSubsystemState& S, FSlot& Slot, int64 JobId, const FSpanJobOutput& Out)
+	{
+#if WITH_DEV_AUTOMATION_TESTS
+		// The job hold (SetJobHold, AfterSpanDelivery): the planner runs after Apply in this tick, so marking the
+		// hold here keeps the sequence's next job unplanned until the test releases it.
+		if (FSuperSLMSubsystemState::FTestJobHold* Hold = S.TestJobHolds.Find(Slot.VendedId))
+		{
+			if (Hold->Point == ESuperSLMJobHoldPoint::AfterSpanDelivery) { Hold->bHeld = true; }
+		}
+#endif
+		FJumpGeneration& J = Slot.Jump;
+		const bool bExact = J.Mode == SuperSLMCore::ESchemaJumpMode::Exact;
+		const int64 ContextBefore = Slot.ContextUsed;
+		const FSequenceJobResult& Tail = Out.Result;
+		const bool bTailRead = J.bActive && Tail.bForcedReadAttempted && Tail.bForcedRead;
+		const int32 Count = Out.ForcedIds.Num();
+		const std::vector<int32_t> Stops(Slot.StopTokenIds.GetData(), Slot.StopTokenIds.GetData() + Slot.StopTokenIds.Num());
+
+		// Review finding 5 (rev 1.3.6, P1X.12 (f)): the walk goes through every confirmed id the engine
+		// committed, each recorded drafted through (exact mode), before any stop-token check; the
+		// output is cut afterwards; the span's tail read is recorded at the state after the last id,
+		// or dropped when the walk cannot reach it, never at a state a stop token broke the loop at.
+		size_t AppendCount = static_cast<size_t>(Count);
+		bool bReadRecorded = false;
+		const superslm::SchemaEntry* Entry = (J.bWalkKnown && J.SchemaIndex != INDEX_NONE)
+			? S.WalkSchemas().ByIndex(static_cast<size_t>(J.SchemaIndex)) : nullptr;
+		if (Entry != nullptr)
+		{
+			const FScm1Automaton Transitions(S.WalkSchemas(), *Entry, J.StartState);
+			SuperSLMCore::FSpanWalkResult Walk;
+			if (bExact)
+			{
+				Walk = SuperSLMCore::WalkSpanResult(Transitions, S.ForcedObservations.FindOrAdd(J.SchemaIndex), J.WalkState,
+					Out.ForcedIds.GetData(), static_cast<size_t>(Count), Stops.data(), Stops.size(), bTailRead, bTailRead && Tail.ForcedCount > 0);
+			}
+			else
+			{
+				// Canonical: forced ids are not drafted, so nothing is recorded drafted through; the
+				// tail read is recorded at the state after the last id, as exact's is.
+				SuperSLMCore::FForcednessObservations Scratch;
+				Walk = SuperSLMCore::WalkSpanResult(Transitions, Scratch, J.WalkState,
+					Out.ForcedIds.GetData(), static_cast<size_t>(Count), Stops.data(), Stops.size(), false, false);
+				if (Walk.bWalkKnown && bTailRead)
+				{
+					S.ForcedObservations.FindOrAdd(J.SchemaIndex).RecordRead(Walk.State, Tail.ForcedCount > 0);
+					Walk.bReadRecorded = true;
+				}
+			}
+			AppendCount = Walk.AppendCount;
+			bReadRecorded = Walk.bReadRecorded;
+			J.bWalkKnown = Walk.bWalkKnown;
+			if (Walk.bWalkKnown)
+			{
+				J.WalkState = Walk.State;
+			}
+		}
+		else
+		{
+			J.bWalkKnown = false;
+			for (int32 I = 0; I < Count; ++I)
+			{
+				if (Slot.StopTokenIds.Contains(Out.ForcedIds[I]))
+				{
+					AppendCount = static_cast<size_t>(I) + 1;
+					break;
+				}
+			}
+		}
+
+		// The ids reach the output once, in order, through the first stop token, each counted toward
+		// MaxNewTokens.
+		for (int32 I = 0; I < static_cast<int32>(AppendCount); ++I)
+		{
+			const int32 Id = Out.ForcedIds[I];
+			Slot.Generated.Add(Id);
+			Slot.LastOutcome = ESuperSLMDecodeOutcome::TokenProduced;
+			++S.TokensFinishedTotal;
+			if (Slot.Generated.Num() == 1 && Slot.BeginSeconds > 0.0)
+			{
+				Slot.TimeToFirstTokenMs = (FPlatformTime::Seconds() - Slot.BeginSeconds) * 1000.0;
+			}
+			if (Slot.StopTokenIds.Contains(Id) || Slot.Generated.Num() >= Slot.MaxNewTokens)
+			{
+				Slot.Phase = ESuperSLMSequencePhase::Complete;
+				break;
+			}
+		}
+		// The verb commits the pending token and the admitted ids (§5.3, §5.10.3), or nothing (a
+		// no-op, a refusal): the sequence's context_length says which.
+		if (Out.Result.ContextLength >= 0)
+		{
+			Slot.ContextUsed = Out.Result.ContextLength;
+		}
+		else if (Out.ForcedIds.Num() > 0)
+		{
+			Slot.ContextUsed += Out.ForcedIds.Num() + (J.bPendingToken ? 1 : 0);
+		}
+		if (Slot.ContextUsed > ContextBefore)
+		{
+			// After any admission ready_for_logits is set: the next decode job is a finish only.
+			Slot.bReadyForLogits = true;
+			Slot.LayersDoneInToken = 0;
+			J.bPendingToken = false;
+		}
+		J.bLastJobWasSpan = true;
+		J.bLastSpanFailed = Out.Status != SSLM_OK;
+		// The chain the loop reads next (ApplyJumpForcedRead's, without its walk-state record: the
+		// walk above already recorded the read where it belongs, or dropped it).
+		if (J.bActive && Tail.bForcedReadAttempted)
+		{
+			J.ForcedChainLength = Tail.bForcedRead ? Tail.ForcedCount : 0;
+			NoteForcednessReadRecord(S, Slot, JobId, Tail, bReadRecorded, J.WalkState);
+		}
+	}
+
+	// One span job: one sslm_seq_jump_forward call (§6: "one call per job"), on the sequence's pinned
+	// lane, priced with the per-C table at its full chunk (§6 "Pricing"). Its JobId is the ledger
+	// counter's next; it appends no ledger row (rev 1.3.5: one counter). Planned only for a due
+	// sequence, so nothing else of it is in flight, and the sequence is not offered to a decode batch
+	// until it delivers (§6 P1-X: both calls take its lifecycle_mutex).
+	void DispatchSpanJob(FSuperSLMSubsystemState& S, TArray<int32>& CandidateLanes, int32 SlotIndex, int32 TickIndex, const FSpanPlan& Plan)
+	{
+		FSlot& Slot = S.Slots[SlotIndex];
+		const int64 StartDepth = Slot.ContextUsed;
+		const int32 ChunkBudget = Plan.ChunkBudget;
+		const double PlannedMs = PrefillChunkCostMs(ChunkBudget, StartDepth, S.Resolved);
+		if (!TrySchedule(S, PlannedMs, TickIndex, TEXT("span")))
+		{
+			S.Fault(Slot, ESuperSLMDecodeOutcome::Generating, kSchedulingDomainFault);
+			return;
+		}
+		++Slot.OutstandingJobCount;
+		Slot.Jump.bSpanOutstanding = true;
+
+		const int64 Owner = Slot.VendedId;
+		const sslm_model Model = S.Model;
+		const sslm_seq SeqHandle = Slot.Seq;
+		const bool bExact = Slot.Jump.Mode == SuperSLMCore::ESchemaJumpMode::Exact;
+		const TArray<int32> Draft = Plan.Draft;
+		// The verb takes the decode parameters decode_step takes (§5.8): greedy. Of them it acts on
+		// the mode only; the layer budget is validated, so it is one decode could take.
+		const int32 LayerBudget = S.Config.MaxLayerBudget;
+		const bool bRead = Slot.Jump.bReads;
+		int32 OverrideStatus = 0;
+#if WITH_DEV_AUTOMATION_TESTS
+		OverrideStatus = S.TestNextSpanStatus; // taken when the job is dispatched
+		S.TestNextSpanStatus = 0;
+#endif
+		FSpanJobOutputRef Out = MakeShared<FSpanJobOutput, ESPMode::ThreadSafe>();
+		const int64 JobId = S.NextJobId; // PostLedgerJob takes exactly this one
+
+		auto BuildExecute = [&S, Model, SeqHandle, ChunkBudget, bExact, Draft, LayerBudget, bRead, OverrideStatus, Out](int32 LaneIndex) -> TFunction<void()>
+		{
+			const sslm_workspace Workspace = S.Lanes[LaneIndex].Workspace;
+			return [Model, SeqHandle, ChunkBudget, bExact, Draft, LayerBudget, bRead, OverrideStatus, Out, Workspace]()
+			{
+				TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Span", SuperSLMChannel);
+				TArray<int32> Forced;
+				Forced.SetNumZeroed(ChunkBudget);
+				int32_t Count = 0;
+				if (OverrideStatus != 0)
+				{
+					// FSuperSLMSchemaJumpTestAccess::SetNextSpanStatusOverride (cell P1X.10): the
+					// status, count 0, and the sequence as Layer 1 had it.
+					Out->Status = static_cast<sslm_status>(OverrideStatus);
+				}
+				else
+				{
+					sslm_decode_params Params;
+					Out->Status = sslm_decode_params_init(Model, SSLM_DECODE_MODE_GREEDY, LayerBudget, &Params);
+					if (Out->Status == SSLM_OK)
+					{
+						// Canonical: NULL options (rev 1.2.4's verb). Exact: the learned draft, never NULL
+						// and never empty (rev 1.3.5 cold start: an empty draft sends no span job).
+						sslm_jump_options Opts;
+						FMemory::Memzero(Opts);
+						Opts.struct_size = sizeof(sslm_jump_options);
+						Opts.mode = SSLM_JUMP_EXACT;
+						Opts.draft = Draft.GetData();
+						Opts.draft_count = Draft.Num();
+						Out->Status = sslm_seq_jump_forward(Model, SeqHandle, ChunkBudget, &Params, bExact ? &Opts : nullptr, Workspace,
+							Forced.GetData(), ChunkBudget, &Count);
+					}
+				}
+				Count = FMath::Clamp<int32>(Count, 0, ChunkBudget);
+				Out->ForcedIds.Append(Forced.GetData(), Count);
+				ReadStatsOnWorker(Model, SeqHandle, Out->Result); // row 22: at the job's tail
+				if (bRead)
+				{
+					ReadForcedOnWorker(Model, SeqHandle, Out->Result);
+				}
+			};
+		};
+
+		auto Deliver = [&S, SlotIndex, Owner, JobId, Out](double WorkerCallMs)
+		{
+			(void)WorkerCallMs;
+			FSlot& Slot = S.Slots[SlotIndex];
+			--Slot.OutstandingJobCount; // unconditional, as every job's
+			CountForcedRead(S, Out->Result);
+			const bool bOwnerHolds = Slot.VendedId == Owner;
+#if WITH_DEV_AUTOMATION_TESTS
+			if (FSuperSLMSpanJobRecord* Record = FindSpanJobRecord(S, JobId))
+			{
+				Record->DeliveredAtTick = S.CurrentTickIndex;
+				Record->Status = static_cast<int32>(Out->Status);
+				Record->ForcedIds = Out->ForcedIds;
+				Record->ForcedChainLeftAfter = Out->Result.bForcedRead ? Out->Result.ForcedCount : 0;
+				Record->OutputIndexBefore = bOwnerHolds ? Slot.Generated.Num() : -1;
+			}
+#else
+			(void)JobId;
+#endif
+			if (!bOwnerHolds)
+			{
+				return; // returned (and possibly re-vended) since this job was posted
+			}
+			Slot.Jump.bSpanOutstanding = false;
+			DeliverStats(Slot, true, Out->Result);
+			if (Slot.Phase == ESuperSLMSequencePhase::Complete || Slot.Phase == ESuperSLMSequencePhase::Faulted)
+			{
+				return;
+			}
+			ApplySpanResult(S, Slot, JobId, *Out);
+		};
+
+		Slot.NextAvailableTick = PostLedgerJob(S, Slot.PinnedLane, CandidateLanes, ESuperSLMWorkerJobKind::DecodeOrPrefill, 0, ChunkBudget, 0, PlannedMs,
+			FSuperSLMSequence{Owner}, FSuperSLMLifecycleOpHandle{}, TickIndex, BuildExecute, MoveTemp(Deliver), INDEX_NONE, /*bAppendLedgerRow*/ false);
+		ensure(S.NextJobId == JobId + 1);
+
+#if WITH_DEV_AUTOMATION_TESTS
+		if (S.bRecordSpanJobs)
+		{
+			FSuperSLMSpanJobRecord& Record = S.SpanJobRecords.AddDefaulted_GetRef();
+			Record.JobId = JobId;
+			Record.Sequence = FSuperSLMSequence{Owner};
+			Record.Mode = ToPublicJumpMode(Slot.Jump.Mode);
+			Record.PlannedAtTick = TickIndex;
+			Record.ChunkBudget = ChunkBudget;
+			Record.bDraftNull = !bExact;
+			Record.Draft = Draft;
+			Record.PlannedJobMs = PlannedMs;
+			Record.PricedChunk = ChunkBudget;
+			Record.StartDepth = StartDepth;
+			Record.DraftSnapshotVersion = Plan.SnapshotVersion;
+			Record.DraftLengthBeforeAllowanceClip = bExact ? Plan.DraftLengthBeforeAllowanceClip : -1;
+			Record.DraftLengthBeforeStopCut = bExact ? Plan.DraftLengthBeforeStopCut : -1;
+		}
+#endif
+	}
+
+	// After Apply: each schema-bound CPU generation that has ended feeds its learned draft (§6 P1-X
+	// "Which generations feed it"): an off or exact one whose walk the plugin knows, with the reads
+	// on, merged on the game thread into a new snapshot swapped in by pointer. The store itself
+	// refuses a canonical stream and one that did not end with the walk accepting.
+	void FinishJumpGenerations(FSuperSLMSubsystemState& S)
+	{
+		for (FSlot& Slot : S.Slots)
+		{
+			FJumpGeneration& J = Slot.Jump;
+			if (!J.bActive || Slot.VendedId == 0)
+			{
+				continue;
+			}
+			if (Slot.Phase != ESuperSLMSequencePhase::Complete && Slot.Phase != ESuperSLMSequencePhase::Faulted)
+			{
+				continue;
+			}
+			J.bActive = false;
+			if (!J.bWalkKnown || !J.bReads || J.SchemaIndex == INDEX_NONE)
+			{
+				continue;
+			}
+			const superslm::SchemaEntry* Entry = S.WalkSchemas().ByIndex(static_cast<size_t>(J.SchemaIndex));
+			if (Entry == nullptr)
+			{
+				continue;
+			}
+			const SuperSLMCore::FDraftTableKey Key = S.DraftKey(J.SchemaIndex);
+			const SuperSLMCore::FDraftTableRef Before = S.DraftTables.Snapshot(Key);
+			const FScm1Automaton Transitions(S.WalkSchemas(), *Entry, J.StartState);
+			const SuperSLMCore::FObservedSchemaAutomaton Automaton(Transitions, S.ForcedObservations.FindOrAdd(J.SchemaIndex));
+			S.DraftTables.OnGenerationFinished(Key, J.Mode, Slot.Stats.bSchemaAccepting, Automaton,
+				Slot.Generated.GetData(), static_cast<size_t>(Slot.Generated.Num()));
+			if (S.DraftTables.Snapshot(Key) != Before)
+			{
+				++S.DraftSnapshotVersions.FindOrAdd(J.SchemaIndex, -1); // one swap (P1X.8)
+			}
+		}
+	}
+
 	// ChainBaseTick is INDEX_NONE for a job planned the ordinary way; for a continuation it is the
 	// committed tick of the job it follows (PlanContinuations, plan §5 item 1a).
 	void DispatchSequencePrefill(FSuperSLMSubsystemState& S, TArray<int32>& CandidateLanes, int32 SlotIndex, int32 TickIndex,
@@ -5597,6 +6918,9 @@ namespace
 		const sslm_span_kind SpanKind = static_cast<sslm_span_kind>(Slot.SpanKind);
 		FJobOutputRef Out = MakeShared<FJobOutput, ESPMode::ThreadSafe>();
 		Out->PerSequence.SetNum(1);
+		// Schema fast-decode plan rev 1.3.5, §6 P1-X: the forcedness read before the first decode
+		// job is made at the tail of the prefill job that consumes the prompt's last token.
+		const bool bReadForced = Slot.Jump.bActive && Slot.Jump.bReads && Slot.PromptConsumed + Chunk >= Slot.Prompt.Num();
 
 		// Plan §2.5 row 20 rule 4: a Generate's first job carries every held entry below its op's
 		// ordinal; each later job of the generation carries adapter entries only.
@@ -5611,10 +6935,10 @@ namespace
 		// D-SLM7528 (plan §5 item 3): the lane is resolved by PostLedgerJob, not chosen here -- the
 		// workspace this call needs is therefore captured through BuildExecute's own resolved-lane
 		// parameter, never read from a LaneIndex this function no longer receives.
-		auto BuildExecute = [&S, Model, SeqHandle, PrefillTokensCopy, Left, Chunk, SpanKind, Carried, Out, Gate, Ticket, bContinuation](int32 LaneIndex) -> TFunction<void()>
+		auto BuildExecute = [&S, Model, SeqHandle, PrefillTokensCopy, Left, Chunk, SpanKind, Carried, Out, Gate, Ticket, bContinuation, bReadForced](int32 LaneIndex) -> TFunction<void()>
 		{
 			const sslm_workspace Workspace = S.Lanes[LaneIndex].Workspace;
-			return [Model, SeqHandle, PrefillTokensCopy, Left, Chunk, SpanKind, Workspace, Carried, Out, Gate, Ticket, bContinuation]()
+			return [Model, SeqHandle, PrefillTokensCopy, Left, Chunk, SpanKind, Workspace, Carried, Out, Gate, Ticket, bContinuation, bReadForced]()
 			{
 				// 1.1 (plan §5 item 1a): a continuation whose generation ended in the job ahead of
 				// it (or was ended from the game thread), or which a later request cancelled, makes
@@ -5638,6 +6962,10 @@ namespace
 					Gate->Stop(); // Deliver() faults the sequence for this, so nothing may follow it
 				}
 				ReadStatsOnWorker(Model, SeqHandle, Result); // row 22: at the job's tail
+				if (bReadForced && Out->Status == SSLM_OK)
+				{
+					ReadForcedOnWorker(Model, SeqHandle, Result); // §6 P1-X: before the first decode job
+				}
 			};
 		};
 
@@ -5666,7 +6994,8 @@ namespace
 			Slot.LayersDoneInToken = 0;
 		}
 
-		auto Deliver = [&S, SlotIndex, SlotVendedIdCap, Carried, Out, PrePromptConsumed, PreContextUsed, PreLayersDoneInToken, bPreReadyForLogits, PrePhase, LedgerRowCap, Ticket](double WorkerCallMs)
+		const int64 JobIdCap = S.NextJobId; // PostLedgerJob takes exactly this one (a forcedness read's AfterJobId)
+		auto Deliver = [&S, SlotIndex, SlotVendedIdCap, Carried, Out, PrePromptConsumed, PreContextUsed, PreLayersDoneInToken, bPreReadyForLogits, PrePhase, LedgerRowCap, Ticket, JobIdCap](double WorkerCallMs)
 		{
 			FSlot& Slot = S.Slots[SlotIndex];
 			if (Ticket.IsValid() && Slot.QueuedContinuation == Ticket)
@@ -5677,6 +7006,7 @@ namespace
 			// returned mid-flight waits on this count reaching zero regardless of whose content,
 			// if anyone's, the job's real result gets applied to.
 			--Slot.OutstandingJobCount;
+			CountForcedRead(S, Out->PerSequence[0]);
 			// Rule 2: caller-owned state only for the job's owner (the holder at post).
 			const bool bOwnerHolds = Slot.VendedId == SlotVendedIdCap;
 			ConfirmCarried(S, Slot, bOwnerHolds, Carried, Out->PerSequence[0].CarriedStatuses, /*bCarrierInGeneration*/ true);
@@ -5729,6 +7059,7 @@ namespace
 					TEXT("sslm_prefill failed after %d of %d prompt tokens (%s)"), Slot.PromptConsumed, Slot.Prompt.Num(), *StatusText(Out->Status)));
 				return;
 			}
+			ApplyJumpForcedRead(S, Slot, JobIdCap, Out->PerSequence[0]); // §6 P1-X: the chain at the prompt's end
 		};
 
 		Slot.NextAvailableTick = PostLedgerJob(S, Slot.PinnedLane, CandidateLanes, ESuperSLMWorkerJobKind::DecodeOrPrefill, 0, Chunk, 0, PlannedMs,
@@ -5906,6 +7237,30 @@ namespace
 			}
 			return;
 		}
+#if WITH_DEV_AUTOMATION_TESTS
+		// FSuperSLMSchemaJumpReviewTestAccess::GetCanonicalDecodesPlannedWithOpenChain (review finding 4):
+		// ground truth for the drain rule. Under recording, before this decode job is posted, the
+		// game thread reads each Canonical member's chain itself (cap 0, read-only, §5.3). A due
+		// member has no job in flight (a jump-mode generation takes no continuation), so the read
+		// sees the state the job will start from. Not one of GetForcednessReads()'s.
+		if (S.bRecordSpanJobs)
+		{
+			for (int32 Idx : SlotIndices)
+			{
+				const FSlot& Member = S.Slots[Idx];
+				if (!Member.Jump.bActive || Member.Jump.Mode != SuperSLMCore::ESchemaJumpMode::Canonical || Member.Seq == nullptr)
+				{
+					continue;
+				}
+				int32_t Chain = 0;
+				int32_t Accepting = 0;
+				if (sslm_seq_forced_tokens(S.Model, Member.Seq, nullptr, 0, &Chain, &Accepting) == SSLM_OK && Chain > 0)
+				{
+					++S.CanonicalOpenChainDecodes;
+				}
+			}
+		}
+#endif
 		for (int32 Idx : SlotIndices)
 		{
 			++S.Slots[Idx].OutstandingJobCount;
@@ -5928,9 +7283,14 @@ namespace
 		Out->MemberSkipped.SetNumZeroed(SlotIndices.Num());
 		TArray<FGenerationGatePtr> Gates;
 		TArray<FContinuationTicketPtr> Tickets; // 1.1: one per member of a continuation, else empty
+		// Schema fast-decode plan rev 1.3.5, §6 P1-X: the members whose generations read forcedness
+		// after every decode job (cap 0, at the job's tail).
+		TArray<bool> ReadForcedPerSlot;
 		Gates.Reserve(SlotIndices.Num());
+		ReadForcedPerSlot.Reserve(SlotIndices.Num());
 		for (int32 Idx : SlotIndices)
 		{
+			ReadForcedPerSlot.Add(S.Slots[Idx].Jump.bActive && S.Slots[Idx].Jump.bReads);
 			Gates.Add(GenerationGateFor(S.Slots[Idx]));
 			if (bContinuation)
 			{
@@ -5955,10 +7315,10 @@ namespace
 
 		// D-SLM7528 (plan §5 item 3): the lane is resolved by PostLedgerJob; the workspace it
 		// requires is read from BuildExecute's own resolved-lane parameter.
-		auto BuildExecute = [&S, Model, Seqs, LayerBudget, bAllFinishOnly, CarriedPerSlot, Out, Gates, Tickets, bContinuation](int32 LaneIndex) -> TFunction<void()>
+		auto BuildExecute = [&S, Model, Seqs, LayerBudget, bAllFinishOnly, CarriedPerSlot, Out, Gates, Tickets, bContinuation, ReadForcedPerSlot](int32 LaneIndex) -> TFunction<void()>
 		{
 			const sslm_workspace Workspace = S.Lanes[LaneIndex].Workspace;
-			return [Model, Seqs, LayerBudget, Workspace, bAllFinishOnly, CarriedPerSlot, Out, Gates, Tickets, bContinuation]()
+			return [Model, Seqs, LayerBudget, Workspace, bAllFinishOnly, CarriedPerSlot, Out, Gates, Tickets, bContinuation, ReadForcedPerSlot]()
 			{
 				// 1.1 (plan §5 item 1a): a continuation leaves out every member whose generation
 				// ended in the job ahead of it (or was ended from the game thread), and every member
@@ -6032,6 +7392,10 @@ namespace
 				for (int32 I : Live)
 				{
 					ReadStatsOnWorker(Model, Seqs[I], Out->PerSequence[I]); // row 22: at the job's tail
+					if (ReadForcedPerSlot[I] && Out->Status == SSLM_OK)
+					{
+						ReadForcedOnWorker(Model, Seqs[I], Out->PerSequence[I]); // §6 P1-X: after every decode job
+					}
 				}
 			};
 		};
@@ -6077,7 +7441,8 @@ namespace
 		}
 
 		const int64 LedgerRowCap = S.JobLedger.AppendedCount(); // the row PostLedgerJob appends
-		auto Deliver = [&S, SlotIndicesCopy, SlotVendedIdsCopy, WasReadyForLogitsCopy, WasFinishingCopy, PreLayersDoneCopy, CarriedPerSlot, Out, bAllFinishOnly, LedgerRowCap, Tickets](double WorkerCallMs) // LayerBudget/NumHiddenLayers no longer needed here: Left/Layers/the finishing decision are already resolved above, at POST time
+		const int64 JobIdCap = S.NextJobId; // PostLedgerJob takes exactly this one (a forcedness read's AfterJobId)
+		auto Deliver = [&S, SlotIndicesCopy, SlotVendedIdsCopy, WasReadyForLogitsCopy, WasFinishingCopy, PreLayersDoneCopy, CarriedPerSlot, Out, bAllFinishOnly, LedgerRowCap, Tickets, JobIdCap](double WorkerCallMs) // LayerBudget/NumHiddenLayers no longer needed here: Left/Layers/the finishing decision are already resolved above, at POST time
 		{
 			for (int32 I = 0; I < Tickets.Num(); ++I)
 			{
@@ -6131,6 +7496,7 @@ namespace
 				const bool bOwnerHolds = Slot.VendedId == SlotVendedIdsCopy[I];
 				ConfirmCarried(S, Slot, bOwnerHolds, CarriedPerSlot[I], Out->PerSequence[I].CarriedStatuses, /*bCarrierInGeneration*/ true);
 				DeliverStats(Slot, bOwnerHolds, Out->PerSequence[I]);
+				CountForcedRead(S, Out->PerSequence[I]);
 			}
 			if (Out->Status != SSLM_OK)
 			{
@@ -6200,6 +7566,9 @@ namespace
 					continue; // an earlier-committed, later-delivered job already made this slot terminal
 				}
 				const int32 Token = Out->DecodeTokens[I];
+				// Schema fast-decode plan rev 1.3.5, §6 P1-X: the walk, the pending token and the
+				// forcedness read, before the token reaches the output.
+				NoteJumpDecodeResult(S, Slot, JobIdCap, Token, Out->PerSequence[I]);
 
 				if (Token >= 0)
 				{
@@ -6342,6 +7711,7 @@ namespace
 		Slot.Generated.Reserve(Request.MaxNewTokens);
 		Slot.BeginSeconds = FPlatformTime::Seconds();
 		Slot.Phase = Slot.Prompt.Num() > 0 ? ESuperSLMSequencePhase::Prefilling : ESuperSLMSequencePhase::Decoding;
+		BeginJumpGeneration(S, Slot, Request); // schema fast-decode plan rev 1.3.5, §6 P1 and P1-X
 	}
 
 	// The Plan half of Tick() (§5): admits at most one lifecycle-kind job this pass (by lowest
@@ -6464,6 +7834,12 @@ namespace
 					int32 Occupied = S.RetiringPrefixes.Num();
 					for (const TPair<int64, FPrefixEntry>& Pair : S.Prefixes)
 					{
+#if SUPERSLM_WITH_PREFIX_CACHE
+						if (SuperSLMPrefixCacheGlue::IsShadow(S, Pair.Key))
+						{
+							continue; // precache plan §5.4: a cache lease holds no prefix block
+						}
+#endif
 						Occupied += (Pair.Value.Handle != nullptr || Pair.Value.bAdminJobInFlight) ? 1 : 0;
 					}
 					if (Occupied >= S.Config.PrefixBlockCount)
@@ -6579,6 +7955,39 @@ namespace
 			Report.JobsPlannedThisTick += static_cast<int32>(S.NextJobId - JobIdBeforeDispatch); // O1: posted jobs only
 		}
 
+		// 2b. Schema fast-decode plan rev 1.3.5, §6 P1 and P1-X: a due decoding sequence whose next job
+		// is a span job (SuperSLMCore::NextJob: canonical mode's drain rule, exact mode's span after a
+		// decode job that left a pending token at a forced state with a non-empty learned draft) gets
+		// it on its own pinned lane, one sequence per job. A sequence that wants one is never offered
+		// to a decode batch below, so mixed batches hold only drained sequences (P1.7, P1X.9).
+		for (int32 I = 0; I < S.Slots.Num() && !FreeLanes.IsEmpty(); ++I)
+		{
+			const FSlot& CandidateSlot = S.Slots[I];
+			if (!CandidateSlot.Jump.bActive || CandidateSlot.Jump.Mode == SuperSLMCore::ESchemaJumpMode::Off)
+			{
+				continue;
+			}
+			if (!CandidateSlot.IsDue(TickIndex) || CandidateSlot.Phase != ESuperSLMSequencePhase::Decoding
+				|| !IsLanePinFree(CandidateSlot.PinnedLane, S.Lanes, TickIndex) || !CanClaimLane(CandidateSlot.PinnedLane, FreeLanes))
+			{
+				continue;
+			}
+#if WITH_DEV_AUTOMATION_TESTS
+			if (const FSuperSLMSubsystemState::FTestJobHold* Hold = S.TestJobHolds.Find(CandidateSlot.VendedId); Hold != nullptr && Hold->bHeld)
+			{
+				continue; // the job hold: nothing is planned for a held sequence
+			}
+#endif
+			const FSpanPlan Plan = PlanJumpNextJob(S, I);
+			if (Plan.Next != SuperSLMCore::EJumpNextJob::Span)
+			{
+				continue;
+			}
+			const int64 JobIdBeforeDispatch = S.NextJobId;
+			DispatchSpanJob(S, FreeLanes, I, TickIndex, Plan);
+			Report.JobsPlannedThisTick += static_cast<int32>(S.NextJobId - JobIdBeforeDispatch); // O1: posted jobs only
+		}
+
 		// 3. Remaining free lanes: due decoding sequences, grouped by (pinned budget, pinned lane)
 		// -- 0/INDEX_NONE meaning the scheduler's own shared choice -- one batched job per group
 		// per free lane. D-SLM7528: grouping by PinnedLane too (not PinnedLayerBudget alone) keeps
@@ -6605,6 +8014,22 @@ namespace
 					&& CandidateSlot.SpeculativeFinishesQueued < CandidateSlot.MaxNewTokens - CandidateSlot.Generated.Num()
 					&& IsLanePinFree(CandidateSlot.PinnedLane, S.Lanes, TickIndex))
 				{
+					// Schema fast-decode plan rev 1.3.5, §6: a sequence whose next job is a span job
+					// (one step 2b could not post this tick) waits for it, never joining a decode batch.
+					if (CandidateSlot.Jump.bActive && CandidateSlot.Jump.Mode != SuperSLMCore::ESchemaJumpMode::Off
+						&& PlanJumpNextJob(S, I).Next != SuperSLMCore::EJumpNextJob::Decode)
+					{
+						continue;
+					}
+#if WITH_DEV_AUTOMATION_TESTS
+					// The job hold: a BeforeDecode hold stops the sequence here, the first time it would join a decode
+					// job; a held sequence joins none until the test releases it.
+					if (FSuperSLMSubsystemState::FTestJobHold* Hold = S.TestJobHolds.Find(CandidateSlot.VendedId))
+					{
+						if (Hold->Point == ESuperSLMJobHoldPoint::BeforeDecode) { Hold->bHeld = true; }
+						if (Hold->bHeld) { continue; }
+					}
+#endif
 					// Plugin paging plan §3.4: the per-step limit pre-check, before the step is
 					// grouped. A due sequence has no job in flight, so ContextUsed is exact here.
 					if (!PreCheckDecodeStep(S, I, CandidateSlot.ContextUsed, /*bFaultOnRefusal*/ true))
@@ -6673,7 +8098,8 @@ namespace
 		for (int32 L = 0; L < S.Lanes.Num(); ++L)
 		{
 			const FLane& Lane = S.Lanes[L];
-			if (Lane.Pending.Num() != 1 || Lane.Pending[0].Kind != ESuperSLMWorkerJobKind::DecodeOrPrefill)
+			// Precache plan rev 1.18.10 (§15.29): no continuation on a lane held for a cache build's chunk.
+			if (Lane.Pending.Num() != 1 || Lane.Pending[0].Kind != ESuperSLMWorkerJobKind::DecodeOrPrefill || Lane.IsHeldForChunk() || Lane.Pending[0].bSpanJob)
 			{
 				continue;
 			}
@@ -6696,6 +8122,13 @@ namespace
 					// A member whose generation has ended, or whose last token is already in flight
 					// (§17's cap), has nothing to continue; it neither joins nor blocks.
 					if (!Slot.IsGenerating() || !Slot.bGenerateFirstJobPosted)
+					{
+						continue;
+					}
+					// Schema fast-decode plan rev 1.3.5, §6: under jump-forward the next job depends on
+					// this one's forcedness read (a span job or a decode job), which only its delivery
+					// gives, so the generation keeps 1.0's hand-off; it neither joins nor blocks.
+					if (Slot.Jump.bActive && Slot.Jump.Mode != SuperSLMCore::ESchemaJumpMode::Off)
 					{
 						continue;
 					}
@@ -6801,6 +8234,8 @@ void USuperSLMSubsystem::Tick(float DeltaSeconds)
 		}
 	}
 	Report.TickIndex = bAtHorizon ? S.TickCounter : S.TickCounter++;
+	S.CurrentTickIndex = Report.TickIndex; // a span job's DeliveredAtTick (schema fast-decode plan rev 1.3.5)
+	PublishSchemaWalkLoad(S, Report.TickIndex); // rev 1.3.6, review finding 1: a finished walk-table load
 
 	// 1. Apply -- never a Layer-1 call (R-S1b (ii), R-S1g). For every lane whose job the worker
 	// has finished, copy its result onto the sequence(s)/prefix/handle it belongs to.
@@ -6898,6 +8333,13 @@ void USuperSLMSubsystem::Tick(float DeltaSeconds)
 		}
 		// Plugin paging plan §3.5 (K3): the applies above may have admitted waiting restores.
 		ResolveWaitingRestores(S);
+#if SUPERSLM_WITH_PREFIX_CACHE
+		// Precache plan §5.5: the cache applies its arrived completions and starts its next commands.
+		SuperSLMPrefixCacheGlue::Pump(S);
+#endif
+		// Schema fast-decode plan rev 1.3.5, §6 P1-X: the generations the applies ended feed the
+		// learned draft, on the game thread.
+		FinishJumpGenerations(S);
 	}
 	Report.ApplyMs = (FPlatformTime::Seconds() - ApplyStart) * 1000.0;
 
@@ -6907,8 +8349,14 @@ void USuperSLMSubsystem::Tick(float DeltaSeconds)
 		TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Tick.Plan", SuperSLMChannel);
 		if (!S.bTickHorizonReached)
 		{
+#if SUPERSLM_WITH_PREFIX_CACHE
+			SuperSLMPrefixCacheGlue::NoteWaitingChunks(S); // precache plan rev 1.18.10 (§15.29): lanes held for a chunk
+#endif
 			PlanNextJobs(S, Report, Report.TickIndex);
 			PlanContinuations(S, Report, Report.TickIndex); // 1.1, plan §5 item 1a
+#if SUPERSLM_WITH_PREFIX_CACHE
+			SuperSLMPrefixCacheGlue::DispatchLaneJobs(S, Report.TickIndex); // precache plan §5.5
+#endif
 		}
 	}
 	Report.PlanMs = (FPlatformTime::Seconds() - PlanStart) * 1000.0;
@@ -7102,7 +8550,12 @@ namespace
 		// Plan §2.5 row 23 (D-SLM7714): a blob saved under another Layer-1 pin is refused by name,
 		// before anything is queued. Saves do not carry across a change of pin (§4, §12 decision 13).
 		const FString CompiledTag = SuperSLMSaveBlob::CompiledLayer1Tag();
+#if SUPERSLM_WITH_PREFIX_CACHE
+		// Precache plan §5.8: the shipped compatibility table admits a named predecessor's saves.
+		if (!SuperSLMPrefixCacheGlue::AcceptSaveLayer1(Contents.Layer1Tag, Contents.Layer1Commit, Payload, PayloadBytes))
+#else
 		if (Contents.Layer1Tag != CompiledTag)
+#endif
 		{
 			OutError = FString::Printf(
 				TEXT("Layer-1 pin mismatch: the blob was saved by a build pinned to Layer 1 %s, and this build is pinned to Layer 1 %s; saves do not carry across a change of pin"),
@@ -7227,7 +8680,19 @@ namespace
 			// as null. A usable hint is pinned from here until the job delivers or is refused.
 			if (Hint != nullptr && Header.Payload == SuperSLMPaging::ERestorePayload::Budget)
 			{
-				if (FPrefixEntry* HintEntry = S.Prefixes.Find(Hint->Id))
+				FPrefixEntry* HintEntry = S.Prefixes.Find(Hint->Id);
+#if SUPERSLM_WITH_PREFIX_CACHE
+				// Precache plan §5.11 (b) *Adopt and hint* (rev 1.18, PC-15 Q5; the U2 draft's V9 ignored it): a Ready
+				// cache lease is a hint. Its entry is adopt-pinned for the restore's life, the ledger pre-charges A for
+				// its shared pages (EHintKind::CacheEntry), and the job shares its full pages. A lease standing in
+				// State->Prefixes as an adopt shadow is the cache's too, never a ledger node. A lease that is not
+				// Ready, or ended, is no hint: the restore is private (a hint is never a requirement).
+				if (SuperSLMPrefixCacheGlue::PinCacheRestoreHint(S, Hint->Id, Op.RestoreHintCache) || SuperSLMPrefixCacheGlue::IsShadow(S, Hint->Id))
+				{
+					HintEntry = nullptr;
+				}
+#endif
+				if (HintEntry != nullptr)
 				{
 					if (HintEntry->bLedgerBuilt && HintEntry->Handle != nullptr && HintEntry->Phase == ESuperSLMPrefixPhase::Ready)
 					{
@@ -7443,7 +8908,18 @@ double USuperSLMSubsystem::GetTokensPerSecond() const { return State ? State->La
 int32 USuperSLMSubsystem::GetHitchCount() const { return State ? State->HitchCount : 0; }
 int32 USuperSLMSubsystem::GetPoolFreeCount() const { return State ? State->FreeSlots.Num() : 0; }
 int32 USuperSLMSubsystem::GetPoolOccupiedCount() const { return State ? State->IdToSlot.Num() : 0; }
-int32 USuperSLMSubsystem::GetLivePrefixCount() const { return State ? State->Prefixes.Num() : 0; }
+int32 USuperSLMSubsystem::GetLivePrefixCount() const
+{
+	if (State == nullptr)
+	{
+		return 0;
+	}
+#if SUPERSLM_WITH_PREFIX_CACHE
+	return State->Prefixes.Num() - SuperSLMPrefixCacheGlue::ShadowCount(*State); // cache leases are not live prefixes
+#else
+	return State->Prefixes.Num();
+#endif
+}
 int64 USuperSLMSubsystem::GetKvPoolReservedBytes() const { return State ? State->KvBytes : 0; }
 
 // Plugin paging plan §3.2: the ledger's regions and counters and the last applied job's pool
@@ -7579,6 +9055,482 @@ int32 FSuperSLMSchedulingTestAccess::GetReportHistoryCapacity()
 #endif // WITH_DEV_AUTOMATION_TESTS
 
 // ---------------------------------------------------------------------------------------------
+// The schema jump-forward test seam (schema fast-decode plan rev 1.3.5, §6 P1 and P1-X;
+// SuperSLMSchemaJumpTestSeam.h). Defined here, beside the state it reads, as the scheduling and
+// paged seams are. Game thread only. It records and seeds; it never changes a token.
+// ---------------------------------------------------------------------------------------------
+
+// Schema fast-decode plan §6 P1, P1-X (P1.9; rev 1.3.6, review finding 3): the example's scratch
+// switch, parsed by the core parser, in the public API so the example can call it. Text outside ASCII
+// is refused before conversion (no value the switch takes has any).
+bool ParseSuperSLMSchemaJumpForwardSwitch(const FString& Text, ESuperSLMSchemaJumpForward& InOutMode)
+{
+	for (const TCHAR Ch : Text)
+	{
+		if (Ch == 0 || static_cast<uint32>(Ch) > 127u)
+		{
+			return false;
+		}
+	}
+	const FTCHARToUTF8 Utf8(*Text);
+	SuperSLMCore::ESchemaJumpMode Mode = SuperSLMCore::ESchemaJumpMode::Off;
+	if (!SuperSLMCore::ParseSchemaJumpSwitch(Utf8.Get(), Mode))
+	{
+		return false;
+	}
+	InOutMode = ToPublicJumpMode(Mode);
+	return true;
+}
+
+#if WITH_DEV_AUTOMATION_TESTS
+namespace
+{
+	// The schema's SCM1 index under the configured mapping: false when not configured, when the
+	// handle is unknown or was looked up on another artifact, or when the section lacks it.
+	bool SeamSchemaIndex(const FSuperSLMSubsystemState* S, const FSuperSLMSchemaHandle& Schema, int32& OutIndex)
+	{
+		if (S == nullptr || Schema.IsNone())
+		{
+			return false;
+		}
+		uint8 Hash[32];
+		FString SchemaName;
+		if (!SuperSLMRuntime::ResolveSchemaName(Schema.Opaque, Hash, SchemaName) || FMemory::Memcmp(Hash, S->ArtifactHash, 32) != 0)
+		{
+			return false;
+		}
+		return S->FindSchemaIndex(SchemaName, OutIndex);
+	}
+
+	SuperSLMCore::FDraftTableRef SeamSnapshot(const FSuperSLMSubsystemState* S, const FSuperSLMSchemaHandle& Schema)
+	{
+		int32 Index = INDEX_NONE;
+		return SeamSchemaIndex(S, Schema, Index) ? S->DraftTables.Snapshot(S->DraftKey(Index)) : SuperSLMCore::FDraftTableRef();
+	}
+
+	// Requests the walk table if no generation has, and waits for its pool task, then publishes it.
+	// False when the load is held (HoldSchemaWalkLoad) or does not finish within a minute.
+	bool SeamEnsureWalkTable(FSuperSLMSubsystemState& S)
+	{
+		RequestSchemaWalkLoad(S);
+		if (S.bWalkLoadPending)
+		{
+			return false;
+		}
+		const double Start = FPlatformTime::Seconds();
+		while (S.WalkLoadInFlight.IsValid() && !S.WalkLoadInFlight->bDone.load(std::memory_order_acquire))
+		{
+			if (FPlatformTime::Seconds() - Start > 60.0)
+			{
+				return false;
+			}
+			FPlatformProcess::Sleep(0.001f);
+		}
+		PublishSchemaWalkLoad(S, S.CurrentTickIndex);
+		return true;
+	}
+
+	// The tokens SCM1 admits at State, ascending.
+	TArray<int32> LegalTokensAt(const superslm::SchemaEntry& Entry, uint32 State)
+	{
+		TArray<int32> Out;
+		if (State >= Entry.state_count)
+		{
+			return Out;
+		}
+		using superslm::schema_masks_detail::ReadLE32;
+		const uint32 Begin = ReadLE32(Entry.state_offsets_le + static_cast<size_t>(State) * 4);
+		const uint32 End = ReadLE32(Entry.state_offsets_le + static_cast<size_t>(State + 1) * 4);
+		for (uint32 K = Begin; K < End; ++K)
+		{
+			Out.Add(static_cast<int32>(ReadLE32(Entry.transitions_le + static_cast<size_t>(K) * 8)));
+		}
+		return Out;
+	}
+}
+
+bool FSuperSLMSchemaJumpTestAccess::IsBuilt()
+{
+	return true;
+}
+
+void FSuperSLMSchemaJumpTestAccess::StartRecording(USuperSLMSubsystem& Subsystem)
+{
+	if (FSuperSLMSubsystemState* S = Subsystem.State)
+	{
+		S->bRecordSpanJobs = true;
+		S->SpanJobRecords.Reset();
+		S->ForcednessReadCount = 0;
+		S->ForcednessReadRecords.Reset();
+	}
+}
+
+TArray<FSuperSLMSpanJobRecord> FSuperSLMSchemaJumpTestAccess::GetSpanJobs(const USuperSLMSubsystem& Subsystem)
+{
+	return Subsystem.State != nullptr ? Subsystem.State->SpanJobRecords : TArray<FSuperSLMSpanJobRecord>();
+}
+
+bool FSuperSLMSchemaJumpTestAccess::HasDraftTable(const USuperSLMSubsystem& Subsystem, const FSuperSLMSchemaHandle& Schema)
+{
+	return static_cast<bool>(SeamSnapshot(Subsystem.State, Schema));
+}
+
+int32 FSuperSLMSchemaJumpTestAccess::GetDraftTableStateCount(const USuperSLMSubsystem& Subsystem, const FSuperSLMSchemaHandle& Schema)
+{
+	const SuperSLMCore::FDraftTableRef Table = SeamSnapshot(Subsystem.State, Schema);
+	return Table ? static_cast<int32>(Table->StateCount()) : 0;
+}
+
+int32 FSuperSLMSchemaJumpTestAccess::GetDraftTableMaxTokensAtAnyState(const USuperSLMSubsystem& Subsystem, const FSuperSLMSchemaHandle& Schema)
+{
+	const SuperSLMCore::FDraftTableRef Table = SeamSnapshot(Subsystem.State, Schema);
+	int32 Max = 0;
+	if (Table)
+	{
+		for (const std::pair<const uint32_t, SuperSLMCore::FDraftStateRow>& Row : Table->Rows)
+		{
+			Max = FMath::Max(Max, static_cast<int32>(Table->TokenCountAt(Row.first)));
+		}
+	}
+	return Max;
+}
+
+// The bound P1X.11 checks the table against (seam header, rev 1.3.5): the states the subsystem has
+// observed forced so far -- read with out_count > 0, or drafted through inside a confirmed draft.
+// Every state the table holds was observed forced (IsEveryDraftTableStateObservedForced), so the
+// table's state count never exceeds it. Zero before the first forced read.
+int32 FSuperSLMSchemaJumpTestAccess::GetSchemaForcedStateCount(const USuperSLMSubsystem& Subsystem, const FSuperSLMSchemaHandle& Schema)
+{
+	const FSuperSLMSubsystemState* S = Subsystem.State;
+	int32 Index = INDEX_NONE;
+	if (!SeamSchemaIndex(S, Schema, Index))
+	{
+		return 0;
+	}
+	const SuperSLMCore::FForcednessObservations* Observed = S->ForcedObservations.Find(Index);
+	if (Observed == nullptr)
+	{
+		return 0;
+	}
+	int32 Count = 0;
+	for (const auto& Flag : Observed->Flags)
+	{
+		if (Flag.second == SuperSLMCore::EForcedObservation::Forced)
+		{
+			++Count;
+		}
+	}
+	return Count;
+}
+
+bool FSuperSLMSchemaJumpTestAccess::IsEveryDraftTableStateObservedForced(const USuperSLMSubsystem& Subsystem, const FSuperSLMSchemaHandle& Schema)
+{
+	const FSuperSLMSubsystemState* S = Subsystem.State;
+	int32 Index = INDEX_NONE;
+	if (!SeamSchemaIndex(S, Schema, Index))
+	{
+		return false;
+	}
+	const SuperSLMCore::FDraftTableRef Table = S->DraftTables.Snapshot(S->DraftKey(Index));
+	const SuperSLMCore::FForcednessObservations* Observed = S->ForcedObservations.Find(Index);
+	if (!Table)
+	{
+		return false;
+	}
+	for (const std::pair<const uint32_t, SuperSLMCore::FDraftStateRow>& Row : Table->Rows)
+	{
+		if (Observed == nullptr || Observed->Get(Row.first) != SuperSLMCore::EForcedObservation::Forced)
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+int32 FSuperSLMSchemaJumpTestAccess::MaxTokensPerState()
+{
+	return static_cast<int32>(SuperSLMCore::FDraftTable::MaxTokensPerState());
+}
+
+int64 FSuperSLMSchemaJumpTestAccess::GetDraftSnapshotVersion(const USuperSLMSubsystem& Subsystem, const FSuperSLMSchemaHandle& Schema)
+{
+	int32 Index = INDEX_NONE;
+	return SeamSchemaIndex(Subsystem.State, Schema, Index) ? Subsystem.State->DraftSnapshotVersion(Index) : -1;
+}
+
+// The shipped-table path (§16 Q20) from whole streams walked from the schema's start state: a
+// token counts only at a state carrying the library's forced flag as the subsystem observed it
+// (rev 1.3.5: a seed carries the flags and only its forced states are loaded). The streams a cell
+// seeds from are off runs on this subsystem, whose every state was read.
+bool FSuperSLMSchemaJumpTestAccess::SeedDraftTableFromStreams(USuperSLMSubsystem& Subsystem, const FSuperSLMSchemaHandle& Schema,
+	const TArray<TArray<int32>>& Streams)
+{
+	FSuperSLMSubsystemState* S = Subsystem.State;
+	// Rev 1.3.6 (review finding 1): the walk table loads lazily, so a seed made before any jump-mode
+	// generation asks for it and waits for the pool task here (test seam, game thread). A held load
+	// is not waited for.
+	if (S != nullptr && !SeamEnsureWalkTable(*S))
+	{
+		return false;
+	}
+	int32 Index = INDEX_NONE;
+	if (!SeamSchemaIndex(S, Schema, Index))
+	{
+		return false;
+	}
+	const superslm::SchemaEntry* Entry = S->WalkSchemas().ByIndex(static_cast<size_t>(Index));
+	if (Entry == nullptr)
+	{
+		return false;
+	}
+	const FScm1Automaton Transitions(S->WalkSchemas(), *Entry, 0);
+	const SuperSLMCore::FObservedSchemaAutomaton Automaton(Transitions, S->ForcedObservations.FindOrAdd(Index));
+	SuperSLMCore::FDraftTableRef Table = SuperSLMCore::MergeFinishedStream(nullptr, Automaton, nullptr, 0);
+	for (const TArray<int32>& Stream : Streams)
+	{
+		Table = SuperSLMCore::MergeFinishedStream(Table.get(), Automaton, Stream.GetData(), static_cast<size_t>(Stream.Num()));
+	}
+	S->SwapDraftTable(Index, Table);
+	return true;
+}
+
+// At every held state where SCM1 admits two or more tokens, the lowest legal token other than the
+// row's leader gets a count above the row's whole total, so it leads with a share above 1/2 and a
+// draft through the state takes it: legal there, and not the model's token, so the verb rejects it.
+// A full row gives up its weakest non-leader token for it (the cap holds).
+bool FSuperSLMSchemaJumpTestAccess::CorruptDraftTable(USuperSLMSubsystem& Subsystem, const FSuperSLMSchemaHandle& Schema)
+{
+	FSuperSLMSubsystemState* S = Subsystem.State;
+	int32 Index = INDEX_NONE;
+	if (!SeamSchemaIndex(S, Schema, Index))
+	{
+		return false;
+	}
+	const SuperSLMCore::FDraftTableRef Table = S->DraftTables.Snapshot(S->DraftKey(Index));
+	const superslm::SchemaEntry* Entry = S->WalkSchemas().ByIndex(static_cast<size_t>(Index));
+	if (!Table || Entry == nullptr)
+	{
+		return false;
+	}
+	std::shared_ptr<SuperSLMCore::FDraftTable> Corrupt = std::make_shared<SuperSLMCore::FDraftTable>(*Table);
+	for (std::pair<const uint32_t, SuperSLMCore::FDraftStateRow>& Row : Corrupt->Rows)
+	{
+		const TArray<int32> Legal = LegalTokensAt(*Entry, Row.first);
+		SuperSLMCore::FDraftStateRow& R = Row.second;
+		if (Legal.Num() < 2 || R.Tokens.empty())
+		{
+			continue;
+		}
+		// The leader as the draft reads it: the highest guaranteed count (count less error, the
+		// Space-Saving cap's lower bound, rev 1.3.6), ties to the lowest id.
+		auto Guaranteed = [](const SuperSLMCore::FDraftKeptToken& T) { return T.Count - T.Error; };
+		size_t Leader = 0;
+		for (size_t K = 1; K < R.Tokens.size(); ++K)
+		{
+			if (Guaranteed(R.Tokens[K]) > Guaranteed(R.Tokens[Leader])
+				|| (Guaranteed(R.Tokens[K]) == Guaranteed(R.Tokens[Leader]) && R.Tokens[K].Token < R.Tokens[Leader].Token))
+			{
+				Leader = K;
+			}
+		}
+		const int32 LeaderToken = R.Tokens[Leader].Token;
+		int32 Wrong = INDEX_NONE;
+		for (const int32 Token : Legal)
+		{
+			if (Token != LeaderToken)
+			{
+				Wrong = Token;
+				break;
+			}
+		}
+		if (Wrong == INDEX_NONE)
+		{
+			continue;
+		}
+		const uint64_t Dominant = R.Total + 1;
+		bool bKept = false;
+		for (SuperSLMCore::FDraftKeptToken& Kept : R.Tokens)
+		{
+			if (Kept.Token == Wrong)
+			{
+				R.Total = R.Total - Kept.Count + Dominant;
+				Kept.Count = Dominant;
+				Kept.Error = 0;
+				bKept = true;
+				break;
+			}
+		}
+		if (!bKept)
+		{
+			if (R.Tokens.size() >= SuperSLMCore::FDraftTable::MaxTokensPerState())
+			{
+				size_t Weakest = Leader == 0 ? 1 : 0;
+				for (size_t K = 0; K < R.Tokens.size(); ++K)
+				{
+					if (K != Leader && Guaranteed(R.Tokens[K]) < Guaranteed(R.Tokens[Weakest]))
+					{
+						Weakest = K;
+					}
+				}
+				R.Tokens.erase(R.Tokens.begin() + static_cast<std::ptrdiff_t>(Weakest));
+			}
+			R.Total += Dominant; // a dropped token's count stays in the total, as a cap eviction's does
+			R.Tokens.push_back(SuperSLMCore::FDraftKeptToken{Wrong, Dominant, 0});
+		}
+	}
+	S->SwapDraftTable(Index, std::move(Corrupt));
+	return true;
+}
+
+void FSuperSLMSchemaJumpTestAccess::ClearDraftTable(USuperSLMSubsystem& Subsystem, const FSuperSLMSchemaHandle& Schema)
+{
+	int32 Index = INDEX_NONE;
+	if (SeamSchemaIndex(Subsystem.State, Schema, Index))
+	{
+		Subsystem.State->SwapDraftTable(Index, nullptr);
+	}
+}
+
+int64 FSuperSLMSchemaJumpTestAccess::GetForcednessReadCount(const USuperSLMSubsystem& Subsystem)
+{
+	return Subsystem.State != nullptr ? Subsystem.State->ForcednessReadCount : 0;
+}
+
+void FSuperSLMSchemaJumpTestAccess::SetForcednessReadsEnabled(USuperSLMSubsystem& Subsystem, bool bEnabled)
+{
+	if (Subsystem.State != nullptr)
+	{
+		Subsystem.State->bForcednessReadsEnabled = bEnabled;
+	}
+}
+
+void FSuperSLMSchemaJumpTestAccess::SetNextSpanStatusOverride(USuperSLMSubsystem& Subsystem, int32 Status)
+{
+	if (Subsystem.State != nullptr)
+	{
+		Subsystem.State->TestNextSpanStatus = Status == static_cast<int32>(SSLM_OK) ? 0 : Status;
+	}
+}
+
+void FSuperSLMSchemaJumpTestAccess::SetJobHold(USuperSLMSubsystem& Subsystem, const FSuperSLMSequence& Sequence, ESuperSLMJobHoldPoint Point)
+{
+	if (Subsystem.State == nullptr || Sequence.Id == 0)
+	{
+		return;
+	}
+	if (Point == ESuperSLMJobHoldPoint::None)
+	{
+		Subsystem.State->TestJobHolds.Remove(Sequence.Id);
+		return;
+	}
+	FSuperSLMSubsystemState::FTestJobHold& Hold = Subsystem.State->TestJobHolds.FindOrAdd(Sequence.Id);
+	Hold.Point = Point;
+	Hold.bHeld = false;
+}
+
+bool FSuperSLMSchemaJumpTestAccess::IsJobHeld(const USuperSLMSubsystem& Subsystem, const FSuperSLMSequence& Sequence)
+{
+	const FSuperSLMSubsystemState::FTestJobHold* Hold = Subsystem.State != nullptr ? Subsystem.State->TestJobHolds.Find(Sequence.Id) : nullptr;
+	return Hold != nullptr && Hold->bHeld;
+}
+
+void FSuperSLMSchemaJumpTestAccess::ReleaseJobHold(USuperSLMSubsystem& Subsystem, const FSuperSLMSequence& Sequence)
+{
+	if (FSuperSLMSubsystemState::FTestJobHold* Hold = Subsystem.State != nullptr ? Subsystem.State->TestJobHolds.Find(Sequence.Id) : nullptr)
+	{
+		Hold->bHeld = false;
+	}
+}
+
+// ---- FSuperSLMSchemaJumpReviewTestAccess (rev 1.3.6, §17.12; SuperSLMSchemaJumpReviewTestAccess.h) ----
+
+bool FSuperSLMSchemaJumpReviewTestAccess::IsBuilt()
+{
+	return true;
+}
+
+TArray<FSuperSLMSchemaWalkLoadRecord> FSuperSLMSchemaJumpReviewTestAccess::GetSchemaWalkLoads(const USuperSLMSubsystem& Subsystem)
+{
+	return Subsystem.State != nullptr ? Subsystem.State->WalkLoadRecords : TArray<FSuperSLMSchemaWalkLoadRecord>();
+}
+
+bool FSuperSLMSchemaJumpReviewTestAccess::IsSchemaWalkReady(const USuperSLMSubsystem& Subsystem)
+{
+	return Subsystem.State != nullptr && Subsystem.State->WalkTable.IsValid();
+}
+
+void FSuperSLMSchemaJumpReviewTestAccess::HoldSchemaWalkLoad(USuperSLMSubsystem& Subsystem, bool bHold)
+{
+	FSuperSLMSubsystemState* S = Subsystem.State;
+	if (S == nullptr)
+	{
+		return;
+	}
+	S->bHoldWalkLoad = bHold;
+	if (!bHold && S->bWalkLoadPending)
+	{
+		S->bWalkLoadPending = false;
+		DispatchSchemaWalkLoad(*S); // the held load goes now; a Tick publishes it
+	}
+}
+
+bool FSuperSLMSchemaJumpReviewTestAccess::LoadSchemaWalkTableNow(USuperSLMSubsystem& Subsystem)
+{
+	FSuperSLMSubsystemState* S = Subsystem.State;
+	return S != nullptr && SeamEnsureWalkTable(*S) && S->WalkTable.IsValid();
+}
+
+TArray<FSuperSLMForcednessReadRecord> FSuperSLMSchemaJumpReviewTestAccess::GetForcednessReads(const USuperSLMSubsystem& Subsystem)
+{
+	return Subsystem.State != nullptr ? Subsystem.State->ForcednessReadRecords : TArray<FSuperSLMForcednessReadRecord>();
+}
+
+int32 FSuperSLMSchemaJumpReviewTestAccess::GetCanonicalDecodesPlannedWithOpenChain(const USuperSLMSubsystem& Subsystem)
+{
+	return Subsystem.State != nullptr ? Subsystem.State->CanonicalOpenChainDecodes : -1;
+}
+
+bool FSuperSLMSchemaJumpReviewTestAccess::IsWalkKnown(const USuperSLMSubsystem& Subsystem, const FSuperSLMSequence& Sequence)
+{
+	const FSuperSLMSubsystemState* S = Subsystem.State;
+	if (S == nullptr || Sequence.Id == 0)
+	{
+		return false;
+	}
+	for (const FSlot& Slot : S->Slots)
+	{
+		if (Slot.VendedId == Sequence.Id)
+		{
+			return Slot.Jump.bWalkKnown;
+		}
+	}
+	return false;
+}
+
+int64 FSuperSLMSchemaJumpReviewTestAccess::GetContextUsed(const USuperSLMSubsystem& Subsystem, const FSuperSLMSequence& Sequence)
+{
+	const FSuperSLMSubsystemState* S = Subsystem.State;
+	if (S == nullptr || Sequence.Id == 0)
+	{
+		return -1;
+	}
+	for (const FSlot& Slot : S->Slots)
+	{
+		if (Slot.VendedId == Sequence.Id)
+		{
+			return Slot.ContextUsed;
+		}
+	}
+	return -1;
+}
+
+int64 FSuperSLMSchemaJumpReviewTestAccess::GetContextCap(const USuperSLMSubsystem& Subsystem)
+{
+	return Subsystem.State != nullptr ? Subsystem.State->Shape.ContextCap : -1;
+}
+#endif // WITH_DEV_AUTOMATION_TESTS
+
+// ---------------------------------------------------------------------------------------------
 // The paged-KV test seams (plugin paging plan §3.9, SuperSLMPagedTestSeam.h)
 // ---------------------------------------------------------------------------------------------
 
@@ -7676,23 +9628,49 @@ bool FSuperSLMPagedTestSeam::RunOnPoolThread(USuperSLMSubsystem& Subsystem, TFun
 	// Quiesce: every posted job's Layer-1 work is finished (a HoldStart() job was never posted; a
 	// HoldApply() job has finished its work and waits only for its apply). Nothing is delivered
 	// here, so the job ledger and every result stay as they were.
+	// Precache plan §8 (rev 1.18): a cache build stopped at the build hold has drawn its reserve and makes no Layer-1
+	// call, so the barrier counts its lane as parked, as an idle one. The barrier opens when every unfinished job is one
+	// held there (every held build is unfinished, so equal counts mean the same set); a build past the hold and not yet
+	// frozen keeps it shut. Fn then runs on the first lane with nothing unfinished and no build at the hold.
+	int32 ProbeLane = INDEX_NONE;
 	for (;;)
 	{
-		bool bAllDone = true;
-		for (const FLane& Lane : State->Lanes)
+		int32 Unfinished = 0;
+		int32 FirstIdle = INDEX_NONE;
+		for (int32 L = 0; L < State->Lanes.Num(); ++L)
 		{
+			const FLane& Lane = State->Lanes[L];
+			int32 LaneUnfinished = 0;
 			for (const FLanePendingDelivery& Pending : Lane.Pending)
 			{
-				bAllDone &= Pending.WorkerJob.IsValid() && Pending.WorkerJob->bDone.load(std::memory_order_acquire);
+				LaneUnfinished += (Pending.WorkerJob.IsValid() && Pending.WorkerJob->bDone.load(std::memory_order_acquire)) ? 0 : 1;
+			}
+			Unfinished += LaneUnfinished;
+			bool bLaneHeld = false;
+#if WITH_DEV_AUTOMATION_TESTS
+			bLaneHeld = Lane.Runnable != nullptr && Lane.Runnable->TestBuildHolds.load(std::memory_order_acquire) > 0;
+#endif
+			if (FirstIdle == INDEX_NONE && LaneUnfinished == 0 && !bLaneHeld && Lane.Runnable != nullptr)
+			{
+				FirstIdle = L;
 			}
 		}
-		if (bAllDone)
+		int32 HeldAtBuildHold = 0;
+#if SUPERSLM_WITH_PREFIX_CACHE && WITH_DEV_AUTOMATION_TESTS
+		HeldAtBuildHold = SuperSLMPrefixCacheGlue::HeldBuildsForBarrier(*State);
+#endif
+		if (Unfinished == HeldAtBuildHold)
 		{
+			if (FirstIdle == INDEX_NONE)
+			{
+				return false; // every lane holds a build at the hold: no lane can run Fn (the cell needs K + 1 lanes)
+			}
+			ProbeLane = FirstIdle;
 			break;
 		}
 		FPlatformProcess::Sleep(0.0005f);
 	}
-	// Lane 0's queue is empty now, so this job runs next on its thread. It is enqueued directly,
+	// That lane's queue is empty now, so this job runs next on its thread. It is enqueued directly,
 	// not posted: it has no ledger row and no delivery.
 	const sslm_model Model = State->Model;
 	sslm_kv_pool* Pool = &State->Pool;
@@ -7703,7 +9681,7 @@ bool FSuperSLMPagedTestSeam::RunOnPoolThread(USuperSLMSubsystem& Subsystem, TFun
 		Fn(Access);
 		Access.ReleaseAll();
 	};
-	State->Lanes[0].Runnable->Enqueue(Job);
+	State->Lanes[ProbeLane].Runnable->Enqueue(Job);
 	while (!Job->bDone.load(std::memory_order_acquire))
 	{
 		FPlatformProcess::Sleep(0.0005f);
@@ -7960,3 +9938,7 @@ bool FSuperSLMPagedTestSeam::SetWrapperContextUsed(TArray<uint8>& WrappedBlob, i
 	return true;
 }
 #endif // WITH_DEV_AUTOMATION_TESTS
+
+#if SUPERSLM_WITH_PREFIX_CACHE
+#include "SuperSLMSubsystemPrefixCache.inl"
+#endif

@@ -67,6 +67,13 @@ namespace SuperSLMRuntime
 	bool ReadModelShape(const USuperSLMModel& Model, FModelShape& OutShape, FString& OutError);
 	bool ReadModelShape(const FModelBytes& Model, FModelShape& OutShape, FString& OutError);
 
+	// Schema fast-decode plan rev 1.3.6, review round 1 F1: one section's bytes, located through the
+	// artifact's own section table (docs/sslm_format.md, Section table) -- a read of the 64-byte header
+	// and the 40-byte rows, never a re-hash, a view load or a copy. OutData points INTO Model.Data, so
+	// it is valid only while Model.Pin is held. Returns false when no row has that type or the row lies
+	// outside the bytes. Callable from any thread (it never touches the UObject).
+	bool FindArtifactSection(const FModelBytes& Model, uint32 SectionType, const uint8*& OutData, uint64& OutSize);
+
 	// --- Model mappings (refcounted, one sslm_model per USuperSLMModel) ---
 
 	// Returns the model's shared mapping, mapping it on first use. Each successful call must be

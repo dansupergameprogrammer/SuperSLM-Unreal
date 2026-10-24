@@ -67,7 +67,9 @@ Double-click a `USuperSLMModel` asset. Two tabs:
   measured call, then times twelve, and reports each call's median and spread (the IQR, which is
   the within-run spread of serial calls, not a confidence interval), thirteen suggested costs
   rounded up, and the CPU load other processes put on the machine (250 ms interval averages,
-  which disclose the load and never stop the estimate). The per-call and per-sample series are kept
+  which disclose the load and never stop the estimate). It also measures, and `--write-ini` saves, the price of
+  prompt chunks of 2 to 7 tokens (which prices skip-ahead's batched passes), a prefix-cache restore's cost per
+  MiB, and the prefix-cache build's prefill price. The per-call and per-sample series are kept
   under `Saved/SuperSLM/Estimates/<run id>/`. Each reset starts from the deepest prepared context
   (capacity minus one token) and must leave it empty; input restoration and verification are
   outside its timed call. This measures releasing the live pages rather than an empty reset.
@@ -91,8 +93,9 @@ Double-click a `USuperSLMModel` asset. Two tabs:
   console commands that choose the CPU decode mode (1 splits one-row decode projections across the
   finish hook's tasks) and the finish task count for the next `Configure()` whose config leaves
   them unset. A configuration already made keeps its settings. `--save` also keeps the choice in
-  `Saved/SuperSLM/RuntimeSettings.ini`, which later sessions, packaged games included, load before
-  their first configuration. Both work in the editor and in packaged builds.
+  `Saved/SuperSLM/RuntimeSettings.ini` (only the setting that command chose; the other keeps its
+  saved value, or its shipped one when none is saved), which later sessions, packaged games
+  included, load before their first configuration. Both work in the editor and in packaged builds.
 - **The conversion pre-check** (`SuperSLMConversionPreCheck::Run`, editor module, C++). It reads a
   checkpoint's configuration and tokenizer files and reports, before you spend time converting,
   every blocker it finds, the context length, the KV block size and the predicted reset and adopt

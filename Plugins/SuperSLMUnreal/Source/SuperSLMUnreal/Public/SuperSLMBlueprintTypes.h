@@ -114,6 +114,55 @@ enum class ESuperSLMRestoreResultBP : uint8
 	KvPagesExhausted,   // Paged KV mode: the request's pages do not fit; nothing was drawn
 	KvModeMismatch,     // Paged KV mode: the save's holder mode differs from the backend's mode, or the sequence needs a reset first
 	ContextCapMismatch, // GPU paged KV mode: the save was taken under a larger Context Cap
+	PrefixLeaseEnded,   // Prefix cache: the adopted lease was returned, or its entry was evicted
+};
+
+// Mirrors ESuperSLMPrefixSource (SuperSLMPrefixCacheTypes.h): the tier that served a cached prefix.
+UENUM(BlueprintType)
+enum class ESuperSLMPrefixSourceBP : uint8
+{
+	Pending,
+	Memory,
+	Cooked,
+	Disk,
+	Recomputed,
+	Invalid,
+};
+
+// Explicit residency control (precache plan §5.6, rev 1.18). Mirrors ESuperSLMPrefixDropScope.
+UENUM(BlueprintType)
+enum class ESuperSLMPrefixDropScopeBP : uint8
+{
+	Memory,
+	MemoryAndDisk,
+};
+
+// Mirrors ESuperSLMPrefixOpResult (SuperSLMPrefixCacheTypes.h).
+UENUM(BlueprintType)
+enum class ESuperSLMPrefixOpResultBP : uint8
+{
+	Pending,
+	Resident,
+	Dropped,
+	DropDeferred,
+	NotCached,
+	BudgetExhausted,
+	PoolExhausted,
+	UnknownSchema,
+	Cancelled,
+	Expired,
+	Failed,           // a warm whose build failed (plan §5.6 rev 1.18.5); appended last
+};
+
+// Mirrors ESuperSLMPrefixDropDisk (SuperSLMPrefixCacheTypes.h).
+UENUM(BlueprintType)
+enum class ESuperSLMPrefixDropDiskBP : uint8
+{
+	NotRequested,
+	Deleted,
+	NoFile,
+	DiskTierOff,
+	Failed,
 };
 
 // Mirrors ESuperSLMPrefixPhase (SuperSLMSequenceTypes.h) -- the shared-prefix wrappers (D-SLM7347).
@@ -227,6 +276,16 @@ struct SUPERSLMUNREAL_API FSuperSLMPrefixBP
 	FSuperSLMPrefix ToNative() const { FSuperSLMPrefix P; P.Id = Id; return P; }
 
 	bool IsValid() const { return Id != 0; }
+};
+
+/** A Warm Prefix or Drop Prefix op (precache plan §5.6). Id 0 is none; ids never repeat. */
+USTRUCT(BlueprintType)
+struct SUPERSLMUNREAL_API FSuperSLMPrefixOpBP
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "SuperSLM")
+	int64 Id = 0;
 };
 
 /** A sequence's runtime statistics, as the inference runtime reports them. */

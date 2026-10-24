@@ -1,5 +1,8 @@
 #include "SuperSLMRuntimeResolve.h"
 
+#include "Core/SuperSLMCacheChunkPricing.h"
+#include "Core/SuperSLMInSituPrefixPrefill.h"
+#include "SuperSLMConfigureTestAccess.h"
 #include "SuperSLMFinishHook.h"
 #include "SuperSLMLog.h"
 #include "SuperSLMPrefillPlanning.h"
@@ -21,6 +24,9 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <string>
+#include <utility>
+#include <vector>
 
 // Decode-threading D4 (plan §10.3.1 item 5b). See SuperSLMRuntimeResolve.h.
 
@@ -216,24 +222,40 @@ namespace SuperSLMRuntimeResolve
 				&& FMath::IsFinite(Config.TickBudgetMs) && Config.TickBudgetMs > 0.0;
 		}
 
-		void SaveSettingsToDisk(const TCHAR* Command)
+		// Writes the setting the command chose. The other setting is written only when the file
+		// already holds a valid value for it, which is kept; a value nobody chose is never saved, so a
+		// saved key always means a choice and a later change of the shipped value reaches it.
+		void SaveSettingsToDisk(const TCHAR* Command, bool bSavingMode)
 		{
-			bool bMode = false;
-			int32 Tasks = kShippedParallelTasks;
-			ResolveUncalledSettings(bMode, Tasks);
+			TOptional<bool> Mode;
+			TOptional<int32> Tasks;
+			ReadSavedSettings(Mode, Tasks);
+			{
+				FScopeLock Lock(&GSelectionLock);
+				if (bSavingMode) { Mode = GSelectedDecodeMode; } else { Tasks = GSelectedParallelTasks; }
+			}
 			const FString Path = RuntimeSettingsPath();
-			const FString Text = FString::Printf(TEXT(
+			FString Text = FString::Printf(TEXT(
 				"; SuperSLM CPU decode settings, saved by SuperSLM.SetDecodeMode or SuperSLM.SetFinishParallelTasks with --save.\n"
 				"; The next CPU Configure() uses them for any field the caller's FSuperSLMRuntimeConfig leaves unset,\n"
-				"; unless this process has selected another value since it started.\n"
-				"%s\n"
-				"%s=%d\n"
-				"%s=%d\n"),
-				kSettingsSection, kModeKey, bMode ? 1 : 0, kTasksKey, Tasks);
+				"; unless this process has selected another value since it started. A setting not listed here takes\n"
+				"; its shipped value.\n"
+				"%s\n"), kSettingsSection);
+			FString Saved;
+			if (Mode.IsSet())
+			{
+				Text += FString::Printf(TEXT("%s=%d\n"), kModeKey, Mode.GetValue() ? 1 : 0);
+				Saved += FString::Printf(TEXT(" %s=%d"), kModeKey, Mode.GetValue() ? 1 : 0);
+			}
+			if (Tasks.IsSet())
+			{
+				Text += FString::Printf(TEXT("%s=%d\n"), kTasksKey, Tasks.GetValue());
+				Saved += FString::Printf(TEXT(" %s=%d"), kTasksKey, Tasks.GetValue());
+			}
 			FString Error;
 			if (WriteTextFileAtomically(Path, Text, Error))
 			{
-				UE_LOG(LogSuperSLM, Display, TEXT("%s: saved bParallelDecode=%d FinishParallelTasks=%d to %s."), Command, bMode ? 1 : 0, Tasks, *Path);
+				UE_LOG(LogSuperSLM, Display, TEXT("%s: saved%s to %s."), Command, *Saved, *Path);
 			}
 			else
 			{
@@ -257,7 +279,7 @@ namespace SuperSLMRuntimeResolve
 			UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM.SetDecodeMode: the next CPU Configure() resolves bParallelDecode=%d when the caller leaves it unset; a configuration already made keeps its mode."), bMode ? 1 : 0);
 			if (bSave)
 			{
-				SaveSettingsToDisk(TEXT("SuperSLM.SetDecodeMode"));
+				SaveSettingsToDisk(TEXT("SuperSLM.SetDecodeMode"), /*bSavingMode*/ true);
 			}
 		}
 
@@ -278,19 +300,45 @@ namespace SuperSLMRuntimeResolve
 			UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM.SetFinishParallelTasks: the next CPU Configure() resolves FinishParallelTasks=%d when the caller leaves it unset; a configuration already made keeps its task count."), Tasks);
 			if (bSave)
 			{
-				SaveSettingsToDisk(TEXT("SuperSLM.SetFinishParallelTasks"));
+				SaveSettingsToDisk(TEXT("SuperSLM.SetFinishParallelTasks"), /*bSavingMode*/ false);
 			}
 		}
 
 		static FAutoConsoleCommand GSetDecodeModeCommand(
 			TEXT("SuperSLM.SetDecodeMode"),
-			TEXT("SuperSLM.SetDecodeMode 0|1 [--save] -- the CPU decode mode the next Configure() uses when the caller's config leaves it unset. 1 splits one-row decode projections through the finish hook; --save keeps it in Saved/SuperSLM/RuntimeSettings.ini, which later sessions load. Editor and packaged."),
+			TEXT("SuperSLM.SetDecodeMode 0|1 [--save] -- the CPU decode mode the next Configure() uses when the caller's config leaves it unset. 1 splits one-row decode projections through the finish hook; 0, the shipped mode, leaves that off; --save keeps it in Saved/SuperSLM/RuntimeSettings.ini, which later sessions load. Editor and packaged."),
 			FConsoleCommandWithArgsDelegate::CreateStatic(&RunSetDecodeMode));
 
 		static FAutoConsoleCommand GSetFinishParallelTasksCommand(
 			TEXT("SuperSLM.SetFinishParallelTasks"),
 			TEXT("SuperSLM.SetFinishParallelTasks <0..256> [--save] -- the CPU finish hook's task count the next Configure() uses when the caller's config leaves it unset (0 or 1 installs no hook); --save keeps it in Saved/SuperSLM/RuntimeSettings.ini. Editor and packaged."),
 			FConsoleCommandWithArgsDelegate::CreateStatic(&RunSetFinishParallelTasks));
+	}
+
+	const TCHAR* PerChunkTokenCostKey(int32 Chunk)
+	{
+		static const TCHAR* const Keys[8] = { nullptr, nullptr,
+			TEXT("PromptChunk2TokenCostMs"), TEXT("PromptChunk3TokenCostMs"), TEXT("PromptChunk4TokenCostMs"),
+			TEXT("PromptChunk5TokenCostMs"), TEXT("PromptChunk6TokenCostMs"), TEXT("PromptChunk7TokenCostMs") };
+		return Chunk >= 2 && Chunk <= 7 ? Keys[Chunk] : nullptr;
+	}
+
+	const TCHAR* PerChunkTokenCostPerPositionKey(int32 Chunk)
+	{
+		static const TCHAR* const Keys[8] = { nullptr, nullptr,
+			TEXT("PromptChunk2TokenCostPerPositionMs"), TEXT("PromptChunk3TokenCostPerPositionMs"), TEXT("PromptChunk4TokenCostPerPositionMs"),
+			TEXT("PromptChunk5TokenCostPerPositionMs"), TEXT("PromptChunk6TokenCostPerPositionMs"), TEXT("PromptChunk7TokenCostPerPositionMs") };
+		return Chunk >= 2 && Chunk <= 7 ? Keys[Chunk] : nullptr;
+	}
+
+	SuperSLMPrefillPlanning::FPerChunkPromptPrices PerChunkPromptPrices(const FSuperSLMResolvedCpuConfig& Costs)
+	{
+		SuperSLMPrefillPlanning::FPerChunkPromptPrices Out;
+		for (int32 C = 2; C <= 7; ++C)
+		{
+			Out.ByChunk[C] = SuperSLMPrefillPlanning::FPromptPrice{ Costs.PerChunkPromptTokenCostMs[C], Costs.PerChunkPromptTokenCostPerPositionMs[C] };
+		}
+		return Out;
 	}
 
 	TConstArrayView<FCostField> CostFields()
@@ -339,7 +387,7 @@ namespace SuperSLMRuntimeResolve
 			if (!Mode.IsSet()) { Mode = SavedMode; }
 			if (!Tasks.IsSet()) { Tasks = SavedTasks; }
 		}
-		OutDecodeModeRequested = Mode.Get(false);
+		OutDecodeModeRequested = Mode.Get(kShippedDecodeMode);
 		OutParallelTasks = Tasks.Get(kShippedParallelTasks);
 	}
 
@@ -349,13 +397,16 @@ namespace SuperSLMRuntimeResolve
 
 		// Mode and task count, each on its own: the caller's value if set, else the process
 		// selection, else RuntimeSettings.ini, else off and 4.
+		if (Config.bParallelDecode.IsSet() && Config.FinishParallelTasks.IsSet())
 		{
-			bool bUncalledMode = false;
-			int32 UncalledTasks = kShippedParallelTasks;
-			if (!Config.bParallelDecode.IsSet() || !Config.FinishParallelTasks.IsSet())
-			{
-				ResolveUncalledSettings(bUncalledMode, UncalledTasks);
-			}
+			Out.bDecodeModeRequested = Config.bParallelDecode.GetValue();
+			Out.ParallelTasks = Config.FinishParallelTasks.GetValue();
+		}
+		else
+		{
+			bool bUncalledMode;
+			int32 UncalledTasks;
+			ResolveUncalledSettings(bUncalledMode, UncalledTasks);
 			Out.bDecodeModeRequested = Config.bParallelDecode.IsSet() ? Config.bParallelDecode.GetValue() : bUncalledMode;
 			Out.ParallelTasks = Config.FinishParallelTasks.IsSet() ? Config.FinishParallelTasks.GetValue() : UncalledTasks;
 		}
@@ -387,18 +438,65 @@ namespace SuperSLMRuntimeResolve
 
 		double Saved[kCostFieldCount] = {};
 		bool bUseSaved = false;
-		if (Out.CallerCostFields < kCostFieldCount && Model != nullptr)
+		double SavedPerMiB = 0.0; // the saved profile's RestoreCostPerMiBMs (U4), read only when it is used
+		SuperSLMCore::FPrefixPrefillPriceInputs PrefixPrice; // rev 1.18.11 (§15.31): the cache chunk's pair
+		FString SavedHeader;
+		PrefixPrice.bCallerTokenSet = Config.PrefixPrefillTokenCostMs.IsSet();
+		PrefixPrice.bCallerSlopeSet = Config.PrefixPrefillTokenCostPerPositionMs.IsSet();
+		PrefixPrice.Caller.TokenMs = Config.PrefixPrefillTokenCostMs.Get(0.0);
+		PrefixPrice.Caller.PerPositionMs = Config.PrefixPrefillTokenCostPerPositionMs.Get(0.0);
+		// Rev 1.3.6 (P1.1): the per-C pairs are read from the same matching section, so it is kept.
+		TArray<FIniSection> SavedSections;
+		const FIniSection* SavedMatch = nullptr;
+		bool bAnyPerChunkUnset = false;
+		for (int32 C = 2; C <= 7; ++C)
+		{
+			bAnyPerChunkUnset = bAnyPerChunkUnset || !Config.PerChunkPromptTokenCostMs[C].IsSet() || !Config.PerChunkPromptTokenCostPerPositionMs[C].IsSet();
+		}
+		if ((Out.CallerCostFields < kCostFieldCount || bAnyPerChunkUnset) && Model != nullptr)
 		{
 			uint8 Hash[32] = {};
 			FString Text;
 			const FString Path = CalibratedCostsPath();
 			if (SuperSLMRuntime::ReadArtifactHash(*Model, Hash) && IFileManager::Get().FileExists(*Path) && FFileHelper::LoadFileToString(Text, *Path))
 			{
-				const TArray<FIniSection> Sections = ParseIniSections(Text);
-				if (const FIniSection* Match = FindSavedEstimate(Sections, SuperSLMRuntime::HashToHex(Hash), Out.bDecodeModeEffective, Out.ParallelTasks))
+				SavedSections = ParseIniSections(Text);
+				const TArray<FIniSection>& Sections = SavedSections;
+				SavedMatch = FindSavedEstimate(Sections, SuperSLMRuntime::HashToHex(Hash), Out.bDecodeModeEffective, Out.ParallelTasks);
+				if (const FIniSection* Match = Out.CallerCostFields < kCostFieldCount ? SavedMatch : nullptr)
 				{
 					TArray<FString> Problems;
 					bUseSaved = ReadSavedCosts(*Match, Saved, Problems);
+					if (bUseSaved)
+					{
+						// Rev 1.18.11 (§15.31): the prefix_prefill pair, optional. A text that does not parse reads as a
+						// value out of the domain, so the pair is not used (ResolvePrefixPrefillPrice).
+						PrefixPrice.bSavedUsed = true;
+						SavedHeader = Match->Header;
+						if (const FString* TokenText = Match->Keys.Find(PrefixPrefillTokenKey()))
+						{
+							PrefixPrice.bSavedTokenSet = true;
+							if (!ParseFiniteDouble(*TokenText, PrefixPrice.Saved.TokenMs)) { PrefixPrice.Saved.TokenMs = -1.0; }
+						}
+						if (const FString* SlopeText = Match->Keys.Find(PrefixPrefillSlopeKey()))
+						{
+							PrefixPrice.bSavedSlopeSet = true;
+							if (!ParseFiniteDouble(*SlopeText, PrefixPrice.Saved.PerPositionMs)) { PrefixPrice.Saved.PerPositionMs = -1.0; }
+						}
+					}
+					if (const FString* PerMiBText = bUseSaved ? Match->Keys.Find(RestorePerMiBKey()) : nullptr)
+					{
+						double Value = 0.0;
+						if (ParseFiniteDouble(*PerMiBText, Value) && Value >= 0.0)
+						{
+							SavedPerMiB = Value;
+						}
+						else
+						{
+							UE_LOG(LogSuperSLM, Warning, TEXT("SuperSLM: CPU Configure: the saved estimate %s in %s has %s=%s, not a finite, non-negative number of milliseconds per MiB; the cache restore is priced flat (the term reads 0)."),
+								*Match->Header, *Path, RestorePerMiBKey(), **PerMiBText);
+						}
+					}
 					if (!bUseSaved)
 					{
 						// D-SLM8145: a saved profile with a missing, non-finite or out-of-domain key is not
@@ -420,6 +518,45 @@ namespace SuperSLMRuntimeResolve
 		Out.CostProfile = Out.CallerCostFields == kCostFieldCount ? ESuperSLMCostProfile::Caller
 			: bUseSaved ? ESuperSLMCostProfile::SavedEstimate
 			: ESuperSLMCostProfile::ModeDefault;
+		// Precache U4 (§5.5): the per-MiB term, outside the thirteen: the caller's, else the used saved profile's.
+		Out.RestoreCostPerMiBMs = Config.RestoreCostPerMiBMs.IsSet() ? Config.RestoreCostPerMiBMs.GetValue()
+			: bUseSaved ? SavedPerMiB : 0.0;
+		// Rev 1.18.11 (§15.31): the cache chunk's pair. A caller error (one field, or out of the domain) resolves to
+		// no pair here; Configure() refuses it by name.
+		{
+			const SuperSLMCore::FPrefixPrefillPrice Price = SuperSLMCore::ResolvePrefixPrefillPrice(PrefixPrice);
+			Out.PrefixPrefillPriceSource = Price.Source == SuperSLMCore::EPrefixPrefillPriceSource::Caller ? ESuperSLMPrefixPrefillPriceSource::Caller
+				: Price.Source == SuperSLMCore::EPrefixPrefillPriceSource::SavedEstimate ? ESuperSLMPrefixPrefillPriceSource::SavedEstimate
+				: ESuperSLMPrefixPrefillPriceSource::BatchedFallback;
+			Out.PrefixPrefillTokenCostMs = Price.Source == SuperSLMCore::EPrefixPrefillPriceSource::BatchedFallback ? 0.0 : Price.Pair.TokenMs;
+			Out.PrefixPrefillTokenCostPerPositionMs = Price.Source == SuperSLMCore::EPrefixPrefillPriceSource::BatchedFallback ? 0.0 : Price.Pair.PerPositionMs;
+			if (Price.bSavedIgnored)
+			{
+				UE_LOG(LogSuperSLM, Warning, TEXT("SuperSLM: CPU Configure: the saved estimate %s in %s has %s and %s not both present as a finite, positive cost and a finite, non-negative slope; the cache chunk is priced with the batched pair."),
+					*SavedHeader, *CalibratedCostsPath(), PrefixPrefillTokenKey(), PrefixPrefillSlopeKey());
+			}
+		}
+
+		// Rev 1.3.6 (P1.1): the per-C pairs, each member on its own. A saved value is used only when
+		// the saved estimate's thirteen were (or the caller set all thirteen), so a rejected profile
+		// never contributes half its figures.
+		auto ResolvePerChunk = [&Config](FSuperSLMResolvedCpuConfig& Into, const FIniSection* Section)
+		{
+			for (int32 C = 2; C <= 7; ++C)
+			{
+				const TOptional<double>& CallerToken = Config.PerChunkPromptTokenCostMs[C];
+				const TOptional<double>& CallerSlope = Config.PerChunkPromptTokenCostPerPositionMs[C];
+				double SavedToken = 0.0, SavedSlope = 0.0;
+				const FString* TokenText = Section ? Section->Keys.Find(PerChunkTokenCostKey(C)) : nullptr;
+				const FString* SlopeText = Section ? Section->Keys.Find(PerChunkTokenCostPerPositionKey(C)) : nullptr;
+				const bool bSavedToken = TokenText && ParseFiniteDouble(*TokenText, SavedToken) && SavedToken > 0.0;
+				const bool bSavedSlope = SlopeText && ParseFiniteDouble(*SlopeText, SavedSlope) && SavedSlope >= 0.0;
+				Into.PerChunkPromptTokenCostMs[C] = CallerToken.IsSet() ? CallerToken.GetValue() : bSavedToken ? SavedToken : Into.PromptTokenCostMs;
+				Into.PerChunkPromptTokenCostPerPositionMs[C] = CallerSlope.IsSet() ? CallerSlope.GetValue() : bSavedSlope ? SavedSlope : Into.PromptTokenCostPerPositionMs;
+			}
+		};
+		const bool bSavedProfileUsable = bUseSaved || (Out.CallerCostFields == kCostFieldCount && SavedMatch != nullptr);
+		ResolvePerChunk(Out, bSavedProfileUsable ? SavedMatch : nullptr);
 
 		// D-SLM8145, ordered by D-SLM8167: when the resolved set trips the composed cost-domain check
 		// and holds saved-estimate values, and the same set with the mode profile in their place does
@@ -440,6 +577,14 @@ namespace SuperSLMRuntimeResolve
 					}
 				}
 				Fallback.CostProfile = ESuperSLMCostProfile::ModeDefault;
+				Fallback.RestoreCostPerMiBMs = Config.RestoreCostPerMiBMs.IsSet() ? Config.RestoreCostPerMiBMs.GetValue() : 0.0;
+				if (Fallback.PrefixPrefillPriceSource == ESuperSLMPrefixPrefillPriceSource::SavedEstimate)
+				{
+					Fallback.PrefixPrefillPriceSource = ESuperSLMPrefixPrefillPriceSource::BatchedFallback;
+					Fallback.PrefixPrefillTokenCostMs = 0.0;
+					Fallback.PrefixPrefillTokenCostPerPositionMs = 0.0;
+				}
+				ResolvePerChunk(Fallback, nullptr); // the saved per-C pairs go with the rest of the saved estimate
 				if (CheckCostDomain(Config, Fallback, Shape.ContextCap, FallbackError))
 				{
 					UE_LOG(LogSuperSLM, Warning, TEXT("SuperSLM: CPU Configure: the saved estimate in %s for this artifact, bParallelDecode=%d and FinishParallelTasks=%d trips the cost domain at this configuration's call shape and TickBudgetMs; its fields come from the mode-%d profile instead."),
@@ -491,7 +636,7 @@ namespace SuperSLMRuntimeResolve
 		const double DecodeDepth = static_cast<double>(FMath::Max<int64>(0, ContextCap)); // T-3006 N1: decode prices up to the cap
 
 		struct FBound { const TCHAR* Kind; const TCHAR* Fields; double Ms; bool bFinite; };
-		FBound Bounds[4];
+		FBound Bounds[5];
 
 		bFinite = true;
 		const double LayerAtCap = Add(Costs.LayerCostMs, Mul(Costs.LayerCostPerPositionMs, DecodeDepth));
@@ -500,11 +645,15 @@ namespace SuperSLMRuntimeResolve
 
 		const int64 PTokens = FMath::Min<int64>(Shape.MaxPrefillChunkBudget, ContextCap);
 		const int64 DPosition = FMath::Max<int64>(0, ContextCap - 1);
-		const SuperSLMPrefillPlanning::FPrefillBound Chunk1Prefill = SuperSLMPrefillPlanning::Chunk1PrefillBoundMs(PTokens, DPosition,
-			SuperSLMPrefillPlanning::FPromptPrice{ Costs.PromptTokenCostMs, Costs.PromptTokenCostPerPositionMs });
+		// Schema fast-decode plan rev 1.3.5/1.3.6, §6 P1 "Pricing": the bound for chunks below 8 uses
+		// the per-C table up to C = 7 (the resolved PerChunkPromptTokenCost*Ms, which default to the
+		// chunk-1 pair until B5f fills them).
+		const SuperSLMPrefillPlanning::FPromptPrice Chunk1Price{ Costs.PromptTokenCostMs, Costs.PromptTokenCostPerPositionMs };
+		const SuperSLMPrefillPlanning::FPrefillBound Chunk1Prefill = SuperSLMPrefillPlanning::SmallChunkPrefillBoundMsWithTable(PTokens, DPosition,
+			Chunk1Price, PerChunkPromptPrices(Costs));
 		const SuperSLMPrefillPlanning::FPrefillBound BatchedPrefill = SuperSLMPrefillPlanning::BatchedPrefillBoundMs(PTokens, DPosition,
 			SuperSLMPrefillPlanning::FPromptPrice{ Costs.BatchedPromptTokenCostMs, Costs.BatchedPromptTokenCostPerPositionMs });
-		Bounds[1] = { TEXT("prefill (chunk-1 price, chunks below 8)"), TEXT("PromptTokenCostMs and PromptTokenCostPerPositionMs"), Chunk1Prefill.Ms, Chunk1Prefill.bFinite };
+		Bounds[1] = { TEXT("prefill (chunk-1 price, chunks below 8)"), TEXT("PromptTokenCostMs and PromptTokenCostPerPositionMs, or the per-C PerChunkPromptTokenCost*Ms[2..7]"), Chunk1Prefill.Ms, Chunk1Prefill.bFinite };
 		Bounds[2] = { TEXT("prefill (batched price, chunks of 8 or more)"), TEXT("BatchedPromptTokenCostMs and BatchedPromptTokenCostPerPositionMs"), BatchedPrefill.Ms, BatchedPrefill.bFinite };
 
 		// The lifecycle bound is the largest of the six operation costs; it names that field.
@@ -524,6 +673,19 @@ namespace SuperSLMRuntimeResolve
 			}
 		}
 		Bounds[3] = { TEXT("lifecycle"), Largest->Key, Largest->Value, bOpsFinite };
+
+		// Rev 1.18.11 (§15.31): a cache chunk priced with the prefix_prefill pair, as the batched bound is, when the
+		// pair is present (it prices every cache chunk of 8 tokens or more in place of the batched pair).
+		if (Costs.PrefixPrefillPriceSource != ESuperSLMPrefixPrefillPriceSource::BatchedFallback)
+		{
+			const SuperSLMPrefillPlanning::FPrefillBound PrefixPrefill = SuperSLMPrefillPlanning::BatchedPrefillBoundMs(PTokens, DPosition,
+				SuperSLMPrefillPlanning::FPromptPrice{ Costs.PrefixPrefillTokenCostMs, Costs.PrefixPrefillTokenCostPerPositionMs });
+			Bounds[4] = { TEXT("cache chunk (prefix_prefill price, chunks of 8 or more)"), TEXT("PrefixPrefillTokenCostMs and PrefixPrefillTokenCostPerPositionMs"), PrefixPrefill.Ms, PrefixPrefill.bFinite };
+		}
+		else
+		{
+			Bounds[4] = { TEXT("cache chunk"), TEXT("the batched pair"), 0.0, true };
+		}
 
 		for (const FBound& Bound : Bounds)
 		{
@@ -697,4 +859,100 @@ namespace SuperSLMRuntimeResolve
 		OutValue = Value;
 		return true;
 	}
+
+	bool WriteSavedPrefixPrefillPair(const FString& HashHex, bool bEffectiveMode, int32 Tasks, const FString& TokenText, const FString& SlopeText,
+		FString& OutHeader, FString& OutError)
+	{
+		OutHeader.Reset();
+		const FString Path = CalibratedCostsPath();
+		FString Text;
+		if (!IFileManager::Get().FileExists(*Path) || !FFileHelper::LoadFileToString(Text, *Path))
+		{
+			OutError = FString::Printf(TEXT("%s is missing or unreadable: SuperSLM.EstimateCosts --write-ini writes the profile the in-situ pair goes into"), *Path);
+			return false;
+		}
+		const TArray<FIniSection> Sections = ParseIniSections(Text);
+		const FIniSection* Match = FindSavedEstimate(Sections, HashHex, bEffectiveMode, Tasks);
+		if (Match == nullptr)
+		{
+			OutError = FString::Printf(TEXT("%s has no profile for ArtifactHash %s, bParallelDecode=%d and FinishParallelTasks=%d: run SuperSLM.EstimateCosts --write-ini at this configuration first"),
+				*Path, *HashHex, bEffectiveMode ? 1 : 0, Tasks);
+			return false;
+		}
+		const size_t Index = static_cast<size_t>(Match - Sections.GetData());
+		const std::string Narrow(FTCHARToUTF8(*Text).Get());
+		const std::vector<std::pair<std::string, std::string>> Keys = {
+			{ std::string(FTCHARToUTF8(PrefixPrefillTokenKey()).Get()), std::string(FTCHARToUTF8(*TokenText).Get()) },
+			{ std::string(FTCHARToUTF8(PrefixPrefillSlopeKey()).Get()), std::string(FTCHARToUTF8(*SlopeText).Get()) } };
+		bool bFound = false;
+		const std::string Edited = SuperSLMCore::SetIniSectionKeys(Narrow, Index, Keys, bFound);
+		if (!bFound)
+		{
+			OutError = FString::Printf(TEXT("%s: the profile %s (section %d) was not found again in its text"), *Path, *Match->Header, static_cast<int32>(Index));
+			return false;
+		}
+		// Code review S1: the rewrite is checked with the parser that chose the section, so a line break or whitespace
+		// the two read differently can never touch another profile. Every other section must come back unchanged, and
+		// the target with its own keys unchanged and exactly the new pair; otherwise nothing is written.
+		const FString EditedText(UTF8_TO_TCHAR(Edited.c_str()));
+		const TArray<FIniSection> After = ParseIniSections(EditedText);
+		const FString TokenKey(PrefixPrefillTokenKey());
+		const FString SlopeKey(PrefixPrefillSlopeKey());
+		auto SameKeys = [](const TMap<FString, FString>& A, const TMap<FString, FString>& B, const FString& SkipA, const FString& SkipB)
+		{
+			int32 Counted = 0;
+			for (const TPair<FString, FString>& Pair : A)
+			{
+				if (Pair.Key == SkipA || Pair.Key == SkipB)
+				{
+					continue;
+				}
+				const FString* Other = B.Find(Pair.Key);
+				if (Other == nullptr || *Other != Pair.Value)
+				{
+					return false;
+				}
+				++Counted;
+			}
+			int32 OtherCounted = 0;
+			for (const TPair<FString, FString>& Pair : B)
+			{
+				OtherCounted += (Pair.Key == SkipA || Pair.Key == SkipB) ? 0 : 1;
+			}
+			return Counted == OtherCounted;
+		};
+		bool bIntact = After.Num() == Sections.Num();
+		for (int32 I = 0; bIntact && I < Sections.Num(); ++I)
+		{
+			bIntact = After[I].Header == Sections[I].Header;
+			if (bIntact && I != static_cast<int32>(Index))
+			{
+				bIntact = SameKeys(Sections[I].Keys, After[I].Keys, FString(), FString());
+			}
+			else if (bIntact)
+			{
+				const FString* Token = After[I].Keys.Find(TokenKey);
+				const FString* Slope = After[I].Keys.Find(SlopeKey);
+				bIntact = SameKeys(Sections[I].Keys, After[I].Keys, TokenKey, SlopeKey)
+					&& Token != nullptr && *Token == TokenText.TrimStartAndEnd() && Slope != nullptr && *Slope == SlopeText.TrimStartAndEnd();
+			}
+		}
+		if (!bIntact)
+		{
+			OutError = FString::Printf(TEXT("%s: the rewrite of the profile %s (section %d) did not read back as that profile with only the new pair changed; the file is unchanged"),
+				*Path, *Match->Header, static_cast<int32>(Index));
+			return false;
+		}
+		OutHeader = Match->Header;
+		return WriteTextFileAtomically(Path, EditedText, OutError);
+	}
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+void FSuperSLMConfigureTestAccess::ClearDecodeSelection()
+{
+	FScopeLock Lock(&SuperSLMRuntimeResolve::GSelectionLock);
+	SuperSLMRuntimeResolve::GSelectedDecodeMode.Reset();
+	SuperSLMRuntimeResolve::GSelectedParallelTasks.Reset();
+}
+#endif // WITH_DEV_AUTOMATION_TESTS

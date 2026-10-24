@@ -49,6 +49,10 @@ namespace HostSim
 
 	bool FMemFs::RemoveFile(const std::string& Path)
 	{
+		if (bFailRemoves)
+		{
+			return false;
+		}
 		return Files.erase(Path) != 0;
 	}
 
@@ -211,9 +215,120 @@ namespace HostSim
 	{
 		for (FPrefixCommand& Command : Cache.TakeCommands())
 		{
+			// The host's StartCommand: a release leaves the live set when it is issued (review finding 2).
+			if (Command.Kind == EPrefixCommandKind::Release && !bHostLiveAtDelivery)
+			{
+				HostLive.erase(Command.EngineHandle);
+			}
 			History.push_back(Command);
 			Queue.push_back(Command);
 		}
+	}
+
+	void FSim::HostDeliver(const FPrefixCommand& Command, const FPrefixCompletion& Done)
+	{
+		// The host's DeliverLaneJob.
+		if ((Command.Kind == EPrefixCommandKind::Build || Command.Kind == EPrefixCommandKind::Restore) &&
+			Done.Engine == EPrefixEngineResult::Ok && Done.EngineHandle != 0)
+		{
+			HostLive.insert(Done.EngineHandle);
+		}
+		if (Command.Kind == EPrefixCommandKind::Release)
+		{
+			const bool bNotConsumed = Done.Engine == EPrefixEngineResult::Busy || Done.Engine == EPrefixEngineResult::Skipped;
+			if (bHostLiveAtDelivery && !bNotConsumed)
+			{
+				HostLive.erase(Command.EngineHandle);
+			}
+			else if (!bHostLiveAtDelivery && bNotConsumed)
+			{
+				HostLive.insert(Command.EngineHandle);
+			}
+		}
+	}
+
+	uint64_t FSim::MintHandle()
+	{
+		if (bReuseReleasedHandles)
+		{
+			for (const auto& Pair : Handles)
+			{
+				if (Pair.second.bReleased)
+				{
+					ReleaseCount.erase(Pair.first);
+					return Pair.first;
+				}
+			}
+		}
+		return NextEngineHandle++;
+	}
+
+	void FSim::DeliverAsPass(const FPrefixCommand& Command, const FPrefixCompletion& Done)
+	{
+		HostDeliver(Command, Done);
+		Cache.Apply(Done);
+		Cache.EndApplyPass();
+		Pull();
+	}
+
+	bool FSim::HashHeld(const FPrefixCommand& Command) const
+	{
+		if (Command.Kind != EPrefixCommandKind::ComputeKey)
+		{
+			return false;
+		}
+		return (Command.OpId != 0 && HeldHashOps.count(Command.OpId) != 0) ||
+			(Command.OpId == 0 && HeldHashLeases.count(Command.LeaseHandle) != 0);
+	}
+
+	void FSim::ApplyAsPass(const FPrefixCommand& Command)
+	{
+		const FPrefixCompletion Done = Execute(Command);
+		HostDeliver(Command, Done);
+		Cache.Apply(Done);
+		Cache.EndApplyPass();
+		if (bAutoPull)
+		{
+			Pull();
+		}
+	}
+
+	void FSim::Pass()
+	{
+		Cache.EndApplyPass();
+		Pull();
+	}
+
+	bool FSim::RunHashOfLease(int64_t Lease)
+	{
+		Pull();
+		for (auto It = Queue.begin(); It != Queue.end(); ++It)
+		{
+			if (It->Kind == EPrefixCommandKind::ComputeKey && It->OpId == 0 && It->LeaseHandle == Lease)
+			{
+				const FPrefixCommand Command = *It;
+				Queue.erase(It);
+				ApplyAsPass(Command);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool FSim::RunHashOfOp(uint64_t OpId)
+	{
+		Pull();
+		for (auto It = Queue.begin(); It != Queue.end(); ++It)
+		{
+			if (It->Kind == EPrefixCommandKind::ComputeKey && It->OpId == OpId)
+			{
+				const FPrefixCommand Command = *It;
+				Queue.erase(It);
+				ApplyAsPass(Command);
+				return true;
+			}
+		}
+		return false;
 	}
 
 	bool FSim::RunOne()
@@ -224,15 +339,11 @@ namespace HostSim
 		}
 		for (auto It = Queue.begin(); It != Queue.end(); ++It)
 		{
-			if (Held.count(It->Kind) == 0)
+			if (Held.count(It->Kind) == 0 && !HashHeld(*It))
 			{
 				const FPrefixCommand Command = *It;
 				Queue.erase(It);
-				Cache.Apply(Execute(Command));
-				if (bAutoPull)
-				{
-					Pull();
-				}
+				ApplyAsPass(Command);
 				return true;
 			}
 		}
@@ -251,15 +362,194 @@ namespace HostSim
 			{
 				const FPrefixCommand Command = *It;
 				Queue.erase(It);
-				Cache.Apply(Execute(Command));
-				if (bAutoPull)
-				{
-					Pull();
-				}
+				ApplyAsPass(Command);
 				return true;
 			}
 		}
 		return false;
+	}
+
+	bool FSim::RunRelease(uint64_t EngineHandle)
+	{
+		if (bAutoPull)
+		{
+			Pull();
+		}
+		for (auto It = Queue.begin(); It != Queue.end(); ++It)
+		{
+			if (It->Kind == EPrefixCommandKind::Release && It->EngineHandle == EngineHandle)
+			{
+				const FPrefixCommand Command = *It;
+				Queue.erase(It);
+				ApplyAsPass(Command);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool FSim::ExecuteOnly(EPrefixCommandKind Kind, FPrefixCompletion& Out)
+	{
+		for (auto It = Queue.begin(); It != Queue.end(); ++It)
+		{
+			if (It->Kind == Kind)
+			{
+				const FPrefixCommand Command = *It;
+				Queue.erase(It);
+				Out = Execute(Command);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool FSim::ExecuteOnly(EPrefixCommandKind Kind, FPrefixCommand& OutCommand, FPrefixCompletion& Out)
+	{
+		for (auto It = Queue.begin(); It != Queue.end(); ++It)
+		{
+			if (It->Kind == Kind)
+			{
+				OutCommand = *It;
+				Queue.erase(It);
+				Out = Execute(OutCommand);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void FSim::DestroyPool()
+	{
+		for (auto& Pair : Handles)
+		{
+			if (!Pair.second.bReleased)
+			{
+				Pair.second.bReleased = true;
+				++PoolDestroyReleases;
+			}
+		}
+		CacheDrawnPages = 0;
+		PageRefs.clear();
+		Queue.clear();
+		Payloads.clear();
+		HostLive.clear();
+	}
+
+	bool FSim::IsLaneKind(EPrefixCommandKind Kind)
+	{
+		return Kind == EPrefixCommandKind::Restore || Kind == EPrefixCommandKind::Build || Kind == EPrefixCommandKind::Save ||
+			Kind == EPrefixCommandKind::Release;
+	}
+
+	bool FSim::HostReleaseForPoolDestroy(std::vector<FPrefixCompletion>& Inbox)
+	{
+		auto RunPoolIo = [this, &Inbox]() {
+			for (auto It = Queue.begin(); It != Queue.end();)
+			{
+				if (IsLaneKind(It->Kind) || HashHeld(*It))
+				{
+					++It;
+					continue;
+				}
+				const FPrefixCommand Command = *It;
+				It = Queue.erase(It);
+				Inbox.push_back(Execute(Command));
+			}
+		};
+		// 1. The test holds yield to teardown; the pool-thread IO already taken completes. The hash-completion
+		// hold does not yield (plan §8: with it set, the held op's hash is never applied), so a held hash
+		// stays queued past the teardown and its completion, when released, carries the old generation.
+		for (auto It = Held.begin(); It != Held.end();)
+		{
+			It = IsLaneKind(*It) ? std::next(It) : Held.erase(It);
+		}
+		RunPoolIo();
+		HostTeardownRounds = 0;
+		if (!Cache.IsConfigured())
+		{
+			return false;
+		}
+		// 1a. Apply the IO completions as an apply pass, then run disk work until no drop delete is pending.
+		for (int Round = 0; Round < 64; ++Round)
+		{
+			++HostTeardownRounds;
+			for (const FPrefixCompletion& Done : Inbox)
+			{
+				Cache.Apply(Done);
+			}
+			Inbox.clear();
+			Cache.EndApplyPass();
+			if (Cache.PendingDropDeletes() == 0)
+			{
+				break;
+			}
+			Pull();
+			RunPoolIo();
+			// A write-back's save no lane has run, which a delete may wait on (§5.4 rev 1.18.5): completed without
+			// running (Skipped) and applied in the next round, so the delete runs under this configuration.
+			for (auto It = Queue.begin(); It != Queue.end();)
+			{
+				if (It->Kind != EPrefixCommandKind::Save)
+				{
+					++It;
+					continue;
+				}
+				FPrefixCompletion Skipped;
+				Skipped.CommandId = It->Id;
+				Skipped.Generation = It->Generation;
+				Skipped.Engine = EPrefixEngineResult::Skipped;
+				Skipped.EngineStatus = -1;
+				Inbox.push_back(Skipped);
+				It = Queue.erase(It);
+			}
+		}
+		// 2. Lane jobs never posted: a release runs; any other job is failed without running. Unapplied.
+		std::deque<FPrefixCommand> Jobs;
+		Jobs.swap(Queue);
+		for (const FPrefixCommand& Job : Jobs)
+		{
+			if (!IsLaneKind(Job.Kind))
+			{
+				Queue.push_back(Job); // a held hash: completes after Abandon(), stale
+				continue;
+			}
+			if (Job.Kind == EPrefixCommandKind::Release)
+			{
+				Inbox.push_back(Execute(Job));
+				HostDeliver(Job, Inbox.back()); // the host's step 2 bookkeeping, not an apply
+				continue;
+			}
+			FPrefixCompletion Failed;
+			Failed.CommandId = Job.Id;
+			Failed.Generation = Job.Generation;
+			Failed.Engine = EPrefixEngineResult::Failed;
+			Failed.EngineStatus = -1;
+			Inbox.push_back(Failed);
+		}
+		Held.clear();
+		// 3. Every engine handle the cache still holds, released; then the pool goes. The sweep below is the
+		// engine's truth; the host sweeps HostLive, so the differences are what the host would leak or double.
+		HostSweepMisses = 0;
+		HostSweepDoubles = 0;
+		for (const auto& Pair : Handles)
+		{
+			const bool bInHostLive = HostLive.count(Pair.first) != 0;
+			HostSweepMisses += (!Pair.second.bReleased && !bInHostLive) ? 1u : 0u;
+			HostSweepDoubles += (Pair.second.bReleased && bInHostLive) ? 1u : 0u;
+		}
+		HostLive.clear();
+		for (auto& Pair : Handles)
+		{
+			if (!Pair.second.bReleased)
+			{
+				Pair.second.bReleased = true;
+				++ReleaseCount[Pair.first];
+			}
+		}
+		CacheDrawnPages = 0;
+		PageRefs.clear();
+		Payloads.clear();
+		return true;
 	}
 
 	int FSim::RunAll(int MaxSteps)
@@ -301,10 +591,75 @@ namespace HostSim
 		return It == Handles.end() ? nullptr : &It->second;
 	}
 
+	namespace
+	{
+		void Ref(std::map<uint64_t, int>& Refs, uint64_t Page) { ++Refs[Page]; }
+		void Unref(std::map<uint64_t, int>& Refs, uint64_t Page)
+		{
+			const auto It = Refs.find(Page);
+			if (It != Refs.end() && --It->second == 0)
+			{
+				Refs.erase(It);
+			}
+		}
+	}
+
 	FPrefixCompletion FSim::Execute(const FPrefixCommand& C)
 	{
+		struct FProbe
+		{
+			FSim& S;
+			~FProbe()
+			{
+				S.CacheDrawnPages = S.PageRefs.size();
+				S.PeakCacheDrawnPages = std::max(S.PeakCacheDrawnPages, S.CacheDrawnPages);
+			}
+		} Probe{*this};
+		auto Draw = [this](uint64_t Count, std::vector<uint64_t>& Into) {
+			for (uint64_t I = 0; I < Count; ++I)
+			{
+				const uint64_t Page = NextPageId++;
+				Ref(PageRefs, Page);
+				Into.push_back(Page);
+			}
+		};
 		FPrefixCompletion Done;
 		Done.CommandId = C.Id;
+		Done.Generation = C.Generation;
+		// The disk part's counters: commands held in Queue are running (see sim.h).
+		const bool bDropDelete = C.Kind == EPrefixCommandKind::RemoveDiskFile && C.OpId != 0;
+		const bool bKeyDisk = C.Kind == EPrefixCommandKind::ReadDisk || C.Kind == EPrefixCommandKind::WriteDisk ||
+			C.Kind == EPrefixCommandKind::TouchDiskFile || bDropDelete;
+		bool bReadRunning = false;
+		for (const FPrefixCommand& Running : Queue)
+		{
+			if (Held.count(Running.Kind) == 0)
+			{
+				continue;
+			}
+			const bool bRunningDelete = Running.Kind == EPrefixCommandKind::RemoveDiskFile && Running.OpId != 0;
+			const bool bRunningKeyDisk = Running.Kind == EPrefixCommandKind::ReadDisk ||
+				Running.Kind == EPrefixCommandKind::WriteDisk || Running.Kind == EPrefixCommandKind::TouchDiskFile || bRunningDelete;
+			if (bKeyDisk && bRunningKeyDisk && Running.Key == C.Key)
+			{
+				MaxKeyDiskOverlap = std::max<uint32_t>(MaxKeyDiskOverlap, 2);
+				bReadRunning = bReadRunning || Running.Kind == EPrefixCommandKind::ReadDisk ||
+					Running.Kind == EPrefixCommandKind::TouchDiskFile;
+			}
+			if ((bDropDelete && Running.Kind == EPrefixCommandKind::TrimDisk) ||
+				(C.Kind == EPrefixCommandKind::TrimDisk && bRunningDelete))
+			{
+				MaxDeleteTrimOverlap = std::max<uint32_t>(MaxDeleteTrimOverlap, 2);
+			}
+		}
+		if (bKeyDisk)
+		{
+			MaxKeyDiskOverlap = std::max<uint32_t>(MaxKeyDiskOverlap, 1);
+		}
+		if (bDropDelete || C.Kind == EPrefixCommandKind::TrimDisk)
+		{
+			MaxDeleteTrimOverlap = std::max<uint32_t>(MaxDeleteTrimOverlap, 1);
+		}
 		switch (C.Kind)
 		{
 		case EPrefixCommandKind::ComputeKey:
@@ -384,23 +739,71 @@ namespace HostSim
 				Done.EngineStatus = RefuseStatus;
 				break;
 			}
-			const uint64_t Need = PagesFor(C.ContextLength) - std::min<uint64_t>(RestoreSharedPages, PagesFor(C.ContextLength));
+			// A nested restore shares its hint's leading floor(origin/B) pages when the hint is live and holds
+			// exactly origin positions (§3.5); any other hint, or none, restores privately.
+			const FEngineHandle* Hint = nullptr;
+			if (C.ParentEngineHandle != 0 && !bNullHints)
+			{
+				const auto HintIt = Handles.find(C.ParentEngineHandle);
+				if (HintIt == Handles.end() || HintIt->second.bReleased)
+				{
+					Violations.push_back("Restore hinted with a released or unknown engine handle");
+				}
+				else if (HintIt->second.Length == C.OriginLength)
+				{
+					Hint = &HintIt->second;
+				}
+			}
+			const uint64_t Pages = PagesFor(C.ContextLength);
+			uint64_t Shared = 0;
+			if (Hint != nullptr)
+			{
+				Shared = std::min<uint64_t>(static_cast<uint64_t>(C.OriginLength) / Config.PageTokens, Hint->PageIds.size());
+			}
+			else if (C.OriginLength == 0)
+			{
+				Shared = std::min<uint64_t>(RestoreSharedPages, Pages);
+			}
+			const uint64_t Need = Pages - Shared;
 			if (CacheDrawnPages + ExternalPages + Need > PoolPages)
 			{
 				Done.Engine = EPrefixEngineResult::PoolExhausted;
 				break;
 			}
-			Handle.Pages = Need;
+			if (Hint != nullptr)
+			{
+				for (uint64_t I = 0; I < Shared; ++I)
+				{
+					Ref(PageRefs, Hint->PageIds[I]);
+					Handle.PageIds.push_back(Hint->PageIds[I]);
+				}
+				Handle.SharedPages = static_cast<uint32_t>(Shared);
+			}
+			Draw(Need, Handle.PageIds);
+			Handle.Pages = Handle.PageIds.size();
+			Handle.Length = C.ContextLength;
 			Handle.bFromRestore = true;
-			CacheDrawnPages += Need;
-			PeakCacheDrawnPages = std::max(PeakCacheDrawnPages, CacheDrawnPages);
-			Done.EngineHandle = NextEngineHandle++;
+			Done.EngineHandle = MintHandle();
 			Handles[Done.EngineHandle] = Handle;
-			Done.SharedPages = RestoreSharedPages;
+			Done.SharedPages = static_cast<uint32_t>(Shared);
 			break;
 		}
 		case EPrefixCommandKind::Build:
 		{
+			// The host's build lambda (review finding 1): counted on its lane while the hold is armed; a forced
+			// build returns without a begin; every other build passes the hold at its begin.
+			const bool bHoldCounted = bBuildHoldArmed;
+			LaneBuildHolds += bHoldCounted ? 1 : 0;
+			if (bForceNextBuild)
+			{
+				bForceNextBuild = false;
+				++ForcedBuilds;
+				Done.Engine = ForcedBuildResult;
+				Done.EngineStatus = ForcedBuildStatus;
+				LaneBuildHolds -= (bHoldCounted && !bForcedBuildSkipsHold) ? 1 : 0;
+				break;
+			}
+			LaneBuildHolds -= bHoldCounted ? 1 : 0;
 			if (C.Spec.SchemaName.compare(0, 7, "missing") == 0)
 			{
 				Done.Engine = EPrefixEngineResult::UnknownSchema;
@@ -410,6 +813,23 @@ namespace HostSim
 			{
 				Done.Engine = EPrefixEngineResult::Failed;
 				break;
+			}
+			const FEngineHandle* Parent = nullptr;
+			if (C.ParentEngineHandle != 0)
+			{
+				const auto ParentIt = Handles.find(C.ParentEngineHandle);
+				if (ParentIt == Handles.end() || ParentIt->second.bReleased)
+				{
+					// begin_from against a released parent: caller UB in the engine (§3.7).
+					Violations.push_back("Build from a released or unknown parent handle");
+					Done.Engine = EPrefixEngineResult::Failed;
+					break;
+				}
+				Parent = &ParentIt->second;
+				if (Parent->Length != C.OriginLength)
+				{
+					Violations.push_back("Build whose OriginLength is not its parent's length");
+				}
 			}
 			const uint64_t Peak = BuildPagesFor(C.ContextLength);
 			if (CacheDrawnPages + ExternalPages + Peak > PoolPages)
@@ -421,16 +841,46 @@ namespace HostSim
 			{
 				Violations.push_back("Build whose ContextLength is not its token count");
 			}
-			// begin_budgeted draws R(L); the freeze returns the unused reserve, leaving ceil(L/B).
-			CacheDrawnPages += Peak;
-			PeakCacheDrawnPages = std::max(PeakCacheDrawnPages, CacheDrawnPages);
-			const uint64_t Steady = PagesFor(C.ContextLength);
-			CacheDrawnPages -= (Peak - Steady);
+			// begin_budgeted / begin_from draw R(budget); begin_from shares the parent's full pages; the
+			// freeze returns the unused reserve, leaving ceil(L/B) - floor(origin/B) private pages.
 			FEngineHandle Handle;
-			Handle.Pages = Steady;
-			Handle.Tokens = C.Spec.Tokens;
-			Handle.Schema = C.Spec.SchemaName;
-			Done.EngineHandle = NextEngineHandle++;
+			const int32_t Origin = Parent != nullptr ? Parent->Length : 0;
+			const uint64_t SharedFull = static_cast<uint64_t>(Origin) / Config.PageTokens;
+			for (uint64_t I = 0; Parent != nullptr && I < SharedFull; ++I)
+			{
+				Ref(PageRefs, Parent->PageIds[I]);
+				Handle.PageIds.push_back(Parent->PageIds[I]);
+			}
+			Handle.SharedPages = static_cast<uint32_t>(SharedFull);
+			std::vector<uint64_t> Drawn;
+			Draw(Peak, Drawn);
+			CacheDrawnPages = PageRefs.size();
+			PeakCacheDrawnPages = std::max(PeakCacheDrawnPages, CacheDrawnPages);
+			const uint64_t Private = PagesFor(Origin + C.ContextLength) - SharedFull;
+			for (uint64_t I = 0; I < Drawn.size(); ++I)
+			{
+				if (I < Private)
+				{
+					Handle.PageIds.push_back(Drawn[I]);
+				}
+				else
+				{
+					Unref(PageRefs, Drawn[I]);
+				}
+			}
+			Handle.Pages = Handle.PageIds.size();
+			Handle.Length = Origin + C.ContextLength;
+			if (Parent != nullptr)
+			{
+				Handle.Tokens = Parent->Tokens;
+				Handle.Schema = Parent->Schema;
+			}
+			else
+			{
+				Handle.Schema = C.Spec.SchemaName;
+			}
+			Handle.Tokens.insert(Handle.Tokens.end(), C.Spec.Tokens.begin(), C.Spec.Tokens.end());
+			Done.EngineHandle = MintHandle();
 			Handles[Done.EngineHandle] = Handle;
 			break;
 		}
@@ -468,8 +918,28 @@ namespace HostSim
 			break;
 		}
 		case EPrefixCommandKind::RemoveDiskFile:
-			Fs->RemoveFile(DiskPath(C.Key));
+		{
+			// The completion reports the delete's outcome (a drop's disk part reads it; the wrapper-miss
+			// removal ignores it): Ok = deleted, NotFound = no file, Error = the file API refused.
+			const bool bExisted = Fs->Exists(DiskPath(C.Key));
+			if (bDropDelete)
+			{
+				++DropDeletesRun;
+			}
+			if (bReadRunning && bExisted)
+			{
+				Done.Io = EPrefixIoStatus::Error; // a delete meeting a file open for reading fails (Windows)
+				Done.IoError = SharingViolationError;
+				break;
+			}
+			const bool bRemoved = Fs->RemoveFile(DiskPath(C.Key));
+			Done.Io = bRemoved ? EPrefixIoStatus::Ok : (bExisted ? EPrefixIoStatus::Error : EPrefixIoStatus::NotFound);
+			if (Done.Io == EPrefixIoStatus::Error)
+			{
+				Done.IoError = RemoveRefusalError;
+			}
 			break;
+		}
 		case EPrefixCommandKind::TouchDiskFile:
 			Fs->TouchModifiedTime(DiskPath(C.Key));
 			break;
@@ -478,6 +948,64 @@ namespace HostSim
 			break;
 		case EPrefixCommandKind::Release:
 		{
+			if (SkipReleases > 0)
+			{
+				// Skipped by the submission thread: never reached the engine; the handle is untouched.
+				--SkipReleases;
+				++SkippedReleases;
+				Done.Engine = EPrefixEngineResult::Skipped;
+				Done.EngineStatus = -1;
+				break;
+			}
+			if (FailReleases > 0)
+			{
+				--FailReleases;
+				Done.Engine = EPrefixEngineResult::Failed;
+				Done.EngineStatus = 1;
+				break;
+			}
+			if (BusyReleases > 0 && !bBusyAfterRelease)
+			{
+				// SSLM_BUSY: the engine's contract leaves the handle untouched, so nothing is released here.
+				--BusyReleases;
+				++BusyIssues;
+				Done.Engine = EPrefixEngineResult::Busy;
+				Done.EngineStatus = 2;
+				break;
+			}
+			bool bReportBusy = false;
+			if (BusyReleases > 0 && bBusyAfterRelease)
+			{
+				--BusyReleases;
+				++BusyIssues;
+				bReportBusy = true;
+			}
+			bool bReportFailed = false;
+			if (ConsumeThenFailReleases > 0)
+			{
+				--ConsumeThenFailReleases;
+				bReportFailed = true;
+			}
+			struct FReport
+			{
+				FPrefixCompletion& D;
+				bool bBusy;
+				bool bFailed;
+				int32_t Status;
+				~FReport()
+				{
+					if (bBusy)
+					{
+						D.Engine = EPrefixEngineResult::Busy;
+						D.EngineStatus = 2;
+					}
+					else if (bFailed)
+					{
+						D.Engine = EPrefixEngineResult::Failed;
+						D.EngineStatus = Status;
+					}
+				}
+			} Report{Done, bReportBusy, bReportFailed, ReleaseFailStatus};
 			++ReleaseCount[C.EngineHandle];
 			const auto It = Handles.find(C.EngineHandle);
 			if (It == Handles.end())
@@ -491,7 +1019,10 @@ namespace HostSim
 				break;
 			}
 			It->second.bReleased = true;
-			CacheDrawnPages -= It->second.Pages;
+			for (uint64_t Page : It->second.PageIds)
+			{
+				Unref(PageRefs, Page);
+			}
 			break;
 		}
 		case EPrefixCommandKind::DropPayload:

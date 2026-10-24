@@ -1,5 +1,8 @@
 #include "SuperSLMEstimateCostsCommand.h"
 
+#include "Core/SuperSLMCacheChunkPricing.h"
+#include "Core/SuperSLMRestorePricing.h"
+
 #include "SuperSLMCalibrationTestAccess.h"
 #include "SuperSLMEstimateTestAccess.h"
 #include "SuperSLMFinishHook.h"
@@ -64,6 +67,32 @@
 // only after the post-window of a complete run, in one atomic replace; Configure() then uses a
 // profile whose artifact hash, effective mode and task count match. This checks that the run
 // executed completely, not that the costs are accurate.
+//
+// Precache U4 (plan §5.5, risk R5): a fourteenth, separate measurement, kept out of the thirteen and out of
+// the per-call CSV so the D4 contract above is unchanged. Per mode, after the thirteen arms' pass, the blob
+// saved at each of the five depths is restored (sslm_seq_restore) five times untimed and twelve times timed; a
+// blob under 1 MiB (depth 1's) is left out. RestoreCostPerMiBMs is the slope between the smallest and the largest
+// remaining readings, floored at 0 (SuperSLMRestorePricing.h, plan erratum 15.26),
+// reported on "restore_size" and "suggested_per_mib" lines and written after the thirteen keys; Configure()
+// reads it from a matching profile and prices the prefix cache's restores by bytes.
+//
+// Precache U5 (plan rev 1.18.11 §15.31, cell 5.9 (d)): a fifteenth, separate measurement, the prefix_prefill arm,
+// also kept out of the thirteen and the per-call CSV. Per mode, after the restore_size pass, one prefix is built
+// from depth 0 in floor-sized (8-token) sslm_prefix_prefill chunks up to depth 2048 (or the cap less one chunk),
+// each chunk timed: the call a sliced cache build's chunk makes. A short build is the warm-up. The readings are
+// fitted to a price pair (SuperSLMCacheChunkPricing.h, FitPrefixPrefillPair), reported on "prefix_prefill" and
+// "suggested_prefix_prefill" lines and written after the per-MiB key as PrefixPrefillTokenCostMs and
+// PrefixPrefillTokenCostPerPositionMs. Both keys are optional to the reader: Configure() prices a cache chunk of
+// 8 tokens or more with the pair when a matching profile carries it, else with the batched pair. An artifact
+// whose cap holds fewer chunks than the fit's groups is a named skip that writes no pair; a refused call or a
+// non-finite time is an incomplete estimate, as for every other arm.
+//
+// Rev 1.18.12 (§15.32): this arm is the isolated one. It times sslm_prefix_prefill with the game thread blocked,
+// outside the worker lanes and away from a build's interleaved generation, and the box read its pair 1.5x low against
+// a build's chunks. Its readings are also written to modeN.prefix_prefill.csv beside the per-call CSVs, as the
+// isolated attribution reading. The pair a cache chunk is priced with is then the in-situ arm's, fitted from a real
+// cache build's ledger rows and written over this pair (USuperSLMSubsystem::WriteInSituPrefixPrefillPrice); this
+// arm's pair prices cache chunks until that runs.
 
 namespace
 {
@@ -83,6 +112,15 @@ namespace
 	constexpr double kSampleIntervalSeconds = 0.25;
 	constexpr double kPreWindowSeconds = 2.0;
 	constexpr double kPostWindowSeconds = 2.0;
+
+	// Schema fast-decode plan rev 1.3.6, §6 P1 "Where the prices come from" (P1.1; mutant XD9): the
+	// C = 2..7 calibration arms, beside the chunk-1 arm. Arm names, indexed by C (stable literals: the
+	// per-call trace keeps the pointer).
+	const TCHAR* const kSmallChunkArms[8] = { nullptr, nullptr,
+		TEXT("prompt_2"), TEXT("prompt_3"), TEXT("prompt_4"), TEXT("prompt_5"), TEXT("prompt_6"), TEXT("prompt_7") };
+	constexpr int32 kSmallChunkMin = 2;
+	constexpr int32 kSmallChunkMax = 7;
+	constexpr int32 kSmallChunkArmCount = kSmallChunkMax - kSmallChunkMin + 1;
 
 	// A cost is a finite, positive number of milliseconds.
 	bool IsValidCostMs(double Ms)
@@ -285,6 +323,10 @@ namespace
 	//    and run the last layer + finish untimed (it must produce a token).
 	//  - prompt_8, per batched depth d and repetition: restore d's blob, then one 8-token sslm_prefill
 	//    at chunk budget 8 (consumed must be 8): the call a chunked prefill job makes.
+	//  - prompt_2 .. prompt_7 (schema fast-decode plan rev 1.3.6, P1.1), per batched depth d and
+	//    repetition: restore d's blob, then one C-token sslm_prefill at chunk budget C (consumed must
+	//    be C): the call a prompt chunk or a span job of C rows makes. They share the batched depths
+	//    (each leaves room for 8 tokens), and are a named skip with the batched arm.
 	//  - finish: reset, prefill one token untimed, time the next decode (the token finish only).
 	//  - reset, save, restore, adopt (a one-token frozen prefix), prefix_begin and prefix_release.
 	class FEstimateSession
@@ -301,7 +343,7 @@ namespace
 		// The calls one pass of Reps repetitions times.
 		int32 ExpectedCallCount(int32 Reps) const
 		{
-			return Reps * (7 + Depths.Num() * (NumLayers - 1) + BatchedDepths.Num());
+			return Reps * (7 + Depths.Num() * (NumLayers - 1) + BatchedDepths.Num() * (1 + kSmallChunkArmCount));
 		}
 
 		bool Setup(USuperSLMModel& Model, bool bMode, int32 ParallelTasks, FString& OutError)
@@ -598,6 +640,32 @@ namespace
 					}
 				}
 				if (Stop(TEXT("prompt_8"))) { return false; }
+
+				// --- Schema fast-decode plan rev 1.3.6 (P1.1): the C = 2..7 arms ---
+				for (int32 Chunk = kSmallChunkMin; Chunk <= kSmallChunkMax; ++Chunk)
+				{
+					for (const int64 Depth : BatchedDepths)
+					{
+						for (int32 Rep = 0; Rep < Reps; ++Rep)
+						{
+							if (!RestoreAtDepth(Depth, OutError))
+							{
+								return Fail(FString::Printf(TEXT("%s arm, depth %lld, rep %d: %s"), kSmallChunkArms[Chunk], Depth, Rep, *OutError));
+							}
+							int32 Consumed = 0;
+							const double Start = FPlatformTime::Seconds();
+							Status = sslm_prefill(Mapping, Seq, BatchedTokens.GetData(), Chunk, Chunk, SSLM_SPAN_PROMPT, Workspace, &Consumed);
+							const double End = FPlatformTime::Seconds();
+							if (Status != SSLM_OK || Consumed != Chunk)
+							{
+								return Fail(FString::Printf(TEXT("%s arm, depth %lld, rep %d: sslm_prefill returned %s and consumed %d of %d"),
+									kSmallChunkArms[Chunk], Depth, Rep, *StatusName(Status), Consumed, Chunk));
+							}
+							Trace.Add(kSmallChunkArms[Chunk], Depth, Rep, -1, Start, End);
+						}
+					}
+					if (Stop(kSmallChunkArms[Chunk])) { return false; }
+				}
 			}
 
 			// --- reset / save / restore ---
@@ -723,6 +791,110 @@ namespace
 				Trace.Add(TEXT("prefix_release"), -1, Rep, -1, Start, End);
 			}
 			return true;
+		}
+
+		// Precache U4: one pass of Reps timed restores of each depth's blob (Depths), each recorded in Trace under the
+		// arm "restore_size" at its depth. The blob's bytes are BlobBytesAt(depth). A blob under 1 MiB is not
+		// measured (IsSizedDepth): the fit leaves it out (review S2).
+		bool MeasureRestoreSizes(int32 Reps, FPerCallTrace& Trace, FString& OutError)
+		{
+			for (const int64 Depth : Depths)
+			{
+				const int32 K = BlobDepths.IndexOfByKey(Depth);
+				if (K == INDEX_NONE)
+				{
+					OutError = FString::Printf(TEXT("restore_size: no blob was saved at depth %lld"), Depth);
+					return false;
+				}
+				if (!IsSizedDepth(Depth))
+				{
+					continue;
+				}
+				const TArray<uint8>& Blob = DepthBlobs[K];
+				for (int32 Rep = 0; Rep < Reps; ++Rep)
+				{
+					sslm_seq Restored = nullptr;
+					const double Start = FPlatformTime::Seconds();
+					sslm_status Status = sslm_seq_restore(Mapping, &Pool, Blob.GetData(), static_cast<size_t>(Blob.Num()), &Restored);
+					const double End = FPlatformTime::Seconds();
+					if (Status != SSLM_OK || Restored == nullptr)
+					{
+						OutError = FString::Printf(TEXT("restore_size arm, depth %lld, rep %d: sslm_seq_restore failed (%s)"), Depth, Rep, *StatusName(Status));
+						return false;
+					}
+					Trace.Add(TEXT("restore_size"), Depth, Rep, -1, Start, End);
+					Status = sslm_seq_release(Seq);
+					Seq = Restored;
+					if (Status != SSLM_OK)
+					{
+						OutError = FString::Printf(TEXT("restore_size arm, depth %lld, rep %d: releasing the replaced sequence failed (%s)"), Depth, Rep, *StatusName(Status));
+						return false;
+					}
+				}
+			}
+			return true;
+		}
+
+		// Precache U5 (§15.31): the prefix_prefill arm's depth, a whole number of floor chunks; 0 when the cap holds
+		// fewer chunks than the fit's groups (the named skip).
+		int64 PrefixPrefillArmDepth() const
+		{
+			const int64 Chunk = SuperSLMCore::kCacheChunkTiledMinTokens;
+			const int64 Depth = (FMath::Min<int64>(SuperSLMCore::kPrefixPrefillArmMaxDepth, Cap - Chunk) / Chunk) * Chunk;
+			return Depth / Chunk >= SuperSLMCore::kPrefixPrefillFitGroups ? Depth : 0;
+		}
+
+		// Precache U5 (§15.31): one prefix built from depth 0 to Depth in floor-sized sslm_prefix_prefill chunks
+		// (consumed must be the chunk), each chunk timed into Out, then released. The prefix takes the pool's spare
+		// block, as the adopt arm's does.
+		bool MeasurePrefixPrefill(int64 Depth, TArray<SuperSLMCore::FPrefixPrefillReading>& Out, FString& OutError)
+		{
+			const int32 Chunk = SuperSLMCore::kCacheChunkTiledMinTokens;
+			Out.Reset();
+			sslm_status Status = sslm_prefix_begin(Mapping, &Pool, &Prefix);
+			if (Status != SSLM_OK || Prefix == nullptr)
+			{
+				Prefix = nullptr;
+				OutError = FString::Printf(TEXT("prefix_prefill arm: sslm_prefix_begin failed (%s)"), *StatusName(Status));
+				return false;
+			}
+			TArray<int32> Tokens;
+			Tokens.Init(PromptToken, Chunk);
+			for (int64 D = 0; D + Chunk <= Depth; D += Chunk)
+			{
+				int32 Consumed = 0;
+				const double Start = FPlatformTime::Seconds();
+				Status = sslm_prefix_prefill(Mapping, Prefix, Tokens.GetData(), Chunk, Chunk, SSLM_SPAN_PROMPT, Workspace, &Consumed);
+				const double End = FPlatformTime::Seconds();
+				if (Status != SSLM_OK || Consumed != Chunk)
+				{
+					OutError = FString::Printf(TEXT("prefix_prefill arm, depth %lld: sslm_prefix_prefill returned %s and consumed %d of %d"),
+						D, *StatusName(Status), Consumed, Chunk);
+					return false;
+				}
+				Out.Add(SuperSLMCore::FPrefixPrefillReading{ D, Chunk, (End - Start) * 1000.0 });
+			}
+			const sslm_prefix Held = Prefix;
+			Prefix = nullptr;
+			Status = sslm_prefix_release(Held);
+			if (Status != SSLM_OK)
+			{
+				OutError = FString::Printf(TEXT("prefix_prefill arm: releasing its prefix failed (%s)"), *StatusName(Status));
+				return false;
+			}
+			return true;
+		}
+
+		int64 BlobBytesAt(int64 Depth) const
+		{
+			const int32 K = BlobDepths.IndexOfByKey(Depth);
+			return K == INDEX_NONE ? 0 : static_cast<int64>(DepthBlobs[K].Num());
+		}
+
+		// The restore_size arm's depths: those whose blob is at least the fit's floor.
+		bool IsSizedDepth(int64 Depth) const
+		{
+			return BlobBytesAt(Depth) >= SuperSLMCore::kRestoreFitMinBytes;
 		}
 
 	private:
@@ -1053,9 +1225,23 @@ namespace
 		int32 Mode = 0;
 		FPerCallTrace Trace;
 		TArray<FArmRow> Rows;
-		FSuperSLMResolvedCpuConfig Suggested;          // the thirteen exact suggestions
+		FSuperSLMResolvedCpuConfig Suggested;          // the thirteen exact suggestions, and the per-C pairs
 		TArray<FString> SuggestedText;                 // in SuperSLMRuntimeResolve::CostFields() order, rounded up
+		// Rev 1.3.6 (P1.1): the C = 2..7 pairs, rounded up as the chunk-1 pair is, indexed by C.
+		FString PerChunkTokenText[8];
+		FString PerChunkPerPositionText[8];
 		double TimedSeconds = 0.0;
+		// Precache U4: the restore_size calls, their per-depth readings and the per-MiB suggestion.
+		FPerCallTrace RestoreSizeTrace;
+		TArray<SuperSLMCore::FRestoreSizeReading> RestoreSizes;
+		TArray<int64> RestoreSizeDepths;
+		FString PerMiBText;                            // rounded up to 6 decimals
+		// Precache U5 (§15.31): the prefix_prefill arm's readings and its pair; no pair on the named skip.
+		TArray<SuperSLMCore::FPrefixPrefillReading> PrefixPrefillReadings;
+		bool bPrefixPrefillPair = false;
+		FString PrefixPrefillSkipReason;
+		FString PrefixPrefillTokenText;                // rounded up to 3 decimals
+		FString PrefixPrefillSlopeText;                // rounded up to 6 decimals
 	};
 
 	// The arm/depth groups one mode times, and how many calls each must hold.
@@ -1072,6 +1258,13 @@ namespace
 		for (const int64 D : Session.BatchedDepths)
 		{
 			Out.Add({ TEXT("prompt_8"), D });
+		}
+		for (int32 C = kSmallChunkMin; C <= kSmallChunkMax; ++C)
+		{
+			for (const int64 D : Session.BatchedDepths)
+			{
+				Out.Add({ kSmallChunkArms[C], D });
+			}
 		}
 		return Out;
 	}
@@ -1171,6 +1364,37 @@ namespace
 			}
 		}
 
+		// Rev 1.3.6 (P1.1): the C = 2..7 pairs from their arms (FitSmallChunkArm, the upper envelope
+		// at each chunk's mean position). With the batched arm skipped they are skipped too, and the
+		// chunk-1 pair just fitted is suggested in their place: the plan's default until B5f.
+		for (int32 C = kSmallChunkMin; C <= kSmallChunkMax; ++C)
+		{
+			SuperSLMPrefillPlanning::FPromptPrice Pair{ S.PromptTokenCostMs, S.PromptTokenCostPerPositionMs };
+			if (!Session.BatchedDepths.IsEmpty())
+			{
+				TArray<double> CallMedians;
+				for (const int64 D : Session.BatchedDepths)
+				{
+					CallMedians.Add(MedianOf(kSmallChunkArms[C], D));
+				}
+				if (!SuperSLMPrefillPlanning::FitSmallChunkArm(C, Session.BatchedDepths.GetData(), CallMedians.GetData(), CallMedians.Num(), Pair))
+				{
+					OutError = FString::Printf(TEXT("mode %d %s arm: its readings could not be fitted"), Result.Mode, kSmallChunkArms[C]);
+					return false;
+				}
+			}
+			if (!IsValidCostMs(Pair.TokenMs) || !FMath::IsFinite(Pair.PerPositionMs) || Pair.PerPositionMs < 0.0)
+			{
+				OutError = FString::Printf(TEXT("mode %d suggested PromptChunk%d pair (%f, %f) is not a finite, positive cost and a finite, non-negative slope"),
+					Result.Mode, C, Pair.TokenMs, Pair.PerPositionMs);
+				return false;
+			}
+			S.PerChunkPromptTokenCostMs[C] = Pair.TokenMs;
+			S.PerChunkPromptTokenCostPerPositionMs[C] = Pair.PerPositionMs;
+			Result.PerChunkTokenText[C] = RoundUpText(Pair.TokenMs, 3);
+			Result.PerChunkPerPositionText[C] = RoundUpText(Pair.PerPositionMs, 6);
+		}
+
 		for (const SuperSLMRuntimeResolve::FCostField& Field : SuperSLMRuntimeResolve::CostFields())
 		{
 			const double Value = S.*(Field.Member);
@@ -1182,6 +1406,81 @@ namespace
 			}
 			Result.SuggestedText.Add(RoundUpText(Value, Field.bPerPosition ? 6 : 3));
 		}
+
+		// Precache U4: the per-MiB term, the slope between the smallest and largest blobs of at least 1 MiB.
+		TMap<int64, TArray<double>> SizeGroups;
+		for (const FCallTiming& Call : Result.RestoreSizeTrace.Calls)
+		{
+			SizeGroups.FindOrAdd(Call.Depth).Add(Call.ElapsedMs());
+		}
+		Result.RestoreSizes.Reset();
+		Result.RestoreSizeDepths.Reset();
+		for (const int64 D : Session.Depths)
+		{
+			if (!Session.IsSizedDepth(D))
+			{
+				continue; // under 1 MiB: not measured, not fitted
+			}
+			TArray<double>* Values = SizeGroups.Find(D);
+			const int32 Got = Values ? Values->Num() : 0;
+			if (Got != kTimedReps)
+			{
+				OutError = FString::Printf(TEXT("mode %d restore_size@%lld holds %d of its %d timed calls (an incomplete arm)"), Result.Mode, D, Got, kTimedReps);
+				return false;
+			}
+			for (const double Ms : *Values)
+			{
+				if (!IsValidCostMs(Ms))
+				{
+					OutError = FString::Printf(TEXT("mode %d restore_size@%lld has a call of %f ms, not a finite, positive cost"), Result.Mode, D, Ms);
+					return false;
+				}
+			}
+			SuperSLMCore::FRestoreSizeReading Reading;
+			Reading.PayloadBytes = Session.BlobBytesAt(D);
+			Reading.MedianMs = ConventionalMedian(*Values);
+			Result.RestoreSizes.Add(Reading);
+			Result.RestoreSizeDepths.Add(D);
+		}
+		if (!SuperSLMCore::FitRestorePerMiB(S.RestoreCostMs, Result.RestoreSizes.GetData(), static_cast<size_t>(Result.RestoreSizes.Num()), S.RestoreCostPerMiBMs))
+		{
+			OutError = FString::Printf(TEXT("mode %d: the restore_size readings give no per-MiB slope (no blob of at least 1 MiB, or a median was not finite)"), Result.Mode);
+			return false;
+		}
+		Result.PerMiBText = RoundUpText(S.RestoreCostPerMiBMs, 6);
+
+		// Precache U5 (§15.31): the prefix_prefill pair, from the arm's chunks (a named skip writes none).
+		Result.bPrefixPrefillPair = false;
+		if (Session.PrefixPrefillArmDepth() == 0)
+		{
+			Result.PrefixPrefillSkipReason = FString::Printf(TEXT("the cap %lld holds fewer than %d chunks of %d tokens"),
+				Session.Cap, SuperSLMCore::kPrefixPrefillFitGroups, SuperSLMCore::kCacheChunkTiledMinTokens);
+			return true;
+		}
+		const int64 ExpectedChunks = Session.PrefixPrefillArmDepth() / SuperSLMCore::kCacheChunkTiledMinTokens;
+		if (Result.PrefixPrefillReadings.Num() != ExpectedChunks)
+		{
+			OutError = FString::Printf(TEXT("mode %d prefix_prefill holds %d of its %lld chunks (an incomplete arm)"), Result.Mode, Result.PrefixPrefillReadings.Num(), ExpectedChunks);
+			return false;
+		}
+		for (const SuperSLMCore::FPrefixPrefillReading& R : Result.PrefixPrefillReadings)
+		{
+			if (!IsValidCostMs(R.Ms))
+			{
+				OutError = FString::Printf(TEXT("mode %d prefix_prefill@%lld has a call of %f ms, not a finite, positive cost"), Result.Mode, R.StartDepth, R.Ms);
+				return false;
+			}
+		}
+		SuperSLMCore::FChunkPricePair Pair;
+		if (!SuperSLMCore::FitPrefixPrefillPair(Result.PrefixPrefillReadings.GetData(), static_cast<size_t>(Result.PrefixPrefillReadings.Num()),
+				SuperSLMCore::kPrefixPrefillFitGroups, Pair))
+		{
+			OutError = FString::Printf(TEXT("mode %d: the prefix_prefill readings give no price pair"), Result.Mode);
+			return false;
+		}
+		Result.bPrefixPrefillPair = true;
+		Result.PrefixPrefillTokenText = RoundUpText(Pair.TokenMs, 3);
+		Result.PrefixPrefillSlopeText = RoundUpText(Pair.PerPositionMs, 6);
 		return true;
 	}
 
@@ -1254,6 +1553,18 @@ namespace
 		}
 		bOutSaved = FFileHelper::SaveStringToFile(Csv, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
 		return Uncovered;
+	}
+
+	// Precache plan rev 1.18.12 (§15.32): the isolated prefix_prefill arm's chunks, one row each, for the attribution
+	// reading the in-situ arm is compared with (an empty arm, the named skip, writes the header only).
+	bool WritePrefixPrefillCsv(const FString& Path, const FString& Block, const FModeResult& Result)
+	{
+		FString Csv = TEXT("block,mode,start_depth,tokens,ms\n");
+		for (const SuperSLMCore::FPrefixPrefillReading& R : Result.PrefixPrefillReadings)
+		{
+			Csv += FString::Printf(TEXT("%s,%d,%lld,%d,%.6f\n"), *Block, Result.Mode, static_cast<long long>(R.StartDepth), R.Tokens, R.Ms);
+		}
+		return FFileHelper::SaveStringToFile(Csv, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
 	}
 
 	bool WriteSamplesCsv(const FString& Path, const FString& Block, const TArray<FLoadSample>& Samples)
@@ -1405,6 +1716,27 @@ namespace
 				bMeasured = false;
 				break;
 			}
+			{
+				// Precache U4: the restore_size pass's own warm-up; its calls are not the thirteen's, so they are not
+				// counted on the warm-up line.
+				FPerCallTrace SizeWarmUp;
+				SizeWarmUp.Origin = Origin;
+				if (!Session.MeasureRestoreSizes(kWarmUpReps, SizeWarmUp, MeasureError))
+				{
+					MeasureError = FString::Printf(TEXT("mode %d warm-up: %s"), Mode, *MeasureError);
+					bMeasured = false;
+					break;
+				}
+				// Precache U5 (§15.31): the prefix_prefill arm's warm-up, a short build of the fit's group count of chunks.
+				TArray<SuperSLMCore::FPrefixPrefillReading> PrefillWarmUp;
+				if (Session.PrefixPrefillArmDepth() > 0
+					&& !Session.MeasurePrefixPrefill(static_cast<int64>(SuperSLMCore::kPrefixPrefillFitGroups) * SuperSLMCore::kCacheChunkTiledMinTokens, PrefillWarmUp, MeasureError))
+				{
+					MeasureError = FString::Printf(TEXT("mode %d warm-up: %s"), Mode, *MeasureError);
+					bMeasured = false;
+					break;
+				}
+			}
 			UE_LOG(LogSuperSLM, Display, TEXT("%sprogress mode=%d phase=warm-up reps=%d calls=%d"), kPrefix, Mode, kWarmUpReps, WarmUp.Calls.Num());
 
 			// The fault seam fires here, in mode 1, after its hook was installed and mode 0 completed.
@@ -1430,6 +1762,20 @@ namespace
 				break;
 			}
 			Result.TimedSeconds = FPlatformTime::Seconds() - TimedStart;
+			Result.RestoreSizeTrace.Origin = Origin;
+			if (!Session.MeasureRestoreSizes(kTimedReps, Result.RestoreSizeTrace, MeasureError))
+			{
+				MeasureError = FString::Printf(TEXT("mode %d: %s"), Mode, *MeasureError);
+				bMeasured = false;
+				break;
+			}
+			if (Session.PrefixPrefillArmDepth() > 0
+				&& !Session.MeasurePrefixPrefill(Session.PrefixPrefillArmDepth(), Result.PrefixPrefillReadings, MeasureError))
+			{
+				MeasureError = FString::Printf(TEXT("mode %d: %s"), Mode, *MeasureError);
+				bMeasured = false;
+				break;
+			}
 			UE_LOG(LogSuperSLM, Display, TEXT("%sprogress mode=%d phase=done calls=%d elapsed_s=%.3f"), kPrefix, Mode, Result.Trace.Calls.Num(), Result.TimedSeconds);
 #if WITH_DEV_AUTOMATION_TESTS
 			if (bFaultMode && Fault == ESuperSLMEstimateFault::TruncateArm && Result.Trace.Calls.Num() > 0)
@@ -1481,6 +1827,7 @@ namespace
 			bool bSaved = false;
 			Uncovered += WriteCallsCsv(FilesDir / FString::Printf(TEXT("mode%d.calls.csv"), Mode), FString::Printf(TEXT("%s-m%d"), *RunId, Mode), Results[Mode], Sampler.Samples, bSaved);
 			bFilesSaved &= bSaved;
+			bFilesSaved &= WritePrefixPrefillCsv(FilesDir / FString::Printf(TEXT("mode%d.prefix_prefill.csv"), Mode), FString::Printf(TEXT("%s-m%d"), *RunId, Mode), Results[Mode]);
 		}
 		bFilesSaved &= WriteSamplesCsv(FilesDir / TEXT("samples.csv"), RunId, Sampler.Samples);
 		if (!bFilesSaved)
@@ -1502,6 +1849,47 @@ namespace
 			{
 				UE_LOG(LogSuperSLM, Display, TEXT("%ssuggested mode=%d %s=%s"), kPrefix, Result.Mode, Fields[I].Name, *Result.SuggestedText[I]);
 			}
+			// Rev 1.3.6 (P1.1): the per-C pairs, on their own lines, so the thirteen-field contract stands.
+			for (int32 C = kSmallChunkMin; C <= kSmallChunkMax; ++C)
+			{
+				UE_LOG(LogSuperSLM, Display, TEXT("%sper_chunk mode=%d chunk=%d %s=%s %s=%s"), kPrefix, Result.Mode, C,
+					SuperSLMRuntimeResolve::PerChunkTokenCostKey(C), *Result.PerChunkTokenText[C],
+					SuperSLMRuntimeResolve::PerChunkTokenCostPerPositionKey(C), *Result.PerChunkPerPositionText[C]);
+			}
+			// Precache U4: the restore-by-size readings and the per-MiB term, on lines of their own.
+			for (int32 I = 0; I < Result.RestoreSizes.Num(); ++I)
+			{
+				UE_LOG(LogSuperSLM, Display, TEXT("%srestore_size mode=%d depth=%lld bytes=%lld mib=%.6f calls=%d median_ms=%.6f"),
+					kPrefix, Result.Mode, Result.RestoreSizeDepths[I], Result.RestoreSizes[I].PayloadBytes,
+					static_cast<double>(Result.RestoreSizes[I].PayloadBytes) / SuperSLMCore::kBytesPerMiB, kTimedReps, Result.RestoreSizes[I].MedianMs);
+			}
+			UE_LOG(LogSuperSLM, Display, TEXT("%ssuggested_per_mib mode=%d %s=%s"), kPrefix, Result.Mode, SuperSLMRuntimeResolve::RestorePerMiBKey(), *Result.PerMiBText);
+			// Precache U5 (§15.31): the prefix_prefill arm, one line per fit group's span, and its pair.
+			if (!Result.bPrefixPrefillPair)
+			{
+				UE_LOG(LogSuperSLM, Display, TEXT("%ssuggested_prefix_prefill mode=%d skipped=\"%s\" (the batched pair prices cache chunks)"), kPrefix, Result.Mode, *Result.PrefixPrefillSkipReason);
+				continue;
+			}
+			{
+				const int32 N = Result.PrefixPrefillReadings.Num();
+				for (int32 G = 0; G < SuperSLMCore::kPrefixPrefillFitGroups; ++G)
+				{
+					const int32 Begin = static_cast<int32>(static_cast<int64>(N) * G / SuperSLMCore::kPrefixPrefillFitGroups);
+					const int32 End = static_cast<int32>(static_cast<int64>(N) * (G + 1) / SuperSLMCore::kPrefixPrefillFitGroups);
+					TArray<double> Ms;
+					for (int32 I = Begin; I < End; ++I)
+					{
+						Ms.Add(Result.PrefixPrefillReadings[I].Ms);
+					}
+					UE_LOG(LogSuperSLM, Display, TEXT("%sprefix_prefill mode=%d depths=%lld-%lld chunk=%d calls=%d median_ms=%.6f"),
+						kPrefix, Result.Mode, Result.PrefixPrefillReadings[Begin].StartDepth,
+						Result.PrefixPrefillReadings[End - 1].StartDepth + Result.PrefixPrefillReadings[End - 1].Tokens,
+						SuperSLMCore::kCacheChunkTiledMinTokens, End - Begin, ConventionalMedian(Ms));
+				}
+			}
+			UE_LOG(LogSuperSLM, Display, TEXT("%ssuggested_prefix_prefill mode=%d %s=%s %s=%s"), kPrefix, Result.Mode,
+				SuperSLMRuntimeResolve::PrefixPrefillTokenKey(), *Result.PrefixPrefillTokenText,
+				SuperSLMRuntimeResolve::PrefixPrefillSlopeKey(), *Result.PrefixPrefillSlopeText);
 		}
 		LogLoad(TEXT("pre"), -1, Summarize(Sampler.Samples, EEstimatePhase::Pre, -1));
 		LogLoad(TEXT("workload"), 0, Summarize(Sampler.Samples, EEstimatePhase::Workload, 0));
@@ -1550,6 +1938,19 @@ namespace
 			{
 				Text += FString::Printf(TEXT("%s=%s\n"), Fields[I].Name, *Result.SuggestedText[I]);
 			}
+			// Precache U4: the cache restore's per-MiB term, after the thirteen (optional to the reader).
+			Text += FString::Printf(TEXT("%s=%s\n"), SuperSLMRuntimeResolve::RestorePerMiBKey(), *Result.PerMiBText);
+			for (int32 C = kSmallChunkMin; C <= kSmallChunkMax; ++C)
+			{
+				Text += FString::Printf(TEXT("%s=%s\n%s=%s\n"), SuperSLMRuntimeResolve::PerChunkTokenCostKey(C), *Result.PerChunkTokenText[C],
+					SuperSLMRuntimeResolve::PerChunkTokenCostPerPositionKey(C), *Result.PerChunkPerPositionText[C]);
+			}
+			// Precache U5 (§15.31): the cache chunk's prefix_prefill pair, optional to the reader; none on a skip.
+			if (Result.bPrefixPrefillPair)
+			{
+				Text += FString::Printf(TEXT("%s=%s\n%s=%s\n"), SuperSLMRuntimeResolve::PrefixPrefillTokenKey(), *Result.PrefixPrefillTokenText,
+					SuperSLMRuntimeResolve::PrefixPrefillSlopeKey(), *Result.PrefixPrefillSlopeText);
+			}
 		}
 		const FString OutPath = SuperSLMRuntimeResolve::CalibratedCostsPath();
 		FString Existing;
@@ -1570,7 +1971,7 @@ namespace
 
 	static FAutoConsoleCommand GSuperSLMEstimateCostsCommand(
 		TEXT("SuperSLM.EstimateCosts"),
-		TEXT("SuperSLM.EstimateCosts \"<ArtifactPath.sslm>\" [--write-ini] -- measures both CPU decode modes on this machine (about 4-5 minutes for a 0.5B artifact) and prints a CALIBRATION ESTIMATE (not verified): per-arm medians and spread, thirteen suggested costs per mode, and the foreign CPU load it ran under. Only --write-ini saves the suggestions to Saved/SuperSLM/CalibratedCosts.ini, which the next CPU Configure() reads for a matching artifact, decode mode and task count. Editor and packaged."),
+		TEXT("SuperSLM.EstimateCosts \"<ArtifactPath.sslm>\" [--write-ini] -- measures both CPU decode modes on this machine (about 5-7 minutes for a 0.5B artifact) and prints a CALIBRATION ESTIMATE (not verified): per-arm medians and spread, thirteen suggested costs per mode, and the foreign CPU load it ran under. Only --write-ini saves the suggestions to Saved/SuperSLM/CalibratedCosts.ini, which the next CPU Configure() reads for a matching artifact, decode mode and task count. Editor and packaged."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&RunEstimateCostsCommand));
 }
 

@@ -100,6 +100,54 @@ namespace SuperSLMCore
 		return Status;
 	}
 
+	bool IsPrefixDiskTempFileName(const std::string& Name)
+	{
+		// "<64 hex>.<instance>.<write serial>.tmp": the key, then two nonempty runs of decimal digits.
+		static const char kTmp[] = ".tmp";
+		constexpr size_t kTmpBytes = sizeof(kTmp) - 1;
+		if (Name.size() < 64 + 1 + 1 + 1 + 1 + kTmpBytes || Name.compare(Name.size() - kTmpBytes, kTmpBytes, kTmp) != 0 || Name[64] != '.')
+		{
+			return false;
+		}
+		FPrefixKey Key;
+		if (!PrefixKeyFromHex(Name.substr(0, 64), Key))
+		{
+			return false;
+		}
+		const std::string Middle = Name.substr(65, Name.size() - 65 - kTmpBytes);
+		const size_t Dot = Middle.find('.');
+		if (Dot == std::string::npos || Dot == 0 || Dot + 1 >= Middle.size())
+		{
+			return false;
+		}
+		for (size_t I = 0; I < Middle.size(); ++I)
+		{
+			if (I != Dot && (Middle[I] < '0' || Middle[I] > '9'))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	uint32_t RemoveStalePrefixDiskTemps(IPrefixFileOps& Files, const std::string& Dir, int64_t Now, int64_t MaxAge)
+	{
+		std::vector<FPrefixDiskFileInfo> Listed;
+		if (!Files.ListDirectory(Dir, Listed))
+		{
+			return 0;
+		}
+		uint32_t Removed = 0;
+		for (const FPrefixDiskFileInfo& File : Listed)
+		{
+			if (IsPrefixDiskTempFileName(File.Name) && File.ModifiedTime <= Now - MaxAge && Files.RemoveFile(DiskPathOf(Dir, File.Name)))
+			{
+				++Removed;
+			}
+		}
+		return Removed;
+	}
+
 	uint32_t TrimPrefixDiskDirectory(IPrefixFileOps& Files, const std::string& Dir, uint64_t MaxBytes)
 	{
 		std::vector<FPrefixDiskFileInfo> Listed;

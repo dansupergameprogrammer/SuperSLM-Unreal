@@ -70,6 +70,8 @@ public class SuperSLMUnrealEditor : ModuleRules
 			"PropertyEditor",         // L2-S3 build: SObjectPropertyEntryBox, the query window's model picker.
 			"WorkspaceMenuStructure", // L2-S3 build: the query window tab's menu group.
 			"RHI",                    // L2-S3: R-S3f's null-RHI refusal reads GUsingNullRHI (GRHIGlobals).
+			"ToolMenus",              // Precache U3: the prefix set's Build Prefixes context-menu entry.
+			"ContentBrowser",         // Precache U3: UContentBrowserAssetContextMenuContext, the selected sets.
 		});
 
 		if (Target.bBuildEditor)

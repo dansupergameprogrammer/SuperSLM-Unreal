@@ -65,6 +65,11 @@ namespace SuperSLMGpuStatusMapping
 			case SslmGpuStatus::SSLM_GPU_HOLDER_MODE_MISMATCH: return "SSLM_GPU_HOLDER_MODE_MISMATCH";
 			case SslmGpuStatus::SSLM_GPU_PREFIX_REJECTED: return "SSLM_GPU_PREFIX_REJECTED";
 			case SslmGpuStatus::SSLM_GPU_PREFIX_SCHEMA_MISMATCH: return "SSLM_GPU_PREFIX_SCHEMA_MISMATCH";
+#if defined(SUPERSLM_WITH_PREFIX_CACHE) && SUPERSLM_WITH_PREFIX_CACHE
+			// Ordinal 30 (the prefix save ABI): a blob from another adapter or engine version. The switch-on
+			// build runs only on the engine re-pin that carries it, so the arm goes with the switch.
+			case SslmGpuStatus::SSLM_RESTORE_PRODUCER_MISMATCH: return "SSLM_RESTORE_PRODUCER_MISMATCH";
+#endif
 		}
 		// After the switch, not a default label inside it (see SuperSLMStatusMapping.h).
 		return "SSLM_GPU_STATUS_UNKNOWN";

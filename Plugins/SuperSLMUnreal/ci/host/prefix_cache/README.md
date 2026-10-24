@@ -9,7 +9,10 @@ the cache policy that needs no engine, in `Source/SuperSLMUnreal/Private/Core/`:
 | `SuperSLMPrefixCacheKey.h/.cpp` | The key (precache plan §5.2): SHA-256 over a length-prefixed preimage of 11 fields. The exact encoding is in the header. |
 | `SuperSLMPrefixCacheWrapper.h/.cpp` | The `'SLUP'` disk and cooked wrapper (§5.7): encode, and every load check as a named miss. |
 | `SuperSLMPrefixDiskCache.h/.cpp` | The disk tier's file rules over an abstract file layer: file and temporary names, write-then-rename with a fault seam, read, and an oldest-first trim. |
-| `SuperSLMPrefixCacheCore.h/.cpp` | `FSuperSLMPrefixCacheCore`, the prefix-specific policy (§5.3–§5.4, §5.9, §5.10). It emits engine and IO work as commands and takes one completion per command. |
+| `SuperSLMPrefixCacheCore.h/.cpp` | `FSuperSLMPrefixCacheCore`, the prefix-specific policy (§5.3–§5.4, §5.9, §5.10, §5.11 (a)–(b)). It emits engine and IO work as commands and takes one completion per command. Every command carries the configuration generation and its completion echoes it. In budget mode it mirrors its ledger into paging's region C. |
+| `SuperSLMSaveCompatCore.h/.cpp` | The `'SLUW'` reader's Layer-1 pin check and its compatibility table (§5.11 (c), PC-13; rev 1.18.1, PC-15 Q8): one row, for the 1.14.0 build, accepting v1.13.1 at `d697927f6d5c…` alone, with the four sequence magics; the 1.13.0 row is dropped. |
+| `SuperSLMPrefixSetCore.h/.cpp` | Cooked prefix sets (§5.8, step U3): the manifest check, entry keys with parents chained by name, a producer's build assembled from its payloads and replaced on rebuild, cook validation (the runtime's own wrapper check, run at cook, one finding per entry by name), and runtime selection per producer (a producer or entry with no bytes registers nothing, so it recomputes). |
+| `SuperSLMPageLedgerCore.h/.cpp` | Paging's ledger (its own suite is `../page_ledger`). Built here for its region-C seam, which budget-mode cells grade against. |
 
 The cores are game-thread bookkeeping. They never call Layer 1's C ABI or touch a file. The
 subsystem runs their commands (`ComputeKey`, `CheckCooked`, `ReadDisk`, `Restore`, `Build`, `Save`,
@@ -43,7 +46,127 @@ The exit code is 0 only when every test that ran passed. `ctest` runs the whole 
 The container these were authored in has no clang sanitizer runtime (`libclang_rt.asan*` is absent).
 So clang builds there without sanitizers, and g++ carries ASan and UBSan.
 
-## Green run
+## Green run, U6 nested entries (2026-10-17, built ahead of the box)
+
+Plan rev 1.17 §5.4 (ghost charges, pins, nested charges) and §5.11 (a) (pending refunds wait on their
+family). The residency core keeps a pending refund per evicted entry and per ending ghost, each
+completing only when every pending release among its entry and that entry's descendants has applied.
+The cache core admits nested specs (`bNestedEntries`, set by the host in budget mode), with the parent
+key in the key. Red first, against the stubbed API: **139 tests, 118 passed, 21 failed**. Then built:
+
+| Toolchain | Result |
+|---|---|
+| g++ 13.3, ASan + UBSan | **140 tests, 140 passed, 0 failed**; no sanitizer report |
+| clang 18.1 | **140 tests, 140 passed, 0 failed** |
+
+The residency and cache cores compile clean alone under both compilers at `-std=c++17` and `-std=c++20`
+with the strict flags. The oracles: the root trace (`refund_oracle_trace.txt`) and the new nested trace
+(`nested_refund_oracle_trace.txt`, 1000 cases, seed 29, generated from the re-strike's executed model
+by the build record's `gen_nested_trace.py`) both replay with 0 mismatches. The nested trace covers
+2857 nested requests, 1779 waits, 852 admissions and 4864 ghost steps.
+
+Mutants (`run_mutants_u6.py` in the build record's U6 folder), each killed:
+
+| Mutant | Red |
+|---|---|
+| no-pin-while-waiting | 3 (oracle, F1 ledger and fill probe) |
+| ghost-refunded-at-decision | 8 |
+| ghost-unclaimable | 8 |
+| ghost-family-ending-only (rev 1.16's rule) | 5 (siblings, chain) |
+| families-on-ghosts-only | 3 (parent after child) |
+| restore-skips-parent | 3 (own parent) |
+| build-evicts-parent | 3 (own parent) |
+| ghost-dropped | 11 |
+| ghost-cleared-at-last-child | 2 (oracle, `residency_nested_ghost_held_by_a_grandchild`) |
+| nested-restore-charged-shared | 1 (8.12) |
+| parent-key-dropped | 3 (2.12) |
+| parent-not-touched | 1 (oracle) |
+
+The earlier 12 (`../u-plugin-cloud-2026-10-17-oracle/run_mutants.py`, four patch sites moved to the new
+refund records, the mutants unchanged) are each still killed.
+
+| Cell | Host test |
+|---|---|
+| 1.9 (host half) | `cache_nested_ghost_charge_fill_probe`, `residency_nested_ghost_until_last_descendant`, `residency_nested_ghost_held_by_a_grandchild` |
+| 8.12 (host half) | `cache_nested_restore_null_hint_charged_whole` |
+| 2.12, parent key | `cache_nested_parent_key_is_in_the_key` |
+| 8.14 F1 | `residency_nested_waiter_pins_its_parent`, `cache_nested_waiter_pins_parent_fill_probe` |
+| 8.14 F2 (i), (ii) | `residency_nested_ending_ghost_is_claimable`, `cache_nested_ending_ghost_claimable_fill_probe` |
+| 8.14 siblings | `residency_nested_siblings_released_out_of_order`, `cache_nested_siblings_out_of_order_fill_probe` |
+| 8.14 chain | `residency_nested_chain_ghost_waits_on_its_own_release`, `cache_nested_chain_fill_probe` |
+| 8.14 parent after child | `residency_nested_parent_after_child_waits_on_the_child`, `cache_nested_parent_after_child_fill_probe` |
+| 8.14 own parent | `residency_nested_own_parent_restore_evicts_build_refused`, `cache_nested_own_parent_restore_and_build` |
+| §5.4 pins, §5.6 refusals | `residency_nested_parent_link_and_refusals`, `cache_nested_refusals_and_legacy_mode`, `cache_nested_build_shares_parent_and_settles_private` |
+| 1.7 / 2.10 with nested entries | `cache_nested_teardown_releases_every_handle_once` |
+| every nested rule at once | `nested_refund_oracle_trace_matches_the_executed_model` |
+
+The simulator's fill probe counts pages by reference, so a page a released parent shares with a cached
+child stays drawn until the last handle mapping it is released.
+
+## Green run, U3 cooked prefix sets (2026-10-17)
+
+`test_prefix_set.cpp`, 11 tests, written against a stubbed `SuperSLMPrefixSetCore` first: **118 tests, 108
+passed, 10 failed** (every new test but `prefix_set_fresh_build_validates_clean`, which an empty stub
+satisfies). Then built:
+
+| Toolchain | Result |
+|---|---|
+| g++ 13.3, ASan + UBSan | **118 tests, 118 passed, 0 failed**; no sanitizer report |
+| clang 18.1 | **118 tests, 118 passed, 0 failed** |
+
+The new core compiles clean alone under both compilers at `-std=c++17` and `-std=c++20` with the strict flags
+below, and the unity target includes it. Five mutants, each killed: GPU device ignored in selection, a key
+mismatch not reported as `SpecEdited`, rebuild appends instead of replacing, parent key dropped from a
+nested key, a set with no CPU build validated silently.
+
+| Cell | Host test |
+|---|---|
+| 2.9 (host twin) | `prefix_set_stale_entries_warn_at_cook_and_recompute_at_runtime` |
+| 2.15, cooked tier (host twin) | `prefix_set_schema_bound_entry_is_a_cooked_hit` |
+| 9.7 (host twin) | `prefix_set_rebuild_after_pin_change_serves_hits_again` |
+| §5.8 rules | `prefix_set_manifest_rules`, `prefix_set_keys_chain_parents`, `prefix_set_assemble_wraps_each_payload_under_its_key`, `prefix_set_fresh_build_validates_clean`, `prefix_set_cook_reports_unbuilt_orphaned_and_invalid_bytes`, `prefix_set_producer_without_an_entry_recomputes`, `prefix_set_replace_keeps_other_producers`, `prefix_set_finding_names_are_distinct` |
+
+## Green run, plan rev 1.17 (2026-10-17)
+
+The cores were brought from plan rev 1.12 to rev 1.17's §5.11: deferred-refund admission with claimed
+and unclaimed pending refunds, waiters that hold the free charge they took, admission at the last
+claimed refund's apply (arrival order within one apply pass), a refused request's evictions standing,
+configuration generations and `Abandon()`, the region-C mirror, and the `'SLUW'` compatibility entry.
+23 tests were added red first (21 red against the rev 1.12 cores, 2 already green there:
+`refund_unclaimed_before_new_evictions_oldest_first` and
+`cache_refund_refused_with_nothing_evictable_and_nothing_pending`, behaviour rev 1.12 had).
+
+| Toolchain | Build | Result |
+|---|---|---|
+| g++ 13.3, ASan + UBSan | clean (`-Werror`) | **105 tests, 105 passed, 0 failed**; no sanitizer report |
+| clang 18.1 | clean (`-Werror`) | **105 tests, 105 passed, 0 failed** |
+
+Review fixes the same day added two tests: `cache_adopt_reports_an_entry_id_that_is_never_reused` (red
+first by compile: `BeginAdopt` had no entry-id output) and
+`cache_refund_failed_release_refunds_nothing_and_is_reissued` (red first at run time: the failed release
+refunded and admitted the waiter). Both toolchains then give **107 tests, 107 passed, 0 failed**.
+
+Every core, the new ones included, compiles clean on its own under both compilers at `-std=c++17` and
+`-std=c++20` with the flags below; the unity target includes the two new sources.
+
+`refund_oracle_trace_matches_the_executed_model` replays `data/refund_oracle_trace.txt`, a recorded run
+of the plan's executed model of §5.11 (a) (1,500 cases, 7,224 requests, 1,691 waits, 583 refusals
+whose evictions stand), against `FSuperSLMResidencyCore`: every decision, eviction list, admission set
+and ledger total must match. Against the rev 1.12 core it reports 5,933 mismatches.
+
+Tests changed: `residency_budget_exhausted_evicts_nothing` is now `residency_budget_exhausted_draws_nothing`.
+Rev 1.15's §5.11 (a) says a refused request's "evictions it decided stand", which reverses the rev 1.12
+builder's choice that a refused admission evicts nothing. The all-pinned half (cell 5.5: nothing
+evicted) is unchanged. The churn invariant counts `WaitingBytes`.
+
+Mutants for the new rules (each applied to a scratch copy, g++, none committed): refund at the eviction
+decision (23 red), unclaimed refunds ignored (7), claims not earmarked (13), a waiter admitted at its
+first claimed refund (4), a refused request keeping its claims (4), the generation check removed (1:
+the stale completion is still dropped by its unknown command id, so only the drop counter tells),
+region C not mirrored (1), arrival order dropped (1), and the compatibility entry widened to any tag
+(1), without its commit compare (1), widened to `SSB4` (2), or removed (2). All killed.
+
+## Green run, plan rev 1.12
 
 The run was recorded on 2026-10-10 against the implemented cores, after the final review's fix round:
 
@@ -138,6 +261,8 @@ and its engine half (fill probe, real pool, lanes) is graded on the box (see the
 | 7.14 | `cache_disk_trim_oldest_first_and_a_hit_refreshes`, `disk_trim_plan_oldest_first`, `disk_trim_directory_removes_oldest`, `disk_write_sets_the_modification_time` |
 | 8.10 (charge half) | `cache_build_is_charged_its_peak_before_it_draws` (R(L) charged before the draw, ceil(L/B) after the freeze, including R(64) = ceil(cap/B)) |
 | 9.6 | `wrapper_versions_0_and_2_and_other_pins_are_misses` |
+| 8.14 (host half) | `cache_refund_eviction_leg_reading_between_decision_and_apply` (the required reading between the eviction decision and the release's apply), `cache_refund_refused_with_nothing_evictable_and_nothing_pending`, `cache_refund_two_waiters_claim_their_own_victims`, `cache_refund_unclaimed_E_W_X`, `cache_refund_orphaned_refund_is_claimed_by_a_later_request`, `cache_refund_a_request_for_a_waiting_key_attaches`, `cache_refund_reconfigure_while_waiting_drops_the_stale_release`, `cache_refund_region_c_mirrors_every_charge` (against paging's real ledger), `cache_refund_waiters_admitted_in_one_pass_are_enqueued_in_arrival_order`; the ledger rules in `refund_*` and the oracle replay. Nested legs are U6. |
+| 9.11 (host half) | `save_compat_*`: the four magics accepted under v1.13.1 at `d697927f6d5c…` (the one row), the dropped 1.13.0 row refused under any commit, 1.11.0 refused, `SSB4`/`SSB3`/`SSB2`/`SPX1` refused, a foreign commit under the 1.13.1 tag refused, the entry inert on other builds, and the entry-removed mutant |
 | 11.4 | `wrapper_spec_compare_is_load_bearing`, `cache_disk_spec_compare_is_load_bearing`, `cache_memory_spec_compare_is_load_bearing`. Each forces a key collision with a different spec. With the compare removed, each turns red: the wrapper check returns Ok, or the request is a `Disk`/`Memory` hit whose handle carries the other spec's tokens. |
 
 Policy the plan states outside a numbered cell, also covered:
@@ -190,6 +315,11 @@ The cores leave these to the subsystem that runs their commands:
 - **Feed exactly one completion per command taken,** in `Tick()`'s apply pass on the game thread.
 
 ## Choices the plan leaves to U2, made here
+
+*Rev 1.17 supersedes two of the rev 1.12 choices below: "a refused admission evicts nothing" (its
+evictions now stand) and "admission is FIFO per ledger" (a request covers its charge from free charge,
+then unclaimed pending refunds, then new evictions; a waiter is admitted at its last claimed refund's
+apply; nothing queues behind a waiter).*
 
 These are interface choices. The implementation may revisit them, and the tests that pin them are named.
 

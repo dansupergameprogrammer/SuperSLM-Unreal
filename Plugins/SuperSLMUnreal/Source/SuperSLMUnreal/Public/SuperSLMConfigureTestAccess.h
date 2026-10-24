@@ -16,5 +16,10 @@ struct SUPERSLMUNREAL_API FSuperSLMConfigureTestAccess
 
 	// Lets the held pool job run. Without a held job it only clears a pending hold.
 	static void ReleasePoolJob();
+
+	// Clears this process's SuperSLM.SetDecodeMode and SuperSLM.SetFinishParallelTasks selection, so
+	// the next resolution reads Saved/SuperSLM/RuntimeSettings.ini and then the shipped values, as a
+	// process that never ran either command does. The console offers no way to unselect.
+	static void ClearDecodeSelection();
 };
 #endif // WITH_DEV_AUTOMATION_TESTS

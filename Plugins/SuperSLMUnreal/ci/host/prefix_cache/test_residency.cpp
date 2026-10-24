@@ -96,7 +96,7 @@ HOST_TEST(residency_release_before_reuse, "LoRA §5.3 release before reuse; prec
 	EXPECT_LE(Core.GetLedger(kResidencyKindPrefix, kHost).ChargedBytes, 200u);
 }
 
-HOST_TEST(residency_budget_exhausted_evicts_nothing, "5.5 (core), §5.4 BudgetExhausted")
+HOST_TEST(residency_budget_exhausted_draws_nothing, "5.5 (core), §5.4 BudgetExhausted; §5.11 (a) (rev 1.15): a refused request's evictions stand")
 {
 	int64_t Counter = 1;
 	FSuperSLMResidencyCore Core(1, &Counter);
@@ -107,17 +107,23 @@ HOST_TEST(residency_budget_exhausted_evicts_nothing, "5.5 (core), §5.4 BudgetEx
 	REQUIRE_TRUE(A != kInvalidResidencyEntry && B != kInvalidResidencyEntry && C != kInvalidResidencyEntry);
 	Core.AddPin(A, EResidencyPin::Lease);
 	Core.AddPin(B, EResidencyPin::Adopt);
-	// Only C is evictable: 100 bytes can be freed, 250 are asked. Refused; C stays.
-	const FResidencyEntryId D = Core.CreateEntry(kResidencyKindPrefix, kHost, KeyOf(4), true);
-	EXPECT_EQ(Core.Charge(D, 250), EChargeOutcome::BudgetExhausted);
-	EXPECT_EQ(Core.TakeEvicted().empty(), true);
-	EXPECT_EQ(Core.GetState(C), EResidencyState::Resident);
-	EXPECT_EQ(Core.GetState(D), EResidencyState::Unadmitted);
-	EXPECT_EQ(Core.GetLedger(kResidencyKindPrefix, kHost).ChargedBytes, 300u);
-	// Every entry pinned: refused, nothing evicted.
+	// Every entry pinned: refused, nothing evicted, nothing charged (cell 5.5).
 	Core.AddPin(C, EResidencyPin::Save);
+	const FResidencyEntryId D = Core.CreateEntry(kResidencyKindPrefix, kHost, KeyOf(4), true);
 	EXPECT_EQ(Core.Charge(D, 1), EChargeOutcome::BudgetExhausted);
 	EXPECT_EQ(Core.TakeEvicted().empty(), true);
+	EXPECT_EQ(Core.GetState(D), EResidencyState::Unadmitted);
+	// Only C is evictable: 100 bytes can be freed, 250 are asked. Refused, nothing charged; C's
+	// eviction, once decided, stands (§5.11 (a): "the evictions it decided stand").
+	Core.RemovePin(C, EResidencyPin::Save);
+	EXPECT_EQ(Core.Charge(D, 250), EChargeOutcome::BudgetExhausted);
+	const std::vector<FResidencyEntryId> Evicted = Core.TakeEvicted();
+	REQUIRE_EQ(Evicted.size(), static_cast<size_t>(1));
+	EXPECT_EQ(Evicted[0], C);
+	EXPECT_EQ(Core.GetState(C), EResidencyState::Releasing);
+	EXPECT_EQ(Core.GetState(D), EResidencyState::Unadmitted);
+	EXPECT_EQ(Core.GetLedger(kResidencyKindPrefix, kHost).ChargedBytes, 300u);
+	EXPECT_EQ(Core.GetLedger(kResidencyKindPrefix, kHost).ClaimedRefundBytes, 0u);
 	EXPECT_EQ(Core.Snapshot().BudgetExhausted, 2u);
 	// Larger than the whole budget: refused even with nothing resident to keep.
 	FSuperSLMResidencyCore Empty(1, &Counter);

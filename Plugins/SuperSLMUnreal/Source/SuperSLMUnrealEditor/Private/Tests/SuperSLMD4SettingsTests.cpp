@@ -68,25 +68,36 @@ namespace SuperSLMD4SettingsTests
 		}
 	};
 
-	// The runtime-settings section: the INI section carrying a bParallelDecode key.
+	// The runtime-settings section: the INI section carrying a bParallelDecode or a
+	// FinishParallelTasks key (--save writes only the key it chose).
 	bool ReadSavedSettings(FAutomationTestBase& T, TMap<FString, FString>& OutKeys)
 	{
 		FString Text;
 		if (!T.TestTrue(TEXT("RuntimeSettings.ini exists and is readable"), FFileHelper::LoadFileToString(Text, *RuntimeSettingsPath()))) { return false; }
 		TArray<FString> Lines;
 		const TArray<FIniSection> Sections = ParseIniSections(Text, Lines);
-		const TArray<const FIniSection*> Found = SectionsWithKey(Sections, TEXT("bParallelDecode"));
+		TArray<const FIniSection*> Found = SectionsWithKey(Sections, TEXT("bParallelDecode"));
+		for (const FIniSection* S : SectionsWithKey(Sections, TEXT("FinishParallelTasks"))) { Found.AddUnique(S); }
 		if (!T.TestEqual(TEXT("RuntimeSettings.ini holds one settings section"), Found.Num(), 1)) { return false; }
 		OutKeys = Found[0]->Keys;
 		return true;
 	}
 
+	// Mode or Tasks null: that key must be absent, because nothing chose it.
 	bool CheckSaved(FAutomationTestBase& T, const TCHAR* Mode, const TCHAR* Tasks, const TCHAR* Label)
 	{
 		TMap<FString, FString> Keys;
 		if (!ReadSavedSettings(T, Keys)) { return false; }
-		bool bOk = T.TestEqual(*FString::Printf(TEXT("%s: saved bParallelDecode"), Label), Keys.FindRef(TEXT("bParallelDecode")), FString(Mode));
-		bOk &= T.TestEqual(*FString::Printf(TEXT("%s: saved FinishParallelTasks"), Label), Keys.FindRef(TEXT("FinishParallelTasks")), FString(Tasks));
+		auto Check = [&](const TCHAR* Key, const TCHAR* Expected)
+		{
+			if (Expected == nullptr)
+			{
+				return T.TestFalse(*FString::Printf(TEXT("%s: no %s saved (none was chosen)"), Label, Key), Keys.Contains(Key));
+			}
+			return T.TestEqual(*FString::Printf(TEXT("%s: saved %s"), Label, Key), Keys.FindRef(Key), FString(Expected));
+		};
+		bool bOk = Check(TEXT("bParallelDecode"), Mode);
+		bOk &= Check(TEXT("FinishParallelTasks"), Tasks);
 		return bOk;
 	}
 
@@ -181,11 +192,31 @@ namespace SuperSLMD4SettingsTests
 		if (!F.Init(*this)) { return false; }
 		FSuperSLMLogCapture Log;
 		FHookReading Hooks;
-		if (!ConfigureObserved(*this, *F.Cpu, *F.Model, ShapeOnlyCpuConfig(), Hooks, TEXT("shipped mode"))) { return false; }
-		bool bOk = TestEqual(TEXT("shipped mode: both lanes install zero-bit hooks"), Hooks.ZeroBits, 2);
-		bOk &= CheckConfigureLine(*this, Log, 0, 4, TEXT("mode-default"), 0, TEXT("shipped mode"));
 
-		// Switch while a generation is running: it keeps its installed mode to the end.
+		// The shipped fallback: no saved file and no process selection (FCleanSettings clears both),
+		// so the mode comes from the runtime's own shipped value. Read from the report, the hooks and
+		// the line, never from a fixture constant; the fixture oracle is compared against it.
+		{
+			FSuperSLMConfigureReport Report;
+			if (!ConfigureObserved(*this, *F.Cpu, *F.Model, ShapeOnlyCpuConfig(), Hooks, TEXT("shipped mode"), &Report)) { return false; }
+			SuperSLMConfigAccess::FResolvedView View;
+			if (!SuperSLMConfigAccess::ReadResolved(Report, View))
+			{
+				AddError(FString::Printf(TEXT("shipped mode: %s"), SuperSLMConfigAccess::NoResolvedText()));
+				return false;
+			}
+			bool bShipped = TestFalse(TEXT("shipped mode: with no selection and no saved file the runtime resolves requested mode 0"), View.bModeRequested);
+			bShipped &= TestFalse(TEXT("shipped mode: effective mode 0"), View.bModeEffective);
+			bShipped &= TestEqual(TEXT("shipped mode: the fixture oracle agrees with the runtime's resolved mode"),
+				SuperSLMConfigAccess::GetMode(ShapeOnlyCpuConfig()), View.bModeRequested);
+			bShipped &= TestEqual(TEXT("shipped mode: both lanes install zero-bit hooks"), Hooks.ZeroBits, 2);
+			bShipped &= CheckConfigureLine(*this, Log, 0, 4, TEXT("mode-default"), 0, TEXT("shipped mode"));
+			if (!bShipped) { return false; }
+		}
+		bool bOk = true;
+
+		// Switch while a generation is running: it keeps its installed (shipped) mode 0 to the end, so
+		// not one decode projection goes through the hook.
 		{
 			FHookProbe Probe;
 			const int64 LedgerBefore = F.Cpu->GetJobLedgerAppendedCount();
@@ -226,9 +257,11 @@ namespace SuperSLMD4SettingsTests
 		bOk &= TestTrue(TEXT("mode 1 decode runs projections through the hook"), Matvec > 0);
 		bOk &= TestFalse(TEXT("SetDecodeMode without --save writes no RuntimeSettings.ini"), IFileManager::Get().FileExists(*RuntimeSettingsPath()));
 
+		// Back off: the next Configure() after SetDecodeMode 0 runs mode 0 again.
 		bOk &= RunConsole(*this, TEXT("SuperSLM.SetDecodeMode 0"));
 		if (!ConfigureObserved(*this, *F.Cpu, *F.Model, ShapeOnlyCpuConfig(), Hooks, TEXT("after SetDecodeMode 0"))) { return false; }
 		bOk &= TestEqual(TEXT("SetDecodeMode 0 returns both lanes to zero-bit hooks"), Hooks.ZeroBits, 2);
+		bOk &= CheckConfigureLine(*this, Log, 0, 4, TEXT("mode-default"), 0, TEXT("after SetDecodeMode 0"));
 
 		// Late selection (D-SLM8144): resolution happens at the BeginConfigure() call, on the game
 		// thread, so SetDecodeMode 1 issued while the pool job is held does not reach it.
@@ -245,6 +278,7 @@ namespace SuperSLMD4SettingsTests
 				});
 			bOk &= bLate;
 			bOk &= TestEqual(TEXT("a selection after BeginConfigure() leaves the held configuration at mode 0: zero matvec bits"), Late.MatvecBits, 0);
+			bOk &= TestEqual(TEXT("the held configuration installs zero-bit hooks on both lanes"), Late.ZeroBits, 2);
 			bOk &= CheckConfigureLine(*this, LateLog, 0, 4, TEXT("mode-default"), 0, TEXT("selection after BeginConfigure()"));
 		}
 #else
@@ -275,6 +309,9 @@ namespace SuperSLMD4SettingsTests
 		bOk &= TestEqual(TEXT("FinishParallelTasks 2 installs a hook on both lanes"), Hooks.Makes, 2);
 		bOk &= CheckConfigureLine(*this, Log, 0, 2, TEXT("mode-default"), 0, TEXT("tasks 2"));
 
+		// Run the refused-input arm from a selected mode 0, which differs from what a lax parser
+		// reading "2" or "on" as 1 would leave, whatever the shipped mode is.
+		bOk &= RunConsole(*this, TEXT("SuperSLM.SetDecodeMode 0"));
 		const TCHAR* BadTasks[] = { TEXT("SuperSLM.SetFinishParallelTasks 257"), TEXT("SuperSLM.SetFinishParallelTasks -1"),
 			TEXT("SuperSLM.SetFinishParallelTasks four"), TEXT("SuperSLM.SetFinishParallelTasks") };
 		const TCHAR* BadModes[] = { TEXT("SuperSLM.SetDecodeMode 2"), TEXT("SuperSLM.SetDecodeMode on"), TEXT("SuperSLM.SetDecodeMode") };
@@ -290,18 +327,25 @@ namespace SuperSLMD4SettingsTests
 		return bOk;
 	}
 
-	// --save persists each setting without dropping the other, leaves no temporary file, and a failed
-	// save (read-only destination) preserves the prior bytes.
+	// --save writes only the setting its command chose, keeps the other's saved value when there is
+	// one, leaves no temporary file, and a failed save (read-only destination) preserves the prior bytes.
 	IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMD4SettingsSaveTest,
 		"SuperSLM.D4.Settings.SaveWritesBothSettingsAtomically", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 	bool FSuperSLMD4SettingsSaveTest::RunTest(const FString& Parameters)
 	{
 		FCleanSettings Clean;
 		if (!TestTrue(TEXT("prior INI files captured and cleared"), Clean.Arm())) { return false; }
-		bool bOk = RunConsole(*this, TEXT("SuperSLM.SetDecodeMode 1 --save"));
-		bOk &= CheckSaved(*this, TEXT("1"), TEXT("4"), TEXT("after SetDecodeMode 1 --save"));
-		bOk &= RunConsole(*this, TEXT("SuperSLM.SetFinishParallelTasks 2 --save"));
-		bOk &= CheckSaved(*this, TEXT("1"), TEXT("2"), TEXT("after SetFinishParallelTasks 2 --save"));
+		bool bOk = RunConsole(*this, TEXT("SuperSLM.SetFinishParallelTasks 2 --save"));
+		bOk &= CheckSaved(*this, nullptr, TEXT("2"), TEXT("after SetFinishParallelTasks 2 --save, no mode chosen"));
+		// Mode 1 differs from the shipped 0, so a save that wrote the shipped value instead of the
+		// chosen one is caught.
+		bOk &= RunConsole(*this, TEXT("SuperSLM.SetDecodeMode 1 --save"));
+		bOk &= CheckSaved(*this, TEXT("1"), TEXT("2"), TEXT("after SetDecodeMode 1 --save"));
+		// The process now selects mode 0, unsaved. A tasks save must keep the saved 1: writing the
+		// selection or the shipped value would leave 0.
+		bOk &= RunConsole(*this, TEXT("SuperSLM.SetDecodeMode 0"));
+		bOk &= RunConsole(*this, TEXT("SuperSLM.SetFinishParallelTasks 3 --save"));
+		bOk &= CheckSaved(*this, TEXT("1"), TEXT("3"), TEXT("after SetDecodeMode 0 and SetFinishParallelTasks 3 --save"));
 		TArray<FString> Left = SiblingsOf(FPaths::GetPath(RuntimeSettingsPath()), FPaths::GetCleanFilename(RuntimeSettingsPath()));
 		bOk &= TestEqual(TEXT("no temporary sibling of RuntimeSettings.ini is left behind"), Left.Num(), 0);
 
@@ -309,13 +353,13 @@ namespace SuperSLMD4SettingsTests
 		TArray<uint8> Saved, After;
 		ReadBytes(RuntimeSettingsPath(), bExists, Saved);
 		bOk &= RunConsole(*this, TEXT("SuperSLM.SetDecodeMode 0"));
-		bOk &= RunConsole(*this, TEXT("SuperSLM.SetFinishParallelTasks 3"));
+		bOk &= RunConsole(*this, TEXT("SuperSLM.SetFinishParallelTasks 5"));
 		ReadBytes(RuntimeSettingsPath(), bExists, After);
 		bOk &= TestTrue(TEXT("settings changed without --save leave the saved bytes"), bExists && After == Saved);
 
 		bOk &= TestTrue(TEXT("RuntimeSettings.ini made read-only"), FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*RuntimeSettingsPath(), true));
 		AddExpectedErrorPlain(TEXT("SuperSLM.SetDecodeMode: could not save"), EAutomationExpectedErrorFlags::Contains, 1);
-		bOk &= RunConsole(*this, TEXT("SuperSLM.SetDecodeMode 0 --save"));
+		bOk &= RunConsole(*this, TEXT("SuperSLM.SetDecodeMode 0 --save")); // would write 0 over the saved 1
 		ReadBytes(RuntimeSettingsPath(), bExists, After);
 		bOk &= TestTrue(TEXT("a failed save preserves the prior bytes"), bExists && After == Saved);
 		FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*RuntimeSettingsPath(), false);
@@ -413,7 +457,8 @@ namespace SuperSLMD4SettingsTests
 	{
 		if (!BackUpForRestart(*this)) { return false; }
 		bool bOk = RunConsole(*this, TEXT("SuperSLM.SetDecodeMode 1 --save"));
-		bOk &= CheckSaved(*this, TEXT("1"), TEXT("4"), TEXT("prepared saved-on"));
+		bOk &= CheckSaved(*this, TEXT("1"), nullptr, TEXT("prepared saved-on"));
+		ResetProcessDecodeSettings(); // leave no selection behind in this process
 		return bOk;
 	}
 
@@ -423,11 +468,12 @@ namespace SuperSLMD4SettingsTests
 	{
 		FRestartRestore Restore;
 		bool bOk = CheckWrittenBeforeThisProcess(*this);
-		bOk &= CheckSaved(*this, TEXT("1"), TEXT("4"), TEXT("restarted saved-on"));
+		bOk &= CheckSaved(*this, TEXT("1"), nullptr, TEXT("restarted saved-on"));
 		FCpuFixture F;
 		if (!F.Init(*this)) { return false; }
 		FSuperSLMLogCapture Log;
 		FHookReading Hooks;
+		// The saved 1 differs from the shipped 0, so matvec bits show the saved mode was loaded.
 		if (!ConfigureObserved(*this, *F.Cpu, *F.Model, ShapeOnlyCpuConfig(), Hooks, TEXT("first Configure after a saved-on restart"))) { return false; }
 		bOk &= TestEqual(TEXT("the saved mode 1 is loaded before the first Configure(): matvec bits on both lanes"), Hooks.MatvecBits, 2);
 		bOk &= CheckConfigureLine(*this, Log, 1, 4, TEXT("mode-default"), 0, TEXT("saved-on restart"));
@@ -445,6 +491,7 @@ namespace SuperSLMD4SettingsTests
 		bool bOk = RunConsole(*this, TEXT("SuperSLM.SetDecodeMode 0 --save"));
 		bOk &= RunConsole(*this, TEXT("SuperSLM.SetFinishParallelTasks 1 --save"));
 		bOk &= CheckSaved(*this, TEXT("0"), TEXT("1"), TEXT("prepared saved-off, one task"));
+		ResetProcessDecodeSettings(); // leave no selection behind in this process
 		return bOk;
 	}
 
@@ -553,7 +600,7 @@ namespace SuperSLMD4SettingsTests
 	}
 
 	// The profile follows the RESOLVED mode and task count (D-SLM8148, D-SLM8166): a process
-	// selection of mode 1 prices from mode 1's profile; a matching mode-1 saved estimate measured at
+	// selection of mode 1 prices from mode 1's profile, and a selection of 0 after it from mode 0's; a matching mode-1 saved estimate measured at
 	// task count 2 is chosen by the selected mode and task count; mode 1 at task count 1 is
 	// effectively mode 0 and prices from mode 0's profile.
 	IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMD4ProfilesResolvedModeTest,
@@ -569,8 +616,13 @@ namespace SuperSLMD4SettingsTests
 		if (!F.Init(*this)) { return false; }
 		FSuperSLMSchedulingTestAccess::FScopedReportHistoryCapacity Capacity;
 
+		// Each selection changes the state it is priced in: 1 differs from the shipped 0, and 0 then
+		// differs from the selected 1.
 		bool bOk = RunConsole(*this, TEXT("SuperSLM.SetDecodeMode 1"));
 		bOk &= ConfigureAndPrice(*this, F, ShapeOnlyCpuConfig(), 1, 4, TEXT("mode-default"), 0, Profiles[1], TEXT("selected mode 1, no estimate"));
+		bOk &= RunConsole(*this, TEXT("SuperSLM.SetDecodeMode 0"));
+		bOk &= ConfigureAndPrice(*this, F, ShapeOnlyCpuConfig(), 0, 4, TEXT("mode-default"), 0, Profiles[0], TEXT("selected mode 0, no estimate"));
+		bOk &= RunConsole(*this, TEXT("SuperSLM.SetDecodeMode 1"));
 
 		// A mode-1 saved estimate measured at task count 2.
 		FString Artifact, Reason;

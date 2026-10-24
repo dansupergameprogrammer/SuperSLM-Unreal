@@ -11,11 +11,13 @@
 // The frame-cost assertions read the plugin's own figures, never the example's timing:
 //  - CPU: every game-thread Tick() of the query (plan and apply, USuperSLMSubsystem::GetTickHistory())
 //    stays under SuperSLMExample::CpuGameThreadTickBoundMs, the plugin's own per-tick bound.
-//  - GPU: the Frame Budget bounds what one tick issues. At the default Frame Budget the backend
-//    issues exactly that many layers per tick (GetLayersPerTick()), and the median per-slice
+//  - GPU: the Frame Budget bounds what one tick issues. At the default Frame Budget (a whole token,
+//    the one-call path) the backend issues exactly that many layers per tick (GetLayersPerTick()),
+//    every sequence was vended on the one-call path (GetDecodePath()), and the median per-slice
 //    gpu_busy_ms (GetLastGpuBusyMs(), one reading per frame that issued work) is at or under
-//    SuperSLMExample::GpuSliceBudgetMs, the criterion the default slice was selected by (measured
-//    headless at context depths up to about 400 tokens; the query's prompts are shorter).
+//    SuperSLMExample::GpuSliceBudgetMs, one 60 fps frame. A second GPU query at ComposedCheckLayers
+//    runs the composed path: that many layers per tick, every sequence composed, the median slice at
+//    or under ComposedSliceBoundMs, and the same token digest as the whole-token query.
 //  - Self-check: no single frame of the stepped self-check (one TickFrame(), which is one Step())
 //    takes SelfCheckFrameBoundMs or more. The step waits on neither backend (it never blocks), so a
 //    frame costs the step budget plus one tick's overshoot and, at an arm boundary, the small
@@ -61,6 +63,12 @@ namespace SuperSLMExampleTests
 	// frame around it.
 	constexpr double SelfCheckFrameBoundMs = 50.0;
 
+	// The composed-path query: 4 layers per slice, the lightest setting the README names for heavier
+	// scenes, held to the bound this test held 4 layers to through 1.2 (at most 1.58 ms on record
+	// headless on one RTX 2080 SUPER).
+	constexpr int32 ComposedCheckLayers = 4;
+	constexpr double ComposedSliceBoundMs = 2.0;
+
 	USuperSLMModel* LoadExampleModel(FAutomationTestBase& Test)
 	{
 		const FString PackagePath = FPackageName::ObjectPathToPackageName(FString(ASuperSLMExampleScene::GetDefaultModelPath()));
@@ -100,6 +108,7 @@ namespace SuperSLMExampleTests
 		SelfCheck,
 		CpuQuery,
 		GpuQuery,
+		GpuComposedQuery,
 		Done,
 	};
 
@@ -119,6 +128,7 @@ namespace SuperSLMExampleTests
 		double MaxGpuQueryFrameMs = 0.0; // reported; at most one GPU query frame may exceed SelfCheckFrameBoundMs (ruling 2026-09-26, round 3)
 		int32 CpuQueryFramesOverBound = 0;
 		int32 GpuQueryFramesOverBound = 0;
+		FString WholeTokenDigest;
 
 		~FRun()
 		{
@@ -141,6 +151,7 @@ namespace SuperSLMExampleTests
 		case EPhase::SelfCheck: return TEXT("the self-check");
 		case EPhase::CpuQuery: return TEXT("the CPU query");
 		case EPhase::GpuQuery: return TEXT("the GPU query");
+		case EPhase::GpuComposedQuery: return TEXT("the composed GPU query");
 		case EPhase::Done: return TEXT("done");
 		}
 		return TEXT("unknown");
@@ -172,10 +183,13 @@ namespace SuperSLMExampleTests
 			R.CpuTicks, R.CpuMaxTickMs, SuperSLMExample::CpuGameThreadTickBoundMs), R.CpuMaxTickMs < SuperSLMExample::CpuGameThreadTickBoundMs);
 	}
 
-	void CheckGpuFrameCost(FAutomationTestBase& Test, const FSuperSLMExampleReadout& R)
+	void CheckGpuFrameCost(FAutomationTestBase& Test, const FSuperSLMExampleReadout& R, bool bExpectOneCall, double BoundMs, const TCHAR* BoundName)
 	{
 		Test.TestEqual(TEXT("GPU frame cost: the backend issues the Frame Budget's layers per tick (GetLayersPerTick())"),
 			R.GpuLayersPerTick, R.Settings.FrameBudgetLayers);
+		Test.TestTrue(FString::Printf(TEXT("GPU path: every sequence was vended on the %s path (%d one-call, %d composed)"),
+				bExpectOneCall ? TEXT("one-call") : TEXT("composed"), R.GpuOneCallSequences, R.GpuComposedSequences),
+			bExpectOneCall ? (R.GpuOneCallSequences > 0 && R.GpuComposedSequences == 0) : (R.GpuComposedSequences > 0 && R.GpuOneCallSequences == 0));
 		if (R.GpuBusyMsSamples.Num() == 0)
 		{
 			Test.AddError(TEXT("GPU frame cost: no per-slice gpu_busy_ms reading (GetLastGpuBusyMs() never changed during the query), so the bound cannot be checked"));
@@ -187,8 +201,8 @@ namespace SuperSLMExampleTests
 			Max = FMath::Max(Max, V);
 		}
 		const double Med = Median(R.GpuBusyMsSamples);
-		Test.TestTrue(FString::Printf(TEXT("GPU frame cost: median per-slice gpu_busy_ms %.3f (max %.3f, %d readings) at %d layers per slice is at or under the %.1f ms slice target"),
-			Med, Max, R.GpuBusyMsSamples.Num(), R.Settings.FrameBudgetLayers, SuperSLMExample::GpuSliceBudgetMs), Med <= SuperSLMExample::GpuSliceBudgetMs);
+		Test.TestTrue(FString::Printf(TEXT("GPU frame cost: median per-slice gpu_busy_ms %.3f (max %.3f, %d readings) at %d layers per slice is at or under %s (%.2f ms)"),
+			Med, Max, R.GpuBusyMsSamples.Num(), R.Settings.FrameBudgetLayers, BoundName, BoundMs), Med <= BoundMs);
 	}
 }
 
@@ -251,7 +265,7 @@ bool FSuperSLMExampleSelfCheckPathTest::RunTest(const FString& Parameters)
 			Run->MaxCpuQueryFrameMs = FMath::Max(Run->MaxCpuQueryFrameMs, FrameMs);
 			Run->CpuQueryFramesOverBound += FrameMs > SelfCheckFrameBoundMs ? 1 : 0;
 		}
-		else if (Run->Phase == EPhase::GpuQuery)
+		else if (Run->Phase == EPhase::GpuQuery || Run->Phase == EPhase::GpuComposedQuery)
 		{
 			Run->MaxGpuQueryFrameMs = FMath::Max(Run->MaxGpuQueryFrameMs, FrameMs);
 			Run->GpuQueryFramesOverBound += FrameMs > SelfCheckFrameBoundMs ? 1 : 0;
@@ -354,7 +368,36 @@ bool FSuperSLMExampleSelfCheckPathTest::RunTest(const FString& Parameters)
 			const FSuperSLMExampleReadout& R = Demo.GetReadout();
 			if (CheckAnswer(*Test, TEXT("GPU"), R))
 			{
-				CheckGpuFrameCost(*Test, R);
+				Test->TestTrue(TEXT("the default GPU Frame Budget is a whole token"), R.Settings.IsWholeToken());
+				CheckGpuFrameCost(*Test, R, /*bExpectOneCall*/ true, SuperSLMExample::GpuSliceBudgetMs, TEXT("one 60 fps frame"));
+			}
+			Run->WholeTokenDigest = R.TokenDigestHex;
+
+			FSuperSLMExampleSettings Settings;
+			Settings.Backend = ESuperSLMExampleBackend::GPU;
+			Settings.FrameBudgetLayers = ComposedCheckLayers;
+			FString Error;
+			if (!Test->TestTrue(FString::Printf(TEXT("the GPU query at %d layers per slice starts"), ComposedCheckLayers), Demo.Start(Settings, Error)))
+			{
+				Test->AddError(Error);
+				return true;
+			}
+			EnterPhase(*Run, EPhase::GpuComposedQuery);
+			return false;
+		}
+
+		case EPhase::GpuComposedQuery:
+		{
+			if (Demo.IsBusy())
+			{
+				return false;
+			}
+			const FSuperSLMExampleReadout& R = Demo.GetReadout();
+			if (CheckAnswer(*Test, TEXT("GPU composed"), R))
+			{
+				CheckGpuFrameCost(*Test, R, /*bExpectOneCall*/ false, ComposedSliceBoundMs, TEXT("the 4-layer bound"));
+				Test->TestEqual(FString::Printf(TEXT("the composed query at %d layers per slice gives the whole-token query's token digest"), ComposedCheckLayers),
+					R.TokenDigestHex, Run->WholeTokenDigest);
 			}
 			// Plan §2.5 row 21, "Ruling 2026-09-26": the GPU tick no longer waits on the submission
 			// thread, so no GPU query frame waits on a backend either. The same
@@ -379,6 +422,98 @@ bool FSuperSLMExampleSelfCheckPathTest::RunTest(const FString& Parameters)
 		return true;
 	}));
 	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FSuperSLMExampleFrameTimeSummaryTest,
+	"SuperSLMExample.FrameTime.OnCapFramesAreNotMissed",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+
+bool FSuperSLMExampleFrameTimeSummaryTest::RunTest(const FString& Parameters)
+{
+	// A frame limiter waits to the period (computed in float: 1.f / 60 is 16.6666675 ms) and
+	// overshoots it by microseconds, so every on-cap frame is a little over 1000 / 60.
+	const double Period = SuperSLMExample::FrameMsAt60Fps;
+	TArray<double> OnCap;
+	for (int32 I = 0; I < 600; ++I)
+	{
+		OnCap.Add(1000.0 * (1.0f / 60.0f) + 0.001 * (I % 37));
+	}
+	const SuperSLMExample::FFrameTimeSummary A = SuperSLMExample::SummarizeFrameTimes(OnCap, Period);
+	TestEqual(TEXT("600 on-cap frames: none missed"), A.MissedFrames, 0);
+	TestEqual(TEXT("600 on-cap frames: none over 20 ms"), A.FramesOverLongFrame, 0);
+	TestEqual(TEXT("600 on-cap frames: all counted"), A.Frames, 600);
+
+	TArray<double> OneMiss = OnCap;
+	OneMiss.Add(33.4);
+	const SuperSLMExample::FFrameTimeSummary B = SuperSLMExample::SummarizeFrameTimes(OneMiss, Period);
+	TestEqual(TEXT("one 33.4 ms frame among on-cap frames: one missed"), B.MissedFrames, 1);
+	TestEqual(TEXT("one 33.4 ms frame among on-cap frames: one over 20 ms"), B.FramesOverLongFrame, 1);
+	TestEqual(TEXT("the max is the 33.4 ms frame"), B.MaxMs, 33.4);
+
+	const SuperSLMExample::FFrameTimeSummary C = SuperSLMExample::SummarizeFrameTimes(TArray<double>(), Period);
+	TestEqual(TEXT("an empty window has no frames"), C.Frames, 0);
+	return true;
+}
+
+// Plan P1.9, mutant XD7, review round 1 finding 3: the example's scratch switch,
+// -SuperSLMExampleJumpForward=0|1|off|exact|canonical, is wired. It is case-insensitive; any other
+// value (empty and padded included) is refused with a Warning naming the switch, and the mode stays
+// as it was; an absent switch leaves it as it was and logs nothing. That the scene applies it and
+// the extraction request carries it is the host cell ci/tests/test_schema_jump_example_switch.py.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FSuperSLMExampleSchemaJumpForwardSwitchTest,
+	"SuperSLMExample.Demo.SchemaJumpForwardSwitch",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+
+bool FSuperSLMExampleSchemaJumpForwardSwitchTest::RunTest(const FString& Parameters)
+{
+	using EMode = ESuperSLMSchemaJumpForward;
+	struct FCase { const TCHAR* CommandLine; EMode Want; };
+	const FCase Accepted[] = {
+		{ TEXT("-SuperSLMExampleJumpForward=0"), EMode::Off },
+		{ TEXT("-SuperSLMExampleJumpForward=1"), EMode::Canonical },
+		{ TEXT("-SuperSLMExampleJumpForward=off"), EMode::Off },
+		{ TEXT("-SuperSLMExampleJumpForward=exact"), EMode::Exact },
+		{ TEXT("-SuperSLMExampleJumpForward=canonical"), EMode::Canonical },
+		{ TEXT("-SuperSLMExampleJumpForward=EXACT"), EMode::Exact },
+		{ TEXT("-Other -SuperSLMExampleJumpForward=CaNoNiCaL -More"), EMode::Canonical },
+	};
+	bool bOk = true;
+	for (const FCase& C : Accepted)
+	{
+		EMode Mode = C.Want == EMode::Exact ? EMode::Canonical : EMode::Exact; // so "unchanged" cannot pass
+		bOk &= TestTrue(*FString::Printf(TEXT("'%s' is accepted"), C.CommandLine), SuperSLMExample::SchemaJumpForwardFromCommandLine(C.CommandLine, Mode));
+		bOk &= TestEqual(*FString::Printf(TEXT("'%s' sets the mode"), C.CommandLine), (uint8)Mode, (uint8)C.Want);
+	}
+
+	// Absent: false, unchanged, no log line.
+	{
+		EMode Mode = EMode::Exact;
+		bOk &= TestFalse(TEXT("no switch: false"), SuperSLMExample::SchemaJumpForwardFromCommandLine(TEXT("-SuperSLMExampleLayers=3"), Mode));
+		bOk &= TestEqual(TEXT("no switch: the mode stays as it was"), (uint8)Mode, (uint8)EMode::Exact);
+	}
+
+	const TCHAR* Refused[] = {
+		TEXT("-SuperSLMExampleJumpForward=2"),
+		TEXT("-SuperSLMExampleJumpForward=on"),
+		TEXT("-SuperSLMExampleJumpForward=exactly"),
+		TEXT("-SuperSLMExampleJumpForward=-1"),
+		TEXT("-SuperSLMExampleJumpForward=\" exact\""),
+		TEXT("-SuperSLMExampleJumpForward=\"\""),
+	};
+	// Each refusal logs one Warning naming the switch; a missing line fails this test.
+	AddExpectedError(TEXT("SuperSLMExampleJumpForward"), EAutomationExpectedErrorFlags::Contains, UE_ARRAY_COUNT(Refused));
+	for (const TCHAR* CommandLine : Refused)
+	{
+		EMode Mode = EMode::Exact;
+		bOk &= TestFalse(*FString::Printf(TEXT("'%s' is refused"), CommandLine), SuperSLMExample::SchemaJumpForwardFromCommandLine(CommandLine, Mode));
+		bOk &= TestEqual(*FString::Printf(TEXT("'%s' leaves the mode as it was"), CommandLine), (uint8)Mode, (uint8)EMode::Exact);
+	}
+
+	// The settings field the scene applies it to defaults to off.
+	bOk &= TestEqual(TEXT("FSuperSLMExampleSettings::SchemaJumpForward defaults to off"), (uint8)FSuperSLMExampleSettings().SchemaJumpForward, (uint8)EMode::Off);
+	return bOk;
 }
 
 #endif // WITH_DEV_AUTOMATION_TESTS

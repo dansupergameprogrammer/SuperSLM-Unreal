@@ -850,6 +850,23 @@ namespace SuperSLMPagingFixtures
 			return Count;
 		}
 
+		// Lines that contain every one of Tokens (case-insensitive), so a cell can require two facts on one line.
+		int32 CountLinesContainingAll(std::initializer_list<const TCHAR*> Tokens) const
+		{
+			FScopeLock Lock(&Guard);
+			int32 Count = 0;
+			for (const FString& Line : Lines)
+			{
+				bool bAll = true;
+				for (const TCHAR* Token : Tokens)
+				{
+					bAll &= Line.Contains(Token);
+				}
+				Count += bAll ? 1 : 0;
+			}
+			return Count;
+		}
+
 	private:
 		mutable FCriticalSection Guard;
 		TArray<FString> Lines;

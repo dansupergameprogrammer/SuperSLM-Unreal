@@ -183,8 +183,8 @@ turns the finished tokens into text, and draws the panel.
 **Controls.** Thinking/Frame Budget (one control, with a value per backend: the panel shows the
 selected backend's); Backend (CPU or GPU); concurrent queries (up to four); and K (GPU only: the
 fixed-tick latency; the panel shows the minimum the current settings need). On the GPU the budget
-is the layers per slice, which is what one frame issues (default 4; the whole-token setting uses
-the one-call path). On the CPU it is the layer budget of each worker job (default 24, a whole
+is the layers per slice, which is what one frame issues (default 24, a whole token, which uses the
+one-call path; heavier scenes can set 4 to 12). On the CPU it is the layer budget of each worker job (default 24, a whole
 token): the inference runs on worker threads, so it sizes the job and never the game thread's
 cost. On the CPU backend no control changes the answer: the layer budget and the number of
 concurrent queries change only how many frames an answer takes and what it costs, and the tokens
@@ -198,11 +198,13 @@ when the GPU verdict is shown and reads *Verified*, which in 1.0 it never is.
 |---|---|
 | `SuperSLMExample.Ask [text]` | Asks with the panel's current settings, or with `text` as what the customer said. |
 | `SuperSLMExample.SelfCheck` | Runs the self-check again, one bounded step per frame, and shows the CPU verdict (in 1.0 the GPU verdict is always withheld). |
-| `SuperSLMExample.PackagedCheck [exit]` | For a packaged build only: in the editor or in PIE its first precondition (`pre.packaged_build`, cooked data) fails, and so does the check. Runs the self-check through the command above, then the default query on the CPU and on the GPU. It checks that the extraction is schema-valid and the reply is voiced, across frames; that the self-check reported; that the GPU dispatched with its device head on, from the shaders staged under the packaged plugin; and that GPU busy time per slice and host finish time were reported at the default setting with the scene rendering. It logs one `PASS`/`FAIL` line per check and writes `Saved/SuperSLMExample/packaged-check-report.json`. With `exit`, the process exits with status 0 when every check passed. |
+| `SuperSLMExample.PackagedCheck [exit]` | For a packaged build only: in the editor or in PIE its first precondition (`pre.packaged_build`, cooked data) fails, and so does the check. Runs the self-check through the command above, then the default query on the CPU and on the GPU. It checks that the extraction is schema-valid and the reply is voiced, across frames; that the self-check reported; that the GPU dispatched with its device head on, from the shaders staged under the packaged plugin; and that GPU busy time per slice and host finish time were reported at the default setting with the scene rendering (under `-SuperSLMExampleLayers` with a value other than 0 or 24, at the requested setting instead: the check is then named `d.at_requested_setting` and the report's `at_default_setting` is false). It logs one `PASS`/`FAIL` line per check and writes `Saved/SuperSLMExample/packaged-check-report.json`, which also records each query's frame times (`frame_ms`: p50, p95, p99, max, the missed frames, those over the cap's period (`t.MaxFPS`, or 60 fps) plus 0.5 ms, and the frames over 20 ms; `frame_ms_samples`: every frame from Ask to the answer). With `exit`, the process exits with status 0 when every check passed. |
 
 **Command-line switches:** `-SuperSLMExamplePackagedCheck` runs the packaged check after load and
 exits; `-SuperSLMExampleSkipLoad` loads no model, for running the plugin's packaged memory-mapping
-test, which must be the first code to load the model package.
+test, which must be the first code to load the model package; `-SuperSLMExampleLayers=<N>` starts
+the GPU Frame Budget at N layers per slice (1 to 24, or 0 for a whole token, the default), and the
+packaged check then runs at that setting, which its report names in `frame_budget_layers_override`.
 
 The scene carries only generic example schemas.
 

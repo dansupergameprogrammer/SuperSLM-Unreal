@@ -7,6 +7,7 @@
 #include "SuperSLMDetokenizer.h"
 #include "SuperSLMLog.h"
 #include "SuperSLMModel.h"
+#include "SuperSLMPrefixSet.h"
 #include "SuperSLMSubsystem.h"
 
 // L2-S3 (plan §6, §10.4). Every wrapper is a forward to USuperSLMSubsystem plus a type
@@ -37,6 +38,31 @@ SUPERSLM_BP_MIRRORS(ESuperSLMRestoreResult, ESuperSLMRestoreResultBP, OutOfMemor
 SUPERSLM_BP_MIRRORS(ESuperSLMRestoreResult, ESuperSLMRestoreResultBP, KvPagesExhausted)
 SUPERSLM_BP_MIRRORS(ESuperSLMRestoreResult, ESuperSLMRestoreResultBP, KvModeMismatch)
 SUPERSLM_BP_MIRRORS(ESuperSLMRestoreResult, ESuperSLMRestoreResultBP, ContextCapMismatch)
+SUPERSLM_BP_MIRRORS(ESuperSLMRestoreResult, ESuperSLMRestoreResultBP, PrefixLeaseEnded)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixSource, ESuperSLMPrefixSourceBP, Pending)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixSource, ESuperSLMPrefixSourceBP, Memory)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixSource, ESuperSLMPrefixSourceBP, Cooked)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixSource, ESuperSLMPrefixSourceBP, Disk)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixSource, ESuperSLMPrefixSourceBP, Recomputed)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixSource, ESuperSLMPrefixSourceBP, Invalid)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixOpResult, ESuperSLMPrefixOpResultBP, Pending)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixOpResult, ESuperSLMPrefixOpResultBP, Resident)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixOpResult, ESuperSLMPrefixOpResultBP, Dropped)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixOpResult, ESuperSLMPrefixOpResultBP, DropDeferred)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixOpResult, ESuperSLMPrefixOpResultBP, NotCached)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixOpResult, ESuperSLMPrefixOpResultBP, BudgetExhausted)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixOpResult, ESuperSLMPrefixOpResultBP, PoolExhausted)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixOpResult, ESuperSLMPrefixOpResultBP, UnknownSchema)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixOpResult, ESuperSLMPrefixOpResultBP, Cancelled)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixOpResult, ESuperSLMPrefixOpResultBP, Expired)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixOpResult, ESuperSLMPrefixOpResultBP, Failed)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixDropDisk, ESuperSLMPrefixDropDiskBP, NotRequested)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixDropDisk, ESuperSLMPrefixDropDiskBP, Deleted)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixDropDisk, ESuperSLMPrefixDropDiskBP, NoFile)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixDropDisk, ESuperSLMPrefixDropDiskBP, DiskTierOff)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixDropDisk, ESuperSLMPrefixDropDiskBP, Failed)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixDropScope, ESuperSLMPrefixDropScopeBP, Memory)
+SUPERSLM_BP_MIRRORS(ESuperSLMPrefixDropScope, ESuperSLMPrefixDropScopeBP, MemoryAndDisk)
 
 SUPERSLM_BP_MIRRORS(ESuperSLMDecodeOutcome, ESuperSLMDecodeOutcomeBP, TokenProduced)
 SUPERSLM_BP_MIRRORS(ESuperSLMDecodeOutcome, ESuperSLMDecodeOutcomeBP, Generating)
@@ -345,6 +371,101 @@ bool USuperSLMBlueprintLibrary::ReleasePrefix(USuperSLMSubsystem* Subsystem, con
 		return false;
 	}
 	return Subsystem->ReleasePrefix(Prefix.ToNative(), OutError);
+}
+
+bool USuperSLMBlueprintLibrary::RequestPrefix(USuperSLMSubsystem* Subsystem, const TArray<int32>& Tokens, FName SchemaName, FSuperSLMPrefixBP& OutPrefix, FString& OutError)
+{
+	OutPrefix = FSuperSLMPrefixBP();
+	if (Subsystem == nullptr)
+	{
+		OutError = NoSubsystem();
+		return false;
+	}
+	FSuperSLMPrefixSpec Spec;
+	Spec.Tokens = Tokens;
+	Spec.SchemaName = SchemaName;
+	FSuperSLMPrefix Prefix;
+	const bool bOk = Subsystem->RequestPrefix(Spec, Prefix, OutError);
+	OutPrefix = FSuperSLMPrefixBP(Prefix);
+	return bOk;
+}
+
+bool USuperSLMBlueprintLibrary::ReturnPrefix(USuperSLMSubsystem* Subsystem, const FSuperSLMPrefixBP& Prefix)
+{
+	return Subsystem != nullptr && Subsystem->ReturnPrefix(Prefix.ToNative());
+}
+
+ESuperSLMPrefixSourceBP USuperSLMBlueprintLibrary::GetPrefixSource(const USuperSLMSubsystem* Subsystem, const FSuperSLMPrefixBP& Prefix)
+{
+	return Subsystem != nullptr
+		? static_cast<ESuperSLMPrefixSourceBP>(Subsystem->GetPrefixSource(Prefix.ToNative()))
+		: ESuperSLMPrefixSourceBP::Invalid;
+}
+
+void USuperSLMBlueprintLibrary::RegisterPrefixSet(USuperSLMSubsystem* Subsystem, USuperSLMPrefixSet* PrefixSet)
+{
+	if (Subsystem != nullptr)
+	{
+		Subsystem->RegisterPrefixSet(PrefixSet);
+	}
+}
+
+void USuperSLMBlueprintLibrary::UnregisterPrefixSet(USuperSLMSubsystem* Subsystem, USuperSLMPrefixSet* PrefixSet)
+{
+	if (Subsystem != nullptr)
+	{
+		Subsystem->UnregisterPrefixSet(PrefixSet);
+	}
+}
+
+bool USuperSLMBlueprintLibrary::WarmPrefix(USuperSLMSubsystem* Subsystem, const TArray<int32>& Tokens, FName SchemaName, FSuperSLMPrefixOpBP& OutOp, FString& OutError)
+{
+	OutOp = FSuperSLMPrefixOpBP();
+	if (Subsystem == nullptr)
+	{
+		OutError = NoSubsystem();
+		return false;
+	}
+	FSuperSLMPrefixSpec Spec;
+	Spec.Tokens = Tokens;
+	Spec.SchemaName = SchemaName;
+	FSuperSLMPrefixOp Op;
+	const bool bOk = Subsystem->WarmPrefix(Spec, Op, OutError);
+	OutOp.Id = Op.Id;
+	return bOk;
+}
+
+bool USuperSLMBlueprintLibrary::DropPrefix(USuperSLMSubsystem* Subsystem, const TArray<int32>& Tokens, FName SchemaName, ESuperSLMPrefixDropScopeBP Scope, FSuperSLMPrefixOpBP& OutOp, FString& OutError)
+{
+	OutOp = FSuperSLMPrefixOpBP();
+	if (Subsystem == nullptr)
+	{
+		OutError = NoSubsystem();
+		return false;
+	}
+	FSuperSLMPrefixSpec Spec;
+	Spec.Tokens = Tokens;
+	Spec.SchemaName = SchemaName;
+	FSuperSLMPrefixOp Op;
+	const bool bOk = Subsystem->DropPrefix(Spec, static_cast<ESuperSLMPrefixDropScope>(Scope), Op, OutError);
+	OutOp.Id = Op.Id;
+	return bOk;
+}
+
+bool USuperSLMBlueprintLibrary::GetPrefixOpResult(const USuperSLMSubsystem* Subsystem, const FSuperSLMPrefixOpBP& Op, ESuperSLMPrefixOpResultBP& OutResult, ESuperSLMPrefixDropDiskBP& OutDisk)
+{
+	OutResult = ESuperSLMPrefixOpResultBP::Pending;
+	OutDisk = ESuperSLMPrefixDropDiskBP::NotRequested;
+	FSuperSLMPrefixOp Native;
+	Native.Id = Op.Id;
+	FSuperSLMPrefixOpResult Result;
+	if (Subsystem == nullptr || !Subsystem->GetPrefixOpResult(Native, Result))
+	{
+		return false;
+	}
+	OutResult = static_cast<ESuperSLMPrefixOpResultBP>(Result.Result);
+	OutDisk = static_cast<ESuperSLMPrefixDropDiskBP>(Result.Disk);
+	return true;
 }
 
 FSuperSLMSelfCheckReportBP USuperSLMBlueprintLibrary::ToSelfCheckReportBP(const FSuperSLMSelfCheckReport& Report)

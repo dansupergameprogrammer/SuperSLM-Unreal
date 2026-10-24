@@ -155,6 +155,7 @@ namespace SuperSLMConfigAccess
 	{
 		if constexpr (requires { Config.bParallelDecode.IsSet(); })
 		{
+			// Unset resolves to the shipped mode, off (SuperSLMRuntimeResolve::kShippedDecodeMode).
 			return Config.bParallelDecode.IsSet() && Config.bParallelDecode.GetValue();
 		}
 		else

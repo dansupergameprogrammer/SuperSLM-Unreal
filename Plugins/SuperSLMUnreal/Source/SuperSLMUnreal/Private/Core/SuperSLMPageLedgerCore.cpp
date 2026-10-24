@@ -562,7 +562,12 @@ struct FPageLedger::FImpl
 	// never counted.
 	uint32_t Guaranteed(const FJobState& J) const
 	{
-		if (SUPERSLM_LEDGER_MUTANT(this, ShareCountedAsGuaranteed) && J.bHintGiven) return J.HCharge;
+		// Nested, not "MUTANT && cond": with the test hooks off the macro is the literal false, and MSVC's /W4 raises
+		// C4127 on "false && cond" (it exempts a bare literal condition).
+		if (SUPERSLM_LEDGER_MUTANT(this, ShareCountedAsGuaranteed))
+		{
+			if (J.bHintGiven) return J.HCharge;
+		}
 		if (SUPERSLM_LEDGER_MUTANT(this, FlatGuarantee)) return RSb;
 		return J.HCharge < RSb ? J.HCharge : RSb;
 	}
@@ -918,7 +923,10 @@ bool FPageLedger::ApplyPrefixBuild(FTicket Ticket, bool bSucceeded)
 	if (P)
 	{
 		Settled = NestedSettledPages(B, P->Length, N->Length - P->Length);
-		if (SUPERSLM_LEDGER_MUTANT(Impl, EmptyChildSettledToZero) && N->Length == P->Length) Settled = 0;
+		if (SUPERSLM_LEDGER_MUTANT(Impl, EmptyChildSettledToZero)) // nested for MSVC C4127, as in Guaranteed()
+		{
+			if (N->Length == P->Length) Settled = 0;
+		}
 		P->Dependents += 1;
 	}
 	Impl->Refund(ERegion::P, N->Charge);
@@ -949,11 +957,14 @@ FAdmission FPageLedger::AdmitPrefixRelease(FNodeId Node)
 	FJobState J;
 	J.Kind = EJobKind::PrefixRelease;
 	J.Node = Node;
-	if (SUPERSLM_LEDGER_MUTANT(Impl, RefundAtEnqueue) && N->Dependents == 0)
+	if (SUPERSLM_LEDGER_MUTANT(Impl, RefundAtEnqueue)) // nested for MSVC C4127, as in Guaranteed()
 	{
-		Impl->Refund(ERegion::P, N->Charge);
-		N->Charge = 0;
-		J.bRefundedEarly = true;
+		if (N->Dependents == 0)
+		{
+			Impl->Refund(ERegion::P, N->Charge);
+			N->Charge = 0;
+			J.bRefundedEarly = true;
+		}
 	}
 	const FTicket T = Impl->MintTicket();
 	Impl->Jobs.emplace(T, J);

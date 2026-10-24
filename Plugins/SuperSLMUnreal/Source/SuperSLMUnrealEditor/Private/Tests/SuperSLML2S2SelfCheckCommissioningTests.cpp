@@ -50,7 +50,8 @@ namespace
 		return FFileHelper::SaveStringToFile(Json, *Path);
 	}
 
-	bool ConfigureBoth(FAutomationTestBase& T, UWorld* World, USuperSLMModel*& OutModel, USuperSLMGpuSubsystem*& OutGpu, USuperSLMSubsystem*& OutCpu)
+	bool ConfigureBoth(FAutomationTestBase& T, UWorld* World, USuperSLMModel*& OutModel, USuperSLMGpuSubsystem*& OutGpu, USuperSLMSubsystem*& OutCpu,
+		int32 GpuLayersPerSlice = 1, int32 GpuK = AExNumHiddenLayers)
 	{
 		FString AExPath, Reason;
 		if (!T.TestTrue(*FString::Printf(TEXT("A-EX must be present (%s)"), *Reason), TryGetAExArtifactPath(AExPath, Reason)))
@@ -76,8 +77,8 @@ namespace
 		FSuperSLMGpuRuntimeConfig GpuConfig;
 		GpuConfig.ContextCap = 4096;
 		GpuConfig.BlockCount = 1;
-		GpuConfig.DispatchBudget = DispatchBudgetForLayersPerSlice(1); // the finest composed granularity, matching plan §7 item 11's own GPU sweep
-		GpuConfig.K = AExNumHiddenLayers;
+		GpuConfig.DispatchBudget = DispatchBudgetForLayersPerSlice(GpuLayersPerSlice); // default 1: the finest composed granularity, matching plan §7 item 11's own GPU sweep
+		GpuConfig.K = GpuK;
 		GpuConfig.TickBudgetMs = 1000.0;
 		if (!T.TestEqual(TEXT("GPU Configure()"), (uint8)OutGpu->Configure(OutModel, GpuConfig).Result, (uint8)ESuperSLMGpuConfigureResult::Success))
 		{
@@ -219,6 +220,35 @@ bool FSuperSLML2S2SelfCheckMustAcceptTest::RunTest(const FString& Parameters)
 	AddInfo(TEXT("GPU verdict awaits the separate GpuMustReject commissioning cell."));
 
 	return bCpuOk && bGpuOk && bGpuNeverReadsReferenceFile;
+}
+
+// --- Must-accept at a whole-token configuration: the GPU backend configured as the Load node
+// and the example project configure it (a whole token per tick, K at its minimum of 1), so the
+// self-check's one-layer-per-slice run gets no tick slack from K. Its tick ceiling must still
+// cover every prompt and decode token at one layer per slice. ---
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FSuperSLML2S2SelfCheckMustAcceptWholeTokenConfigTest,
+	"SuperSLM.L2S2.SelfCheck.MustAcceptAtWholeTokenConfiguration",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FSuperSLML2S2SelfCheckMustAcceptWholeTokenConfigTest::RunTest(const FString& Parameters)
+{
+	FTestWorldWrapper TestWorldWrapper;
+	if (!TestWorldWrapper.CreateTestWorld(EWorldType::Game))
+	{
+		return false;
+	}
+	USuperSLMModel* Model = nullptr;
+	USuperSLMGpuSubsystem* Gpu = nullptr;
+	USuperSLMSubsystem* Cpu = nullptr;
+	if (!ConfigureBoth(*this, TestWorldWrapper.GetTestWorld(), Model, Gpu, Cpu, /*GpuLayersPerSlice*/ AExNumHiddenLayers, /*GpuK*/ 1))
+	{
+		return false;
+	}
+	const FSuperSLMSelfCheckReport Report = SuperSLMDeterminismSelfCheck::Run(*Model, FString());
+	AddInfo(FString::Printf(TEXT("GPU at %d layers per tick, K 1: %s"), AExNumHiddenLayers, *Report.Gpu.ScopeText));
+	TestFalse(TEXT("the GPU arm's runs finish (the scope text names no failed run)"), Report.Gpu.ScopeText.StartsWith(TEXT("Not run")));
+	return TestEqual(TEXT("GPU arm must report Verified at a whole-token configuration"), (uint8)Report.Gpu.Verdict, (uint8)ESuperSLMSelfCheckVerdict::Verified);
 }
 
 // --- Must-reject: a corrupted entry in the shipped reference file makes the self-check

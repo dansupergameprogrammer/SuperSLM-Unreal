@@ -14,6 +14,8 @@
 //   SuperSLM.EstimateCosts: progress mode=<0|1> phase=<text>
 //   SuperSLM.EstimateCosts: row mode=<m> arm=<arm> depth=<d> calls=<n> median_ms=<x> iqr_ms=<y>
 //   SuperSLM.EstimateCosts: suggested mode=<m> <Field>=<value>          (13 per mode)
+//   SuperSLM.EstimateCosts: per_chunk mode=<m> chunk=<C> PromptChunk<C>TokenCostMs=<v> PromptChunk<C>TokenCostPerPositionMs=<v>
+//                                                                       (C = 2..7 per mode; schema fast-decode plan rev 1.3.6, P1.1)
 //   SuperSLM.EstimateCosts: load phase=<pre|workload|post> [mode=<m>] samples=<n> median_pct=<x> p95_pct=<y> max_pct=<z>
 //   SuperSLM.EstimateCosts: coverage uncovered_calls=<n> samples=<n>
 //   SuperSLM.EstimateCosts: lock state=<absent|own|foreign|not-configured>
@@ -42,6 +44,7 @@
 #include "Misc/OutputDevice.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
+#include "SuperSLMConfigureTestAccess.h"
 #include "SuperSLMJson.h"
 #include "SuperSLMModel.h"
 #include "SuperSLMModelImport.h"
@@ -429,8 +432,10 @@ namespace SuperSLMD4Fixtures
 		return R;
 	}
 
-	// The 22 arm/depth groups one mode's T-3050d block times on A-EX at cap 4096, keyed as the
-	// per-call CSV keys them (arm, depth).
+	// The arm/depth groups one mode times on A-EX at cap 4096, keyed as the per-call CSV keys them
+	// (arm, depth): the T-3050d block's 22, and (schema fast-decode plan rev 1.3.6, P1.1; the
+	// ruling on the red suite's question 2) the C = 2..7 arms at the batched depths,
+	// 30 more: 52 per mode.
 	struct FArmDepth { const TCHAR* Arm; int64 Depth; };
 	inline TArray<FArmDepth> ExpectedArmDepths()
 	{
@@ -443,6 +448,10 @@ namespace SuperSLMD4Fixtures
 			Out.Add({ TEXT("layer"), D });
 		}
 		for (const int64 D : { int64(1), int64(1024), int64(2048), int64(3072), int64(4088) }) { Out.Add({ TEXT("prompt_8"), D }); }
+		for (const TCHAR* Arm : { TEXT("prompt_2"), TEXT("prompt_3"), TEXT("prompt_4"), TEXT("prompt_5"), TEXT("prompt_6"), TEXT("prompt_7") })
+		{
+			for (const int64 D : { int64(1), int64(1024), int64(2048), int64(3072), int64(4088) }) { Out.Add({ Arm, D }); }
+		}
 		return Out;
 	}
 
@@ -975,13 +984,13 @@ namespace SuperSLMD4Fixtures
 		return bOk;
 	}
 
-	// Restores process-wide decode settings to the shipped defaults (no --save, so no bytes) for a
-	// cell that changed them through the console. A missing command is reported by the cell that
-	// needs it, not here.
+	// Clears this process's decode selection (no bytes written), for a cell that changed it through
+	// the console: the next resolution reads RuntimeSettings.ini and then the runtime's own shipped
+	// values, exactly as in a process that never ran SetDecodeMode or SetFinishParallelTasks. With
+	// the settings file removed, a cell therefore observes the runtime's fallback, not a selection.
 	inline void ResetProcessDecodeSettings()
 	{
-		IConsoleManager::Get().ProcessUserConsoleInput(TEXT("SuperSLM.SetDecodeMode 0"), *GLog, nullptr);
-		IConsoleManager::Get().ProcessUserConsoleInput(TEXT("SuperSLM.SetFinishParallelTasks 4"), *GLog, nullptr);
+		FSuperSLMConfigureTestAccess::ClearDecodeSelection();
 	}
 }
 

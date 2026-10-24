@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status:** the implemented Windows x64 architecture as of 1.2.0. See [PAGING.md](PAGING.md) for
+> **Status:** the implemented Windows x64 architecture as of 1.3.0. See [PAGING.md](PAGING.md) for
 > the paging API, and [BLUEPRINT_API.md](BLUEPRINT_API.md) and [TOOLING.md](TOOLING.md).
 
 ---
@@ -15,6 +15,8 @@
 - [The CPU backend](#the-cpu-backend)
 - [The GPU backend](#the-gpu-backend)
 - [Save and restore](#save-and-restore)
+- [The prefix cache](#the-prefix-cache)
+- [Skip-ahead for schema-bound generations](#skip-ahead-for-schema-bound-generations)
 - [Scope](#scope)
 
 ---
@@ -51,8 +53,8 @@ The plugin compiles SuperSLM's sources with the engine's toolchain. It never lin
 SuperSLM library.
 
 - The library sources of one exact SuperSLM commit are vendored under
-  `Plugins/SuperSLMUnreal/Source/ThirdParty/SuperSLM/`; 1.2.0 vendors SuperSLM v1.13.1
-  (d697927f6d5ce5fa73ecbb8660020a425518b923). `VENDORED_VERSION.txt` names the tag and its commit,
+  `Plugins/SuperSLMUnreal/Source/ThirdParty/SuperSLM/`; 1.3.0 vendors SuperSLM v1.15.0
+  (165962acafe901753dfe37153d7116b132a18b5a). `VENDORED_VERSION.txt` names the tag and its commit,
   and `VENDORED_MANIFEST.sha256` records each file's hash. Five route-P witness tool files carry
   a tracked hook-API adaptation described in `VENDORED_VERSION.txt`. The build reads the tag and commit from
   `VENDORED_VERSION.txt` and compiles them into the plugin, so every report and save blob can name
@@ -289,9 +291,9 @@ example model is `DispatchBudget = 96`. It has no default: `Configure()` refuses
 layer's dispatches.
 Where a figure below names a "default", it names its host:
 
-- **The example project** runs 4 layers per slice, selected from slice-cost measurements on an
-  NVIDIA RTX 2080 SUPER with the 0.5B example model. The measured slice times are in the
-  [Measured section of STATUS.md](STATUS.md#measured).
+- **The example project** runs a whole token per frame (the one-call path), as the Load node and a
+  default query do. Heavier scenes can set 4 to 12 layers per slice. The measured slice times at
+  each setting are in the [Measured section of STATUS.md](STATUS.md#measured).
 - **The Load SuperSLM Model node** sets the tick's budget to the model's whole depth, shared by the
   sequences in flight. Set a smaller slice from C++, or per query with
   `FSuperSLMQueryConfig::FrameBudgetLayers`.
@@ -309,10 +311,187 @@ pinned to a different SuperSLM tag. **So a save does not carry across a change o
 SuperSLM pin.** The plugin does not design your game's save format: it hands over the bytes, and
 your save system stores them.
 
+## The prefix cache
+
+A game often starts many generations from the same opening: a world description, an NPC's persona, a shop's rules.
+The prefix cache keeps those openings, called prefixes, already computed, so a generation starts from a stored prefix
+instead of prefilling it again.
+
+**Turning it on.** Set `FSuperSLMRuntimeConfig::PrefixCacheBudgetBytes` (0, the default, is no cache). In budget mode
+the cache takes that many bytes of the page pool. In legacy mode the pool grows by enough blocks for that many bytes. For the disk tier,
+also set `bPrefixDiskCacheEnabled`. `PrefixDiskCacheDirectory` defaults to `<ProjectSaved>/SuperSLM/PrefixCache`, and
+the directory is trimmed to `PrefixDiskCacheMaxBytes` (256 MiB by default), oldest file first. A write's temporary file
+that a crash left behind is removed at the next trim once it is an hour old. A re-`Configure()` empties the memory
+tier, and disk files stay. Registered prefix sets stay while the model stays the same: a `Configure()` of another model
+unregisters the sets built for a different one (logged `PrefixSetModelMismatch`), so register them again after
+configuring their model. In 1.3.0 the budget is set in C++: the **Load SuperSLM Model** node has no input for it.
+
+**Using it.** `RequestPrefix(Spec, OutPrefix, OutError)` takes a spec: the prefix's tokens, its schema name
+(`NAME_None` for none) and, for a nested prefix, its parent. It returns a lease at once. When `GetPrefixPhase` reads
+Ready, adopt the lease with `AdoptPrefix`, as you would a shared prefix. Return it with `ReturnPrefix` when you are done
+with it. A returned prefix stays cached until it is evicted. `GetPrefixLeaseState` names a refusal:
+
+- `BudgetExhausted`: the prefix does not fit the budget even after every possible eviction.
+- `PoolExhausted`: the page pool is short.
+- `UnknownSchema`: the schema name does not resolve.
+- `Cancelled`: a re-`Configure()` came while the lease was pending.
+- `Failed`: the build failed. The log names the reason.
+
+**Where a prefix comes from.** A request is served from the first tier that has it, and `GetPrefixSource` says which:
+
+1. **Memory**: a prefix already resident. Nothing is restored or built.
+2. **Cooked**: an entry of a registered prefix set (below), restored from the set's bytes.
+3. **Disk**: a file the disk tier wrote in an earlier session, restored.
+4. **Recomputed**: built by prefill, as `CreatePrefix` builds a shared prefix. With the disk tier on, the result is
+   also written to disk.
+
+The tokens a generation writes from the prefix are the same whichever tier served it. The automation and packaged
+checks compare every tier's tokens with a recompute's, and the determinism self-check gives the same verdict with
+the cache on as with it off.
+
+**The key.** An entry is found by:
+
+- its tokens;
+- its schema;
+- its parent, for a nested prefix;
+- the model;
+- the engine that built it, which is the backend, the vendored SuperSLM build and, on the GPU, the adapter's vendor
+  and device.
+
+So a cooked entry or a disk file built for another model, another SuperSLM release or another GPU is never served.
+Its request is a miss, and the prefix is built by prefill.
+
+**Memory and eviction.** Each resident prefix is charged its pages: a 128-token prefix of the 0.5B example model holds
+768 KiB. When a new prefix does not fit, the least recently used prefix that nothing is using is evicted. A prefix is
+in use while it is leased, or while a cached nested prefix still maps its pages. `GetPrefixCacheStats` reports the
+charge, resident bytes, evictions and the tier that served each request.
+
+**Nested prefixes** (budget mode only). A spec with a `Parent` lease is a suffix on that parent: the nested prefix
+shares the parent's full pages and holds only its own. For example, a world description can be the parent, and each
+NPC's persona a nested prefix on it. A child takes its parent's schema. Legacy mode refuses nested specs with
+`NestedRequiresBudgetMode`.
+
+**Level loads: warm and drop.** `WarmPrefix(Spec)` is a request that takes no lease: when it resolves, the prefix is
+resident and evictable like any unleased one. Warm a level's prefixes while it loads, and its first requests are
+`Memory` hits. `DropPrefix(Spec, Scope)` evicts a prefix now, or when the last thing using it lets go.
+`MemoryAndDisk` also deletes its disk file. Neither call ends or reaches through a lease, and neither touches a cooked
+set. Both return an op, which resolves on a later tick: read it with `GetPrefixOpResult`.
+
+**Prefix sets: cooked prefixes.** A `USuperSLMPrefixSet` asset names its model and lists entries. Each entry is
+defined by its token ids or by text, with an optional schema and an optional parent entry.
+
+- The editor's **Build Prefixes** action builds the set in the background: tokenize the text entries, prefill each
+  entry, and store its bytes in the asset. The progress notification has a Cancel button. A cancelled build, or one
+  whose set was edited while it ran, stores nothing.
+- The `SuperSLMBuildPrefixes` commandlet runs the same build for a build machine. Its output is byte-equal to the
+  action's.
+- The game never tokenizes a set's text: the ids stored at the build are the key.
+- The cook checks every entry. It logs a warning naming each entry the game would not use: one not built, built for
+  another model or another SuperSLM build, or edited since its build. The game builds such an entry by prefill when
+  it is requested. A text entry whose text or model changed ships with no ids and no bytes.
+- **Rebuild your sets whenever the plugin's vendored SuperSLM changes.**
+- In 1.3.0 a nested entry is not built; the build says so, and its requests are built by prefill.
+- `RegisterPrefixSet(Set)` adds a set's entries to the cooked tier, and registering the set again after a rebuild
+  replaces them. `FindEntrySpec(ConfiguredModel, Entry, OutSpec, OutParentEntry)` gives the spec to request an entry
+  by name.
+
+**How the work is scheduled.** Every cache operation runs on a worker lane and is planned like other jobs:
+
+- **A restore** is priced at `RestoreCostMs` plus `RestoreCostPerMiBMs` per MiB of its bytes.
+- **A build by prefill is sliced.** Each chunk is one prefill call of at least `MinPrefillChunk` tokens, and
+  generations on the same lane run between the chunks. A 2,000-token build ran as 250 chunks of 8 tokens, with at
+  most one generation job between two of its chunks. The tokens and the saved bytes equal a single-call build's.
+- **The prices come from `SuperSLM.EstimateCosts`.** It measures a restore's per-MiB cost and the build's prefill
+  price. `USuperSLMSubsystem::WriteInSituPrefixPrefillPrice` refits the build's price from a build that ran inside the
+  game. On an AMD Ryzen 9 3950X with the 0.5B example model, the in-game price was about 1.5 times the one measured
+  alone.
+
+**What it costs, measured.** These readings are from a packaged Development build on an AMD Ryzen 9 3950X with the
+0.5B example model. They were taken at SuperSLM 1.14.0's engine; 1.15.0 does not change prefill or prefix restore.
+
+| What | Measured |
+|---|---|
+| Restore a 128-token prefix from a cooked set | 0.92 to 1.01 ms of worker time (10 restores) |
+| Build a prefix by prefill, timed alone | about 15.5 ms per token plus 0.0046 ms per position: about 2.0 s for 128 tokens |
+| Build a prefix inside a running game (sliced, 2,048 tokens) | a median of 30.1 ms per token |
+| Longest game-thread tick while 10 cooked prefixes loaded | 0.24 ms (3,828 ticks) |
+
+Worker time is not frame time: the plugin spreads a long job over frames, and the game thread only hands jobs out and
+collects their results.
+
+**On the GPU.** The cache is CPU-only in 1.3.0. `USuperSLMGpuSubsystem` declares the same calls
+(`ConfigurePrefixCache`, `RequestPrefix` and the rest, for pooled sequences, keyed by the adapter), but they are not
+yet connected to the GPU scheduler, so they refuse `NotConfigured`. SuperSLM 1.15.0 also does not release GPU prefix
+save and restore, which the GPU cache's cooked and disk tiers need.
+
+## Skip-ahead for schema-bound generations
+
+When a schema is bound, there are stretches where it allows only one text: the rest of a key name, a quote, a colon,
+a closing brace. Normally the model still spends one decode on each of those tokens. Skip-ahead (the
+`SchemaJumpForward` setting) writes such a stretch in one batched pass through the prefill path. It is set per
+generation on `FSuperSLMGenerationRequest`, and it is CPU-only: the GPU backend ignores it. One decode job can mix
+sequences in different modes.
+
+| Setting | Tokens | How it works |
+|---|---|---|
+| `Off` (default) | the model's own | One decode per token. |
+| `Exact` | identical to `Off`, and so is the save | The plugin guesses the next tokens, and SuperSLM checks each guess with the model's own decode rule. It keeps only the guesses the model would have written. A wrong guess costs time, never a different token. |
+| `Canonical` | fewer, and different | SuperSLM writes the schema's own spelling of the forced text, for example `"name"`, even where the model would have split it into other tokens. The model then continues from text it did not write. |
+
+**Where `Exact`'s guesses come from.** The plugin learns them per model and schema, from that schema's earlier
+finished generations in this configuration. It learns from `Off` and `Exact` generations that reached the end of
+their schema, never from `Canonical` ones. It learns only at points where the schema allows one text, and keeps at most
+4 tokens per point. It stops guessing where its history is unsure. What it learned starts empty at every
+`Configure()`, is dropped when the model is unmapped, and is never saved.
+
+So `Exact` speeds up a schema the game uses repeatedly. Its first generations, before anything is learned, run as
+`Off` does. The schema's walk table loads on a pool thread at the first schema-bound `Exact` or `Canonical`
+generation. Until it has loaded, `Exact` guesses nothing.
+
+**What it buys.** SuperSLM measured skip-ahead with the same model and the same CPU as the table above. The prompt was
+the example's potion-shop order: 41 prompt tokens, and 28 tokens to the schema's end. The times are generation only,
+the median of 15 runs.
+
+| Setting | Tokens written | One thread | 4 tasks (threaded decode) |
+|---|---|---|---|
+| `Off` | 28 | 897 ms | 549 ms |
+| `Exact`, guessing from earlier orders | 28, the same | 604 ms (1.48x) | 557 ms (about even) |
+| `Canonical` | 21, different | 471 ms | 456 ms |
+
+Over 20 other orders, `Exact` took 12,878 ms against 16,676 ms off, 1.3 times faster in total. The median order was
+1.42 times faster, and one order was slower (0.82x). `Exact` pays only when most guesses are right: about 60% of the
+guessed tokens must be accepted before it gains, and a wrong guess costs about 0.6 of a decode. With threaded decode
+on (`bParallelDecode` with `FinishParallelTasks` above 1), `Exact` is about even with `Off`, and the plugin caps its
+guesses at 6 tokens.
+
+These are SuperSLM's timings, not timings inside a running game. In the game, the scheduler sizes a skip-ahead pass
+from the prices of 2- to 7-token prompt chunks. `SuperSLM.EstimateCosts` measures those prices. Until a saved estimate
+has them, each pass is priced as that many one-token prompt calls, which over-prices it: the pass takes more ticks to
+deliver, and the tokens are unchanged.
+
+**Rules it keeps.**
+
+- Skipped tokens count toward `MaxNewTokens`.
+- In `Exact`, a pass never writes the generation's last allowed token. So at a `MaxNewTokens` cut, an `Exact` sequence
+  saves exactly the state an `Off` one saves. A `Canonical` pass may write it, so a `Canonical` save at a cut is not
+  `Off`'s (its tokens differ anyway).
+- A guess stops before the first of the request's `StopTokenIds`. So an `Exact` generation stops where `Off` stops,
+  with the same save.
+- Skip-ahead needs to know where the sequence is in its schema. That is true of a fresh sequence, and of one that
+  adopted a prompt-only prefix. On a restored sequence it is not known, so `Exact` runs as `Off` does there, and
+  `Canonical` still writes the forced text.
+- An `Exact` or `Canonical` generation does not use the worker's decode continuations.
+
+**Choosing a mode.** Use `Exact` for a schema the game fills many times, at one decode thread. The output is
+unchanged, so nothing else in the game needs to know. Use `Canonical` only after checking its output for your
+schema. Its tokens differ from `Off`'s, so its token digests and determinism comparisons differ too. On SuperSLM's 40
+test orders, 32 came out different from `Off`, and the quality verdict was inconclusive.
+
 ## Scope
 
 In scope: the `.sslm` asset and cooked serialization; engine-owned KV and workspace memory on the
-CPU backend; the CPU and GPU schedulers; a Blueprint surface; the determinism self-check as an
+CPU backend; the CPU and GPU schedulers; the prefix cache and cooked prefix sets; skip-ahead on the CPU backend;
+a Blueprint surface; the determinism self-check as an
 editor tool and a packaged-build entry point; the editor tooling; a minimal example project.
 
 Out of scope: any change to SuperSLM; game-specific logic built on top of the plugin; the design

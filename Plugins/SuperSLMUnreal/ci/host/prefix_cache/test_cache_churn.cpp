@@ -34,14 +34,15 @@ HOST_TEST(cache_churn_keeps_every_invariant, "1.4, 7.10 (host half: the fake poo
 		const FPrefixCacheDiagnostics D = F.Diag();
 		const uint64_t Drawn = F.Sim->CacheDrawnPages * F.Config.PageBytes;
 		if (D.ChargedBytes > F.Config.BudgetBytes || Drawn > D.ChargedBytes || F.Sim->CacheDrawnPages > BudgetPages ||
-			D.ChargedBytes != D.ResidentBytes + D.InFlightBytes + D.ReleasingBytes || !F.Sim->Violations.empty())
+			D.ChargedBytes != D.ResidentBytes + D.InFlightBytes + D.ReleasingBytes + D.WaitingBytes ||
+			D.ClaimedRefundBytes + D.UnclaimedRefundBytes != D.ReleasingBytes || !F.Sim->Violations.empty())
 		{
 			if (!bBroken)
 			{
 				HostTest::Fail(__FILE__, __LINE__, std::string("invariant broken ") + Where + " at step " + std::to_string(Steps) +
 					": charged=" + std::to_string(D.ChargedBytes) + " budget=" + std::to_string(F.Config.BudgetBytes) +
-					" drawn=" + std::to_string(Drawn) + " resident+inflight+releasing=" +
-					std::to_string(D.ResidentBytes + D.InFlightBytes + D.ReleasingBytes) +
+					" drawn=" + std::to_string(Drawn) + " resident+inflight+releasing+waiting=" +
+					std::to_string(D.ResidentBytes + D.InFlightBytes + D.ReleasingBytes + D.WaitingBytes) +
 					(F.Sim->Violations.empty() ? std::string() : " violation: " + F.Sim->Violations.front()));
 			}
 			bBroken = true;

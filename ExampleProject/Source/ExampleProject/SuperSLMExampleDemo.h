@@ -7,6 +7,7 @@
 #include "SuperSLMGpuSchemaHandle.h"
 #include "SuperSLMGpuTypes.h"
 #include "SuperSLMSchemaHandle.h"
+#include "SuperSLMSchemaJumpTypes.h"
 #include "SuperSLMSequenceTypes.h"
 
 class USuperSLMModel;
@@ -61,15 +62,25 @@ namespace SuperSLMExample
 	// The voiced reply's decode budget. Fixed: no control moves the answer or its digest.
 	constexpr int32 ReplyMaxNewTokens = 32;
 
-	// The GPU default slice: 4 layers. At 4, every decode- and prompt-slice median gpu_busy_ms on
-	// record, headless and in the editor with its viewport rendering, was at most 1.58 ms on one
-	// RTX 2080 SUPER (context up to about 400 tokens); at 5 one prompt-slice median was 2.20 ms.
-	// It moves only if a headless and a rendering measurement both select another setting.
-	constexpr int32 DefaultFrameBudgetLayers = 4;
+	// The GPU default Frame Budget: a whole token per frame, the one-call path. This is the plugin's
+	// own default (FSuperSLMQueryConfig::FrameBudgetLayers = 0, and the Load node's whole depth).
+	// Heavier scenes can set 4 to 12 layers per slice. -SuperSLMExampleLayers=N replaces it at
+	// startup (FrameBudgetLayersFromCommandLine()).
+	constexpr int32 DefaultFrameBudgetLayers = NumHiddenLayers;
 
-	// The GPU slice budget a slice's gpu_busy_ms is compared with for the hitch count
-	// (the 2 ms slice target). A comparison, never a refusal.
-	constexpr double GpuSliceBudgetMs = 2.0;
+	// One frame at 60 fps, the cap the example's packaged runs use.
+	constexpr double FrameMsAt60Fps = 1000.0 / 60.0;
+
+	// A frame counts as missed only past the cap's period plus this tolerance. A frame limiter waits
+	// to the period and overshoots it by microseconds, so an on-cap frame is always slightly over it.
+	constexpr double MissedFrameToleranceMs = 0.5;
+
+	// The frame-time record's second threshold: a frame this long is a visible stall at the cap.
+	constexpr double LongFrameMs = 20.0;
+
+	// What a GPU slice's gpu_busy_ms is compared with for the hitch count: one 60 fps frame.
+	// A comparison, never a refusal.
+	constexpr double GpuSliceBudgetMs = FrameMsAt60Fps;
 
 	// The plugin's bound on the CPU backend's own game-thread Tick() (plan and apply bookkeeping,
 	// no inference): under 1 ms per tick, set about three orders of magnitude above the
@@ -91,6 +102,41 @@ namespace SuperSLMExample
 	// Binaries/Win64/shaders; logits_site is the one the logits head loads at map time.
 	constexpr int32 ExpectedGpuShaderCount = 35;
 	inline const TCHAR* LogitsSiteShaderFile() { return TEXT("logits_site.cso"); }
+}
+
+namespace SuperSLMExample
+{
+	// A frame-time record: nearest-rank percentiles of per-frame ms, the frames that missed the cap
+	// (over its period plus MissedFrameToleranceMs) and the frames over LongFrameMs.
+	struct FFrameTimeSummary
+	{
+		int32 Frames = 0;
+		double P50Ms = 0.0;
+		double P95Ms = 0.0;
+		double P99Ms = 0.0;
+		double MaxMs = 0.0;
+		double CapPeriodMs = 0.0;
+		int32 MissedFrames = 0;
+		int32 FramesOverLongFrame = 0;
+	};
+
+	FFrameTimeSummary SummarizeFrameTimes(const TArray<double>& FrameMs, double CapPeriodMs);
+
+	// The active frame cap's period: 1000 / t.MaxFPS when it is set, otherwise one 60 fps frame.
+	double ActiveCapPeriodMs();
+
+	// -SuperSLMExampleLayers=N on the command line: the GPU Frame Budget the scene and its packaged
+	// check start at, 1 to NumHiddenLayers, or 0 for a whole token (the plugin's convention). True
+	// when the switch is present and valid; an empty, non-numeric or out-of-range value is logged
+	// and the default is kept.
+	bool FrameBudgetLayersFromCommandLine(int32& OutLayers);
+
+	// -SuperSLMExampleJumpForward=0|1|off|exact|canonical in CommandLine: the schema-jump-forward mode
+	// the scene's extraction requests carry (FSuperSLMExampleSettings::SchemaJumpForward), parsed by
+	// the plugin's ParseSuperSLMSchemaJumpForwardSwitch (case-insensitive; 0 is off, 1 canonical).
+	// True when the switch is present and valid. Any other value, empty or padded included, is
+	// refused with a Warning naming the switch, and InOutMode stays as it was (plan P1.9, XD7).
+	bool SchemaJumpForwardFromCommandLine(const TCHAR* CommandLine, ESuperSLMSchemaJumpForward& InOutMode);
 }
 
 enum class ESuperSLMExampleBackend : uint8
@@ -129,6 +175,11 @@ struct FSuperSLMExampleSettings
 	int32 RequestedK = 1;
 
 	FString Utterance = SuperSLMExample::DefaultUtterance();
+
+	// The extraction's schema-jump-forward mode (-SuperSLMExampleJumpForward). Off by default; it
+	// moves only frames-to-answer, never the structured result or its digest. The free-decode reply
+	// is unbound, so the setting does not apply to it.
+	ESuperSLMSchemaJumpForward SchemaJumpForward = ESuperSLMSchemaJumpForward::Off;
 
 	// The GPU's Frame Budget at its top position: the one-call path.
 	bool IsWholeToken() const { return FrameBudgetLayers >= SuperSLMExample::NumHiddenLayers; }
@@ -180,6 +231,11 @@ struct FSuperSLMExampleReadout
 	int32 FramesToAnswer = 0;
 	double WallMsToAnswer = 0.0;
 
+	// The engine's frame time (FApp::GetDeltaTime(), ms) of every frame from Ask to the answer,
+	// one sample per frame counted in FramesToAnswer, and its summary.
+	TArray<double> FrameMsSamples;
+	SuperSLMExample::FFrameTimeSummary FrameTime;
+
 	// Backend facts the packaged check reads directly.
 	bool bGpuDeviceHeadActive = false;
 	FString GpuDeviceHeadStatus;
@@ -194,6 +250,10 @@ struct FSuperSLMExampleReadout
 	// (USuperSLMGpuSubsystem::GetLayersPerTick()), which the Frame Budget sets. CPU: the longest
 	// game-thread Tick() of this run and how many ticks it covers (GetTickHistory() DurationMs).
 	int32 GpuLayersPerTick = 0;
+
+	// GPU: how many of this run's sequences the backend vended on each path (GetDecodePath()).
+	int32 GpuOneCallSequences = 0;
+	int32 GpuComposedSequences = 0;
 	double CpuMaxTickMs = -1.0;
 	int32 CpuTicks = 0;
 
@@ -356,6 +416,7 @@ private:
 	double CpuTokensPerSecondLast = 0.0;
 	TArray<double> GpuBusySamples;
 	double LastHostFinishMs = 0.0;
+	TArray<double> FrameMsSamples;
 
 	// Baselines for the invariant: key = utterance.
 	struct FBaseline
