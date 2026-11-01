@@ -17,10 +17,15 @@ namespace HostSim
 		std::unique_ptr<FSim> Sim;
 		bool bConfigured = false;
 
-		// PoolSlackPages: pages the fake pool has beyond the budget's.
-		FCacheFixture(uint32_t EntryBudget, bool bDisk, uint64_t PoolSlackPages = 8)
+		// PoolSlackPages: pages the fake pool has beyond the budget's. Identity (optional): the engine identity the
+		// cache keys by in place of the fixture's CPU one (a GPU device's, for the cooked GPU twins, step U7).
+		FCacheFixture(uint32_t EntryBudget, bool bDisk, uint64_t PoolSlackPages = 8, const FPrefixEngineIdentity* Identity = nullptr)
 		{
 			Config = FixtureConfig(EntryBudget, bDisk);
+			if (Identity != nullptr)
+			{
+				Config.Identity = *Identity;
+			}
 			bConfigured = Cache.Configure(Config);
 			Sim.reset(new FSim(Cache, Config, BudgetPages() + PoolSlackPages));
 		}

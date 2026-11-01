@@ -3,7 +3,7 @@
 The front page is the [README](../README.md). This page is the precise version: what 1.0 has been built and tested on, what it does not claim, and every figure on file with the machine it came from.
 
 > **Status: 1.0.** Built and tested on Windows x64: the model asset and importer, the CPU and GPU
-> backends with their schedulers, save and restore, shared prefixes (CPU backend only), the
+> backends with their schedulers, save and restore, shared prefixes (CPU backend only in 1.0; 1.4 adds the prefix cache on the GPU backend), the
 > determinism self-check, the Blueprint surface, the editor tools, the Unreal Insights
 > instrumentation, and the example project, which has been built, run and packaged. What 1.0 does not claim is listed under
 > *Known limitations* in [CHANGELOG.md](../CHANGELOG.md).
@@ -53,6 +53,11 @@ which was measured loading the 1.5B model on the maintainer's machine (AMD Ryzen
 
 What the GPU backend buys over the CPU backend is CPU time: inference runs on the GPU in slices of whole layers. At 4 layers per slice on an RTX 2080 SUPER with the 0.5B model, a slice measured about 2 ms.
 
+From 1.4, prompts are read several tokens per pass, so they take fewer frames, and the plugin plans each frame's
+GPU work within the budget you set. GPU frame timing is measured and reported, not certified to the frame: a card
+that slows down under sustained load can run over a small budget for a stretch (see
+[Multi-row GPU passes](ARCHITECTURE.md#multi-row-gpu-passes)).
+
 The per-slice GPU times on file, with and without the engine rendering, are under
 [Measured](#measured).
 
@@ -71,7 +76,7 @@ which you enable in your project. In practice both mean a source-built engine.
 | Platform | 1.0 status |
 |---|---|
 | **Windows x64**, CPU backend | Supported and verified. |
-| **Windows x64**, GPU backend (D3D12) | Supported. Its determinism is not claimed in 1.0: GPU determinism is per device, and in 1.0 the self-check's GPU verdict is always withheld (recorded in the report, *Not Yet Run* on every public surface). A later release shows it. SuperSLM itself certifies two GPUs: the NVIDIA RTX 2080 SUPER and the AMD Radeon RX 7900 XTX. |
+| **Windows x64**, GPU backend (D3D12) | Supported. Its determinism is not claimed in 1.0: GPU determinism is per device, and in 1.0 the self-check's GPU verdict is always withheld (recorded in the report, *Not Yet Run* on every public surface). A later release shows it. SuperSLM's GPU certification covers the NVIDIA RTX 2080 SUPER and the AMD Radeon RX 7900 XTX. Its multi-row passes, which 1.4 uses, are certified on the AMD Radeon RX 7900 XT. On an NVIDIA RTX 5060 they gave the same tokens as SuperSLM's reference, but its timing is not certified. |
 | **Linux x64**, **macOS (Apple Silicon)** | Share the same sources, **not verified**: neither has been built or tested as an Unreal plugin. The GPU backend is Windows-only. |
 
 - **Unreal Engine 5.8.**
@@ -163,6 +168,7 @@ Every figure here is a measurement, or computed where marked, with the machine i
 | Determinism self-check, CPU | *Verified* at SuperSLM `v1.9.0` (1.0), at `v1.13.1` (1.2) and at `v1.15.0` (1.3, with the prefix cache off and again with it serving a cooked set), in a packaged Windows Development build of the example | AMD Ryzen 9 3950X CPU, Windows x64 |
 | Prefix cache, restore of a cooked 128-token prefix, 1.3 | 0.92 to 1.01 ms of worker time (10 restores); the prefix holds 768 KiB. Building it by prefill instead: about 15.5 ms per token timed alone | Packaged Windows Development build of the example, AMD Ryzen 9 3950X, at SuperSLM 1.14.0's engine (1.15.0 does not change prefill or prefix restore) |
 | Prefix cache, game-thread tick while 10 cooked prefixes load, 1.3 | at most 0.24 ms (3,828 ticks) | Packaged Windows Development build of the example, AMD Ryzen 9 3950X |
+| Prefix cache on the GPU backend, packaged game, 1.4 | 10 cooked 128-token prefixes all served from the cooked set, no prefill, the same tokens as building them; at a budget of five, re-entering the level served 5 from memory and the 5 evicted from the cooked set; with the disk tier on, a second run served all 10 from disk with the same tokens. Game thread's time in the GPU backend's tick at most 0.18 ms (2,269 ticks) | Packaged Windows Development build of the example, AMD Radeon RX 7900 XT, 0.5B model |
 | Determinism self-check, GPU | Withheld: in 1.0 the GPU verdict is always withheld (recorded in the report, shown as *Not Yet Run*); a later release shows it | |
 | GPU device-resident head, VRAM per mapped 0.5B model | 137,353,728 B requested buffers (a lower bound on what the driver occupies) | Computed from the model's shape (not a measurement); SuperSLM measured 137,433,088 B on the RTX 2080 SUPER |
 | GPU time per slice, 4 layers per slice | Below the table | NVIDIA RTX 2080 SUPER, 0.5B example model |

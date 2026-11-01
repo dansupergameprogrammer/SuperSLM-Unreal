@@ -1,9 +1,10 @@
 #pragma once
 
 // Preprocessed out unless SUPERSLM_WITH_PREFIX_CACHE is on. Its save and restore calls are preprocessed out
-// unless SUPERSLM_WITH_GPU_PREFIX_SAVE is on as well. It defaults to 0: Layer 1 1.15.0 exports the GPU prefix
-// save and restore verbs but does not release them (1.16.0 does), and defines no feature macro for them.
-// Not yet installed by the GPU subsystem: see SuperSLMGpuSubsystemPrefixCache.h.
+// unless SUPERSLM_WITH_GPU_PREFIX_SAVE is on as well. It defaults to 0 here: Layer 1 1.15.0 exported the GPU prefix
+// save and restore verbs without releasing them (1.16.0 released them) and defines no feature macro for them, so
+// SuperSLMUnreal.Build.cs sets it on Win64, where the vendored engine is v1.18.1 (plugin 1.4.0). Installed by the
+// GPU subsystem's Configure(): see SuperSLMGpuSubsystemPrefixCache.h.
 //
 // The GPU subsystem's prefix cache instance (precache plan §5.3-§5.7, §5.11; step U6). It is the CPU
 // cache host (SuperSLMPrefixCacheHost.h) with the GPU's Layer-1 half: the same host-tested core, the
@@ -69,14 +70,19 @@ public:
 	// backend 1, and the adapter's vendor and device ids (ResolveAdapterIds).
 	static SuperSLMCore::FPrefixEngineIdentity MakeGpuIdentity(const SuperSLMCore::FPrefixEngineIdentity& Base, uint32 AdapterVendorId, uint32 AdapterDeviceId);
 
-	// The adapter ids for the key. 1.15.0 exposes no getter for the context's adapter: the subsystem's
-	// RHI adapter ids stand in (GRHIVendorId, GRHIDeviceId), which name the same adapter when the engine
-	// context was created on the RHI's adapter. If they ever differ the cost is misses, never a wrong
-	// prefix: the engine's restore checks the blob's producer against its own context.
-	static void ResolveAdapterIds(uint32& OutVendorId, uint32& OutDeviceId);
+	// The adapter ids for the key (precache U7): those of the adapter Layer 1 dispatches on, read from its
+	// DXGI_ADAPTER_DESC1 at Configure (bLayer1Known), which are the ids the engine writes into each SPX1 blob it
+	// saves. The RHI's adapter ids (GRHIVendorId, GRHIDeviceId) stand in only when that description did not read;
+	// they name another adapter under -nullrhi or when the RHI runs on another GPU, and the cost then is misses,
+	// never a wrong prefix: the engine's restore checks the blob's producer against its own context.
+	static void ResolveAdapterIds(bool bLayer1Known, uint32 Layer1VendorId, uint32 Layer1DeviceId, uint32& OutVendorId, uint32& OutDeviceId);
 
 	// Configure()'s GPU half, before Configure(): the handles and callbacks the Layer-1 calls use.
 	void SetLayer1(FSuperSLMGpuPrefixLayer1 InLayer1) { Layer1 = MoveTemp(InLayer1); }
+
+	// Precache U6, Q7: a build step's prefill slice. A step stops prefilling once its slice is spent (after one call at
+	// least), far under the row-21 bound (kFramePathBoundSeconds, 10 s) a single job is held to.
+	static constexpr double BuildStepSliceSeconds = 0.25;
 
 protected:
 	virtual FSuperSLMPrefixLaneJob MakeLaneJob(const SuperSLMCore::FPrefixCommand& Command) override;

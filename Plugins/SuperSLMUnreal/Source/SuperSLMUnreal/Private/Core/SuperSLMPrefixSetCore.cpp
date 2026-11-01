@@ -225,7 +225,7 @@ namespace SuperSLMCore
 				else
 				{
 					Finding = EPrefixSetFinding::NestedRequiresBudgetMode;
-					Detail = "nested cache entries wait for budget-mode nesting; the build leaves it empty and the runtime refuses the spec by name";
+					Detail = "a cooked set builds no nested entry; the build leaves it empty and a request for it is served as any request without a cooked entry";
 				}
 			}
 			if (Finding == EPrefixSetFinding::Count)
@@ -687,6 +687,59 @@ namespace SuperSLMCore
 				}
 			}
 		}
+	}
+
+	namespace
+	{
+		uint32_t PrefixSetReadLe32(const uint8_t* At)
+		{
+			return static_cast<uint32_t>(At[0]) | (static_cast<uint32_t>(At[1]) << 8u) | (static_cast<uint32_t>(At[2]) << 16u)
+				| (static_cast<uint32_t>(At[3]) << 24u);
+		}
+	}
+
+	bool ReadSpx1Producer(const uint8_t* Data, size_t Size, uint32_t& OutBackend, uint32_t& OutVendorId, uint32_t& OutDeviceId)
+	{
+		OutBackend = 0;
+		OutVendorId = 0;
+		OutDeviceId = 0;
+		if (Data == nullptr || Size < kSpx1HeaderBytes || Data[0] != 'S' || Data[1] != 'P' || Data[2] != 'X' || Data[3] != '1')
+		{
+			return false;
+		}
+		OutBackend = PrefixSetReadLe32(Data + 4);
+		OutVendorId = PrefixSetReadLe32(Data + 20);
+		OutDeviceId = PrefixSetReadLe32(Data + 24);
+		return true;
+	}
+
+	bool PrefixSetPayloadsFromProducer(const std::vector<std::vector<uint8_t>>& Payloads, const FPrefixEngineIdentity& Producer,
+		size_t& OutIndex, uint32_t& OutBackend, uint32_t& OutVendorId, uint32_t& OutDeviceId)
+	{
+		OutIndex = 0;
+		OutBackend = 0;
+		OutVendorId = 0;
+		OutDeviceId = 0;
+		for (size_t I = 0; I < Payloads.size(); ++I)
+		{
+			if (Payloads[I].empty())
+			{
+				continue;
+			}
+			uint32_t Backend = 0;
+			uint32_t Vendor = 0;
+			uint32_t Device = 0;
+			const bool bRead = ReadSpx1Producer(Payloads[I].data(), Payloads[I].size(), Backend, Vendor, Device);
+			if (!bRead || Backend != static_cast<uint32_t>(Producer.Backend) || Vendor != Producer.AdapterVendorId || Device != Producer.AdapterDeviceId)
+			{
+				OutIndex = I;
+				OutBackend = Backend;
+				OutVendorId = Vendor;
+				OutDeviceId = Device;
+				return false;
+			}
+		}
+		return true;
 	}
 
 	std::vector<size_t> PrefixSetStaleTextEntries(const std::vector<FPrefixSetEntry>& Entries, const std::array<uint8_t, 32>& ModelArtifactHash)

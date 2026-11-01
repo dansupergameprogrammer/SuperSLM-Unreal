@@ -21,25 +21,27 @@
 // a run before the re-vendor reads "the engine verbs are red stubs" rather than a token mismatch.
 inline bool SuperSLMSchemaJumpVerbsAreReal() { return SUPERSLM_WITH_SCHEMA_JUMP_FORWARD != 0; }
 
-// The setting (§6 P1-X; the ruling of 2026-10-20 16:23Z: both modes are plain options,
-// default Off). Per generation, on FSuperSLMGenerationRequest::SchemaJumpForward, so one decode job
-// can hold an Exact, a Canonical and an Off sequence (cell P1X.9). The GPU subsystem ignores it
-// (cells P1.6, P1X.4).
+// The setting (§6 P1-X; the ruling of 2026-10-20 16:23Z: a plain option, default Off). Per generation, on
+// FSuperSLMGenerationRequest::SchemaJumpForward, so one decode job can hold an Exact and an Off sequence (cell P1X.9).
 //   Off       jump-forward off: today's decode, token for token.
-//   Exact     exact mode (§5.10): the same tokens as Off, with drafted tokens checked in batches.
-//   Canonical canonical jump-forward (§5.1-§5.6): fewer, different tokens; a new digest.
+//   Exact     exact mode (§5.10): the same tokens as Off, with drafted tokens checked in batches. On the GPU
+//             backend (plugin 1.4, multi-row GPU plan MR-D11) Exact runs on the multi-row path: the pending token
+//             and the schema's forced chain are checked as one row chunk, sliced inside the frame budget.
+// Plugin 1.4 removes Canonical (SuperSLM 1.18.0 removes it from the engine; errata E-11 (e)). Off and Exact keep their
+// numbers, so a value of 2 saved by an older project is no enumerator: it falls back to the default, Off, with no
+// migration (multi-row ruling 39 Q10).
 enum class ESuperSLMSchemaJumpForward : uint8
 {
 	Off = 0,
 	Exact = 1,
-	Canonical = 2,
 };
 
 // The example's scratch switch, -SuperSLMExampleJumpForward=<value> (§6 P1 and P1-X; cell P1.9; mutant
 // XD7; review round 1 finding 3, a code defect against plan text). The example reads only this
 // module's public API, so this is the switch's parser for it: it parses Text with the core's
 // SuperSLMCore::ParseSchemaJumpSwitch, which gives that function its production caller. `0` is Off,
-// `1` is Canonical (P1's on), and `off`, `exact` and `canonical` in any case are those modes: true,
-// with InOutMode set. Any other value, empty or padded text included, is refused: false, with
+// `1` is Exact (plugin 1.4, multi-row ruling 39 Q7), and `off` and `exact` in any case are those modes: true,
+// with InOutMode set. `canonical` in any case and `2` are refused with InOutMode set to Off: Canonical was removed
+// in 1.4, and the caller logs that. Any other value, empty or padded text included, is refused: false, with
 // InOutMode unchanged. The caller logs the refusal, naming the value. Game thread or any thread.
 SUPERSLMUNREAL_API bool ParseSuperSLMSchemaJumpForwardSwitch(const FString& Text, ESuperSLMSchemaJumpForward& InOutMode);

@@ -921,7 +921,40 @@ void FSuperSLMPrefixCacheTestSeam::SetDiskFault(USuperSLMSubsystem& Subsystem, E
 bool FSuperSLMPrefixCacheTestSeam::EditDiskWrapper(const FString& Path, ESuperSLMDiskWrapperEdit Edit)
 {
 	TArray<uint8> Bytes;
-	if (!FFileHelper::LoadFileToArray(Bytes, *Path) || Bytes.Num() < static_cast<int32>(SuperSLMCore::kPrefixWrapperFixedBytes))
+	if (!FFileHelper::LoadFileToArray(Bytes, *Path) || !EditWrapperBytes(Bytes, Edit))
+	{
+		return false;
+	}
+	return FFileHelper::SaveArrayToFile(Bytes, *Path);
+}
+
+bool FSuperSLMPrefixCacheTestSeam::ReadWrapperPayloadProducer(const TArray<uint8>& Wrapper, uint32& OutBackend, uint32& OutVendorId, uint32& OutDeviceId)
+{
+	OutBackend = 0;
+	OutVendorId = 0;
+	OutDeviceId = 0;
+	int64 Offset = 0;
+	int64 Size = 0;
+	if (Wrapper.Num() < static_cast<int32>(SuperSLMCore::kPrefixWrapperFixedBytes) || !SuperSLMPrefixCacheGlue::PrefixGlueWrapperPayload(Wrapper, Offset, Size))
+	{
+		return false;
+	}
+	uint32_t Backend = 0;
+	uint32_t Vendor = 0;
+	uint32_t Device = 0;
+	if (!SuperSLMCore::ReadSpx1Producer(Wrapper.GetData() + Offset, static_cast<size_t>(Size), Backend, Vendor, Device))
+	{
+		return false;
+	}
+	OutBackend = Backend;
+	OutVendorId = Vendor;
+	OutDeviceId = Device;
+	return true;
+}
+
+bool FSuperSLMPrefixCacheTestSeam::EditWrapperBytes(TArray<uint8>& Bytes, ESuperSLMDiskWrapperEdit Edit)
+{
+	if (Bytes.Num() < static_cast<int32>(SuperSLMCore::kPrefixWrapperFixedBytes))
 	{
 		return false;
 	}
@@ -954,6 +987,57 @@ bool FSuperSLMPrefixCacheTestSeam::EditDiskWrapper(const FString& Path, ESuperSL
 		Bytes[Offset + Size / 2] ^= 0x5A;
 		break;
 	}
+	case ESuperSLMDiskWrapperEdit::PayloadAdapter:
+	{
+		// Another producer adapter: the SPX1 header's adapter vendor (offset 20) and device (24) fields changed and the
+		// digest (28) recomputed, so the restore passes the digest and backend checks and is refused at the producer check
+		// (Layer 1's src/spx1_format.h: "engine major, minor or patch, or adapter vendor or device, differ").
+		constexpr int64 kSpx1Header = 184, kVendorAt = 20, kDeviceAt = 24, kDigestAt = 28;
+		int64 Offset = 0;
+		int64 Size = 0;
+		if (!SuperSLMPrefixCacheGlue::PrefixGlueWrapperPayload(Bytes, Offset, Size) || Size < kSpx1Header
+			|| FMemory::Memcmp(Bytes.GetData() + Offset, "SPX1", 4) != 0)
+		{
+			return false;
+		}
+		uint8* Spx1 = Bytes.GetData() + Offset;
+		uint32 Vendor = 0;
+		uint32 Device = 0;
+		FMemory::Memcpy(&Vendor, Spx1 + kVendorAt, 4);
+		FMemory::Memcpy(&Device, Spx1 + kDeviceAt, 4);
+		Vendor ^= 0x1u;
+		Device ^= 0x1u;
+		FMemory::Memcpy(Spx1 + kVendorAt, &Vendor, 4);
+		FMemory::Memcpy(Spx1 + kDeviceAt, &Device, 4);
+		FMemory::Memzero(Spx1 + kDigestAt, 32);
+		uint8 Digest[32] = {};
+		superslm::Sha256Hash(Spx1, static_cast<size_t>(Size), Digest);
+		FMemory::Memcpy(Spx1 + kDigestAt, Digest, 32);
+		break;
+	}
+	case ESuperSLMDiskWrapperEdit::PayloadDevice:
+	{
+		// Precache U7: the SPX1 header's adapter device (offset 24) alone changed and the digest (28) recomputed, so the
+		// restore passes the digest and backend checks and is refused at the producer check: the same vendor's other GPU.
+		constexpr int64 kSpx1Header = 184, kDeviceAt = 24, kDigestAt = 28;
+		int64 Offset = 0;
+		int64 Size = 0;
+		if (!SuperSLMPrefixCacheGlue::PrefixGlueWrapperPayload(Bytes, Offset, Size) || Size < kSpx1Header
+			|| FMemory::Memcmp(Bytes.GetData() + Offset, "SPX1", 4) != 0)
+		{
+			return false;
+		}
+		uint8* Spx1 = Bytes.GetData() + Offset;
+		uint32 Device = 0;
+		FMemory::Memcpy(&Device, Spx1 + kDeviceAt, 4);
+		Device ^= 0x1u;
+		FMemory::Memcpy(Spx1 + kDeviceAt, &Device, 4);
+		FMemory::Memzero(Spx1 + kDigestAt, 32);
+		uint8 Digest[32] = {};
+		superslm::Sha256Hash(Spx1, static_cast<size_t>(Size), Digest);
+		FMemory::Memcpy(Spx1 + kDigestAt, Digest, 32);
+		break;
+	}
 	case ESuperSLMDiskWrapperEdit::PayloadProducer:
 	{
 		// Another producer: the SPX1 header's engine patch field (offset 16) moved by one and the digest (offset 28,
@@ -983,7 +1067,7 @@ bool FSuperSLMPrefixCacheTestSeam::EditDiskWrapper(const FString& Path, ESuperSL
 	default:
 		return false;
 	}
-	return FFileHelper::SaveArrayToFile(Bytes, *Path);
+	return true;
 }
 
 void FSuperSLMPrefixCacheTestSeam::SetBeforeDiskRead(USuperSLMSubsystem& Subsystem, TFunction<void(const FString& Path)> Hook)

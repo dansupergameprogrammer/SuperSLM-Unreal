@@ -8,10 +8,12 @@ the game thread, and gives the same answer to the same prompt every time.
 It needs no server, API key or internet connection. The model ships with your game as an Unreal
 asset, and the plugin schedules its work around your frame.
 
-> **Status: 1.3.** Released; built and tested on Windows x64. 1.3 adds a prefix cache with cooked prefix
-> sets ([The prefix cache](docs/ARCHITECTURE.md#the-prefix-cache)) and skip-ahead for schema-bound
-> generations ([Skip-ahead](docs/ARCHITECTURE.md#skip-ahead-for-schema-bound-generations)), both on the CPU
-> backend and off unless you turn them on. 1.2 added an optional shared page pool for sequence memory
+> **Status: 1.4.** Released; built and tested on Windows x64. 1.4 reads prompts on the GPU several tokens
+> per pass and brings `Exact` skip-ahead to the GPU backend
+> ([Multi-row GPU passes](docs/ARCHITECTURE.md#multi-row-gpu-passes)), brings the prefix cache to the GPU
+> backend, and measures the GPU's cost per token when a model loads. `Canonical` skip-ahead is removed. 1.3 added a prefix cache with cooked prefix sets
+> ([The prefix cache](docs/ARCHITECTURE.md#the-prefix-cache)) and skip-ahead for schema-bound generations
+> on the CPU backend ([Skip-ahead](docs/ARCHITECTURE.md#skip-ahead-for-schema-bound-generations)). 1.2 added an optional shared page pool for sequence memory
 > ([Paging](docs/PAGING.md)). Performance tuning is the
 > current focus: expect generation to take many frames, and measure on your own target hardware before
 > you design around it. What 1.0 covers and does not cover is in [What 1.0 covers](docs/STATUS.md);
@@ -47,24 +49,42 @@ current SuperSLM version they support objects with required keys in a fixed orde
 and free-text strings. Constrained output is exactly as deterministic as free text. See
 [Assets and Import](docs/ASSETS_AND_IMPORT.md#schemas).
 
-### Skip-ahead for schema-bound output (new in 1.3)
+### Skip-ahead for schema-bound output
 
 Where a schema allows only one text (the rest of a key name, a quote, a closing brace), skip-ahead
-writes that stretch in one batched pass instead of one decode per token. It is set per generation,
-off by default, in one of two modes:
-
-- **Exact** writes exactly the tokens the model would have written, and saves the same state. The
-  plugin guesses the next tokens from the schema's earlier finished generations, and SuperSLM keeps
-  only the guesses the model confirms. A wrong guess costs time, never a different token.
-- **Canonical** writes the schema's own spelling of the forced text: fewer tokens, and different ones.
+writes that stretch in one batched pass instead of one decode per token. It is set per generation and
+off by default. Its one mode, **Exact**, writes exactly the tokens the model would have written, and
+saves the same state. The plugin guesses the next tokens from the schema's earlier finished
+generations, and SuperSLM keeps only the guesses the model confirms. A wrong guess costs time, never a
+different token. It runs on the CPU backend and, new in 1.4, on the GPU backend's one-call path. 1.3's
+second mode, `Canonical`, is removed: it changed the tokens, and C++ that names it no longer
+compiles: use `Exact` or `Off`.
 
 On the example's potion-shop order (41 prompt tokens, 28 generated; AMD Ryzen 9 3950X, 0.5B model,
 one thread), SuperSLM measured generation at 1,257 ms in 1.2 and 921 ms in 1.3 with skip-ahead off.
-Timed beside the skip-ahead runs, off took 897 ms, Exact 604 ms, and Canonical 471 ms (21 tokens). The first step needs nothing from you:
+Timed beside the skip-ahead runs, off took 897 ms and Exact 604 ms. The first step needs nothing from you:
 1.3's engine scores only the tokens a bound schema allows, with the same tokens, on every
 schema-bound CPU generation. Over 20 other orders, Exact took 12,878 ms against 16,676 ms off,
 1.3 times faster in total, with one order slower; it gains when most guesses are right, and is about
 even with threaded decode on. See [Skip-ahead](docs/ARCHITECTURE.md#skip-ahead-for-schema-bound-generations).
+
+### Multi-row GPU passes (new in 1.4)
+
+The GPU backend now reads a prompt in passes of up to 8 tokens instead of one at a time, still within
+the GPU time per frame you set. With a 0.5B model on an AMD Radeon RX 7900 XT, a prompt that took 123
+frames to read one token at a time took 47 on the one-call path, at the default budget of one
+token's GPU cost per frame. On the one-call path, `Exact` skip-ahead checks its guesses the same
+way, several tokens in one pass. The tokens are the same as one at a time, and `bGpuMultiRow = false` turns it off.
+
+What `Exact` gains on the GPU depends on the setup and the budget, and it can be a loss. With four
+agents writing 84 tokens on that card: one call at the default budget went from 48.4 to 62.2 tokens per
+second, and one call at 2 ms per frame from 19.9 to 38.5; mixed one-call and composed agents at the default
+budget went from 24.0 down to 20.1 (all tokens per second, the 0.5B model, one card, one workload). On the
+composed path `Exact` runs as `Off`. Measure on your own hardware.
+
+When a GPU model loads, the plugin times a few tokens on the player's card and sizes each frame's work
+from that, unless you set the cost yourself. See
+[Multi-row GPU passes](docs/ARCHITECTURE.md#multi-row-gpu-passes).
 
 ### Prefix cache and cooked prefix sets (new in 1.3)
 
@@ -78,8 +98,10 @@ on their parent's pages, and can warm or drop prefixes at a level load.
 
 Restoring a cooked 128-token prefix took about 1 ms of worker time (0.92 to 1.01 ms), where
 building it by prefill takes about 2 s; the game thread's tick stayed at or under 0.24 ms while 10
-cooked prefixes loaded (packaged Development build, AMD Ryzen 9 3950X, 0.5B model). CPU backend;
-turned on with `PrefixCacheBudgetBytes` in C++. See
+cooked prefixes loaded (packaged Development build, AMD Ryzen 9 3950X, 0.5B model). Turned on in
+C++: `PrefixCacheBudgetBytes` on the CPU backend, and from 1.4 `ConfigurePrefixCache` on the GPU
+backend for pooled sequences, where the game thread's tick stayed at or under 0.18 ms while 10
+cooked prefixes loaded (packaged Development build, AMD Radeon RX 7900 XT). See
 [The prefix cache](docs/ARCHITECTURE.md#the-prefix-cache).
 
 ### Runtime-switchable LoRA adapters
@@ -115,7 +137,8 @@ verified. GPU determinism depends on the device and is not claimed. See
 - **Models are assets.** A `.sslm` file imports through the Content Browser and is fully validated
   there, so a corrupt or unsupported file fails in the editor with a reason.
 - **Conversation state.** Save and restore a sequence, share one long prompt prefix across many
-  sequences, and cache or cook prefixes so they are restored rather than recomputed (CPU backend).
+  sequences, and cache or cook prefixes so they are restored rather than recomputed (on the GPU, from 1.4, with the
+  shared page pool).
 - **Blueprint and C++.** Latent Blueprint nodes for loading and querying, and a full C++ API.
 - **Profiling.** Unreal Insights trace channels, timing scopes and counters on both backends.
 
@@ -201,7 +224,7 @@ model. See [Assets and Import](docs/ASSETS_AND_IMPORT.md).
 
 SuperSLM is the engine-independent runtime: the `.sslm` format, the converter, the inference kernels,
 constrained decoding and the determinism guarantee. This plugin builds SuperSLM's sources, vendored
-unmodified at a pinned release tag (currently `v1.15.0`), with the engine's own toolchain. Nothing is
+unmodified at a pinned release tag (currently `v1.18.1`), with the engine's own toolchain. Nothing is
 downloaded at build time and no prebuilt library is used. For the runtime's internals, see the
 [SuperSLM repository](https://github.com/dansupergameprogrammer/SuperSLM).
 
@@ -212,7 +235,7 @@ Measured with 1.2 in a packaged Development build of the example on one machine 
 three runs. The query reads 123 prompt tokens (41 for the order, 82 for the reply, which includes
 the order) and generates 35 (a 28-token JSON order, then a 7-token reply).
 
-This table is 1.2's. 1.3 has not been timed in this scene yet; what it changes is measured by
+This table is 1.2's. 1.3 and 1.4 have not been timed in this scene yet; what it changes is measured by
 SuperSLM on the same CPU and model: schema-bound generation of the example order took 1,257 ms at
 1.2's engine and 921 ms at 1.3's, with the same tokens, timed in one session; a later session
 timed 1.3 at 897 ms with skip-ahead off and 604 ms with Exact (see
@@ -250,8 +273,9 @@ most 0.07 ms in these runs). Every figure, with its conditions, is in
 - Windows x64 only for now. The GPU backend is Windows-only.
 - GPU determinism is not claimed, and the self-check's GPU verdict is withheld.
 - On the GPU, shared prompt prefixes need the shared page pool ([Paging](docs/PAGING.md)).
-- The prefix cache and skip-ahead are CPU-backend features, set in C++: the GPU backend has no
-  prefix cache in 1.3 and ignores the skip-ahead setting, and the Load node has no cache input.
+- The prefix cache and skip-ahead are set in C++, and on the GPU the cache needs the shared page pool: the
+  Load node has no cache input, and no Blueprint request carries the skip-ahead setting. On the GPU,
+  `Exact` skip-ahead runs on the one-call path only.
 - The plugin uses greedy decoding; sampling is not exposed.
 - Performance is still being tuned, and every published figure comes from one development machine.
 

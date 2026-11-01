@@ -211,6 +211,7 @@ namespace SuperSLMCore
 		std::set<int64_t> EndedCancelledLeases;
 		std::deque<int64_t> EndedCancelledOrder;
 		uint64_t NextOpId = 1;               // never reset
+		uint64_t FirstOpId = 1;              // the first id this core issues (CarryOpIdsFrom raises both before any op)
 		std::map<FPrefixKey, FKeyDisk> KeyDisks;
 		std::map<uint64_t, FPrefixKey> SavesInFlight; // save command id -> its key (emitted, not yet completed)
 		std::vector<FWaitingDelete> WaitingDeletes;
@@ -1695,12 +1696,30 @@ namespace SuperSLMCore
 		return EPrefixRequestResult::Accepted;
 	}
 
+	uint64_t FSuperSLMPrefixCacheCore::PeekNextOpId() const
+	{
+		return Impl->NextOpId;
+	}
+
+	void FSuperSLMPrefixCacheCore::CarryOpIdsFrom(uint64_t NextOpId)
+	{
+		FImpl& I = *Impl;
+		if (NextOpId > I.NextOpId)
+		{
+			if (I.NextOpId == I.FirstOpId)
+			{
+				I.FirstOpId = NextOpId; // no op issued yet: the ids below are another core's, never this one's
+			}
+			I.NextOpId = NextOpId;
+		}
+	}
+
 	bool FSuperSLMPrefixCacheCore::GetOpResult(uint64_t OpId, FPrefixOpResult& Out) const
 	{
 		const FImpl& I = *Impl;
-		if (OpId == 0 || OpId >= I.NextOpId)
+		if (OpId < I.FirstOpId || OpId >= I.NextOpId)
 		{
-			return false; // never issued
+			return false; // never issued (an id below FirstOpId is a carried-from core's)
 		}
 		const auto Pending = I.PendingOps.find(OpId);
 		if (Pending != I.PendingOps.end())
@@ -1764,6 +1783,16 @@ namespace SuperSLMCore
 			return Impl->EndedCancelledLeases.count(Handle) != 0 ? EPrefixLeaseState::Cancelled : EPrefixLeaseState::Unknown;
 		}
 		return It->second.State;
+	}
+
+	bool FSuperSLMPrefixCacheCore::IsCancelledWhilePending(int64_t Handle) const
+	{
+		const auto It = Impl->Leases.find(Handle);
+		if (It == Impl->Leases.end())
+		{
+			return Impl->EndedCancelledLeases.count(Handle) != 0;
+		}
+		return It->second.bCancelledPending && It->second.State == EPrefixLeaseState::Cancelled;
 	}
 
 	bool FSuperSLMPrefixCacheCore::GetLeaseKey(int64_t Handle, FPrefixKey& OutKey) const

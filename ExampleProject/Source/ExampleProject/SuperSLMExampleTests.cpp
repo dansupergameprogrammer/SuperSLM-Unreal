@@ -456,10 +456,11 @@ bool FSuperSLMExampleFrameTimeSummaryTest::RunTest(const FString& Parameters)
 	return true;
 }
 
-// Plan P1.9, mutant XD7, review round 1 finding 3: the example's scratch switch,
-// -SuperSLMExampleJumpForward=0|1|off|exact|canonical, is wired. It is case-insensitive; any other
-// value (empty and padded included) is refused with a Warning naming the switch, and the mode stays
-// as it was; an absent switch leaves it as it was and logs nothing. That the scene applies it and
+// The example's scratch switch,
+// -SuperSLMExampleJumpForward=0|1|off|exact, is wired. It is case-insensitive. Plugin 1.4:
+// `0` is Off and `1` is Exact; `canonical` in any case and `2` are refused with a Warning naming the switch and the
+// mode falls back to Off; any other value (empty and padded included) is refused with that Warning and the mode
+// stays as it was; an absent switch leaves it as it was and logs nothing. That the scene applies it and
 // the extraction request carries it is the host cell ci/tests/test_schema_jump_example_switch.py.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FSuperSLMExampleSchemaJumpForwardSwitchTest,
@@ -472,17 +473,16 @@ bool FSuperSLMExampleSchemaJumpForwardSwitchTest::RunTest(const FString& Paramet
 	struct FCase { const TCHAR* CommandLine; EMode Want; };
 	const FCase Accepted[] = {
 		{ TEXT("-SuperSLMExampleJumpForward=0"), EMode::Off },
-		{ TEXT("-SuperSLMExampleJumpForward=1"), EMode::Canonical },
+		{ TEXT("-SuperSLMExampleJumpForward=1"), EMode::Exact },
 		{ TEXT("-SuperSLMExampleJumpForward=off"), EMode::Off },
 		{ TEXT("-SuperSLMExampleJumpForward=exact"), EMode::Exact },
-		{ TEXT("-SuperSLMExampleJumpForward=canonical"), EMode::Canonical },
 		{ TEXT("-SuperSLMExampleJumpForward=EXACT"), EMode::Exact },
-		{ TEXT("-Other -SuperSLMExampleJumpForward=CaNoNiCaL -More"), EMode::Canonical },
+		{ TEXT("-Other -SuperSLMExampleJumpForward=oFf -More"), EMode::Off },
 	};
 	bool bOk = true;
 	for (const FCase& C : Accepted)
 	{
-		EMode Mode = C.Want == EMode::Exact ? EMode::Canonical : EMode::Exact; // so "unchanged" cannot pass
+		EMode Mode = C.Want == EMode::Exact ? EMode::Off : EMode::Exact; // so "unchanged" cannot pass
 		bOk &= TestTrue(*FString::Printf(TEXT("'%s' is accepted"), C.CommandLine), SuperSLMExample::SchemaJumpForwardFromCommandLine(C.CommandLine, Mode));
 		bOk &= TestEqual(*FString::Printf(TEXT("'%s' sets the mode"), C.CommandLine), (uint8)Mode, (uint8)C.Want);
 	}
@@ -495,15 +495,35 @@ bool FSuperSLMExampleSchemaJumpForwardSwitchTest::RunTest(const FString& Paramet
 	}
 
 	const TCHAR* Refused[] = {
-		TEXT("-SuperSLMExampleJumpForward=2"),
 		TEXT("-SuperSLMExampleJumpForward=on"),
 		TEXT("-SuperSLMExampleJumpForward=exactly"),
 		TEXT("-SuperSLMExampleJumpForward=-1"),
 		TEXT("-SuperSLMExampleJumpForward=\" exact\""),
 		TEXT("-SuperSLMExampleJumpForward=\"\""),
 	};
-	// Each refusal logs one Warning naming the switch; a missing line fails this test.
-	AddExpectedError(TEXT("SuperSLMExampleJumpForward"), EAutomationExpectedErrorFlags::Contains, UE_ARRAY_COUNT(Refused));
+	// Canonical's old values: refused, and the mode falls back to Off.
+	const TCHAR* Removed[] = {
+		TEXT("-SuperSLMExampleJumpForward=canonical"),
+		TEXT("-SuperSLMExampleJumpForward=CaNoNiCaL"),
+		TEXT("-SuperSLMExampleJumpForward=2"),
+	};
+	// Every Warning is expected by count, and a missing or extra one fails this test.
+	// - Each removed value, from either start (Exact and Off), logs the demo's Warning naming the switch and Canonical
+	//   (from Off it must not log the generic "not one of" line) and the plugin parser's own Warning.
+	// - Each other refused value logs the demo's Warning naming the switch and the value, and nothing from the parser.
+	const int32 RemovedCalls = 2 * UE_ARRAY_COUNT(Removed);
+	AddExpectedError(TEXT("SuperSLMExampleJumpForward=\"(canonical|CaNoNiCaL|2)\".*Canonical"), EAutomationExpectedErrorFlags::Contains, RemovedCalls);
+	AddExpectedError(TEXT("Schema jump-forward \"(canonical|CaNoNiCaL|2)\".*Canonical was removed"), EAutomationExpectedErrorFlags::Contains, RemovedCalls);
+	AddExpectedError(TEXT("SuperSLMExampleJumpForward=\"(on|exactly|-1| exact|)\""), EAutomationExpectedErrorFlags::Contains, UE_ARRAY_COUNT(Refused));
+	for (const TCHAR* CommandLine : Removed)
+	{
+		for (const EMode Start : { EMode::Exact, EMode::Off })
+		{
+			EMode Mode = Start;
+			bOk &= TestFalse(*FString::Printf(TEXT("'%s' is refused (Canonical was removed in 1.4)"), CommandLine), SuperSLMExample::SchemaJumpForwardFromCommandLine(CommandLine, Mode));
+			bOk &= TestEqual(*FString::Printf(TEXT("'%s' falls back to Off"), CommandLine), (uint8)Mode, (uint8)EMode::Off);
+		}
+	}
 	for (const TCHAR* CommandLine : Refused)
 	{
 		EMode Mode = EMode::Exact;

@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status:** the implemented Windows x64 architecture as of 1.3.0. See [PAGING.md](PAGING.md) for
+> **Status:** the implemented Windows x64 architecture as of 1.4.0. See [PAGING.md](PAGING.md) for
 > the paging API, and [BLUEPRINT_API.md](BLUEPRINT_API.md) and [TOOLING.md](TOOLING.md).
 
 ---
@@ -14,6 +14,7 @@
 - [Memory](#memory)
 - [The CPU backend](#the-cpu-backend)
 - [The GPU backend](#the-gpu-backend)
+- [Multi-row GPU passes](#multi-row-gpu-passes)
 - [Save and restore](#save-and-restore)
 - [The prefix cache](#the-prefix-cache)
 - [Skip-ahead for schema-bound generations](#skip-ahead-for-schema-bound-generations)
@@ -53,8 +54,8 @@ The plugin compiles SuperSLM's sources with the engine's toolchain. It never lin
 SuperSLM library.
 
 - The library sources of one exact SuperSLM commit are vendored under
-  `Plugins/SuperSLMUnreal/Source/ThirdParty/SuperSLM/`; 1.3.0 vendors SuperSLM v1.15.0
-  (165962acafe901753dfe37153d7116b132a18b5a). `VENDORED_VERSION.txt` names the tag and its commit,
+  `Plugins/SuperSLMUnreal/Source/ThirdParty/SuperSLM/`; 1.4.0 vendors SuperSLM v1.18.1
+  (c3c14b16690a0c0c54de781f6f30380d88e62bd1). `VENDORED_VERSION.txt` names the tag and its commit,
   and `VENDORED_MANIFEST.sha256` records each file's hash. Five route-P witness tool files carry
   a tracked hook-API adaptation described in `VENDORED_VERSION.txt`. The build reads the tag and commit from
   `VENDORED_VERSION.txt` and compiles them into the plugin, so every report and save blob can name
@@ -302,6 +303,58 @@ With the engine rendering, the per-slice GPU time the backend reports is the spa
 first GPU timestamp to its last, and it includes the renderer's work on the same GPU inside that
 span. It bounds the slice's own cost from above.
 
+## Multi-row GPU passes
+
+From 1.4 the GPU backend can put several tokens through the model in one pass (SuperSLM 1.18.0's multi-row verbs).
+It is on by default (`FSuperSLMGpuRuntimeConfig::bGpuMultiRow`); `false` restores 1.3's one-token scheduling. The
+tokens are the same either way.
+
+- **Prompts** are read in passes of up to 8 tokens, on both paths. Each pass is sliced by whole layers so it fits the
+  frame's GPU time, `SchemaJumpGpuFrameBudgetMs` (0, the default, means one token's cost). With a 0.5B model on an AMD
+  Radeon RX 7900 XT, a prompt that took 123 frames to read one token at a time took 47 on the one-call path at the
+  default budget, and 372 frames instead of 738 on the composed path.
+- **`Exact` skip-ahead** runs on the one-call path: the schema's forced text and the learned guesses go through
+  the model as one pass, and the pass keeps each guess up to the first one the model would not have written. The
+  guesses are the CPU backend's (see [Skip-ahead](#skip-ahead-for-schema-bound-generations)). They exist only when the
+  CPU backend is configured with the same model and has finished generations of that schema, because GPU generations
+  do not add to them. On the composed path, or with multi-row off, `Exact` runs as `Off`. Without the device-resident
+  logits head, or when no pass fits the budget, it also runs as `Off`, with one log line per session.
+- **The plan comes from prices, not from timing the generations.** How many tokens a pass carries, and how many
+  layers each frame runs, comes from the configuration and the cost table SuperSLM ships, scaled by one token's cost
+  (`GpuRowCostMs`, measured when the model loads unless you set it). With a frame budget set, a second measurement
+  taken behind the first generations can change the price of later positions once, so slice sizes can change when it
+  settles. The tokens never depend on the device's timing.
+
+**The cost of one token is measured when the model loads.** With `GpuRowCostMs` left at 0, `Configure()` times a few
+tokens of the model on the player's card, on a throwaway sequence, and prices each frame's work from that. A value
+above 0 is your own price and wins. The measurement is taken once per model, GPU and logits-head placement in
+the process, discards a timing far slower than the others, and prices later positions in a long reply higher. If it
+fails it falls back to 6.2 ms with one warning and never refuses the model. A GPU device lost during it makes
+`Configure()` return `DeviceUnavailable`, as at any other step. With a frame budget set, it runs one slice per frame
+and nothing else is planned until it settles, so the first generation after a model loads waits for it.
+`USuperSLMGpuSubsystem::GetGpuRowCostMs()` reads the cost in use.
+
+**What `Exact` gains depends on the setup.** SuperSLM measured it through this plugin with the 0.5B model on the RX
+7900 XT: four agents, 84 tokens in total, `Exact` against `Off` on the same setup.
+
+| Setup, GPU time per frame | `Off` | `Exact` |
+|---|---|---|
+| One call, default (one token's cost) | 1.73 s, 48.4 tokens per second | 1.35 s, 62.2 tokens per second |
+| One call, 2 ms | 4.22 s, 19.9 tokens per second | 2.18 s, 38.5 tokens per second |
+| One call, 4 ms | 2.84 s, 29.6 tokens per second | 2.12 s, 39.6 tokens per second |
+| Mixed one-call and composed, default | 3.51 s, 24.0 tokens per second | 4.17 s, 20.1 tokens per second |
+| Mixed, 4 ms | 4.01 s, 21.0 tokens per second | 3.59 s, 23.4 tokens per second |
+| Composed, 4 ms and up | about 16 to 18 tokens per second | the same: `Exact` runs as `Off` |
+
+These are one card, one model and one workload. `Exact` never changes the reply, so it is safe to turn on; measure
+whether it is faster in your game.
+
+**Known issue.** On a card that slows down under sustained load, a 2 ms budget can run over for a stretch of frames.
+In certification, two 2 ms setups ran consecutive frames at 2.0 to 2.6 ms while the card ran slow (their 99th
+percentile frames were 2.05 and 2.38 ms) and delivered 12 to 12.5 tokens per second against 18 to 21 normally.
+Larger budgets were not affected. The plan stays within the budget; a card that slows down takes longer than its
+measured cost.
+
 ## Save and restore
 
 A save produces opaque bytes bound to the model: restoring against a different model is refused.
@@ -324,7 +377,7 @@ the directory is trimmed to `PrefixDiskCacheMaxBytes` (256 MiB by default), olde
 that a crash left behind is removed at the next trim once it is an hour old. A re-`Configure()` empties the memory
 tier, and disk files stay. Registered prefix sets stay while the model stays the same: a `Configure()` of another model
 unregisters the sets built for a different one (logged `PrefixSetModelMismatch`), so register them again after
-configuring their model. In 1.3.0 the budget is set in C++: the **Load SuperSLM Model** node has no input for it.
+configuring their model. In 1.4.0 the budget is set in C++: the **Load SuperSLM Model** node has no input for it.
 
 **Using it.** `RequestPrefix(Spec, OutPrefix, OutError)` takes a spec: the prefix's tokens, its schema name
 (`NAME_None` for none) and, for a nested prefix, its parent. It returns a lease at once. When `GetPrefixPhase` reads
@@ -383,17 +436,28 @@ defined by its token ids or by text, with an optional schema and an optional par
 - The editor's **Build Prefixes** action builds the set in the background: tokenize the text entries, prefill each
   entry, and store its bytes in the asset. The progress notification has a Cancel button. A cancelled build, or one
   whose set was edited while it ran, stores nothing.
-- The `SuperSLMBuildPrefixes` commandlet runs the same build for a build machine. Its output is byte-equal to the
-  action's.
+- The set holds one build per producer: the CPU's, which serves every CPU, and one per GPU vendor and device, which
+  serves only that GPU. The action builds the CPU entries and this editor's GPU's entries and stores both together.
+  For the GPU entries it configures a GPU subsystem of its own (pooled, with a prefix cache, disk off), requests
+  each entry from that cache, and saves it on the GPU submission thread; each saved entry is checked to name the
+  device it is stored under. While another GPU subsystem is configured (Play In Editor, the query window), or when
+  the GPU cannot be configured, the GPU entries are left as they were and the build says why; the CPU entries are
+  still built. Build a set on each GPU model you ship to: a GPU with no build of its own builds every entry by
+  prefill.
+- The `SuperSLMBuildPrefixes` commandlet runs the same build for a build machine. Its CPU output is byte-equal to the
+  action's. `-NoGpu`, `-RequireGpu` and `-ExpectGpuDevice` control its GPU entries (see
+  [TOOLING.md](TOOLING.md)).
 - The game never tokenizes a set's text: the ids stored at the build are the key.
 - The cook checks every entry. It logs a warning naming each entry the game would not use: one not built, built for
   another model or another SuperSLM build, or edited since its build. The game builds such an entry by prefill when
   it is requested. A text entry whose text or model changed ships with no ids and no bytes.
 - **Rebuild your sets whenever the plugin's vendored SuperSLM changes.**
-- In 1.3.0 a nested entry is not built; the build says so, and its requests are built by prefill.
+- In 1.4.0 a nested entry is not built; the build says so, and its requests are built by prefill.
 - `RegisterPrefixSet(Set)` adds a set's entries to the cooked tier, and registering the set again after a rebuild
-  replaces them. `FindEntrySpec(ConfiguredModel, Entry, OutSpec, OutParentEntry)` gives the spec to request an entry
-  by name.
+  replaces them. Only the build for the subsystem's own producer is used: any CPU build on the CPU, and on the GPU a
+  build of that exact vendor and device. A set with no such build registers nothing (one log line), and its requests
+  are built by prefill. `FindEntrySpec(ConfiguredModel, Entry, OutSpec, OutParentEntry)` gives the spec to request an
+  entry by name.
 
 **How the work is scheduled.** Every cache operation runs on a worker lane and is planned like other jobs:
 
@@ -419,33 +483,51 @@ defined by its token ids or by text, with an optional schema and an optional par
 Worker time is not frame time: the plugin spreads a long job over frames, and the game thread only hands jobs out and
 collects their results.
 
-**On the GPU.** The cache is CPU-only in 1.3.0. `USuperSLMGpuSubsystem` declares the same calls
-(`ConfigurePrefixCache`, `RequestPrefix` and the rest, for pooled sequences, keyed by the adapter), but they are not
-yet connected to the GPU scheduler, so they refuse `NotConfigured`. SuperSLM 1.15.0 also does not release GPU prefix
-save and restore, which the GPU cache's cooked and disk tiers need.
+**On the GPU (1.4.0, Windows x64).** `USuperSLMGpuSubsystem` has its own cache, for pooled sequences only. Call
+`ConfigurePrefixCache(Settings)` with `Settings.BudgetBytes` above 0, then `Configure()` with `SequenceBudget` above 0.
+The cache's memory is its own region of the GPU page pool, sized from the budget, and the pool grows by that much. A
+budget with a dedicated configuration (`SequenceBudget` 0) installs no cache, and `RequestPrefix` refuses
+`NotConfigured: PrefixCacheRequiresPooled`. `RequestPrefix`, `ReturnPrefix`, `GetPrefixSource`, `GetPrefixLeaseState`
+and `GetPrefixCacheStats` work as on the CPU; adopt a Ready lease with `RequestAdoptPrefix(Sequence, Prefix)`.
+`ReleasePrefix` refuses a cache lease. The tiers are memory, cooked and disk (`Settings.bDiskEnabled`, `DiskDirectory`,
+default `<ProjectSaved>/SuperSLM/PrefixCacheGpu`, trimmed oldest first to `DiskMaxBytes`, default 256 MiB). Entries are keyed by the vendor and device of the GPU SuperSLM runs
+on (read from that adapter, not from the engine's renderer) as well as the model and engine, so an entry written on
+another GPU is a miss, never a wrong prefix. `WarmPrefix`, `DropPrefix` and `GetPrefixOpResult` work as on the CPU.
+Nested prefixes share their parent's pages, as on the CPU. A build by prefill runs as a series of short jobs on the
+GPU submission thread, each well under its device-loss bound, so frame work runs between them. After a device loss
+the cache issues nothing more.
+
+`USuperSLMGpuSubsystem::RegisterPrefixSet(Set)` and `UnregisterPrefixSet(Set)` (C++ only) register a prefix set with
+the GPU cache's cooked tier. Only a build of this GPU's exact vendor and device registers; any other GPU's build, or a
+CPU-only set, registers nothing and its entries are built by prefill. Entries are matched by GPU vendor and device id
+(not by revision or board): cards that share a device id (for example the RX 7900 XT and XTX) share entries; GPU determinism is per device, so such a card is served the entry but is not certified to match its own prefill byte for byte. The GPU cache belongs to its configuration, so
+the subsystem keeps a copy of each registered set and registers it with every `Configure()` that installs a cache: a
+set registered before the first `Configure()` is kept until then, and the asset may unload once registered. A set
+built for another model is refused by name, once, and forgotten. A cooked entry whose bytes SuperSLM refuses (another
+producer) is a miss: the entry is built by prefill and the bytes are not tried again in that configuration.
 
 ## Skip-ahead for schema-bound generations
 
 When a schema is bound, there are stretches where it allows only one text: the rest of a key name, a quote, a colon,
 a closing brace. Normally the model still spends one decode on each of those tokens. Skip-ahead (the
 `SchemaJumpForward` setting) writes such a stretch in one batched pass through the prefill path. It is set per
-generation on `FSuperSLMGenerationRequest`, and it is CPU-only: the GPU backend ignores it. One decode job can mix
-sequences in different modes.
+generation on `FSuperSLMGenerationRequest`. This section describes the CPU backend; on the GPU backend `Exact` runs
+on the one-call path only (see [Multi-row GPU passes](#multi-row-gpu-passes)). One decode job can mix sequences in
+different modes.
 
 | Setting | Tokens | How it works |
 |---|---|---|
 | `Off` (default) | the model's own | One decode per token. |
 | `Exact` | identical to `Off`, and so is the save | The plugin guesses the next tokens, and SuperSLM checks each guess with the model's own decode rule. It keeps only the guesses the model would have written. A wrong guess costs time, never a different token. |
-| `Canonical` | fewer, and different | SuperSLM writes the schema's own spelling of the forced text, for example `"name"`, even where the model would have split it into other tokens. The model then continues from text it did not write. |
 
 **Where `Exact`'s guesses come from.** The plugin learns them per model and schema, from that schema's earlier
 finished generations in this configuration. It learns from `Off` and `Exact` generations that reached the end of
-their schema, never from `Canonical` ones. It learns only at points where the schema allows one text, and keeps at most
+their schema. It learns only at points where the schema allows one text, and keeps at most
 4 tokens per point. It stops guessing where its history is unsure. What it learned starts empty at every
 `Configure()`, is dropped when the model is unmapped, and is never saved.
 
 So `Exact` speeds up a schema the game uses repeatedly. Its first generations, before anything is learned, run as
-`Off` does. The schema's walk table loads on a pool thread at the first schema-bound `Exact` or `Canonical`
+`Off` does. The schema's walk table loads on a pool thread at the first schema-bound `Exact`
 generation. Until it has loaded, `Exact` guesses nothing.
 
 **What it buys.** SuperSLM measured skip-ahead with the same model and the same CPU as the table above. The prompt was
@@ -456,7 +538,6 @@ the median of 15 runs.
 |---|---|---|---|
 | `Off` | 28 | 897 ms | 549 ms |
 | `Exact`, guessing from earlier orders | 28, the same | 604 ms (1.48x) | 557 ms (about even) |
-| `Canonical` | 21, different | 471 ms | 456 ms |
 
 Over 20 other orders, `Exact` took 12,878 ms against 16,676 ms off, 1.3 times faster in total. The median order was
 1.42 times faster, and one order was slower (0.82x). `Exact` pays only when most guesses are right: about 60% of the
@@ -473,24 +554,26 @@ deliver, and the tokens are unchanged.
 
 - Skipped tokens count toward `MaxNewTokens`.
 - In `Exact`, a pass never writes the generation's last allowed token. So at a `MaxNewTokens` cut, an `Exact` sequence
-  saves exactly the state an `Off` one saves. A `Canonical` pass may write it, so a `Canonical` save at a cut is not
-  `Off`'s (its tokens differ anyway).
+  saves exactly the state an `Off` one saves.
 - A guess stops before the first of the request's `StopTokenIds`. So an `Exact` generation stops where `Off` stops,
   with the same save.
 - Skip-ahead needs to know where the sequence is in its schema. That is true of a fresh sequence, and of one that
-  adopted a prompt-only prefix. On a restored sequence it is not known, so `Exact` runs as `Off` does there, and
-  `Canonical` still writes the forced text.
-- An `Exact` or `Canonical` generation does not use the worker's decode continuations.
+  adopted a prompt-only prefix. On a restored sequence it is not known, so `Exact` runs as `Off` does there.
+- An `Exact` generation does not use the worker's decode continuations.
 
-**Choosing a mode.** Use `Exact` for a schema the game fills many times, at one decode thread. The output is
-unchanged, so nothing else in the game needs to know. Use `Canonical` only after checking its output for your
-schema. Its tokens differ from `Off`'s, so its token digests and determinism comparisons differ too. On SuperSLM's 40
-test orders, 32 came out different from `Off`, and the quality verdict was inconclusive.
+**When to use it.** Use `Exact` for a schema the game fills many times, at one decode thread. The output is
+unchanged, so nothing else in the game needs to know.
+
+**`Canonical` is removed (1.4).** 1.3's second mode wrote the schema's own spelling of the forced text, which changed
+the tokens and, on SuperSLM's test orders, sometimes the answer. SuperSLM 1.18.0 removed it. C++ that names
+`ESuperSLMSchemaJumpForward::Canonical` no longer compiles: use `Exact`, which keeps `Off`'s tokens, or `Off`. A value
+of 2 reaching the plugin runs as `Off`. The example's `-SuperSLMExampleJumpForward=canonical` (or `2`) runs `Off`,
+with a warning that says Canonical was removed.
 
 ## Scope
 
 In scope: the `.sslm` asset and cooked serialization; engine-owned KV and workspace memory on the
-CPU backend; the CPU and GPU schedulers; the prefix cache and cooked prefix sets; skip-ahead on the CPU backend;
+CPU backend; the CPU and GPU schedulers; the prefix cache and cooked prefix sets; skip-ahead on the CPU backend and the GPU one-call path; multi-row GPU passes;
 a Blueprint surface; the determinism self-check as an
 editor tool and a packaged-build entry point; the editor tooling; a minimal example project.
 

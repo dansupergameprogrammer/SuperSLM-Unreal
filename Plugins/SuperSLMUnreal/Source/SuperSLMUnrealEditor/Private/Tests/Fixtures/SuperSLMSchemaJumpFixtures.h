@@ -50,7 +50,6 @@ namespace SuperSLMSchemaJumpFixtures
 		{
 			case ESuperSLMSchemaJumpForward::Off: return TEXT("Off");
 			case ESuperSLMSchemaJumpForward::Exact: return TEXT("Exact");
-			case ESuperSLMSchemaJumpForward::Canonical: return TEXT("Canonical");
 		}
 		return TEXT("?");
 	}

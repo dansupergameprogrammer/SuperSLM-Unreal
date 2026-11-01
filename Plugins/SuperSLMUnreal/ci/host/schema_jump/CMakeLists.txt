@@ -33,7 +33,7 @@ endif()
 
 # The core, built as Unreal will build it: no exceptions, no RTTI, and the warnings MSVC raises under
 # Unreal's settings made errors here.
-add_library(schema_jump_core STATIC ${CORE_DIR}/SuperSLMSchemaJumpCore.cpp)
+add_library(schema_jump_core STATIC ${CORE_DIR}/SuperSLMSchemaJumpCore.cpp ${CORE_DIR}/SuperSLMGpuSchemaJumpCore.cpp)
 target_include_directories(schema_jump_core PUBLIC ${CORE_DIR})
 target_compile_options(schema_jump_core PRIVATE ${WARN_FLAGS} -Wconversion -Wsign-conversion -Wundef
   -fno-exceptions -fno-rtti ${SAN_FLAGS})
@@ -67,6 +67,9 @@ if(NOT SCHEMA_JUMP_VERB_AT EQUAL -1)
   target_compile_definitions(schema_jump_abi_stubs PRIVATE SUPERSLM_WITH_SCHEMA_JUMP_FORWARD=1)
 endif()
 
+# P2's GPU skip-ahead stubs (gpu_schema_jump_abi_stubs) are retired with P2's Canonical GPU core (ruling 40,
+# red-suite-mr6.md): plugin 1.4 deletes SuperSLMGpuSchemaJumpAbi.h and its stubs.
+
 add_executable(schema_jump_host_tests
   harness.cpp
   test_setting.cpp
@@ -75,6 +78,7 @@ add_executable(schema_jump_host_tests
   test_store.cpp
   test_span_loop.cpp
   test_review_round1.cpp
+  test_gpu_delivery.cpp
   $<TARGET_OBJECTS:schema_jump_pricing_cells>)
 target_link_libraries(schema_jump_host_tests PRIVATE schema_jump_core Threads::Threads)
 # The B7 fixtures (fixtures/d2-table.txt, fixtures/b4a-b2-walked.txt), read by fixture.h's LoadB7.

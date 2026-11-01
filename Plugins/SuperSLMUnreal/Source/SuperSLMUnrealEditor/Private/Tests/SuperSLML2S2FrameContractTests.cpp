@@ -60,7 +60,7 @@ namespace
 	constexpr int32 kCandidateLayersPerSlice = 4;
 
 	bool SetUpGpuAndCpu(FAutomationTestBase& T, UWorld* World, int32 BlockCount, USuperSLMModel*& OutModel,
-		USuperSLMGpuSubsystem*& OutGpu, USuperSLMSubsystem*& OutCpu, int32 KOverride = 0)
+		USuperSLMGpuSubsystem*& OutGpu, USuperSLMSubsystem*& OutCpu, int32 KOverride = 0, bool bOneRowPerStart = false)
 	{
 		FString AExPath, Reason;
 		if (!T.TestTrue(*FString::Printf(TEXT("A-EX must be present (%s)"), *Reason), TryGetAExArtifactPath(AExPath, Reason)))
@@ -91,6 +91,9 @@ namespace
 		GpuConfig.BlockCount = BlockCount;
 		GpuConfig.DispatchBudget = DispatchBudgetForLayersPerSlice(kCandidateLayersPerSlice);
 		GpuConfig.TickBudgetMs = 1000.0;
+		// The stall arm counts one start per prompt token (its e); MR6 made multi-row prompt chunks the default, which
+		// embeds a prompt in fewer starts, so that arm configures one row per start (bGpuMultiRow false, the pre-MR6 plan).
+		GpuConfig.bGpuMultiRow = !bOneRowPerStart;
 
 		// A K below MinimumK must be refused, by name (D-SLM7381) -- checked BEFORE the
 		// real Configure() below, against a throwaway config, so the refusal itself
@@ -975,7 +978,7 @@ bool FSuperSLML2S2FrameContractStallTest::RunTest(const FString& Parameters)
 	USuperSLMModel* Model = nullptr;
 	USuperSLMGpuSubsystem* Gpu = nullptr;
 	USuperSLMSubsystem* Cpu = nullptr;
-	if (!SetUpGpuAndCpu(*this, World, kBlockCount, Model, Gpu, Cpu, kK))
+	if (!SetUpGpuAndCpu(*this, World, kBlockCount, Model, Gpu, Cpu, kK, /*bOneRowPerStart*/ true))
 	{
 		return false;
 	}

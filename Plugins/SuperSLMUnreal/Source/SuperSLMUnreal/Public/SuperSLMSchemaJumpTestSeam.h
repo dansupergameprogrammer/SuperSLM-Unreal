@@ -71,6 +71,9 @@ enum class ESuperSLMJobHoldPoint : uint8
 	None,              // no hold
 	AfterSpanDelivery, // after each span job of the sequence is delivered, before its next job is planned
 	BeforeDecode,      // when the sequence would next join a decode job, before that job is planned
+	// Ruling 40 (red-suite-mr6.md; cell P1.11 (c), re-pointed at Exact): after each decode-or-prefill job carrying the
+	// sequence is delivered, before its next job is planned. Appended, so the values above keep their numbers.
+	AfterDecodeDelivery,
 };
 
 struct SUPERSLMUNREAL_API FSuperSLMSchemaJumpTestAccess

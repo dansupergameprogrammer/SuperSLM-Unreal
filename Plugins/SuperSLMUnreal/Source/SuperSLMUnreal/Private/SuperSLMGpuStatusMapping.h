@@ -70,6 +70,13 @@ namespace SuperSLMGpuStatusMapping
 			// build runs only on the engine re-pin that carries it, so the arm goes with the switch.
 			case SslmGpuStatus::SSLM_RESTORE_PRODUCER_MISMATCH: return "SSLM_RESTORE_PRODUCER_MISMATCH";
 #endif
+			// Ordinals 31-32, appended at 1.17.0 for schema skip-ahead (gpu_1p0.h). SSLM_GPU_FORCED_TABLE_ABSENT is a
+			// forced-token verb on a model whose artifact has no tokenizer section; SSLM_GPU_CONTEXT_CAP_EXCEEDED is a
+			// jump or a row chunk with no room before the context cap.
+			case SslmGpuStatus::SSLM_GPU_FORCED_TABLE_ABSENT: return "SSLM_GPU_FORCED_TABLE_ABSENT";
+			case SslmGpuStatus::SSLM_GPU_CONTEXT_CAP_EXCEEDED: return "SSLM_GPU_CONTEXT_CAP_EXCEEDED";
+			// Multi-row GPU passes (1.18.0): a save while a row chunk is open; nothing is written.
+			case SslmGpuStatus::SSLM_GPU_ROWS_CHUNK_OPEN: return "SSLM_GPU_ROWS_CHUNK_OPEN";
 		}
 		// After the switch, not a default label inside it (see SuperSLMStatusMapping.h).
 		return "SSLM_GPU_STATUS_UNKNOWN";

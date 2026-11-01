@@ -5,7 +5,7 @@
 //   SuperSLM.PrefixCache.Cpu.Cooked.TwoNameRefused       cell 2.15, the editor build's refusal     [U3]
 //   SuperSLM.PrefixCache.Cpu.Cooked.ThreeSchemaIndex2    cell 2.15, the cooked tier                [U3]
 //   SuperSLM.PrefixCache.Cpu.Cooked.RebuiltAfterPin      cell 9.7                                  [U3]
-//   SuperSLM.PrefixCache.Cpu.Cooked.NoEntryRecomputes    §5.8 per-producer entries, CPU now        [U3]
+//   SuperSLM.PrefixCache.Cpu.Cooked.NoEntryRecomputes    §5.8 per-producer entries, the CPU's      [U3]
 //   SuperSLM.PrefixCache.Cpu.Cooked.RecycledObjectId     1.3.0 review item 4: a set that reuses a collected
 //                                                        set's object id leaves its registration alone
 //
@@ -23,7 +23,8 @@
 // names: two_name.sslm and three_schema.sslm. Box queue: copy them there. The tests fail by name when
 // the directory or a file is missing.
 //
-// The host twins of 2.9, 2.15 (cooked) and 9.7 are ci/host/prefix_cache/test_prefix_set.cpp.
+// The host twins of 2.9, 2.15 (cooked) and 9.7 are ci/host/prefix_cache/test_prefix_set.cpp. The GPU twins of 2.9, 9.7
+// and NoEntryRecomputes, per device, are SuperSLMPrefixCacheGpuCookedTests.cpp (step U7).
 // Mutants: cook validation skipped -> 2.9's warning legs red; stale bytes used (the cooked check
 // skipped) -> 2.9's runtime legs red; rebuild appends rather than replaces -> 9.7 red (the stale CPU
 // build is selected first); a set with no CPU build registering anything -> NoEntryRecomputes red.
@@ -360,8 +361,9 @@ bool FSuperSLMPrefixCacheCookedRebuiltTest::RunTest(const FString& Parameters)
 	return bOk;
 }
 
-// §5.8's per-producer rule on the CPU now (U7 states it for GPU devices): a set with no CPU build, and
-// an entry its build left empty, register nothing; those requests recompute.
+// §5.8's per-producer rule on the CPU: a set with no CPU build (here, one GPU device's build only), and an entry its
+// build left empty, register nothing; those requests recompute. Its GPU twin, per device, is
+// SuperSLM.PrefixCache.Gpu.Cooked.NoEntryRecomputes (SuperSLMPrefixCacheGpuCookedTests.cpp).
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMPrefixCacheCookedNoEntryTest, "SuperSLM.PrefixCache.Cpu.Cooked.NoEntryRecomputes",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMPrefixCacheCookedNoEntryTest::RunTest(const FString& Parameters)

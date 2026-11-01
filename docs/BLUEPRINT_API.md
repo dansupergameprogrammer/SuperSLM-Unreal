@@ -34,13 +34,16 @@ it:
 | Read a queued operation's result, then release its handle | `GetLifecycleOpResult`, `GetSaveResult` (which also returns the blob), `ReleaseLifecycleOpHandle` |
 | Shared prefixes | `CreatePrefix`, `GetPrefixPhase`, `IsPrefixReady`, `AdoptPrefix`, `ReleasePrefix` |
 | The prefix cache (configured by `PrefixCacheBudgetBytes`) | `RequestPrefix`, `ReturnPrefix`, `GetPrefixSource`, `GetPrefixLeaseState`, `GetPrefixCacheStats`; `WarmPrefix`, `DropPrefix`, `GetPrefixOpResult`; `RegisterPrefixSet`, `UnregisterPrefixSet` |
-| Skip-ahead for a schema-bound generation | `FSuperSLMGenerationRequest::SchemaJumpForward` (`Off`, `Exact`, `Canonical`) on `BeginGeneration` |
+| Skip-ahead for a schema-bound generation | `FSuperSLMGenerationRequest::SchemaJumpForward` (`Off`, `Exact`) on `BeginGeneration` |
 | Diagnostics (timings, tick reports, pool and memory counts) | `GetLastTickReport`, `GetTickHistory`, `GetJobLedger`, `GetTokensPerSecond`, `GetTimeToFirstTokenMs`, `GetPoolFreeCount` and the other `Get*` readers in the header |
 
 The GPU subsystem follows the same shape, with its own configuration
 (`FSuperSLMGpuRuntimeConfig`: `ContextCap`, `BlockCount`, `DispatchBudget`, `K`, `TickBudgetMs`,
-`MaxQueuedOperationsPerSequence` and `FinishParallelTasks`) and a choice of decode path per
-sequence (`ESuperSLMGpuDecodePath`). `DispatchBudget` is required and has no default. Its unit is
+`MaxQueuedOperationsPerSequence`, `FinishParallelTasks`, and from 1.4 the multi-row fields
+`bGpuMultiRow`, `SchemaJumpGpuFrameBudgetMs`, `GpuRowCostMs`, `bCalibrateGpuRowCost`, `SceneGpuShareMs`,
+`NominalTickMs` and `GpuRowsMarginPerMille`, described in
+[ARCHITECTURE.md](ARCHITECTURE.md#multi-row-gpu-passes)) and a choice of decode path per sequence
+(`ESuperSLMGpuDecodePath`). `DispatchBudget` is required and has no default. Its unit is
 SuperSLM dispatches, not layers: one layer is 24 dispatches for a model without QK-norm (the
 example model, Qwen2.5) and 25 for a model with it, so N layers per slice is
 `DispatchBudget = N * 24` (or `N * 25`). `Configure()` refuses a value below one layer's
@@ -64,12 +67,17 @@ The GPU subsystem also has calls the CPU one does not:
 | Restore and save results | `GetRestoreResult` (the restored sequence), `GetSaveTokenCounts` |
 | Refusals and faults | `GetLastLifecycleRequestError`, `GetLastFaultReason` |
 | Adapters and the device | `MapAdapter`, `UnmapAdapter`, `ProbeContextUsable`, `IsGpuBackendActive`, `IsDeviceHeadActive` |
-| Diagnostics | `GetLastGpuBusyMs`, `GetLastHostFinishMs`, `GetHitchCount`, `GetGpuDispatchCount` and the other `Get*` readers in the header |
+| Diagnostics | `GetLastGpuBusyMs`, `GetLastHostFinishMs`, `GetHitchCount`, `GetGpuDispatchCount`, `GetGpuRowCostMs` (1.4) and the other `Get*` readers in the header |
 
 The GPU subsystem declares the prefix cache's calls (`ConfigurePrefixCache`, `RequestPrefix`, `ReturnPrefix`,
-`GetPrefixSource`, `GetPrefixLeaseState`, `GetPrefixCacheStats`), but in 1.3.0 they are not connected to its
-scheduler and refuse `NotConfigured`: the cache is CPU-only (see
-[ARCHITECTURE.md](ARCHITECTURE.md#the-prefix-cache)). The GPU subsystem ignores `SchemaJumpForward`.
+`GetPrefixSource`, `GetPrefixLeaseState`, `GetPrefixCacheStats`, and from 1.4.0 `WarmPrefix`, `DropPrefix`,
+`GetPrefixOpResult`, `RegisterPrefixSet` and `UnregisterPrefixSet`), with no Blueprint nodes: call them from C++.
+From 1.4.0 they serve a cache of GPU prefixes for pooled sequences, configured from C++ (`ConfigurePrefixCache`
+before `Configure()`); adopt a lease with `RequestAdoptPrefix(Sequence, Prefix)`. A prefix set registered with the
+GPU subsystem serves only the entries built for that GPU's vendor and device; on any other GPU its entries are built
+by prefill (see [ARCHITECTURE.md](ARCHITECTURE.md#the-prefix-cache)). The GPU
+subsystem honours `SchemaJumpForward`'s `Exact` for a schema-bound generation on the one-call path, with multi-row on and the device-resident logits head.
+It runs it as `Off` elsewhere (see [ARCHITECTURE.md](ARCHITECTURE.md#multi-row-gpu-passes)).
 
 The headers in `Plugins/SuperSLMUnreal/Source/SuperSLMUnreal/Public/` are the reference for exact
 signatures.
@@ -85,7 +93,7 @@ prefix stays cached until it is evicted. Adopting a lease that was returned, or 
 refused `PrefixLeaseEnded`. See [ARCHITECTURE.md](ARCHITECTURE.md#the-prefix-cache).
 
 **Skip-ahead** writes the stretches a bound schema forces in batched passes instead of one decode per token. `Exact`
-keeps the tokens and the save of `Off`; `Canonical` writes fewer, different tokens. It is per generation and CPU-only.
+keeps the tokens and the save of `Off`. It is per generation, on the CPU backend and the GPU backend's one-call path.
 See [ARCHITECTURE.md](ARCHITECTURE.md#skip-ahead-for-schema-bound-generations).
 
 ## The Blueprint surface
@@ -102,6 +110,10 @@ the model, `bConfigureGpu` (default true), `PoolSize` (4), `CpuTickBudgetMs` (16
 backend loaded and says why in the result. It refuses by name to reconfigure a backend that still
 holds a vended sequence, a shared prefix or a mapped adapter. On the GPU it sets the tick's budget
 to the model's whole depth.
+
+From 1.4 the GPU backend it configures reads prompts several tokens per pass, at one token's GPU cost
+per frame, and measures that cost when the model loads, so **Loaded** fires after the measurement.
+`GpuTickBudgetMs` is not that budget. The multi-row settings are C++ only.
 
 **One query on either backend: `USuperSLMQuery`** (category *SuperSLM | Query*).
 
@@ -153,7 +165,7 @@ Rules the surface keeps:
   the two enums keep the same numbering; no Blueprint node returns them (see the C++ results
   below).
 - **The decoding mode is not exposed**; the plugin uses greedy decoding.
-- **The prefix cache's budget and skip-ahead are C++ settings in 1.3.0.** The **Load SuperSLM Model** node has no
+- **The prefix cache's budget and skip-ahead are C++ settings in 1.4.0.** The **Load SuperSLM Model** node has no
   cache input, so the cache nodes work once C++ has configured the cache; no Blueprint request carries
   `SchemaJumpForward`.
 - **No Blueprint text states GPU determinism.** In 1.0 the GPU verdict is always withheld: it

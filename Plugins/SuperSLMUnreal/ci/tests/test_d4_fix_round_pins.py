@@ -115,9 +115,10 @@ def test_local_tool_delta_is_manifested_and_disclosed():
         committed_contents[rel] = contents
         assert hashlib.sha256(contents).hexdigest() == entries[rel], rel
         assert name in version, f"local tool repair is not disclosed: {name}"
-    assert "Commit: 165962acafe901753dfe37153d7116b132a18b5a" in version
-    assert "Base release commit: 165962acafe901753dfe37153d7116b132a18b5a" in version
-    assert "Release status: published release v1.15.0" in version
+    # Plugin 1.4: re-vendored at the v1.18.1 tag (the exit-destructor fix).
+    assert "Commit: c3c14b16690a0c0c54de781f6f30380d88e62bd1" in version
+    assert "Base release commit: c3c14b16690a0c0c54de781f6f30380d88e62bd1" in version
+    assert "Release status: published release v1.18.1" in version
     assert "sslm_seq_jump_forward" in version
     architecture = (REPO / "RepoDrafts" / "SuperSLMUnreal" / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
     assert "Five route-P witness tool files carry" in architecture

@@ -1,11 +1,11 @@
-// The GPU prefix cache in plugin 1.3.0 (review round 2, item d): USuperSLMGpuSubsystem declares the cache's calls for
-// 1.4.0, and in 1.3.0 every one of them refuses NotConfigured, by name, even after ConfigurePrefixCache() and a GPU
-// Configure(). The documented behaviour (CHANGELOG 1.3.0 Known issues, ARCHITECTURE.md "On the GPU").
+// The GPU prefix cache is pooled-only (plugin 1.4.0, precache U6; build record reading R39): it keeps GPU prefixes, which
+// exist only with pooled sequences (SequenceBudget > 0). A dedicated Configure() after ConfigurePrefixCache() installs no
+// cache, and every cache call refuses NotConfigured, naming PrefixCacheRequiresPooled. (In 1.3.0 this cell was
+// SuperSLM.PrefixCache.Gpu.NotInRelease, when the GPU cache did not exist at all.)
 //
-//   SuperSLM.PrefixCache.Gpu.NotInRelease   the calls refuse NotConfigured and name 1.4.0; the stats read unconfigured
+//   SuperSLM.PrefixCache.Gpu.RequiresPooled   the calls refuse NotConfigured, naming PrefixCacheRequiresPooled; the stats read unconfigured
 //
-// Its sibling cells under SuperSLM.PrefixCache.Gpu.Instance and .Nested are the U6 twins owed at plugin 1.4.0; they
-// are red in 1.3.0 by design.
+// Its sibling cells under SuperSLM.PrefixCache.Gpu.Instance and .Nested run the cache in pooled mode.
 
 #include "Misc/AutomationTest.h"
 #include "SuperSLMSlotGates.h"
@@ -21,9 +21,9 @@
 #include "SuperSLMGpuSubsystem.h"
 #include "Tests/AutomationCommon.h"
 
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMPrefixCacheGpuNotInReleaseTest, "SuperSLM.PrefixCache.Gpu.NotInRelease",
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMPrefixCacheGpuRequiresPooledTest, "SuperSLM.PrefixCache.Gpu.RequiresPooled",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
-bool FSuperSLMPrefixCacheGpuNotInReleaseTest::RunTest(const FString& Parameters)
+bool FSuperSLMPrefixCacheGpuRequiresPooledTest::RunTest(const FString& Parameters)
 {
 	FTestWorldWrapper W;
 	if (!W.CreateTestWorld(EWorldType::Game)) { return false; }
@@ -51,8 +51,8 @@ bool FSuperSLMPrefixCacheGpuNotInReleaseTest::RunTest(const FString& Parameters)
 	FString Error;
 	bool bOk = TestFalse(TEXT("RequestPrefix is refused"), Gpu->RequestPrefix(Spec, Lease, Error));
 	bOk &= TestTrue(*FString::Printf(TEXT("the refusal is NotConfigured, by name (%s)"), *Error), Error.StartsWith(TEXT("NotConfigured")));
-	bOk &= TestTrue(*FString::Printf(TEXT("the refusal says the GPU prefix cache is not in this release, and names 1.4.0 (%s)"), *Error),
-		Error.Contains(TEXT("1.4.0")));
+	bOk &= TestTrue(*FString::Printf(TEXT("the refusal names PrefixCacheRequiresPooled (%s)"), *Error), Error.Contains(TEXT("PrefixCacheRequiresPooled")));
+	bOk &= TestFalse(*FString::Printf(TEXT("the refusal no longer says the cache is planned for a later release (%s)"), *Error), Error.Contains(TEXT("planned for")));
 	bOk &= TestFalse(TEXT("no lease is made"), Lease.IsValid());
 	bOk &= TestFalse(TEXT("ReturnPrefix ends nothing"), Gpu->ReturnPrefix(Lease));
 	bOk &= TestEqual(TEXT("GetPrefixSource reads Invalid"), (uint8)Gpu->GetPrefixSource(Lease), (uint8)ESuperSLMPrefixSource::Invalid);

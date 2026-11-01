@@ -12,7 +12,11 @@
 //   P1.11 (e) / finding 4 (b) SuperSLM.SchemaJump.P1.NoPromptReadsAfterFirstDecode
 //   P1.11 (f) (XD11)          SuperSLM.SchemaJump.P1.ExactOverPromptOnlyPrefix
 //   P1X.12 (f) (XD10)         SuperSLM.SchemaJump.P1X.StopTokenInsideDraft
-//   P1.2 drain, ground truth  SuperSLM.SchemaJump.P1.DrainGroundTruth
+//
+// Ruling 40 (red-suite-mr6.md): plugin 1.4 removes Canonical (E-11). P1.2's ground-truth drain cell was Canonical's
+// alone and is retired. The cells that ran Canonical for behaviour Exact shares now run Exact over a seeded table
+// (P1.1's scheduler half, P1.11 (c)); the switch cell follows ruling 39 Q7; the Canonical legs of P1.11 (a), (b),
+// (d) and (e) are retired.
 //
 // Red now: the review seam (SuperSLMSchemaJumpReviewTestAccess.h) and the public switch parser are the
 // suite's stubs, the per-C configuration fields are declared but unread, and every cell that
@@ -35,7 +39,6 @@ namespace SuperSLMSchemaJumpReviewTests
 
 	constexpr ESuperSLMSchemaJumpForward kOff = ESuperSLMSchemaJumpForward::Off;
 	constexpr ESuperSLMSchemaJumpForward kExact = ESuperSLMSchemaJumpForward::Exact;
-	constexpr ESuperSLMSchemaJumpForward kCanon = ESuperSLMSchemaJumpForward::Canonical;
 
 	bool ReviewSeamGate(FAutomationTestBase& T)
 	{
@@ -229,13 +232,22 @@ bool FSuperSLMSchemaJumpP1PriceSourceTest::RunTest(const FString& Parameters)
 			(uint8)Report.Result, (uint8)ESuperSLMConfigureResult::InvalidCostDomain);
 	}
 
-	// The scheduler: every span job of C rows is planned at the per-C price (needs the live verbs).
+	// The scheduler: every span job of C rows is planned at the per-C price (needs the live verbs). Ruling 40: the span
+	// jobs are Exact's (M = 1 + its draft rows), over a table seeded from the Off run, not Canonical's.
 	if (!LiveGate(*this)) { return false; }
 	if (!TestEqual(TEXT("re-Configure with the per-C pairs"), (uint8)Rig.Cpu->Configure(Rig.Model, Split).Result, (uint8)ESuperSLMConfigureResult::Success)) { return false; }
-	FSuperSLMSchemaJumpTestAccess::StartRecording(*Rig.Cpu);
+	if (!LoadWalkTableForSeeding(*this, Rig)) { return false; } // after the re-Configure(), which drops the table (O6)
 	FSuperSLMGenerationRequest Req;
 	FRunResult Run;
-	if (!MakeRequest(*this, Rig, PopulationPrompts()[0], kCanon, 256, Req) || !RunSolo(*this, Rig, Req, Run)) { return false; }
+	if (!MakeRequest(*this, Rig, PopulationPrompts()[0], kOff, 256, Req)) { return false; }
+	{
+		FRunResult Off;
+		if (!RunOff(*this, Rig, Req, Off)) { return false; }
+		FSuperSLMSchemaJumpTestAccess::SeedDraftTableFromStreams(*Rig.Cpu, Rig.Schema, { Off.Tokens });
+	}
+	Req.SchemaJumpForward = kExact;
+	FSuperSLMSchemaJumpTestAccess::StartRecording(*Rig.Cpu);
+	if (!RunSolo(*this, Rig, Req, Run)) { return false; }
 	const TArray<FSuperSLMSpanJobRecord> Spans = SpanJobsOf(*Rig.Cpu, Run.Sequence);
 	if (!RequireSpanActivity(*this, Spans, TEXT("P1.1 price source"))) { return false; }
 	int32 Small = 0;
@@ -253,7 +265,8 @@ bool FSuperSLMSchemaJumpP1PriceSourceTest::RunTest(const FString& Parameters)
 
 // P1.9 and review finding 3 (a code defect against plan text): the scratch switch's parser is the
 // plugin's public API, so the example (which reads only the public API) can call it, and it is the
-// core parser's production caller. Case-insensitive; anything else refused with the mode unchanged.
+// core parser's production caller. Case-insensitive; anything else refused with the mode unchanged. Plugin 1.4 (ruling
+// 39 Q7): `0` is Off and `1` is Exact; `canonical` in any case and `2` are refused and the mode falls back to Off.
 // The example's own wiring and log line: SuperSLMExample.Demo.SchemaJumpForwardSwitch and the host
 // cell ci/tests/test_schema_jump_example_switch.py. Mutant XD7.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMSchemaJumpP1SwitchParserIsPublicTest, "SuperSLM.SchemaJump.P1.SwitchParserIsPublic",
@@ -262,24 +275,37 @@ bool FSuperSLMSchemaJumpP1SwitchParserIsPublicTest::RunTest(const FString& Param
 {
 	struct FCase { const TCHAR* Text; ESuperSLMSchemaJumpForward Want; };
 	const FCase Accepted[] = {
-		{ TEXT("0"), kOff }, { TEXT("1"), kCanon },
-		{ TEXT("off"), kOff }, { TEXT("exact"), kExact }, { TEXT("canonical"), kCanon },
-		{ TEXT("OFF"), kOff }, { TEXT("Exact"), kExact }, { TEXT("CaNoNiCaL"), kCanon },
+		{ TEXT("0"), kOff }, { TEXT("1"), kExact },
+		{ TEXT("off"), kOff }, { TEXT("exact"), kExact },
+		{ TEXT("OFF"), kOff }, { TEXT("Exact"), kExact }, { TEXT("eXACT"), kExact },
 	};
 	bool bOk = true;
 	for (const FCase& C : Accepted)
 	{
 		// Start from a mode other than the one wanted, so "unchanged" cannot pass.
-		ESuperSLMSchemaJumpForward Mode = C.Want == kExact ? kCanon : kExact;
+		ESuperSLMSchemaJumpForward Mode = C.Want == kExact ? kOff : kExact;
 		bOk &= TestTrue(*FString::Printf(TEXT("'%s' is accepted"), C.Text), ParseSuperSLMSchemaJumpForwardSwitch(C.Text, Mode));
 		bOk &= TestEqual(*FString::Printf(TEXT("'%s' sets %s"), C.Text, ModeName(C.Want)), (uint8)Mode, (uint8)C.Want);
 	}
-	const TCHAR* Refused[] = { TEXT(""), TEXT(" exact"), TEXT("exact "), TEXT("2"), TEXT("-1"), TEXT("on"), TEXT("true"), TEXT("exactly"), TEXT("canon"), TEXT("01") };
+	const TCHAR* Refused[] = { TEXT(""), TEXT(" exact"), TEXT("exact "), TEXT("-1"), TEXT("on"), TEXT("true"), TEXT("exactly"), TEXT("canon"), TEXT("01") };
 	for (const TCHAR* Text : Refused)
 	{
 		ESuperSLMSchemaJumpForward Mode = kExact;
 		bOk &= TestFalse(*FString::Printf(TEXT("'%s' is refused"), Text), ParseSuperSLMSchemaJumpForwardSwitch(Text, Mode));
 		bOk &= TestEqual(*FString::Printf(TEXT("'%s' leaves the mode as it was"), Text), (uint8)Mode, (uint8)kExact);
+	}
+	// Ruling 39 Q7: Canonical's old values are refused and fall back to Off, from either mode. Ruling 42 S3: each logs
+	// the parser's one Warning that Canonical was removed, so 4 values x 2 starts = 8, by count; the plainly refused
+	// values above log nothing.
+	AddExpectedError(TEXT("Schema jump-forward \"(canonical|CANONICAL|CaNoNiCaL|2)\".*Canonical was removed"), EAutomationExpectedErrorFlags::Contains, 8);
+	for (const TCHAR* Text : { TEXT("canonical"), TEXT("CANONICAL"), TEXT("CaNoNiCaL"), TEXT("2") })
+	{
+		for (const ESuperSLMSchemaJumpForward Start : { kOff, kExact })
+		{
+			ESuperSLMSchemaJumpForward Mode = Start;
+			bOk &= TestFalse(*FString::Printf(TEXT("'%s' is refused (Canonical was removed in 1.4)"), Text), ParseSuperSLMSchemaJumpForwardSwitch(Text, Mode));
+			bOk &= TestEqual(*FString::Printf(TEXT("'%s' from %s falls back to Off"), Text, ModeName(Start)), (uint8)Mode, (uint8)kOff);
+		}
 	}
 	return bOk;
 }
@@ -384,8 +410,8 @@ bool FSuperSLMSchemaJumpP1WalkTableLoadInFlightTest::RunTest(const FString& Para
 	return bOk;
 }
 
-// P1.11 (a) (rev 1.3.6). An Exact or Canonical generation neither joins nor blocks a worker
-// continuation; Off keeps its continuations.
+// P1.11 (a) (rev 1.3.6). An Exact generation neither joins nor blocks a worker continuation; Off keeps its
+// continuations. Ruling 40: the Canonical member is retired with Canonical.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMSchemaJumpP1NoContinuationForJumpModesTest, "SuperSLM.SchemaJump.P1.NoContinuationForJumpModes",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMSchemaJumpP1NoContinuationForJumpModesTest::RunTest(const FString& Parameters)
@@ -415,20 +441,18 @@ bool FSuperSLMSchemaJumpP1NoContinuationForJumpModesTest::RunTest(const FString&
 	Settle(*Rig.Cpu);
 	bool bOk = TestTrue(*FString::Printf(TEXT("precondition: Off alone takes worker continuations (%d)"), OffSoloContinuations), OffSoloContinuations > 0);
 
-	// Off beside an Exact and a Canonical generation (the exact one with a seeded table).
+	// Off beside an Exact generation (with a seeded table).
 	FSuperSLMSchemaJumpTestAccess::SeedDraftTableFromStreams(*Rig.Cpu, Rig.Schema, { Solo[0].Result.Tokens });
 	FSuperSLMSchemaJumpTestAccess::StartRecording(*Rig.Cpu);
 	TArray<FConcurrentRun> Mixed;
-	Mixed.AddDefaulted(3);
+	Mixed.AddDefaulted(2);
 	if (!MakeRequest(*this, Rig, PopulationPrompts()[0], kOff, 64, Mixed[0].Request) ||
 		!MakeRequest(*this, Rig, PopulationPrompts()[1], kExact, 64, Mixed[1].Request) ||
-		!MakeRequest(*this, Rig, PopulationPrompts()[2], kCanon, 64, Mixed[2].Request) ||
 		!RunConcurrently(*this, Rig, Mixed, /*bKeep*/ true)) { return false; }
 	bOk &= TestEqual(TEXT("(a) no worker continuation includes the Exact generation"), ContinuationRowsOf(Mixed[1].Result.Sequence), 0);
-	bOk &= TestEqual(TEXT("(a) no worker continuation includes the Canonical generation"), ContinuationRowsOf(Mixed[2].Result.Sequence), 0);
-	bOk &= TestTrue(*FString::Printf(TEXT("(a) Off beside them still takes continuations (%d): they do not block one"), ContinuationRowsOf(Mixed[0].Result.Sequence)),
+	bOk &= TestTrue(*FString::Printf(TEXT("(a) Off beside it still takes continuations (%d): Exact does not block one"), ContinuationRowsOf(Mixed[0].Result.Sequence)),
 		ContinuationRowsOf(Mixed[0].Result.Sequence) > 0);
-	bOk &= TestEqual(TEXT("Off beside them equals Off alone"), Mixed[0].Result.Tokens, Solo[0].Result.Tokens);
+	bOk &= TestEqual(TEXT("Off beside it equals Off alone"), Mixed[0].Result.Tokens, Solo[0].Result.Tokens);
 	bOk &= RequireSpanActivity(*this, SpanJobsOf(*Rig.Cpu, Mixed[1].Result.Sequence), TEXT("P1.11 (a) exact"));
 	for (const FConcurrentRun& R : Mixed) { Rig.Cpu->ReturnSequence(R.Result.Sequence); }
 	Settle(*Rig.Cpu);
@@ -436,8 +460,8 @@ bool FSuperSLMSchemaJumpP1NoContinuationForJumpModesTest::RunTest(const FString&
 }
 
 // P1.11 (b) (rev 1.3.6). On a sequence that is neither fresh nor over a prompt-only prefix the plugin
-// adopted, the walk is unknown: Exact and Off make no forcedness read and issue no span job, and
-// Canonical still drains. The CPU input here is a restored sequence (the plugin did not build its
+// adopted, the walk is unknown: Exact and Off make no forcedness read and issue no span job. (Ruling 40: the leg
+// "Canonical still drains" is retired with Canonical.) The CPU input here is a restored sequence (the plugin did not build its
 // contents). A CPU prefix is always prompt-only (CreatePrefix prefills tokens on the base model), so
 // "after a prefix that carries schema progress" has no CPU input; see the build record.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMSchemaJumpP1WalkUnknownAfterRestoreTest, "SuperSLM.SchemaJump.P1.WalkUnknownAfterRestore",
@@ -473,7 +497,7 @@ bool FSuperSLMSchemaJumpP1WalkUnknownAfterRestoreTest::RunTest(const FString& Pa
 
 	bool bOk = true;
 	TArray<int32> OffTokens;
-	for (const ESuperSLMSchemaJumpForward Mode : { kOff, kExact, kCanon })
+	for (const ESuperSLMSchemaJumpForward Mode : { kOff, kExact })
 	{
 		FSuperSLMSequence Seq;
 		FSuperSLMLifecycleOpHandle Restore;
@@ -492,17 +516,10 @@ bool FSuperSLMSchemaJumpP1WalkUnknownAfterRestoreTest::RunTest(const FString& Pa
 		bOk &= TestFalse(*FString::Printf(TEXT("(b) %s over a restored sequence: the walk is unknown"), ModeName(Mode)), FSuperSLMSchemaJumpReviewTestAccess::IsWalkKnown(*Rig.Cpu, Seq));
 		const int32 Reads = ReadsOf(*Rig.Cpu, Seq).Num();
 		const int32 Spans = SpanJobsOf(*Rig.Cpu, Seq).Num();
-		if (Mode == kCanon)
-		{
-			bOk &= TestTrue(*FString::Printf(TEXT("(b) Canonical still reads forcedness (%d): its drain needs no walk"), Reads), Reads > 0);
-		}
-		else
-		{
-			bOk &= TestEqual(*FString::Printf(TEXT("(b) %s makes no forcedness read"), ModeName(Mode)), Reads, 0);
-			bOk &= TestEqual(*FString::Printf(TEXT("(b) %s issues no span job"), ModeName(Mode)), Spans, 0);
-			if (Mode == kOff) { OffTokens = Tokens; }
-			else { bOk &= TestEqual(TEXT("(b) Exact over a restored sequence equals Off"), Tokens, OffTokens); }
-		}
+		bOk &= TestEqual(*FString::Printf(TEXT("(b) %s makes no forcedness read"), ModeName(Mode)), Reads, 0);
+		bOk &= TestEqual(*FString::Printf(TEXT("(b) %s issues no span job"), ModeName(Mode)), Spans, 0);
+		if (Mode == kOff) { OffTokens = Tokens; }
+		else { bOk &= TestEqual(TEXT("(b) Exact over a restored sequence equals Off"), Tokens, OffTokens); }
 		Rig.Cpu->ReturnSequence(Seq);
 		Settle(*Rig.Cpu);
 	}
@@ -510,11 +527,13 @@ bool FSuperSLMSchemaJumpP1WalkUnknownAfterRestoreTest::RunTest(const FString& Pa
 	return bOk;
 }
 
-// P1.11 (c) (rev 1.3.6; review finding 4 (a)). While a schema change or an adapter swap is held for the
-// sequence, no span job is planned: the next job is a decode, which carries the request. The input:
-// Canonical with a chunk budget that splits chains, and an adapter swap (to no adapter, which changes
-// no token on the base model) requested right after a span job left its chain open, when the plain
-// drain rule would plan another span job.
+// P1.11 (c) (rev 1.3.6; review finding 4 (a); ruling 40: re-pointed from Canonical at Exact). While a schema change or
+// an adapter swap is held for the sequence, no span job is planned: the next job is a decode, which carries the
+// request. The input: Exact over a table seeded from the Off run, and an adapter swap (to no adapter, which changes no
+// token on the base model) requested at the decode after which the unheld twin planned a span job, so the plain loop
+// would plan a span job next. The twin finds that decode: a sequence's job order is fixed by its drafts, and the table
+// is seeded again before the held run (a completed Exact generation merges into it). The held run stops after each
+// decode's delivery through the job hold's AfterDecodeDelivery point.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMSchemaJumpP1HeldRequestGoesFirstTest, "SuperSLM.SchemaJump.P1.HeldRequestGoesFirst",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMSchemaJumpP1HeldRequestGoesFirstTest::RunTest(const FString& Parameters)
@@ -524,39 +543,67 @@ bool FSuperSLMSchemaJumpP1HeldRequestGoesFirstTest::RunTest(const FString& Param
 	FTestWorldWrapper W;
 	if (!W.CreateTestWorld(EWorldType::Game)) { return false; }
 	FCpuRig Rig;
-	FSuperSLMRuntimeConfig Config = BaseConfig(1, 1);
-	Config.MaxPrefillChunkBudget = 3; // splits the longer key chains
-	if (!SetUpCpu(*this, W.GetTestWorld(), Config, Rig)) { return false; }
+	if (!SetUpCpu(*this, W.GetTestWorld(), BaseConfig(1, 1), Rig) || !LoadWalkTableForSeeding(*this, Rig)) { return false; }
 	FSuperSLMGenerationRequest Req;
-	if (!MakeRequest(*this, Rig, PopulationPrompts()[0], kCanon, 256, Req)) { return false; }
+	FRunResult Off;
+	if (!MakeRequest(*this, Rig, PopulationPrompts()[0], kOff, 256, Req) || !RunOff(*this, Rig, Req, Off)) { return false; }
+	Req.SchemaJumpForward = kExact;
+
+	// The twin: the ordinal of the first decode job whose next job for the sequence is a span job.
+	FSuperSLMSchemaJumpTestAccess::SeedDraftTableFromStreams(*Rig.Cpu, Rig.Schema, { Off.Tokens });
+	FSuperSLMSchemaJumpTestAccess::StartRecording(*Rig.Cpu);
+	FRunResult Twin;
+	if (!RunSolo(*this, Rig, Req, Twin, false, /*bKeep*/ true)) { return false; }
+	int32 DecodeOrdinal = 0;
+	{
+		TArray<TPair<int64, bool>> Jobs; // (JobId, is a span job)
+		for (const int64 Id : DecodeJobIdsOf(*Rig.Cpu, Twin.Sequence)) { Jobs.Add(TPair<int64, bool>(Id, false)); }
+		for (const FSuperSLMSpanJobRecord& S : SpanJobsOf(*Rig.Cpu, Twin.Sequence)) { Jobs.Add(TPair<int64, bool>(S.JobId, true)); }
+		Jobs.Sort([](const TPair<int64, bool>& A, const TPair<int64, bool>& B) { return A.Key < B.Key; });
+		int32 Decodes = 0;
+		for (int32 I = 0; I + 1 < Jobs.Num(); ++I)
+		{
+			if (Jobs[I].Value) { continue; }
+			++Decodes;
+			if (Jobs[I + 1].Value) { DecodeOrdinal = Decodes; break; }
+		}
+	}
+	Rig.Cpu->ReturnSequence(Twin.Sequence);
+	Settle(*Rig.Cpu);
+	if (!TestTrue(TEXT("precondition: the twin planned a span job right after some decode"), DecodeOrdinal > 0)) { return false; }
+
+	// The held run.
+	FSuperSLMSchemaJumpTestAccess::SeedDraftTableFromStreams(*Rig.Cpu, Rig.Schema, { Off.Tokens });
 	FSuperSLMSequence Seq;
 	FString Error;
 	if (!TestEqual(TEXT("vend"), (uint8)Rig.Cpu->VendSequence(Seq), (uint8)ESuperSLMVendResult::Success)) { return false; }
 	if (!TestTrue(*Error, Rig.Cpu->SetSchema(Seq, Rig.Schema, Error))) { return false; }
 	FSuperSLMSchemaJumpTestAccess::StartRecording(*Rig.Cpu);
+	FSuperSLMSchemaJumpTestAccess::SetJobHold(*Rig.Cpu, Seq, ESuperSLMJobHoldPoint::AfterDecodeDelivery);
 	if (!TestTrue(*Error, Rig.Cpu->BeginGeneration(Seq, Req, Error))) { return false; }
-
 	int32 HoldTick = -1;
+	int32 Held = 0;
 	const double Start = FPlatformTime::Seconds();
 	while (!IsEnded(*Rig.Cpu, Seq) && FPlatformTime::Seconds() - Start < kRunSeconds)
 	{
 		Rig.Cpu->Tick(1.0f / 60.0f);
-		if (HoldTick < 0)
+		if (HoldTick < 0 && FSuperSLMSchemaJumpTestAccess::IsJobHeld(*Rig.Cpu, Seq))
 		{
-			for (const FSuperSLMSpanJobRecord& S : SpanJobsOf(*Rig.Cpu, Seq))
+			if (++Held == DecodeOrdinal)
 			{
-				if (S.ForcedChainLeftAfter > 0)
-				{
-					HoldTick = FSuperSLMSchedulingTestAccess::GetTickCounter(*Rig.Cpu); // jobs planned from here on follow the request
-					Rig.Cpu->RequestAdapterSwap(Seq, FSuperSLMAdapterHandle());
-					break;
-				}
+				HoldTick = FSuperSLMSchedulingTestAccess::GetTickCounter(*Rig.Cpu); // jobs planned from here on follow the request
+				Rig.Cpu->RequestAdapterSwap(Seq, FSuperSLMAdapterHandle());
+				FSuperSLMSchemaJumpTestAccess::SetJobHold(*Rig.Cpu, Seq, ESuperSLMJobHoldPoint::None);
+			}
+			else
+			{
+				FSuperSLMSchemaJumpTestAccess::ReleaseJobHold(*Rig.Cpu, Seq);
 			}
 		}
 		FPlatformProcess::Sleep(0.001f);
 	}
 	bool bOk = TestTrue(TEXT("the run ends"), IsEnded(*Rig.Cpu, Seq));
-	if (!TestTrue(TEXT("precondition: a span job left its chain open, and the swap was requested then"), HoldTick >= 0)) { return false; }
+	if (!TestTrue(*FString::Printf(TEXT("precondition: the held run reached decode %d, and the swap was requested then"), DecodeOrdinal), HoldTick >= 0)) { return false; }
 	// The first job for the sequence planned at or after HoldTick.
 	int64 FirstJob = TNumericLimits<int64>::Max();
 	bool bFirstIsDecode = false;
@@ -577,13 +624,15 @@ bool FSuperSLMSchemaJumpP1HeldRequestGoesFirstTest::RunTest(const FString& Param
 		}
 	}
 	bOk &= TestTrue(TEXT("(c) the first job after the held request is a decode, which carries it, not a span job"), bFirstIsDecode);
+	bOk &= TestEqual(TEXT("(c) the held Exact run's tokens equal Off's"), Rig.Cpu->GetGeneratedTokens(Seq), Off.Tokens);
 	Rig.Cpu->ReturnSequence(Seq);
 	Settle(*Rig.Cpu);
 	return bOk;
 }
 
 // P1.11 (d) (rev 1.3.6). A span's budget never exceeds the context cap or the slot limit (less the
-// context used), the largest prefill chunk, or the allowance. Budget mode, so the slot limit binds.
+// context used), the largest prefill chunk, or the allowance. Budget mode, so the slot limit binds. Ruling 40: the
+// Canonical leg is retired; the Exact leg stays.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMSchemaJumpP1SpanClipTest, "SuperSLM.SchemaJump.P1.SpanClip",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMSchemaJumpP1SpanClipTest::RunTest(const FString& Parameters)
@@ -596,7 +645,7 @@ bool FSuperSLMSchemaJumpP1SpanClipTest::RunTest(const FString& Parameters)
 	if (!SetUpCpu(*this, W.GetTestWorld(), BaseConfig(1, 1), Rig)) { return false; }
 	bool bOk = true;
 	TArray<FRunResult> OffRuns;
-	for (const ESuperSLMSchemaJumpForward Mode : { kCanon, kExact })
+	for (const ESuperSLMSchemaJumpForward Mode : { kExact })
 	{
 		for (const int32 ChunkBudget : { 3, 7 })
 		{
@@ -634,9 +683,8 @@ bool FSuperSLMSchemaJumpP1SpanClipTest::RunTest(const FString& Parameters)
 }
 
 // P1.11 (e) (rev 1.3.6; review finding 4 (b)). A generation with no prompt (over an adopted prefix) has
-// no prefill job to read after: its first forcedness read follows its first decode. In Canonical
-// mode its first token is therefore the model's choice; after it, no decode is planned with a chain
-// open.
+// no prefill job to read after: its first forcedness read follows its first decode. (Ruling 40: the Canonical leg,
+// "no decode is planned with a chain open" after the first, is retired with Canonical.)
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMSchemaJumpP1NoPromptReadsAfterFirstDecodeTest, "SuperSLM.SchemaJump.P1.NoPromptReadsAfterFirstDecode",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMSchemaJumpP1NoPromptReadsAfterFirstDecodeTest::RunTest(const FString& Parameters)
@@ -653,11 +701,13 @@ bool FSuperSLMSchemaJumpP1NoPromptReadsAfterFirstDecodeTest::RunTest(const FStri
 	if (!TestTrue(TEXT("tokenize"), Rig.Cpu->Tokenize(PopulationPrompts()[0], PromptTokens))) { return false; }
 	FSuperSLMPrefix Prefix;
 	if (!MakePromptOnlyPrefix(*this, Rig, PromptTokens, Prefix)) { return false; }
+	// Ruling 53 (triage run 3, finding 7): with Canonical's leg retired, Exact ran first and cold, before the walk table
+	// was published, so it read nothing. The table is loaded before the loop, as the cell's reads assume.
+	if (!TestTrue(TEXT("the walk table is loaded before the runs (ruling 53)"), FSuperSLMSchemaJumpReviewTestAccess::LoadSchemaWalkTableNow(*Rig.Cpu))) { return false; }
 	bool bOk = true;
-	for (const ESuperSLMSchemaJumpForward Mode : { kCanon, kExact, kOff })
+	for (const ESuperSLMSchemaJumpForward Mode : { kExact, kOff })
 	{
 		FSuperSLMSchemaJumpTestAccess::StartRecording(*Rig.Cpu);
-		const int32 OpenBefore = FSuperSLMSchemaJumpReviewTestAccess::GetCanonicalDecodesPlannedWithOpenChain(*Rig.Cpu);
 		FRunResult Run;
 		if (!RunOverPrefix(*this, Rig, Prefix, Mode, 64, Run, /*bKeep*/ true)) { return false; }
 		const TArray<int64> Decodes = DecodeJobIdsOf(*Rig.Cpu, Run.Sequence);
@@ -667,11 +717,6 @@ bool FSuperSLMSchemaJumpP1NoPromptReadsAfterFirstDecodeTest::RunTest(const FStri
 		int64 FirstDecode = TNumericLimits<int64>::Max();
 		for (const int64 Id : Decodes) { FirstDecode = FMath::Min(FirstDecode, Id); }
 		bOk &= TestEqual(*FString::Printf(TEXT("(e) %s with no prompt: the first read follows the first decode"), ModeName(Mode)), Reads[0].AfterJobId, FirstDecode);
-		if (Mode == kCanon)
-		{
-			const int32 Open = FSuperSLMSchemaJumpReviewTestAccess::GetCanonicalDecodesPlannedWithOpenChain(*Rig.Cpu) - OpenBefore;
-			bOk &= TestTrue(*FString::Printf(TEXT("(e) Canonical with no prompt: only the first decode can be planned with a chain open (%d)"), Open), Open >= 0 && Open <= 1);
-		}
 		Rig.Cpu->ReturnSequence(Run.Sequence);
 		Settle(*Rig.Cpu);
 	}
@@ -897,37 +942,6 @@ bool FSuperSLMSchemaJumpP1XStopTokenInsideDraftStateTest::RunTest(const FString&
 		}
 		bOk &= SameEnding(*this, Exact, OffRun, *FString::Printf(TEXT("%s: exact equals off with the same stop token"), Case));
 		bOk &= TestTrue(*FString::Printf(TEXT("%s: the saved blobs are byte-identical"), Case), ExactBlob == OffBlob);
-	}
-	return bOk;
-}
-
-// P1.2's drain rule against ground truth (review finding 4): with a chunk budget that splits chains
-// and no held request, no decode job is planned for a Canonical sequence while the engine reports a
-// chain (the seam reads sslm_seq_forced_tokens itself before each such decode).
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMSchemaJumpP1DrainGroundTruthTest, "SuperSLM.SchemaJump.P1.DrainGroundTruth",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
-bool FSuperSLMSchemaJumpP1DrainGroundTruthTest::RunTest(const FString& Parameters)
-{
-	if (!LiveGate(*this) || !ReviewSeamGate(*this)) { return false; }
-	FSuperSLMSchedulingTestAccess::FScopedReportHistoryCapacity History;
-	FTestWorldWrapper W;
-	if (!W.CreateTestWorld(EWorldType::Game)) { return false; }
-	FCpuRig Rig;
-	FSuperSLMRuntimeConfig Config = BaseConfig(1, 1);
-	Config.MaxPrefillChunkBudget = 3;
-	if (!SetUpCpu(*this, W.GetTestWorld(), Config, Rig)) { return false; }
-	bool bOk = true;
-	for (const FString& Prompt : PopulationPrompts())
-	{
-		FSuperSLMSchemaJumpTestAccess::StartRecording(*Rig.Cpu);
-		const int32 Before = FSuperSLMSchemaJumpReviewTestAccess::GetCanonicalDecodesPlannedWithOpenChain(*Rig.Cpu);
-		FSuperSLMGenerationRequest Req;
-		FRunResult Run;
-		if (!MakeRequest(*this, Rig, Prompt, kCanon, 256, Req) || !RunSolo(*this, Rig, Req, Run)) { return false; }
-		bOk &= RequireSpanActivity(*this, SpanJobsOf(*Rig.Cpu, Run.Sequence), *Prompt);
-		bOk &= TestEqual(*FString::Printf(TEXT("'%s': no decode planned with a chain open"), *Prompt),
-			FSuperSLMSchemaJumpReviewTestAccess::GetCanonicalDecodesPlannedWithOpenChain(*Rig.Cpu) - Before, 0);
-		bOk &= TestTrue(TEXT("the seam's counter is live"), Before >= 0);
 	}
 	return bOk;
 }

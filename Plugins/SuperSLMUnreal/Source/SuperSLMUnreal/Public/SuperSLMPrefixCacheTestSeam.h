@@ -37,6 +37,10 @@ enum class ESuperSLMDiskWrapperEdit : uint8
 	PayloadByte,       // one byte inside the SPX1 payload's body flipped (the engine's digest refuses it)
 	PayloadProducer,   // the SPX1 payload's producer identity changed, digest recomputed by the seam
 	                   // (the engine's producer check refuses it: SSLM_RESTORE_PRODUCER_MISMATCH)
+	PayloadAdapter,    // the SPX1 payload's producer adapter (vendor, device) changed, digest recomputed: a GPU blob
+	                   // from another GPU (the producer check refuses it: SSLM_RESTORE_PRODUCER_MISMATCH)
+	PayloadDevice,     // precache U7: the SPX1 payload's adapter device (offset 24) alone changed, digest recomputed:
+	                   // a blob from the same vendor's other GPU (refused SSLM_RESTORE_PRODUCER_MISMATCH)
 };
 
 // A cache build's progress through its lane jobs (cell 8.10 (c), the build hold; §5.3 item 4): Begun once its begin
@@ -108,6 +112,11 @@ public:
 
 	// Applies Edit to the wrapper file at Path in place. False when Path is not a well-formed wrapper.
 	static bool EditDiskWrapper(const FString& Path, ESuperSLMDiskWrapperEdit Edit);
+	// Precache U7: the same edit on wrapper bytes held in memory (a cooked prefix set's stored entry), and the producer
+	// the SPX1 payload inside a wrapper names in its header (backend at offset 4, adapter vendor at 20, device at 24).
+	// False when the bytes are not a well-formed wrapper, or (the reading) its payload is not SPX1.
+	static bool EditWrapperBytes(TArray<uint8>& Wrapper, ESuperSLMDiskWrapperEdit Edit);
+	static bool ReadWrapperPayloadProducer(const TArray<uint8>& Wrapper, uint32& OutBackend, uint32& OutVendorId, uint32& OutDeviceId);
 
 	// Runs Hook on the pool thread after the disk tier's directory scan names a file and before it
 	// opens it (cell 2.8's "replaced between scan and read"). One-shot; cleared at Configure().
@@ -215,6 +224,106 @@ public:
 	static FString DiskFileOf(const USuperSLMGpuSubsystem& Subsystem, const FSuperSLMPrefixSpec& Spec);
 	static FString DiskFileOfWithAdapter(const USuperSLMGpuSubsystem& Subsystem, const FSuperSLMPrefixSpec& Spec, uint32 VendorId, uint32 DeviceId);
 	static bool AdapterIdsOf(const USuperSLMGpuSubsystem& Subsystem, uint32& OutVendorId, uint32& OutDeviceId);
+
+	// The rest of the CPU seams above, for the GPU instance (the GPU twins of the [U] cells; the GPU host shares the
+	// CPU host's core, disk tier, pool-thread IO and test state, so each reads as its CPU twin). The GPU's differences:
+	// the build hold and the chunk hold never wait inside a submission-thread job (a held step returns and is posted
+	// again, so no job nears the device-loss bound); a GPU build's "chunk jobs" are its prefilling steps (Q7).
+	static void SetBuildHold(USuperSLMGpuSubsystem& Subsystem, bool bHold);
+	static int32 HeldBuildCount(const USuperSLMGpuSubsystem& Subsystem);
+	static ESuperSLMPrefixBuildState BuildStateOf(const USuperSLMGpuSubsystem& Subsystem, const FSuperSLMPrefix& Lease);
+	static int32 InFlightBuildCount(const USuperSLMGpuSubsystem& Subsystem);
+	static void SetBuildChunkHold(USuperSLMGpuSubsystem& Subsystem, int32 AfterChunkJobs);
+	static int32 BuildChunkJobsOf(const USuperSLMGpuSubsystem& Subsystem, const FSuperSLMPrefix& Lease);
+	static int64 UnfrozenBuildReleases(const USuperSLMGpuSubsystem& Subsystem);
+	static bool DispatchHeldRelease(USuperSLMGpuSubsystem& Subsystem, int32 Index = 0);
+	static int32 MaxReleasesOfOneHandle(const USuperSLMGpuSubsystem& Subsystem);
+	static void ForceKeyCollision(USuperSLMGpuSubsystem& Subsystem, const FSuperSLMPrefixSpec& Spec, const FSuperSLMPrefixSpec& CollideWith);
+	static void SetDiskFault(USuperSLMGpuSubsystem& Subsystem, ESuperSLMPrefixDiskFault Fault);
+	static void SetBeforeDiskRead(USuperSLMGpuSubsystem& Subsystem, TFunction<void(const FString& Path)> Hook);
+	static int32 DiskIoInFlight(const USuperSLMGpuSubsystem& Subsystem);
+	static bool IsCacheIoSettled(const USuperSLMGpuSubsystem& Subsystem);
+	static void HoldWriteBacks(USuperSLMGpuSubsystem& Subsystem, bool bHold);
+	static int32 HeldWriteBackCount(const USuperSLMGpuSubsystem& Subsystem);
+	static int32 MaxDiskExclusion(const USuperSLMGpuSubsystem& Subsystem);
+	static void HoldDiskReads(USuperSLMGpuSubsystem& Subsystem, bool bHold);
+	static int32 HeldDiskReadCount(const USuperSLMGpuSubsystem& Subsystem);
+	static int32 MaxKeyDiskOverlap(const USuperSLMGpuSubsystem& Subsystem);
+	static void SetDeleteRefusal(USuperSLMGpuSubsystem& Subsystem, bool bRefuse);
+	static void HoldKeyHash(USuperSLMGpuSubsystem& Subsystem, const FSuperSLMPrefixSpec& Spec, bool bHold);
+	static void SetOffGameThreadRecording(USuperSLMGpuSubsystem& Subsystem, bool bRecord);
+	static int64 OffGameThreadViolations(const USuperSLMGpuSubsystem& Subsystem);
+	static int64 GameThreadStateAccesses(const USuperSLMGpuSubsystem& Subsystem);
+	static int64 OffGameThreadChecks(const USuperSLMGpuSubsystem& Subsystem);
+	static bool OffGameThreadAssertTrips(USuperSLMGpuSubsystem& Subsystem);
+	static bool GameThreadAccessorTrips(USuperSLMGpuSubsystem& Subsystem);
+	// GPU only. The busy-release substitution (cell 5.15's GPU legs): the next Count cache releases return SSLM_BUSY
+	// without calling sslm_gpu_prefix_release, so each handle stays live and the core issues its release again.
+	static void SetBusyReleases(USuperSLMGpuSubsystem& Subsystem, int32 Count);
+	// GPU only. Latches the subsystem's terminal-loss flag as a confirmed device loss does (cell 5.14, Q9): the cache
+	// posts nothing more, requests refuse DeviceUnavailable, and the next Tick() tears the GPU backend down. The
+	// device itself is untouched; a later Configure() sets everything up again.
+	static void ForceTerminalLoss(USuperSLMGpuSubsystem& Subsystem);
+	// GPU only. Lane jobs the cache has posted to the submission thread since Configure() (every step of a build counts).
+	static int64 PostedLaneJobs(const USuperSLMGpuSubsystem& Subsystem);
+	// GPU only. Marks the submission thread unresponsive, as an overrun of a job's bound does (cell 5.14's
+	// unresponsive leg): the queued jobs complete Skipped, the terminal-loss flag latches, and the cache posts nothing.
+	static void ForceUnresponsive(USuperSLMGpuSubsystem& Subsystem);
+	// GPU only. The release-status substitution (cell 5.15's non-busy leg): the real sslm_gpu_prefix_release runs, then
+	// GpuStatus (an SslmGpuStatus value) is returned in place of its own; 0 (SSLM_OK) clears it.
+	static void SubstituteReleaseStatus(USuperSLMGpuSubsystem& Subsystem, int32 GpuStatus);
+	// GPU only (cell 5.13). A bound, in seconds, for the cache's submission-thread jobs in place of the frame-path bound
+	// (0 restores it; a job over it takes the unresponsive path, as any overrun does), and each cache job's wall time
+	// on the submission thread since Configure().
+	static void SetCacheJobBoundSeconds(USuperSLMGpuSubsystem& Subsystem, double Seconds);
+	static TArray<double> CacheJobSeconds(const USuperSLMGpuSubsystem& Subsystem);
+	// GPU only (cells 3.5, 5.5). One-shot: the next cache build's begin is not called and GpuStatus (an SslmGpuStatus,
+	// e.g. SSLM_GPU_KV_POOL_EXHAUSTED) is its result; nothing is drawn.
+	static void SetNextCacheBuildStatus(USuperSLMGpuSubsystem& Subsystem, int32 GpuStatus);
+	// GPU only (cell 1.7's restore legs). The restore hold: while set, each cache restore job calls nothing and is posted
+	// again (never waiting inside a submission-thread job); HeldRestoreCount: restores stopped at it now.
+	static void SetRestoreHold(USuperSLMGpuSubsystem& Subsystem, bool bHold);
+	static int32 HeldRestoreCount(const USuperSLMGpuSubsystem& Subsystem);
+	// GPU only (cells 1.5, 1.7). The last ended configuration's cache, read after TearDown() or a re-Configure(): its
+	// releases per engine handle (the teardown's own included), the most of one handle, its unfrozen builds released.
+	// 0 when no configuration with a cache has ended.
+	static int32 ReleasesOfAtLastTeardown(const USuperSLMGpuSubsystem& Subsystem, uint64 EngineHandle);
+	static int32 MaxReleasesOfOneHandleAtLastTeardown(const USuperSLMGpuSubsystem& Subsystem);
+	static int64 UnfrozenBuildReleasesAtLastTeardown(const USuperSLMGpuSubsystem& Subsystem);
+	// GPU readings of the shared host's pool-thread holds (cell 3.10 (ii), (iii) and the trim race; the host suite's
+	// Sim->Held on RemoveDiskFile and TrimDisk). HoldDropDeletes: while set, a drop's delete (DropPrefix(MemoryAndDisk)'s
+	// disk part) stops on its pool thread after it is taken -- inside the delete/trim exclusion counter (MaxDiskExclusion)
+	// and the per-key overlap counter -- and before it touches the file; HeldDropDeleteCount: deletes stopped there now.
+	// HoldTrims: the same for the disk tier's trim, before it lists the directory; HeldTrimCount. Both yield to teardown,
+	// as the write-back hold does, so a delete held at a re-Configure() runs then, under the old configuration (§5.4 rev
+	// 1.18.5). DropDeletesRun: drop deletes that went past the hold to the file API under the current configuration's
+	// cache; DropDeletesRunAtLastTeardown: under the last ended configuration's, its teardown's drain included (-1 when
+	// none).
+	static void HoldDropDeletes(USuperSLMGpuSubsystem& Subsystem, bool bHold);
+	static int32 HeldDropDeleteCount(const USuperSLMGpuSubsystem& Subsystem);
+	static void HoldTrims(USuperSLMGpuSubsystem& Subsystem, bool bHold);
+	static int32 HeldTrimCount(const USuperSLMGpuSubsystem& Subsystem);
+	static int64 DropDeletesRun(const USuperSLMGpuSubsystem& Subsystem);
+	static int64 DropDeletesRunAtLastTeardown(const USuperSLMGpuSubsystem& Subsystem);
+	// GPU only (cell 3.10 (v); the U2 code review's delete-behind-save, findings 1 and 2, on the GPU). The save hold, the
+	// GPU's reading of the lane-park seam on a write-back's save: while set, each cache save job calls nothing and is
+	// posted again (never waiting inside a submission-thread job), so the save stays queued and no file write is issued;
+	// HeldSaveCount: saves stopped at it now. A save still held when the configuration ends never runs: the teardown
+	// delivers it Skipped (no engine call), as the CPU host's step 1a does for a save no lane has run, so a drop's delete
+	// waiting on it is drained before the teardown returns.
+	static void SetSaveHold(USuperSLMGpuSubsystem& Subsystem, bool bHold);
+	static int32 HeldSaveCount(const USuperSLMGpuSubsystem& Subsystem);
+	// GPU only (cell 5.12's PoolExhausted row: "the pool filled from outside the cache", 5.5's construction). ShortGpuPool
+	// creates budgeted sequences on the subsystem's own pool, on the submission thread, outside the cache and the ledger,
+	// until the pool's free pages (sslm_gpu_kv_pool_stats) are at most LeaveFreePages, and holds them; it returns the free
+	// pages left (-1 with no GPU cache, or a closed lane). RestoreGpuPool releases them; the teardown releases any left
+	// before the cache's own releases. While the pool is short the fill probe and the ledger's form-1 reading do not
+	// hold (the holders are drawn outside every region), so a cell reads them only after RestoreGpuPool.
+	static int32 ShortGpuPool(USuperSLMGpuSubsystem& Subsystem, int32 LeaveFreePages);
+	static void RestoreGpuPool(USuperSLMGpuSubsystem& Subsystem);
+	// GPU only (precache U7; Gpu.Cooked.ProducerRefused). Registered cooked entries whose bytes the engine refused, which
+	// the cache marked stale and never restores again in this configuration; -1 with no GPU cache.
+	static int32 StaleCookedEntries(const USuperSLMGpuSubsystem& Subsystem);
 
 private:
 	// The GPU subsystem's cache instance, through this class's friendship (null when none).

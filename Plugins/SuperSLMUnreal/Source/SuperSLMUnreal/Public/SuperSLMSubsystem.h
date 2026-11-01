@@ -537,6 +537,10 @@ private:
 	// SuperSLMSchemaJumpReviewTestAccess.h).
 	friend struct FSuperSLMSchemaJumpReviewTestAccess;
 
+	// Multi-row GPU ruling 41 (Q13): the GPU's Exact reads this subsystem's learned draft table
+	// (Private/SuperSLMExactDraftProvider.h), so both backends draft from one provider.
+	friend struct FSuperSLMExactDraftProvider;
+
 	// Every Layer-1 handle, buffer, slot, and scheduler figure (SuperSLMSubsystem.cpp). Owned
 	// here and freed by Deinitialize()/BeginDestroy(); held by pointer so this reflected header
 	// includes no Layer-1 header.

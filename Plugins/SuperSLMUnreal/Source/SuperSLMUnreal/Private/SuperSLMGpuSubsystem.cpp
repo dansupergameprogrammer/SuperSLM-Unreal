@@ -10,6 +10,7 @@
 #include "SuperSLMLog.h"
 #include "SuperSLMModel.h"
 #include "SuperSLMPagedGpuTestSeam.h" // the paged-KV test seams (plugin paging plan §3.9; declared under WITH_DEV_AUTOMATION_TESTS)
+#include "SuperSLMGpuMultiRowTestSeam.h" // MR6's multi-row test seam (multi-row GPU plan §5.2-§5.4; WITH_DEV_AUTOMATION_TESTS)
 #include "SuperSLMSubsystem.h" // SuperSLMChannel (§5.1's shared trace channel, extern'd there)
 
 #include "ProfilingDebugging/CpuProfilerTrace.h"
@@ -94,6 +95,21 @@
 #include "SuperSLMGpuStatusMapping.h"
 #include "SuperSLMRuntimeRegistry.h"
 #include "SuperSLMSaveBlob.h"
+// Multi-id delivery, the save carry and the wrapper codec (kept from P2 for Exact on the multi-row path; ruling 40),
+// and the multi-row chooser (multi-row GPU plan §5.1; MR6). Engine 1.18's gpu_1p0.h declares every multi-row and
+// forced-chain verb the plugin calls, so no shim stands between them.
+#include "Core/SuperSLMGpuSchemaJumpCore.h"
+#include "Core/SuperSLMGpuRowsChooser.h"
+#include "Core/SuperSLMGpuRowCostCalibration.h" // erratum E-13 (rulings 48, 48a): the calibration's pure pieces
+#include "superslm/gpu_rows_cost_table.h"
+// Ruling 41 (Q13): Exact's drafts come from the plugin's one provider, the CPU subsystem's learned table.
+#include "Core/SuperSLMSchemaJumpCore.h"
+#include "SuperSLMExactDraftProvider.h"
+#include "SuperSLMSubsystem.h"
+#include "Engine/GameInstance.h"
+namespace GpuJumpCore = SuperSLMCore::GpuJump;
+namespace GpuRows = SuperSLMCore::GpuRows;
+namespace GpuRowCost = SuperSLMCore::GpuRowCost;
 
 #include "HAL/CriticalSection.h"
 #include "Interfaces/IPluginManager.h"
@@ -154,11 +170,47 @@
 // module's link loudly rather than changing the adopt path silently. The K7 build record carries
 // it as a decision (D6) for the planner to rule on.
 int64_t* SslmGpuSeqHandleContextLengthForBench(SslmGpuSequenceHandle* seq);
+// Ruling 59.1: the engine's layer index for a sequence (the same header, the same unconditional definition), read after
+// every one-row decode call to prove the engine ran exactly the layers the planner billed (ExpectLayerAfter).
+uint32_t* SslmGpuSeqHandleLayerIndexForBench(SslmGpuSequenceHandle* seq);
+
+// Ruling 41 (Q13): SCM1's transitions for one schema of the GPU's own parsed section, as the shared draft provider
+// (SuperSLMCore::BuildDraft) walks them; the CPU subsystem's FScm1Automaton over the same artifact's section. IsForced is
+// never consulted by BuildDraft (the table holds only states observed forced).
+class FGpuScm1Automaton final : public SuperSLMCore::ISchemaAutomaton
+{
+public:
+	FGpuScm1Automaton(const superslm::SchemaMasksTable& InTable, const superslm::SchemaEntry& InEntry)
+		: Table(InTable), Entry(InEntry)
+	{
+	}
+	virtual uint32_t StartState() const override { return 0; }
+	virtual bool Step(uint32_t State, int32_t Token, uint32_t& OutNext) const override
+	{
+		if (State >= Entry.state_count || Token < 0 || static_cast<uint32_t>(Token) >= Table.VocabSize())
+		{
+			return false;
+		}
+		uint32_t Next = 0;
+		if (!Table.Transition(Entry, State, static_cast<uint32_t>(Token), &Next))
+		{
+			return false;
+		}
+		OutNext = Next;
+		return true;
+	}
+	virtual bool IsForced(uint32_t) const override { return false; }
+
+private:
+	const superslm::SchemaMasksTable& Table;
+	const superslm::SchemaEntry& Entry;
+};
 
 // Plugin paging plan §3.4 "Prefixes" (K7): GPU prefix ids come from the CPU subsystem's shared
 // counter (SuperSLMSubsystem.cpp, GNextPrefixId), so a handle of one backend is unknown to the other.
 // Game thread.
 int64 SuperSLMMintPrefixId();
+int64* SuperSLMPrefixIdCounter(); // precache U6: the GPU cache host mints from the same counter
 
 // §5.1 (plan §5.1, "GPU backend"; D-SLM7411; R-S2h; T-2826 round 5, 2026-09-19). A dedicated
 // SuperSLMGpuChannel, sibling to SuperSLMSubsystem.h's own SuperSLMChannel, with the identical
@@ -189,6 +241,18 @@ TRACE_DECLARE_INT_COUNTER(SuperSLMGpuK, TEXT("SuperSLM/GPU/K"));
 TRACE_DECLARE_INT_COUNTER(SuperSLMGpuDueTokens, TEXT("SuperSLM/GPU/DueTokens"));
 // Plan §2.5 row 19 (D-SLM7763): save-blob bytes held in handle entries and not yet taken.
 TRACE_DECLARE_INT_COUNTER(SuperSLMGpuRetainedResultBytes, TEXT("SuperSLM/GPU/RetainedResultBytes"));
+// Multi-row GPU plan §5.5 and ruling 39 Q4, Q6 (MR6): the rows a chunk admitted, a chunk slice's wall time, the host
+// finish of an Exact close (report-only, never a chooser input: ruling 37), and the Exact generations that ran as Off
+// because no M in 2..8 fit the logits stage.
+TRACE_DECLARE_INT_COUNTER(SuperSLMGpuRowsPerChunk, TEXT("SuperSLM/GPU/RowsPerChunk"));
+TRACE_DECLARE_FLOAT_COUNTER(SuperSLMGpuRowsSliceMs, TEXT("SuperSLM/GPU/RowsSliceMs"));
+TRACE_DECLARE_INT_COUNTER(SuperSLMGpuHostFinishUs, TEXT("SuperSLM/GPU/HostFinishUs"));
+TRACE_DECLARE_INT_COUNTER(SuperSLMGpuExactFellBackToOff, TEXT("SuperSLM/GPU/ExactFellBackToOff"));
+// Ruling 42a: Exact steps that ran as Off's one-row step (no draft, S2; or a failed Exact open, S1), counted per step.
+TRACE_DECLARE_INT_COUNTER(SuperSLMGpuExactStepFellBack, TEXT("SuperSLM/GPU/ExactStepFellBack"));
+// Ruling 48 (erratum E-13): the row cost Configure() calibrated on this GPU, in microseconds (set when a calibration, or
+// the process's cache of one, settles on a measured price).
+TRACE_DECLARE_INT_COUNTER(SuperSLMGpuCalibratedRowCostUs, TEXT("SuperSLM/GPU/CalibratedGpuRowCostUs"));
 
 namespace
 {
@@ -281,6 +345,18 @@ namespace
 		// (sslm_gpu_prefix_prefill, count 1, a whole token's dispatches). Slot is INDEX_NONE: the
 		// action names its prefix by PrefixId, and no sequence's generation filter applies to it.
 		PrefixBuildTurn,
+		// Multi-row GPU plan §5.2-§5.3 (MR6): one slice of a multi-row chunk -- a prompt chunk's
+		// (sslm_gpu_seq_embed_rows PROMPT) on either path, or an Exact chunk's (EXACT_DRAFT) on OneCall. The
+		// slice that opens the chunk embeds its rows first; the slice that runs its last layer closes it.
+		RowsSlice,
+	};
+
+	// The kind of chunk a RowsSlice action belongs to (the seam's ESuperSLMGpuRowsActionKind, less OneRow).
+	enum class ERowsKind : uint8
+	{
+		None = 0,
+		Prompt = 1,
+		Exact = 2,
 	};
 
 	enum class EResultKind : uint8
@@ -328,6 +404,44 @@ namespace
 		// kind (0 prompt, 1 schema content) and, with bLastPrompt, that the turn freezes it.
 		int64 PrefixId = 0;
 		int32 PrefixKind = 0;
+		// RowsSlice only (MR6). The chunk's kind; whether this slice opens it (embeds its rows first) and closes it
+		// (runs its last layer); the slice's layers are Layers. A prompt chunk carries its rows' tokens (RowsTokens,
+		// 2..8 of them, and bLastPrompt when the prompt's last token is among them); an Exact chunk carries the most rows
+		// it may take (RowsCount, M_exact) and the CPU subsystem's learned draft table as it stood when the chunk was
+		// planned (DraftTable, null when none is loaded; ruling 41 Q13); its drafts are built on the thread, from the
+		// walk state the pending token left. bComposed: the slice belongs to a composed sequence and runs in the
+		// composed phase of the job.
+		ERowsKind RowsKind = ERowsKind::None;
+		bool bOpenRows = false;
+		bool bCloseRows = false;
+		bool bComposed = false;
+		int32 RowsCount = 0;
+		TArray<int32, TInlineAllocator<8>> RowsTokens;
+		SuperSLMCore::FDraftTableRef DraftTable;
+		// MR6's seam (test builds): the action's record in RowsRecords, INDEX_NONE when not recorded, and the record of
+		// its chunk's opening slice (a RowsSlice only).
+		int32 RowsRecord = INDEX_NONE;
+		int32 RowsFirstRecord = INDEX_NONE;
+		// Ruling 43 N1: an Exact slice planned below one row carries l(1), the layers of Off's first one-row slice that
+		// its close runs when the step fell back (0: Off's whole token, at B_eff >= C(1)).
+		int32 RowsFallbackLayers = 0;
+		// Ruling 43 N2: a one-row slice of a OneCall token (ruling 42 R1). It runs as its own decode call, never in the
+		// composed batch, whose running remainder would hand it the layers to its token's end.
+		bool bOneCallRow = false;
+		// Run 5: a one-row slice whose layers reach its token's last layer. Layer 1's batch call hands each member the
+		// running remainder up to its token's end, so only such a slice may run in the batch; one the planner cut short of
+		// its token's end runs as its own call, at its own layers (else it takes a later member's layers and that member
+		// is refused SSLM_BATCH_BUDGET_EXHAUSTED).
+		bool bEndsToken = false;
+		// Ruling 59.1 (as written, 59c point 4): the one slice short of its token's end this tick's batch may hold, placed last,
+		// where the engine's running remainder is exactly its planned layers.
+		bool bBatchLast = false;
+		// Ruling 59.1: a one-row slice's planned layer position after its decode call (PlanLayerPos then), which the engine's
+		// layer index must equal; -1: not checked.
+		int32 ExpectLayerAfter = -1;
+		// Erratum E-14 (ruling 53): an Exact chunk's closing slice carries the positions its open counted beyond the
+		// pending token (M_exact - 1, an upper bound), which the close's apply removes (FGameSlot::ExactExtraBound).
+		int32 PosExtraBound = 0;
 	};
 
 	struct FActionResult
@@ -357,6 +471,27 @@ namespace
 		// Plugin paging plan §3.4 "The armed flag" (K7): the thread slot's bArmed after this action ran,
 		// 1 or 0, carried back for the slot's armed mirror. -1 on a result whose action did not run.
 		int32 Armed = -1;
+		// Multi-row GPU plan §4.1, §4.7 (MR6; kept from P2's delivery, ruling 40): the ids an Exact chunk's close
+		// delivered, in order -- its committed drafts, each marked forced, then the produced token. Results stay one-to-one
+		// with the job's actions: a close's ids are this one result. Empty for every other result, whose one token is
+		// Token. When non-empty, Kind is Token, Token is the last id, and JumpEnd says how the action ended after them:
+		// Skipped (it did not), DeadEnd or Fault (Message and Fault as for a result of that kind).
+		TArray<GpuJumpCore::FDeliveredId, TInlineAllocator<8>> JumpIds;
+		EResultKind JumpEnd = EResultKind::Skipped;
+		// An Exact chunk's close only (the MR6 seam's record; ruling 42 S1, S2, S5): the step fell back to Off's, and
+		// what its open read -- the forced chain's ids (-1: the read did not answer) and the drafts in all.
+		bool bRowsFellBack = false;
+		int32 RowsForcedChain = -1;
+		int32 RowsDraftCount = -1;
+#if WITH_DEV_AUTOMATION_TESTS
+		// Ruling 59e point 1 (the MR6 seam): what the open proposed, CPU Exact's draft at the same walk state, the table's arrival.
+		TArray<int32> TestRowsProposed;
+		TArray<int32> TestRowsCpuDraft;
+		bool bTestRowsTableReached = false;
+#endif
+		// Ruling 43 N1: a fell-back close below one row ran the embed and this many layers of Off's one-row token (its
+		// first l(1) slice) and delivered nothing; the planner runs the rest as one-row slices. 0 otherwise.
+		int32 RowsFallbackLayers = 0;
 	};
 
 	struct FJob
@@ -390,6 +525,12 @@ namespace
 		// It selects which outstanding counter the job is held in (OutstandingTickJobs, the cap's
 		// measure, or OutstandingOtherJobs).
 		bool bTickJob = false;
+		// Run 5: the warm price of the work Plan billed this tick job (us; 0: unpriced, no budget cap). The cold ramp takes it off
+		// the job's wall time to tell a host stall that idled the GPU (UpdateColdRamp()).
+		double PricedUs = 0.0;
+		// Ruling 59b point 4: the job's GPU time, the delta of the engine's cumulative GPU-busy counter across it (< 0 until it
+		// ran), read only in MeasureTickJobForLayerSizing() and only to size the next ticks' layers (the feedback guard).
+		double GpuBusyUs = -1.0;
 		// Test access only (ruling 2026-09-26, FSuperSLMGpuTestAccess::SetSubmissionDelaySeconds()):
 		// how long Run() sleeps after this job's Layer-1 work, outside the lock and the holder
 		// record, before it is marked done. Copied from the setting by PlanAndIssue() when it
@@ -410,6 +551,51 @@ namespace
 		// before bDone's release store; RunSync() reads it after, so a skipped job never reads as
 		// success.
 		bool bSkipped = false;
+		// Ruling 48 (erratum E-13): a row-cost calibration job. Always a tick job (bTickJob) and never a Custom job, so
+		// the per-tick GPU seam records it like any tick job. bWhole (no frame budget, at Configure): WholeTokens whole
+		// fused tokens, stopping at Deadline (wall seconds). Otherwise one slice of the token in flight: Layers layers,
+		// embedding the token first when bEmbed and finishing it when bFinish. The submission thread writes the results
+		// into the same struct before bDone.
+		struct FCalibrationStep
+		{
+			bool bActive = false;
+			bool bWhole = false;
+			int32 WholeTokens = 0;
+			double Deadline = 0.0;
+			int32 Layers = 0;
+			bool bEmbed = false;
+			bool bFinish = false;
+			int32 Attempt = 0; // the calibration attempt it belongs to (ruling 50's call records; phase 2 is kMaxAttempts)
+			// Erratum E-14 (rulings 53, 54): the throwaway sequence's capacity (P2 + 8 at B > 0, made by the first job);
+			// phase 2's filler (FillRows > 0: a prompt chunk of FillRows zeros, embedded when bFillOpen, then
+			// Layers layers of it); and bRider: a phase-2 slice that rides a generation tick job, after its actions.
+			int64 SeqCap = 16;
+			int32 FillRows = 0;
+			bool bFillOpen = false;
+			bool bRider = false;
+			// Ruling 56 (2): the load-time warm-up of the widened row kernels -- WidenRows > 0: this slice is one layer of a
+			// prompt chunk of that many zero rows, then the chunk abandoned (untimed); WholeWidenMask (bit M; ruling 57 F5:
+			// the chooser's candidate widths, WidenCandidateMask()): a whole calibration runs one for each width in it after
+			// its first WholeWidenAfter tokens.
+			int32 WidenRows = 0;
+			uint32 WholeWidenMask = 0;
+			int32 WholeWidenAfter = 0;
+			// Results.
+			FGpuStatus Status = FGpuStatus::SSLM_OK;
+			bool bNoSequence = false; // the throwaway sequence could not be made
+			bool bTimedOut = false;   // bWhole: Deadline passed before every token ran
+			TArray<double> TokenUs;   // bWhole: each token's cumulative GPU-busy counter delta, in order
+			TArray<double> WholeFinishUs; // bWhole: each token's finish (ruling 56 (1)), in order
+			double SliceUs = 0.0;     // a slice: its counter delta, the finish's included
+			double FinishUs = -1.0;   // ruling 56 (1): a slice's logits finish on its own (its counter delta); -1: none ran
+			uint32 WidenRanMask = 0;  // ruling 56 (2): the widened warm-ups that ran, bit M for M rows
+			FGpuStatus WidenStatus = FGpuStatus::SSLM_OK; // the last one skipped, and why (not the calibration's failure)
+		};
+		FCalibrationStep Calibration;
+#if WITH_DEV_AUTOMATION_TESTS
+		// Test access only (ruling 45, GetTickGpuBusyUs()): the tick that enqueued this tick job. -1 for other jobs.
+		int64 TestTick = -1;
+#endif
 		std::atomic<bool> bDone{false};
 	};
 
@@ -464,10 +650,10 @@ namespace
 		// 0 in dedicated mode, where ContextHasRoom() checks Cap alone, exactly as before.
 		int64 Limit = 0;
 		// Plugin paging plan §3.4 "The armed flag" (K7): the exact mirror of the engine's
-		// ready_for_logits for this pooled holder. Set by an adopt (the prefix's last write) and by a
-		// restore (the payload's ready word); cleared by a reset and by the first finish-only step
-		// while armed, which runs SslmGpuSeqDecodeStepForG5Bridge's ready shortcut instead of the
-		// finish bridge (ArmedFinish()). Never set in dedicated mode.
+		// ready_for_logits for this holder. Set by an adopt (the prefix's last write) and by a
+		// restore (the payload's ready word) and, since ruling 40, by a schema dead end in either mode (the engine re-arms
+		// there); cleared by a reset (in either mode) and by the first finish-only step while armed, which runs
+		// SslmGpuSeqDecodeStepForG5Bridge's ready shortcut instead of the finish bridge (ArmedFinish()).
 		bool bArmed = false;
 		int32 Produced = 0;
 		int32 MaxNewTokens = 0;
@@ -476,6 +662,29 @@ namespace
 		const SslmGpuAdapterHandle* BoundAdapter = nullptr;
 		const SslmGpuAdapterHandle* PinnedAdapter = nullptr;
 		int64 AppliedBindTag = 0;   // the bind tag of the most recent tagged bind that ran (rule 4)
+		// Multi-row GPU plan §4.1 (MR6): the chunk open on this handle (RowsOpen rows admitted; 0 when none), its kind,
+		// the layers its slices have run, whether the prompt's last token is among its rows, and an Exact chunk's drafts
+		// (the rows after the pending token). The engine holds the chunk's adapter fixed from its first slice
+		// (PinnedAdapter, rule 4). A save abandons an open chunk (sslm_gpu_seq_rows_abandon) before it saves (§5.4).
+		int32 RowsOpen = 0;
+		ERowsKind RowsKind = ERowsKind::None;
+		int32 RowsLayersDone = 0;
+		bool bRowsLastPrompt = false;
+		TArray<int32, TInlineAllocator<8>> RowsDrafts;
+		// Ruling 42 S1/S2 (42a): the Exact step planned as a chunk runs as Off's one-row step instead -- no draft, or the
+		// Exact open failed. Nothing is embedded; the chunk's slices do no device work, and its closing slice runs Off's
+		// whole-token step (RunOneCallToken), so the token is Off's and is delivered at the planned close. Below one row
+		// (ruling 43 N1) the close runs Off's first one-row slice instead, and the planner runs the rest of the token.
+		bool bRowsFellBack = false;
+		// What the Exact open read (reported on the close's result): the forced chain's ids after the stop-token cut (-1
+		// when the read did not answer) and the drafts in all.
+		int32 RowsForcedChain = -1;
+		int32 RowsDraftCount = -1;
+#if WITH_DEV_AUTOMATION_TESTS
+		TArray<int32> TestRowsProposed;   // ruling 59e point 1, as FActionResult's
+		TArray<int32> TestRowsCpuDraft;
+		bool bTestRowsTableReached = false;
+#endif
 	};
 
 	enum class EEventKind : uint8 { Prefill, Token };
@@ -533,6 +742,9 @@ namespace
 		int32 ObservedAtSave = -1;
 		// Diagnostic only (R-S2k (vi), U1 round 3): FThreadSlot::AppliedBindTag when the save job ran.
 		int64 BindTagAtSave = 0;
+		// Multi-row GPU plan §5.4 (MR6): the save job abandoned an open chunk before it saved, and the abandon's status.
+		bool bAbandonedRows = false;
+		FGpuStatus AbandonStatus = FGpuStatus::SSLM_OK;
 		// Row 19 (D-SLM7763): the save's wrapper is assembled off the game thread by AssembleJob,
 		// enqueued at finalize; FinishedBlob is its output, moved into the handle's result entry
 		// when the save resolves. bAssembled is false when the job never ran (row 21's
@@ -562,6 +774,9 @@ namespace
 		FString RestoreWhere;
 		SslmGpuSequenceHandle* FreshHandle = nullptr;
 		bool bAdapterBound = false; // rule 4 (T-2987 F4): the restore job bound the saved adapter
+		// The restore job's ready_for_logits reading, for the armed mirror (kept from P2's review N2; ruling 40).
+		bool bRestoreGetterRead = false;
+		bool bRestoreGetterReady = false;
 		bool bSchemaCrossCheckFailed = false; // row 5: the restored binding disagrees with the wrapper
 		// Plugin paging plan §3.5 (K7): a pooled restore's out_shared_pages, for the ledger's apply.
 		uint32 SharedPages = 0;
@@ -640,7 +855,7 @@ namespace
 		bool bRestoreStopped = false;
 		int32 RestoreLastToken = -1;
 		int32 RestoreInFlightIssued = 0;
-		struct FRestoreCarried { EResultKind Kind; ESuperSLMGpuFaultReason Fault; int32 Token; int32 Delay; };
+		struct FRestoreCarried { EResultKind Kind = EResultKind::Skipped; ESuperSLMGpuFaultReason Fault = ESuperSLMGpuFaultReason::None; int32 Token = -1; int32 Delay = 1; };
 		TArray<FRestoreCarried> RestoreCarried;
 		FSuperSLMGpuSequence RestoreOutSequence;
 		// The slot AdmitRestoreFront() reserved for this restore, set at admission (finding 2,
@@ -661,6 +876,13 @@ namespace
 		// Plugin paging plan §3.4 "Adopt" (K7), pooled mode: the prefix RequestAdoptPrefix(Sequence,
 		// Prefix) names. 0 for the no-prefix overload and in dedicated mode.
 		int64 AdoptPrefixId = 0;
+#if SUPERSLM_WITH_PREFIX_CACHE
+		// Precache U6, edit 6: AdoptPrefixId names a cache lease. Its entry is pinned (Token) from the call until the
+		// op resolves (ResolveEntry() ends the pin, whatever the outcome); Token 0 for a subsystem prefix. A pooled
+		// restore hinted with a cache lease (§5.11 (b) *Adopt and hint*) holds its pin here too, with
+		// RestoreHintPrefixId 0.
+		SuperSLMGpuPrefixCacheGlue::FCacheAdopt CacheAdopt;
+#endif
 
 		// Plugin paging plan §3.5 (K7), a pooled restore: the 'SLM6' header's budget, origin and ready
 		// word as the call checked them (the ledger's charge and the holder's shape and armed flag
@@ -762,11 +984,50 @@ namespace
 		// K7: the generation now planned is an armed sequence's empty-prompt one, whose first
 		// (finish-only) step still has to carry the generation's limits (FAction::bBeginLimits).
 		bool bPlanBeginLimits = false;
+		// Multi-row GPU plan §4.7, §5.2 (MR6; ruling 39 Q3, Q4): the generation runs Exact as EXACT_DRAFT chunks (set at
+		// its admission: the setting Exact, a schema bound, the OneCall path, and the chooser's plan running Exact), and
+		// the forced ids among its applied tokens (GetForcedTokenCount(); 0 since 1.4: an Exact close delivers its
+		// committed drafts as the model's own tokens, ruling 40). Both cleared with the generation.
+		bool bExactRows = false;
+		int64 ForcedTokenCount = 0;
+		// The generation reads no prompt by rows: multi-row is off, or the sequence was armed at its admission (a
+		// prompt chunk clears the engine's ready flag, which a one-row suffix keeps, §4.1).
+		bool bNoPromptRows = false;
+		// The chunk the planner has open on this sequence (MR6): its kind and rows (0: none), the layers planned so
+		// far and per slice, an Exact chunk's slice schedule position, and the prompt index of its first row. While
+		// PlanRows > 0 the sequence is mid-token (AtTokenBoundary()).
+		ERowsKind PlanRowsKind = ERowsKind::None;
+		int32 PlanRows = 0;
+		int32 PlanRowsLayer = 0;
+		// Erratum E-14 (ruling 53): a slice is priced at its end position. The open chunk's last row's position and an
+		// Exact chunk's schedule at that position; the position of the one-row token in flight; and the position bound's
+		// parts (NextPosition()): the context at the generation's start, and the drafts open Exact chunks may still commit.
+		int64 PlanRowsEndPos = 0;
+		TArray<int32, TInlineAllocator<16>> PlanExactSlices;
+		int64 PlanTokenPos = 0;
+		int64 PosBase = 0;
+		int64 ExactExtraBound = 0;
+		int32 PlanRowsPerSlice = 0;
+		int32 PlanRowsSlice = 0;
+		int32 PlanRowsPromptStart = 0;
+		// The adapter the open chunk is pinned to (an adapter id; 0: base): UnmapAdapter() refuses it until the close.
+		int64 PlanAdapterId = 0;
+		// The record index of the chunk's last recorded slice (the seam marks an abandon on it), and of its opening
+		// slice; INDEX_NONE when none.
+		int32 PlanRowsRecord = INDEX_NONE;
+		int32 PlanRowsFirstRecord = INDEX_NONE;
+		// Ruling 43 N1: an Exact close planned below one row whose result is not applied yet. Until it is, the sequence
+		// is not due and a save waits at its front: a close that fell back leaves Off's token in flight, which the
+		// planner finishes with one-row slices (ApplyResult()), so nothing is planned past the close before it knows.
+		bool bPlanAwaitClose = false;
 		// K7 review S1, pooled mode: the generation's limit, read from the page ledger's applied shape
 		// when its BeginGeneration was admitted (it waits at the slot front while the slot has a ledger
 		// job open, so no job is in flight then), carried to the thread by its first step
 		// (FAction::BeginLimit). 0 in dedicated mode and outside a generation.
 		int64 PlanBeginLimit = 0;
+		// Ruling 56 (3), E14_4's diagnosis: the ticks in a row this sequence had work and no action, and that it warned.
+		int32 StallTicks = 0;
+		bool bStallWarned = false;
 	};
 
 	struct FGameSlot : FGameSlotUser
@@ -842,6 +1103,113 @@ namespace
 
 	constexpr uint32 kWrapperExtMagic = 0x47554c53u; // 'S','L','U','G'
 	constexpr uint32 kWrapperExtVersion = 1;
+	// The wrapper extension is written and read by the core's codec, version 1 byte for byte as above. Version 2 (a
+	// Canonical GPU generation of the unreleased P2) is refused (ruling 39 Q8).
+	static_assert(kWrapperExtMagic == GpuJumpCore::WrapperExtMagic && kWrapperExtVersion == GpuJumpCore::WrapperExtVersion1,
+		"the core's wrapper codec writes this layout");
+}
+
+// Ruling 48 (erratum E-13) and 48a: the load-time row-cost calibration's process-wide record. A price is measured once
+// per model artifact and GPU adapter: the key is the artifact's content hash and the adapter's LUID (never a LoRA
+// adapter), so the same artifact imported again as a new model, or configured again, takes the price measured before.
+// Ruling 51: whether the logits head is on the device is part of the key (it decides whether the finish is GPU time),
+// and a fallback is kept too (F2), so a later Configure() neither waits nor warns again; ForgetRowCostCalibrations()
+// clears both. The count is every calibration that ran to a used price or a fallback. Any thread (Configure() and BeginConfigure() prepare on either).
+namespace
+{
+	constexpr double kRowCostCalibrationTimeoutSeconds = 2.0; // ruling 48a (4): the whole calibration's wall-clock cap
+	constexpr double kRowCostCalibrationTimeoutSecondsAtBudget = 10.0; // ruling 51 F2: the cap with a frame budget set
+	// The throwaway sequence's least capacity: phase 1 adds one position per token, and there are at most two attempts,
+	// each with its widened warm-ups (ruling 56a: up to 8 rows embedded and abandoned after its warm-up tokens).
+	// Phase 2 (ruling 54) needs P2 + 1; the sequence is made with P2 + 16 when that is more (FRowCostStep::SeqCap).
+	// Ruling 60: up to 2 replacement runs per timed set, and a spread failure's retry (a third phase-1 attempt; a second
+	// phase-2 set behind P2), so both leave room for them.
+	constexpr int64 kRowCostCalibrationSequenceCap = 40;
+	constexpr int64 kRowCostCalibrationLateMargin = 16;
+	// Ruling 56 (2): phase 1 runs 3 warm-up tokens before its 3 timed ones (phase 2 keeps the 1 + 3 of
+	// GpuRowCost::kWarmUpRunsPerPosition and kTimedRunsPerPosition), and after the warm-ups it warms each widened row kernel
+	// the chooser can pick: one layer of M zero rows on the throwaway sequence, abandoned, untimed, never over B.
+	constexpr int32 kPhase1WarmUpRuns = 3;
+	constexpr int32 kPhase1TimedRuns = GpuRowCost::kTimedRunsPerPosition;
+	constexpr int32 kWidenWarmUpRows[] = {2, 4, 8};
+	constexpr int32 kWidenWarmUpCount = UE_ARRAY_COUNT(kWidenWarmUpRows);
+	// Ruling 60: the sanity-range retry and a spread failure's retry, so at most kMaxAttempts + 1 phase-1 attempts.
+	constexpr int32 kPhase1MaxAttemptTokens = kPhase1WarmUpRuns + kPhase1TimedRuns + GpuRowCost::kMaxOutlierExtraRuns;
+	static_assert(kRowCostCalibrationSequenceCap >= (GpuRowCost::kMaxAttempts + 1) * kPhase1MaxAttemptTokens,
+		"the throwaway sequence holds every phase-1 token");
+	static_assert(kRowCostCalibrationSequenceCap >= GpuRowCost::kMaxAttempts * kPhase1MaxAttemptTokens + kPhase1WarmUpRuns + 8,
+		"the last attempt's widened warm-ups (8 rows after its warm-up tokens) fit behind every earlier token");
+	struct FRowCostCacheEntry
+	{
+		uint8 ArtifactHash[32] = {};
+		uint64 AdapterLuid = 0;
+		bool bDeviceLogitsHead = false;
+		int64 PriceUs = 0;
+		bool bFallBack = false; // ruling 51 F2: the calibration fell back to the default; PriceUs is unused
+		// Erratum E-14 (rulings 53, 54): the line (C_a and the slope) and whether its slope is phase 2's measurement; a
+		// failed phase 2 is kept too, so it warns once.
+		GpuRowCost::FRowCostLine Line;
+		bool bSlopeMeasured = false;
+		bool bLateFailed = false;
+		bool bCapWarned = false; // ruling 55 F2: a measured line out of range under another ContextCap warned
+		int64 FinishUs = -1; // ruling 56 (1): F, phase 1's measured logits finish (us); -1: not measured
+	};
+
+	FCriticalSection& RowCostCacheLock()
+	{
+		static FCriticalSection Lock;
+		return Lock;
+	}
+
+	TArray<FRowCostCacheEntry>& RowCostCache()
+	{
+		static TArray<FRowCostCacheEntry> Cache;
+		return Cache;
+	}
+
+	std::atomic<int32> GRowCostCalibrationCount{0};
+	// Ruling 54 (reading 3): ForgetRowCostCalibrations() also drops a phase 2 in flight; a state's phase 2 runs only while
+	// the epoch it started in is current.
+	std::atomic<int32> GRowCostForgetEpoch{0};
+#if WITH_DEV_AUTOMATION_TESTS
+	// Ruling 60 (5): the test hook (ArmRowCostRunDelay()): for phase 0 (phase 1) and 1 (phase 2), the timed runs (bit i:
+	// the phase's i-th timed run in a state, replacements and retries counted) whose measured time gets DelayUs added.
+	std::atomic<uint32> GRowCostRunDelayMask[2] = {};
+	std::atomic<int64> GRowCostRunDelayUs[2] = {};
+#endif
+
+	bool FindCachedRowCost(const uint8 (&Hash)[32], uint64 Luid, bool bDeviceLogitsHead, FRowCostCacheEntry& Out)
+	{
+		FScopeLock Lock(&RowCostCacheLock());
+		for (const FRowCostCacheEntry& E : RowCostCache())
+		{
+			if (E.AdapterLuid == Luid && E.bDeviceLogitsHead == bDeviceLogitsHead && FMemory::Memcmp(E.ArtifactHash, Hash, sizeof(E.ArtifactHash)) == 0)
+			{
+				Out = E;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// The entry for this key, made when absent; Update writes its fields. Any thread.
+	void CacheRowCost(const uint8 (&Hash)[32], uint64 Luid, bool bDeviceLogitsHead, TFunctionRef<void(FRowCostCacheEntry&)> Update)
+	{
+		FScopeLock Lock(&RowCostCacheLock());
+		for (FRowCostCacheEntry& E : RowCostCache())
+		{
+			if (E.AdapterLuid == Luid && E.bDeviceLogitsHead == bDeviceLogitsHead && FMemory::Memcmp(E.ArtifactHash, Hash, sizeof(E.ArtifactHash)) == 0)
+			{
+				Update(E);
+				return;
+			}
+		}
+		FRowCostCacheEntry& E = RowCostCache().AddDefaulted_GetRef();
+		FMemory::Memcpy(E.ArtifactHash, Hash, sizeof(E.ArtifactHash));
+		E.AdapterLuid = Luid;
+		E.bDeviceLogitsHead = bDeviceLogitsHead;
+		Update(E);
+	}
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -859,11 +1227,215 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	// Config.K alone is re-set after Configure(), by SetFixedTickLatency() while the pool is drained.
 	FSuperSLMGpuRuntimeConfig Config;
 	int32 NumHiddenLayers = 0;
+	// Ruling 56 (5): the K/V shape a dedicated 'SLM5' save's workspace is laid out in (GetLiveSaveBytes()).
+	int32 KvHeads = 0;
+	int32 KvHeadDim = 0;
 	int32 VocabSize = 0;
 	int64 ModelContextCap = 0;
 	uint32 DispatchesPerLayer = 0;
 	int32 LayersPerTick = 0;
 	int32 MinimumK = 0;
+	// Multi-row GPU plan §5.1-§5.3 (MR6): the chooser's plan, from Config and the vendored cost table alone at
+	// Configure (never from measured time, C18), and the slice schedule of an Exact chunk of MExact rows (layers per
+	// slice, in order; its last slice carries the logits stage, ruling 39 Q3). Game thread after Configure.
+	GpuRows::FChooserPlan RowsPlan;
+	TArray<int32, TInlineAllocator<16>> ExactSlices;
+	// Ruling 39 Q4: an Exact generation that ran as Off because no M in 2..8 fit the logits stage is logged once per
+	// session (this state's lifetime). Game thread.
+	bool bExactFellBackLogged = false;
+	// The device-resident logits head is mapped (EXACT_DRAFT needs it; 7.11 (b)). Set at Configure.
+	bool bDeviceLogitsHead = false;
+	// --- Erratum E-13 (rulings 48 and 48a): the row cost the plan is built from, and the calibration behind it ---
+	// RowCostMs is GpuRowCostMs as the chooser takes it; RowCostSource says where it came from. While a calibration at a
+	// frame budget runs (bRowCostPending) the plan is a provisional one at the 6.2 ms default, used only for the room a
+	// calibration slice is sized against (B_eff less the scene share; ruling 50 -- its l(1) sizes nothing), and nothing
+	// else is planned. Attempts, the last attempt's warm-ups and timed runs
+	// are GetRowCost()'s. Game thread once published (PrepareGpuState() fills them before).
+	double RowCostMs = 0.0;
+	GpuRowCost::ESource RowCostSource = GpuRowCost::ESource::Default;
+	bool bRowCostPending = false;
+	int32 RowCostAttempts = 0;
+	int32 RowCostWarmUpRuns = 0;
+	TArray<double> RowCostRunsUs;
+	// The log line's names, and the once-per-model-and-adapter key (the artifact's content hash is ArtifactHash).
+	FString RowCostModelName;
+	FString AdapterName;
+	uint64 AdapterLuid = 0;
+	// Precache U7: the PCI vendor and device ids of the adapter Layer 1 dispatches on (its DXGI_ADAPTER_DESC1), which the
+	// GPU prefix cache keys by and a cooked prefix set's GPU build is stored under. bAdapterIdsKnown is false when the
+	// description did not read; the cache then falls back to the RHI's ids (FSuperSLMGpuPrefixCacheHost::ResolveAdapterIds).
+	uint32 AdapterVendorId = 0;
+	uint32 AdapterDeviceId = 0;
+	bool bAdapterIdsKnown = false;
+	bool bArtifactHashKnown = false;
+	// The calibration in flight: the attempt (0, or 1 for the retry), the token within it (warm-ups first), the layers
+	// of that token already run and their counter time, the attempt's timed runs, when it started (0: not yet, the
+	// first slice starts the 2 s clock), and the slice job in flight. Game thread.
+	int32 CalAttempt = 0;
+	int32 CalToken = 0;
+	int32 CalLayerPos = 0;
+	double CalTokenUs = 0.0;
+	TArray<double> CalRunsUs;
+	double CalStartSeconds = 0.0;
+	TSharedPtr<FJob> CalJob;
+	// Ruling 50: the slicing is sized from what the calibration has measured, never from the provisional plan. The room
+	// one slice may take (B_eff less the scene share, us), p -- the largest per-unit GPU cost measured so far in this
+	// calibration (a unit is one layer, or the logits finish; the counter delta over the slice's units), whether a
+	// finish has been measured (until then it runs as its own slice), and the slices this attempt has issued (an
+	// attempt's first slice is 1 layer). p and the finish carry over a retry; the slice count does not.
+	int64 CalRoomUs = 0;
+	double CalMaxUnitUs = 0.0;
+	// Ruling 57 F1: the largest per-layer cost measured so far with the finish taken out -- (SliceUs - FinishUs) / Layers
+	// over phase 1's slices with layers -- which sizes the widened warm-up's room check (a one-layer pass of M rows costs
+	// r(M) x a layer, not r(M) x the finish p may hold). Carries over a retry, as p does.
+	double CalMaxLayerUs = 0.0;
+	// Ruling 51 F10: a calibrated price waiting for the game thread to write the trace counter (0: none). Set by
+	// whichever thread owns the state; read and cleared on the game thread only (PublishRowCostTrace()).
+	int64 PendingRowCostTraceUs = 0;
+	bool bCalFinishMeasured = false;
+	int32 CalAttemptSlices = 0;
+	// Ruling 56 (1): F, the logits finish a token-ending one-row slice carries -- the max of phase 1's timed finishes, in
+	// us (-1: not measured; the planner then prices it at g(1) x C(1) / 1000) -- and the attempt's max so far.
+	int64 RowCostFinishUs = -1;
+	double CalFinishMaxUs = -1.0;
+	// Ruling 56 (2), 56a: the widened warm-ups -- the next of kWidenWarmUpRows a sliced calibration issues, and that this
+	// attempt has done them (once per M per phase-1 attempt; a cache hit runs none).
+	int32 CalWidenNext = 0;
+	bool bCalWidened = false;
+	// Ruling 57 F5, 57a: the widths this Configure()'s phase 1 warms (bit M), WidenCandidateMask() at the provisional plan
+	// phase 1 runs under, taken once so a retry warms the same set. 0 with multi-row off, and when no phase 1 runs.
+	uint32 CalWidenMask = 0;
+	// The test seams (ArmRowCostCalibration(), ArmRowCostCalibrationTimeout()) this state's calibration spends: one entry
+	// per attempt (> 0 replaces its measured maximum, in us; 0 leaves it; < 0 fails it), and a first attempt that times
+	// out. Set before the state is published; always present, empty in a product run.
+	TArray<double> CalArmMaxUs;
+	TArray<double> CalArmLateMaxUs; // E-14: the late position's arms (phase 2): its first entry, or by attempt (below)
+	bool bCalArmLateByAttempt = false; // ArmRowCostCalibration(): phase 2 takes the arm of the attempt phase 1 used
+	bool bCalForceTimeout = false;
+	// --- Erratum E-14 (rulings 53, 54): the row cost as a line in position, and phase 2 ---
+	// The line the planner prices each slice by (C(1, pos) at the slice's end position): flat for the game's value, the
+	// default and the fallback; after phase 1, C_a with the default slope; after phase 2, the measured slope. Game thread.
+	GpuRowCost::FRowCostLine RowCostLine = GpuRowCost::FlatLine(GpuRowCost::kDefaultRowCostUs);
+	bool bRowCostSlopeMeasured = false;
+	int64 RowCostLatePosition = -1;
+	int64 RowCostLateUs = -1;
+	int32 RowCostLateWarmUpRuns = 0;
+	TArray<double> RowCostLateRunsUs;
+	// The chooser's input as BuildRowsPlan() last set it, and the plans priced at other C(1)s (by C(1) in us), each with
+	// its Exact schedule for the base plan's M_exact. Cleared when the plan is rebuilt. Game thread.
+	GpuRows::FChooserInput RowsInput;
+	struct FPricedPlan
+	{
+		GpuRows::FChooserPlan Plan;
+		TArray<int32, TInlineAllocator<16>> ExactSlices;
+	};
+	TMap<int64, FPricedPlan> PricedPlans;
+	// Phase 2 (ruling 54, B > 0 only): running; its stage (0: the filler read, 1: the late tokens); the positions the
+	// throwaway sequence holds (game thread's count); the filler's target length (P2 - 3, so the 4 late tokens end at P2);
+	// the open filler chunk's rows and layers run; the largest per-layer cost of a filler slice measured so far (us per
+	// layer of a FillRows-row chunk; 0: none yet); the late tokens' layer position, token count, token time and runs;
+	// P2; whether the throwaway sequence must be made again (a cache hit: this state has none); and that a failure warned.
+	bool bCalPhase2 = false;
+	int32 CalP2Stage = 0;
+	int64 CalSeqLength = 0;
+	int64 CalP2FillTarget = 0;
+	int64 CalP2Late = 0;
+	int32 CalFillRows = 0;
+	int32 CalFillLayerPos = 0;
+	double CalMaxFillLayerUs = 0.0;
+	int32 CalP2Token = 0;
+	// Run 5 (the cold ramp never sizes a timed token; phase 2 never stalls): a token that would have been timed but
+	// starts on a cold tick runs as an extra untimed warm-up instead (derated like any untimed slice), at most
+	// kCalP2MaxExtraWarmUps of them, so every timed token runs on a warm GPU at its own size.
+	bool bCalP2TokenUntimed = false;
+	int32 CalP2ExtraWarmUps = 0;
+	static constexpr int32 kCalP2MaxExtraWarmUps = 7; // within CalSeqCapFor()'s P2 + 8
+	int32 CalP2LayerPos = 0;
+	double CalP2TokenUs = 0.0;
+	TArray<double> CalP2RunsUs;
+	int32 CalSettledAttempt = 0;
+	int32 CalP2Epoch = 0;
+	// Erratum E-16 (ruling 60): the outlier rule. Phase 1's set -- each kept run's finish (beside CalRunsUs), the extra
+	// runs it has timed (at most GpuRowCost::kMaxOutlierExtraRuns), whether a spread failure was retried, and the
+	// attempts the sanity-range retry counts (a spread retry is not one of them) -- and phase 2's extra runs and spread
+	// retry. The runs dropped (each phase's, in order), the spread failures, and the hook's per-phase run ordinals are
+	// GetRowCost()'s.
+	TArray<double> CalRunFinishUs;
+	int32 CalExtraRuns = 0;
+	bool bCalSpreadRetried = false;
+	int32 CalRangeAttempt = 0;
+	int32 CalP2ExtraRuns = 0;
+	bool bCalP2SpreadRetried = false;
+	TArray<double> RowCostDroppedRunsUs;
+	TArray<double> RowCostLateDroppedRunsUs;
+	int32 RowCostSpreadFailures = 0;
+	int32 RowCostLateSpreadFailures = 0;
+	int32 CalTimedOrdinal[2] = {0, 0};
+	// Submission thread: the throwaway dedicated sequence (kRowCostCalibrationSequenceCap positions), made by the first
+	// calibration job and released with the other sequences at teardown (ReleaseLayer1()).
+	SslmGpuSequenceHandle* CalSeq = nullptr;
+#if WITH_DEV_AUTOMATION_TESTS
+	// MR6's seam (FSuperSLMGpuMultiRowTestAccess): one record per action a sequence ran, filled as the planner issues
+	// actions while recording. Game thread.
+	bool bRowsRecording = false;
+	int32 RowsRecordCount = 0;
+	TArray<FSuperSLMGpuRowsActionRecord> RowsRecords;
+	// ArmRowsFault(): the one-shot injected status (point -1: none), and GetExactFallbacks()'s counts. Written on the
+	// game thread, taken on the submission thread.
+	std::atomic<int32> TestRowsFaultPoint{-1};
+	std::atomic<int32> TestRowsFaultStatus{0};
+	std::atomic<int32> TestExactFallbackNoDraft{0};
+	std::atomic<int32> TestExactFallbackOpenFailed{0};
+	std::atomic<bool> bTestNoDraftArmed{false}; // ArmNoDraftStep() (ruling 56 (6)): the next Exact open drafts nothing
+	// GetLayer1StatusCount() (ruling 43 N2): every non-OK status NoteLayer1Status() saw since StartRecording(), by status.
+	// Written on either thread.
+	FCriticalSection Layer1StatusLock;
+	TMap<uint32, int32> Layer1StatusCounts;
+	// GetTickGpuBusyUs() (rulings 45/45a): one record per tick job the submission thread completed while
+	// bTickGpuRecording. The submission thread fills TestTickGpu* while it runs a tick job (it alone touches them) and
+	// appends the finished record under TickGpuLock; the game thread reads and resets under the same lock.
+	std::atomic<bool> bTickGpuRecording{false};
+	FCriticalSection TickGpuLock;
+	TArray<FSuperSLMGpuTickGpuBusyRecord> TickGpuRecords;
+	bool bTestTickGpuActive = false;
+	bool bTestTickCallOpen = false;
+	double TestTickCallMarkUs = 0.0;
+	TArray<FSuperSLMGpuTickCallRecord> TestTickCalls;
+	// DecodeOneRowLayers()'s call kind, set by its caller: a Composed singleton's slice (ComposedSolo) or a OneCall
+	// sequence's one-row slice (OneCallStep).
+	ESuperSLMGpuTickCallKind TestSoloCallKind = ESuperSLMGpuTickCallKind::ComposedSolo;
+#endif
+
+	// True when the plan reads by rows at all (bGpuMultiRow and the table's provenance, N4).
+	bool MultiRowOn() const { return RowsPlan.bValid && RowsPlan.bMultiRowOn; }
+
+	// Ruling 57 F5: the widened warm-up's widths, from the chooser's candidates (bit M of the mask, M in
+	// kWidenWarmUpRows). A width is the kernel variant M rows run on (the smallest of 2, 4, 8 at or above M), so it is a
+	// candidate when multi-row is on and the plan admits a row count that runs on it: l(M') > 0 for some M' above the
+	// next narrower width, up to it. Every M the chooser picks (OneCall's M_max, Composed's rows, Exact's M) is admitted.
+	uint32 WidenCandidateMask() const
+	{
+		uint32 Mask = 0;
+		if (!MultiRowOn())
+		{
+			return Mask;
+		}
+		int32 Narrower = 1;
+		for (const int32 M : kWidenWarmUpRows)
+		{
+			for (int32 Rows = Narrower + 1; Rows <= M && Rows <= GpuRows::MaxRows; ++Rows)
+			{
+				if (RowsPlan.LayersPerSlice[Rows - 1] > 0)
+				{
+					Mask |= 1u << M;
+					break;
+				}
+			}
+			Narrower = M;
+		}
+		return Mask;
+	}
+
 	// Review round 2, R2-W3: the schedule Configure() set (LayersPerTick, DispatchBudget, MinimumK,
 	// K). SetLayersPerTick()/SetFixedTickLatency() override it for one client's query;
 	// RequestConfiguredScheduleRestore() puts it back at the first tick the pool is drained.
@@ -873,6 +1445,9 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	int32 ConfiguredK = 0;
 	bool bRestoreScheduleWhenDrained = false;
 	uint8 ArtifactHash[32] = {};
+	// Ruling 41 (Q13): the CPU subsystem of the same game instance, whose learned draft table Exact reads (set each
+	// tick; game thread).
+	TWeakObjectPtr<USuperSLMSubsystem> CpuDrafts;
 	int64 DeclaredModelBytes = 0;
 	// The per-sequence GPU K/V byte count Configure() computed once, from Config/
 	// NumHiddenLayers exactly as the local KvBytesPerSequence it is copied from -- restored
@@ -900,8 +1475,10 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	bool bHasPoolSnapshot = false;
 	SslmGpuKvPoolStats LastPoolStats = {};
 
-	// Region C: the GPU has no prefix cache in the paging release, so it is 0 (plan §3.2).
-	static constexpr uint32 CacheRegionPages() { return 0u; }
+	// Region C (precache U6, wiring edit 1): the GPU prefix cache's pages, sized at Configure from the cache's budget as the
+	// CPU's region C is (RegionCPagesFor()); 0 with no cache or in dedicated mode.
+	uint32 CacheRegionPagesValue = 0;
+	uint32 CacheRegionPages() const { return CacheRegionPagesValue; }
 
 	bool IsPooled() const { return bPooled; }
 
@@ -939,6 +1516,13 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		{
 			Layer1BusyCount.fetch_add(1);
 		}
+#if WITH_DEV_AUTOMATION_TESTS
+		if (Status != FGpuStatus::SSLM_OK)
+		{
+			FScopeLock Lock(&Layer1StatusLock);
+			Layer1StatusCounts.FindOrAdd(static_cast<uint32>(Status)) += 1;
+		}
+#endif
 	}
 
 	// HoldApply()'s holds (§3.9). Game thread.
@@ -1152,6 +1736,160 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	// (holds, the cap, lifecycle ops) never shift the rotation's base.
 	int32 OneCallCursor = INDEX_NONE;
 	int32 ComposedCursor = INDEX_NONE;
+	// Ruling 43 N2: below one row the tick's units are l(1) in all; while both paths have a due sequence, they take the
+	// ticks in turn (true: the next contended tick is Composed's), so neither path starves the other.
+	bool bOneRowTurnToComposed = false;
+	// Ruling 58 (4): at or above one row (OneCall's tokens run whole), with the knob set, a tick whose OneCall action
+	// (billed at its real cost, L units for a whole token) left too little of l(1) for Composed's share and a finish
+	// owes Composed the next contended tick: OneCall yields it, so Composed's ending slices never wait for good.
+	bool bComposedOwedTurn = false;
+	// Run 5 (workhorse, the first-frame overruns at B = 2 and 4 ms; rulings 59a, 59b): a GPU that sat idle runs its first
+	// ticks slow while its clocks ramp (2.9x the steady cost on the first tick, settled by about the sixth), so a tick that
+	// has a budget cap (multi-row on, the knob set) is priced up by ColdScalePerMille() after an idle gap: only the layers it
+	// runs shrink (one layer is always admitted); rows, tokens and the chooser's plan never change. The gap is the GPU's:
+	// no tick job outstanding and the last one finished kColdIdleSeconds ago or more (a steady 20 fps game never meets
+	// it), or a finished job whose host work alone outlasted kColdStallSeconds (the GPU idled inside it). The ramp
+	// advances one step per finished tick job -- per job the GPU ran, never per tick planned, so a queue planned ahead of
+	// a slow first job stays at the ramp's top. Wall times only: nothing here reads the GPU-busy counter (ruling 49).
+	TArray<TSharedPtr<FJob>> RampJobs;  // tick jobs issued under a budget cap, not yet read (FIFO, they finish in order)
+	// Ruling 59b point 4, the feedback guard: the last read job's GPU time over the warm price of what it ran (finishes,
+	// finish-only steps and Exact logits stages included, H3), plus 10 %, from 1000 to 4000. It scales the layers a tick runs
+	// as the ramp does (LayerScalePerMille()); IsCold(), which gates Exact and phase 2's timed tokens, stays the ramp alone.
+	int64 FeedbackPerMille = 1000;
+	static constexpr int64 kFeedbackSafetyPerMille = 1100;
+	static constexpr int64 kFeedbackMaxPerMille = 4000;
+	double LastJobDoneSeconds = -1.0;   // when the last read job finished (< 0: none since Configure)
+	int32 ColdTick = MAX_int32;         // the finished jobs since the gap; MAX_int32: no ramp (no cap, or never cold)
+	bool bColdRampYielded = false;      // a cold tick planned nothing while work was due: the next tick plans warm
+	bool bTickShortBatched = false;     // ruling 59.1: this tick's batch already holds its one short member
+	bool bColdHeldWork = false;         // ruling 59c point 7: the cold rule held work back this tick (what may empty a tick)
+	uint32 ConfigureWidenedMask = 0;    // run 5 (59c point 3): the widths (bit M) Configure()'s warm-up ran
+#if WITH_DEV_AUTOMATION_TESTS
+	TArray<TPair<int64, FIntVector4>> TestExactApplySamples; // 59d point 6: (sequence, (generated, next pos, bound, chunk open))
+#endif
+	static constexpr double kColdIdleSeconds = 0.100;
+	static constexpr double kColdStallSeconds = 0.050;
+	static constexpr int32 kColdScaleTicks = 6;
+	// Whether this tick is one the ramp may derate (ruling 59b H2): multi-row on and the knob set. Otherwise every slice is
+	// exactly as in 1.17 (P4.4) and B = 0's whole tokens.
+	bool RampApplies() const
+	{
+		return Config.SchemaJumpGpuFrameBudgetMs != 0.0 && MultiRowOn();
+	}
+	// Plan's first step: read the finished jobs, then decide whether this tick follows an idle gap.
+	void UpdateColdRamp(double Now)
+	{
+		if (!RampApplies())
+		{
+			ColdTick = MAX_int32;
+			FeedbackPerMille = 1000;
+			RampJobs.Reset();
+			return;
+		}
+		int32 Read = 0;
+		while (Read < RampJobs.Num() && RampJobs[Read]->bDone.load(std::memory_order_acquire))
+		{
+			const FJob& J = *RampJobs[Read++];
+			LastJobDoneSeconds = FMath::Max(LastJobDoneSeconds, J.CompletedWallSeconds);
+			const double HostSeconds = (J.CallEndWallSeconds - J.StartedWallSeconds) - (J.GpuBusyUs >= 0.0 ? J.GpuBusyUs : J.PricedUs) * 1.0e-6;
+			if (!J.bSkipped && J.PricedUs > 0.0 && J.GpuBusyUs >= 0.0)
+			{
+				FeedbackPerMille = FMath::Clamp<int64>(static_cast<int64>(FMath::CeilToDouble(J.GpuBusyUs / J.PricedUs * static_cast<double>(kFeedbackSafetyPerMille))),
+					1000, kFeedbackMaxPerMille);
+			}
+			if (!J.bSkipped && HostSeconds >= kColdStallSeconds)
+			{
+				ColdTick = 0; // the GPU idled inside this job: the ramp restarts
+			}
+			else if (ColdTick < kColdScaleTicks)
+			{
+				++ColdTick;
+			}
+		}
+		RampJobs.RemoveAt(0, Read);
+		if (bColdRampYielded)
+		{
+			bColdRampYielded = false; // the tick after a yield plans warm (see PlanAndIssue's end)
+		}
+		else if (RampJobs.Num() == 0 && (LastJobDoneSeconds < 0.0 || Now - LastJobDoneSeconds >= kColdIdleSeconds))
+		{
+			ColdTick = 0;
+		}
+	}
+	// Run 5: the warm price of Layers layers of a Rows-row slice priced at Pos (E-14), added to the job's PricedUs (the GPU
+	// time the stall test above takes off the job's wall time).
+	void AddJobPrice(FJob& Job, int32 Rows, int32 Layers, int64 Pos)
+	{
+		if (!RampApplies() || NumHiddenLayers <= 0 || Rows < 1 || Rows > GpuRows::MaxRows || Layers <= 0)
+		{
+			return;
+		}
+		const GpuRows::FChooserPlan At = PlanAt(Pos).Plan;
+		if (At.bValid)
+		{
+			Job.PricedUs += static_cast<double>(static_cast<int64>(Layers) * At.CostUs[Rows - 1] * (1000 + static_cast<int64>(Config.GpuRowsMarginPerMille))) /
+				static_cast<double>(static_cast<int64>(NumHiddenLayers) * 1000);
+		}
+	}
+	// Ruling 59b H3: the warm price of a token's logits finish (F at Pos, with the margin), and of an Exact close's logits
+	// stage (G(M) at Pos, with the margin), added to the job's PricedUs, so the guard reads a token-ending tick at its price.
+	void AddJobFinishPrice(FJob& Job, int64 Pos)
+	{
+		if (!RampApplies())
+		{
+			return;
+		}
+		const int64 C = FMath::Max<int64>(1, PlanAt(Pos).Plan.RowCostUs);
+		Job.PricedUs += static_cast<double>(FinishPriceUs(C) * (1000 + static_cast<int64>(Config.GpuRowsMarginPerMille))) / 1000.0;
+	}
+	void AddJobLogitsPrice(FJob& Job, int32 Rows, int64 Pos)
+	{
+		if (!RampApplies() || Rows < 1 || Rows > GpuRows::MaxRows)
+		{
+			return;
+		}
+		const GpuRows::FChooserPlan At = PlanAt(Pos).Plan;
+		if (At.bValid)
+		{
+			Job.PricedUs += static_cast<double>(At.LogitsUs[Rows - 1] * (1000 + static_cast<int64>(Config.GpuRowsMarginPerMille))) / 1000.0;
+		}
+	}
+	// The ramp's price-up (1000 = none): 2.0, 1.6, 1.35, 1.2, 1.1, 1.05 over the first finished jobs (ruling 59b M3).
+	int64 ColdScalePerMille() const
+	{
+		static constexpr int64 Scale[kColdScaleTicks] = {2000, 1600, 1350, 1200, 1100, 1050};
+		return ColdTick >= 0 && ColdTick < kColdScaleTicks ? Scale[ColdTick] : 1000;
+	}
+	bool IsCold() const
+	{
+		return ColdScalePerMille() > 1000;
+	}
+	// What a tick's layers are scaled by: the ramp's or the feedback guard's price-up, the larger.
+	int64 LayerScalePerMille() const
+	{
+		return FMath::Max(ColdScalePerMille(), FeedbackPerMille);
+	}
+	// The layers (or one-row-layer units) a tick may run at the cold scale: floor(N x 1000 / scale), at least 1 when N is.
+	// MAX_int32 (no cap) passes through: an uncapped tick is never derated (H2).
+	int32 ColdLayers(int32 N) const
+	{
+		const int64 Scale = LayerScalePerMille();
+		if (N <= 0 || N == MAX_int32 || Scale <= 1000)
+		{
+			return N;
+		}
+		return static_cast<int32>(FMath::Max<int64>(1, static_cast<int64>(N) * 1000 / Scale));
+	}
+	// A OneCall one-row cap while cold (ruling 59b M1): at or above one row (no cap, whole tokens), a cold tick slices the
+	// token at ColdLayers(L) instead; otherwise ColdLayers(cap). MAX_int32 when warm and uncapped (whole tokens, 1.17).
+	int32 ColdOneRowCap(int32 WarmCap) const
+	{
+		if (WarmCap < MAX_int32)
+		{
+			return ColdLayers(WarmCap);
+		}
+		return IsCold() ? ColdLayers(NumHiddenLayers) : MAX_int32;
+	}
 	bool bActive = false;
 	int32 GameHitches = 0;
 
@@ -1187,6 +1925,14 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	{
 		Entry.Result = NewResult;
 		Entry.ResolutionOrdinal = NextResolutionOrdinal++;
+#if SUPERSLM_WITH_PREFIX_CACHE
+		// Precache U6, edit 6: a cache lease's adopt pin ends with the adopt, whatever its outcome.
+		if (Entry.CacheAdopt.Token != 0)
+		{
+			SuperSLMGpuPrefixCacheGlue::EndCacheAdopt(*this, Entry.CacheAdopt.Token);
+			Entry.CacheAdopt.Token = 0;
+		}
+#endif
 		// Row 19 (D-SLM7763): a restore resolved before its job took the blob (a refusal at
 		// admission) hands its share to the submission thread, so its release never runs here.
 		if (Entry.RestoreBlob.IsValid())
@@ -1473,7 +2219,45 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			}
 			else
 			{
-				ExecuteTickJob(*Job);
+#if WITH_DEV_AUTOMATION_TESTS
+				// Rulings 45/45a (GetTickGpuBusyUs()): the job's GPU time is the delta of the engine's cumulative
+				// GPU-busy counter across it. The process-wide Layer-1 lock is held, so no other caller's work lands
+				// in the delta. Test builds only; reads, never changes, what the job does.
+				const bool bTickGpu = Job->bTickJob && bTickGpuRecording.load();
+				const double TickGpuStartUs = bTickGpu ? superslm_gpu::CumulativeGpuBusyUs() : 0.0;
+				const int64 TickGpuStartDispatches = DispatchCount.load();
+				const double TickGpuStartWall = FPlatformTime::Seconds();
+				if (bTickGpu)
+				{
+					bTestTickGpuActive = true;
+					bTestTickCallOpen = false;
+					TestTickCallMarkUs = TickGpuStartUs;
+					TestTickCalls.Reset();
+				}
+#endif
+				MeasureTickJobForLayerSizing(*Job); // ruling 59b point 4: ExecuteTickJob, with the job's GPU time for the guard
+#if WITH_DEV_AUTOMATION_TESTS
+				if (bTickGpu)
+				{
+					TestCloseTickCall(); // the last call's delta runs to the job's end
+					bTestTickGpuActive = false;
+					FSuperSLMGpuTickGpuBusyRecord Rec;
+					Rec.Tick = Job->TestTick;
+					// With calls, the per-call deltas telescope to this same end point, so their sum is the total.
+					Rec.GpuBusyUs = (TestTickCalls.Num() > 0 ? TestTickCallMarkUs : superslm_gpu::CumulativeGpuBusyUs()) - TickGpuStartUs;
+					Rec.Submissions = static_cast<int32>(DispatchCount.load() - TickGpuStartDispatches);
+					for (const FSuperSLMGpuTickCallRecord& K : TestTickCalls)
+					{
+						// A call after which the counter did not advance published no GPU timing.
+						Rec.UntimedSubmissions += K.CounterDeltaUs > 0.0 ? 0 : K.Members;
+					}
+					Rec.WallUs = (FPlatformTime::Seconds() - TickGpuStartWall) * 1.0e6;
+					Rec.Calls = MoveTemp(TestTickCalls);
+					TestTickCalls.Reset();
+					FScopeLock Lock(&TickGpuLock);
+					TickGpuRecords.Add(Rec);
+				}
+#endif
 			}
 			if (bLayer1)
 			{
@@ -1739,9 +2523,80 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		DispatchCount.fetch_add(N);
 	}
 
+#if WITH_DEV_AUTOMATION_TESTS
+	// Rulings 45/45a, test builds only (GetTickGpuBusyUs()): the calls of a recorded tick job. Each Layer-1 call opens a
+	// record just before it submits; the open record's counter delta runs until the next call opens or the job ends, so
+	// it takes in the call's result reads, and the deltas telescope to the job's total. Reads only; changes nothing the
+	// product does. Submission thread.
+	void TestCloseTickCall()
+	{
+		if (!bTestTickCallOpen)
+		{
+			return;
+		}
+		const double Now = superslm_gpu::CumulativeGpuBusyUs();
+		TestTickCalls.Last().CounterDeltaUs = Now - TestTickCallMarkUs;
+		TestTickCallMarkUs = Now;
+		bTestTickCallOpen = false;
+	}
+	void TestOpenTickCall(ESuperSLMGpuTickCallKind Kind, int32 Members = 1)
+	{
+		if (!bTestTickGpuActive)
+		{
+			return;
+		}
+		TestCloseTickCall();
+		FSuperSLMGpuTickCallRecord& K = TestTickCalls.AddDefaulted_GetRef();
+		K.Kind = Kind;
+		K.Members = Members;
+		bTestTickCallOpen = true;
+	}
+	// Ruling 50: a Calibration call record carries the layers its slice ran and its attempt (-1 on every other kind).
+	void TestOpenCalibrationCall(int32 Layers, int32 Attempt, int32 Rows = 1)
+	{
+		TestOpenTickCall(ESuperSLMGpuTickCallKind::Calibration);
+		if (bTestTickGpuActive)
+		{
+			TestTickCalls.Last().Layers = Layers;
+			TestTickCalls.Last().CalibrationAttempt = Attempt;
+			TestTickCalls.Last().Rows = Rows; // ruling 56 (2): M for a widened warm-up, a filler's rows, else 1
+		}
+	}
+	// Ruling 46/46a: a finish-bridge call that is its own Layer-1 call (the standalone finish, and the decode bridge's
+	// ready shortcut) publishes its device logits submission's timing, so it gets its own record: kind Finish (6), Members
+	// 0 (not a submission the subsystem counts). A host-path finish submits nothing and publishes nothing, so a record
+	// whose counter did not advance is dropped. The value is cast so this compiles before and after the enumerator.
+	static constexpr ESuperSLMGpuTickCallKind TestFinishCallKind = static_cast<ESuperSLMGpuTickCallKind>(6);
+	double TestOpenFinishCall()
+	{
+		TestOpenTickCall(TestFinishCallKind, 0);
+		return superslm_gpu::CumulativeGpuBusyUs();
+	}
+	void TestEndFinishCall(double StartUs)
+	{
+		if (!bTestTickGpuActive || !bTestTickCallOpen || TestTickCalls.Last().Kind != TestFinishCallKind)
+		{
+			return;
+		}
+		if (superslm_gpu::CumulativeGpuBusyUs() > StartUs)
+		{
+			TestTickCalls.Last().LastPublishedUs = superslm_gpu::LastCallTiming().gpu_busy_ms * 1000.0;
+			return;
+		}
+		TestTickCalls.Pop(); // nothing submitted: the mark already stands at this point, so the deltas still telescope
+		bTestTickCallOpen = false;
+	}
+#endif
+
 	void RecordGpuBusy()
 	{
 		const double Busy = superslm_gpu::LastCallTiming().gpu_busy_ms;
+#if WITH_DEV_AUTOMATION_TESTS
+		if (bTestTickGpuActive && bTestTickCallOpen)
+		{
+			TestTickCalls.Last().LastPublishedUs = Busy * 1000.0; // the call's published timing (a batch's last member's)
+		}
+#endif
 		LastGpuBusyMs.store(Busy);
 		{
 			FScopeLock Guard(&TimingLock);
@@ -1906,6 +2761,10 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		TS.bHasStopFault = false;
 		TS.StopFault = FActionResult();
 		TS.bPrimed = false;
+		if (TS.RowsOpen > 0 || TS.bRowsFellBack)
+		{
+			DropRowsAfterFailure(TS); // ruling 42 M2: an earlier generation's chunk never outlives it on the thread
+		}
 	}
 
 	// A prompt token reached full depth. After the last one the sequence is primed: its next step
@@ -1972,6 +2831,9 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			R.Kind = EResultKind::DeadEnd;
 			R.Message = TEXT("the bound schema has no legal continuation (schema dead end)");
 			TS.bStopped = true;
+			// The armed invariant (kept from P2's re-check R1; ruling 40): the engine re-arms ready_for_logits at a
+			// dead end, so the mirror follows it, in every mode (it removes 1.3.0's stale flag on a reused sequence).
+			TS.bArmed = true;
 			return;
 		}
 		R.Kind = EResultKind::Token;
@@ -2027,9 +2889,15 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		int32_t Token = -1;
 		// HostFinishMs is the finish call's wall time on this thread; with the device-resident
 		// head it includes the logits dispatch's own synchronous submission (plan §5.1).
+#if WITH_DEV_AUTOMATION_TESTS
+		const double TestFinishStartUs = TestOpenFinishCall(); // ruling 46: the finish is its own call
+#endif
 		const double Start = FPlatformTime::Seconds();
 		const FGpuStatus St = SslmGpuSeqFinishTokenForG5Bridge(Ctx, TS.Handle, &Token);
 		const double FinishMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+#if WITH_DEV_AUTOMATION_TESTS
+		TestEndFinishCall(TestFinishStartUs);
+#endif
 		LastHostFinishMs.store(FinishMs);
 		TRACE_COUNTER_SET(SuperSLMGpuHostFinishMs, FinishMs);
 		if (St != FGpuStatus::SSLM_OK)
@@ -2052,9 +2920,15 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		FGpuStatus St;
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Finish", SuperSLMGpuChannel);
+#if WITH_DEV_AUTOMATION_TESTS
+			const double TestFinishStartUs = TestOpenFinishCall(); // ruling 46: the ready shortcut is a finish-only call
+#endif
 			const double Start = FPlatformTime::Seconds();
 			St = SslmGpuSeqDecodeStepForG5Bridge(Ctx, TS.Handle, FMath::Max(TS.LastToken, 0), FullTokenBudget(), &Token);
 			const double FinishMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+#if WITH_DEV_AUTOMATION_TESTS
+			TestEndFinishCall(TestFinishStartUs);
+#endif
 			LastHostFinishMs.store(FinishMs);
 			TRACE_COUNTER_SET(SuperSLMGpuHostFinishMs, FinishMs);
 		}
@@ -2066,6 +2940,581 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			return;
 		}
 		RecordToken(TS, R, Token);
+	}
+
+	// --- Multi-row GPU plan §4.1, §4.7, §5.2-§5.4 (MR6): chunk slices on the submission thread ---
+
+	// The thread slot's chunk is gone (closed, abandoned, rolled back, or the handle reset).
+	static void ClearRows(FThreadSlot& TS)
+	{
+		TS.bRowsFellBack = false;
+		TS.RowsForcedChain = -1;
+		TS.RowsDraftCount = -1;
+		TS.RowsOpen = 0;
+		TS.RowsKind = ERowsKind::None;
+		TS.RowsLayersDone = 0;
+		TS.bRowsLastPrompt = false;
+		TS.RowsDrafts.Reset();
+	}
+
+	// After a failed slice: a device or allocation failure rolled the chunk back (the engine closed it); a pool or
+	// budget refusal left it open, so it is abandoned here (best effort: the sequence faults either way, and a reset
+	// closes any chunk that remains). Submission thread.
+	void DropRowsAfterFailure(FThreadSlot& TS)
+	{
+		int32_t Open = 0;
+		if (TS.Handle != nullptr && sslm_gpu_seq_rows_open(TS.Handle, &Open) == FGpuStatus::SSLM_OK && Open > 0)
+		{
+			NoteLayer1Status(sslm_gpu_seq_rows_abandon(Ctx, TS.Handle));
+		}
+		ClearRows(TS);
+	}
+
+	// Opens the action's chunk: binds a requested adapter (rule 4: before the chunk; bind_adapter is refused while one
+	// is open), checks the room, and embeds the rows with sslm_gpu_seq_embed_rows. A prompt chunk embeds the action's
+	// tokens and must admit all of them (the activation pre-check already priced the prompt). An Exact chunk embeds
+	// [p, drafts]: p the pending token in hand (the last finish produced and walked it), the drafts from the plugin's
+	// one provider (ruling 41 Q13): the forced chain from the walk (sslm_gpu_seq_forced_tokens), then the learned
+	// table's draft (SuperSLMCore::BuildDraft, as CPU Exact) from the state after the chain when the CPU subsystem holds
+	// a table for this artifact and schema. Each part is cut before the first stop token; the whole to the generation's
+	// allowance less one, so the produced token stays within it, and to RowsCount - 1 (M_exact, MR-D11). As CPU Exact,
+	// the table drafts only after a non-empty chain (ruling 42 S5). With no draft, or when the forced read or the
+	// embed fails, the step runs as Off's one-row step (FallBackToOff; ruling 42 S1, S2). False when the sequence
+	// stopped (R carries why). Submission thread.
+	// Ruling 42 S1/S2 (42a): marks the planned Exact step as Off's one-row step (see FThreadSlot::bRowsFellBack). True:
+	// the step goes on. Submission thread.
+	// Ruling 59e point 1: the open's test-only readings onto the close's result (the MR6 seam). Submission thread.
+	void CopyTestRowsOpen(const FThreadSlot& TS, FActionResult& R) const
+	{
+#if WITH_DEV_AUTOMATION_TESTS
+		R.TestRowsProposed = TS.TestRowsProposed;
+		R.TestRowsCpuDraft = TS.TestRowsCpuDraft;
+		R.bTestRowsTableReached = TS.bTestRowsTableReached;
+#else
+		(void)TS; (void)R;
+#endif
+	}
+
+	bool FallBackToOff(FThreadSlot& TS, bool bOpenFailed, int32 ForcedChain, int32 DraftCount)
+	{
+		ClearRows(TS);
+		TS.bRowsFellBack = true;
+		TS.RowsKind = ERowsKind::Exact;
+		TS.RowsForcedChain = ForcedChain;
+		TS.RowsDraftCount = DraftCount;
+		TRACE_COUNTER_INCREMENT(SuperSLMGpuExactStepFellBack);
+#if WITH_DEV_AUTOMATION_TESTS
+		(bOpenFailed ? TestExactFallbackOpenFailed : TestExactFallbackNoDraft).fetch_add(1);
+#else
+		(void)bOpenFailed;
+#endif
+		return true;
+	}
+
+	// ArmRowsFault() (test builds): true, with the injected status, when the one-shot fault is armed at Point. Submission
+	// thread.
+	bool TakeRowsFault(int32 Point, FGpuStatus& OutStatus)
+	{
+#if WITH_DEV_AUTOMATION_TESTS
+		int32 Expected = Point;
+		if (TestRowsFaultPoint.compare_exchange_strong(Expected, -1))
+		{
+			OutStatus = static_cast<FGpuStatus>(TestRowsFaultStatus.load());
+			return true;
+		}
+#else
+		(void)Point;
+		(void)OutStatus;
+#endif
+		return false;
+	}
+
+	// One decode call of Layers layers for TS's one-row token in flight, drained: the composed single-member call, a
+	// OneCall one-row slice's own call (ruling 43 N2) and a fell-back close's first slice (N1). Submission thread.
+	// Ruling 59.1: after a one-row decode call, the engine's layer index must be the layer position the planner billed the
+	// slice to. A mismatch is a plugin defect (an engine that ran other layers than planned): ensure, and the sequence faults
+	// rather than drift. Submission thread.
+	void CheckLayerAfter(const FAction& A, FActionResult& R)
+	{
+		if (A.ExpectLayerAfter < 0 || !ThreadSlots.IsValidIndex(A.Slot) || ThreadSlots[A.Slot].Handle == nullptr)
+		{
+			return;
+		}
+		FThreadSlot& TS = ThreadSlots[A.Slot];
+		const uint32_t* Engine = SslmGpuSeqHandleLayerIndexForBench(TS.Handle);
+		if (Engine == nullptr || static_cast<int32>(*Engine) == A.ExpectLayerAfter)
+		{
+			return;
+		}
+		ensureMsgf(false, TEXT("SuperSLM GPU: a one-row slice left the engine at layer %u, the plan at %d (plugin defect, ruling 59.1)."), *Engine, A.ExpectLayerAfter);
+		R.Kind = EResultKind::Fault;
+		R.Fault = ESuperSLMGpuFaultReason::RecoverablePerSequenceRejection;
+		R.Message = FString::Printf(TEXT("internal error: a slice left the engine at layer %u, the plan at %d (ruling 59.1)"), *Engine, A.ExpectLayerAfter);
+		StopWith(TS, R);
+	}
+
+	FGpuStatus DecodeOneRowLayers(FThreadSlot& TS, int32 Layers)
+	{
+		FGpuStatus St;
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Submit", SuperSLMGpuChannel);
+#if WITH_DEV_AUTOMATION_TESTS
+			TestOpenTickCall(TestSoloCallKind); // ruling 45: the caller names the kind
+#endif
+			CountSubmission();
+			St = sslm_decode_step_gpu(Ctx, TS.Handle, TS.PinnedAdapter, static_cast<uint32>(Layers) * DispatchesPerLayer);
+		}
+		if (St == FGpuStatus::SSLM_OK)
+		{
+			int32_t Ready = 0;
+			FGpuStatus Drained = FGpuStatus::SSLM_OK;
+			{
+				TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Drain", SuperSLMGpuChannel);
+				St = sslm_gpu_ready(Ctx, TS.Handle, 1, &Ready, &Drained);
+				NoteLayer1Status(St);
+			}
+			if (St == FGpuStatus::SSLM_OK)
+			{
+				St = Drained;
+			}
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Readback", SuperSLMGpuChannel);
+			RecordGpuBusy();
+		}
+		return St;
+	}
+
+	// A slice of an Exact step that fell back: nothing until the planned close, which runs Off's step (its adapter bind
+	// already ran at the open): at B_eff >= C(1) the whole token; below one row (ruling 43 N1) Off's first one-row slice
+	// -- the embed and l(1) layers -- after which the planner runs the rest as Off does, one-row slices of l(1).
+	// Submission thread.
+	void RunFallenBackSlice(const FAction& A, FActionResult& R)
+	{
+		FThreadSlot& TS = ThreadSlots[A.Slot];
+		if (!A.bCloseRows)
+		{
+			R.Kind = EResultKind::Progress;
+			return;
+		}
+		const int32 ForcedChain = TS.RowsForcedChain;
+		const int32 DraftCount = TS.RowsDraftCount;
+		ClearRows(TS);
+		if (A.RowsFallbackLayers > 0 && A.RowsFallbackLayers < NumHiddenLayers)
+		{
+			R.bRowsFellBack = true;
+			R.RowsForcedChain = ForcedChain;
+			R.RowsDraftCount = DraftCount;
+			CopyTestRowsOpen(TS, R);
+			if (!ContextHasRoom(TS, R))
+			{
+				return;
+			}
+			FGpuStatus St;
+			{
+				TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Embed", SuperSLMGpuChannel);
+				St = sslm_gpu_seq_embed_token(Ctx, TS.Handle, TS.LastToken);
+			}
+			if (St != FGpuStatus::SSLM_OK)
+			{
+				FaultResult(TS, R, St, TEXT("sslm_gpu_seq_embed_token"));
+				return;
+			}
+			TS.ContextUsed += 1;
+			TS.PinnedAdapter = TS.BoundAdapter;
+#if WITH_DEV_AUTOMATION_TESTS
+			TestSoloCallKind = ESuperSLMGpuTickCallKind::OneCallStep; // ruling 45: Off's one-row step on a OneCall sequence
+#endif
+			St = DecodeOneRowLayers(TS, A.RowsFallbackLayers);
+			if (St != FGpuStatus::SSLM_OK)
+			{
+				FaultResult(TS, R, St, TEXT("sslm_decode_step_gpu"));
+				return;
+			}
+			R.Kind = EResultKind::Progress;
+			R.RowsFallbackLayers = A.RowsFallbackLayers;
+			return;
+		}
+		FAction Off = A;
+		Off.Kind = EActionKind::OneCallToken;
+		Off.bBindAdapter = false;
+		Off.bOpenRows = false;
+		Off.bCloseRows = false;
+		Off.RowsKind = ERowsKind::None;
+		RunOneCallToken(Off, R);
+		R.bRowsFellBack = true;
+		R.RowsForcedChain = ForcedChain;
+		R.RowsDraftCount = DraftCount;
+		CopyTestRowsOpen(TS, R);
+	}
+
+	bool OpenRows(FThreadSlot& TS, const FAction& A, FActionResult& R)
+	{
+		if (!BindAdapterIfRequested(TS, A, R) || !ContextHasRoom(TS, R))
+		{
+			return false;
+		}
+		TArray<int32, TInlineAllocator<8>> Tokens;
+		int32 ForcedChain = -1; // Exact: the chain's ids after the stop-token cut (the MR6 seam's ForcedChainCount)
+		if (A.RowsKind == ERowsKind::Prompt)
+		{
+			Tokens = A.RowsTokens;
+		}
+		else
+		{
+			Tokens.Add(TS.LastToken);
+			ForcedChain = 0;
+			const int32 Cap = FMath::Min(FMath::Min(A.RowsCount, static_cast<int32>(GpuRows::MaxRows)) - 1, TS.MaxNewTokens - TS.Produced - 1);
+			if (Cap > 0)
+			{
+				int32_t Ids[GpuRows::MaxRows] = {};
+				int32_t Count = 0;
+				int32_t Accepting = 0;
+				FGpuStatus ForcedSt = FGpuStatus::SSLM_OK;
+				if (!TakeRowsFault(2, ForcedSt))
+				{
+					ForcedSt = sslm_gpu_seq_forced_tokens(Ctx, TS.Handle, Ids, Cap, &Count, &Accepting);
+				}
+				NoteLayer1Status(ForcedSt);
+				if (ForcedSt == FGpuStatus::SSLM_GPU_FORCED_TABLE_ABSENT)
+				{
+					Count = 0; // a model without the forced-next table drafts nothing: one-row reads, the same tokens
+				}
+				else if (ForcedSt != FGpuStatus::SSLM_OK)
+				{
+					// Ruling 53: the failed read is named, so a fallback that changes no tokens is still visible.
+					UE_LOG(LogSuperSLM, Warning, TEXT("SuperSLM GPU: the Exact open's forced-chain read (sslm_gpu_seq_forced_tokens) returned %s; the step runs as Off's one-row step (ruling 42 S1)."),
+						*GpuStatusText(ForcedSt));
+					return FallBackToOff(TS, true, -1, -1); // ruling 42 S1: a failed forced-chain read runs Off's step, as P2 did
+				}
+				bool bStopped = false;
+				for (int32 I = 0; I < FMath::Min(static_cast<int32>(Count), Cap); ++I)
+				{
+					if (TS.StopTokenIds.Contains(Ids[I]))
+					{
+						bStopped = true;
+						break;
+					}
+					Tokens.Add(Ids[I]);
+				}
+				ForcedChain = Tokens.Num() - 1;
+				// Ruling 59f (erratum E-15; ruling 41 Q13's one provider): the proposal is CPU Exact's -- the learned table's draft
+				// (SuperSLMCore::BuildDraft) from the walk state right after the pending token, with the same stop-token cut. The
+				// table holds what the model emitted; the engine's chain is the tokenizer's canonical spelling of the same forced
+				// text, which the model's own rows reject wherever it spells it otherwise. The chain is the gate (a non-empty chain:
+				// that state is forced, CPU Exact's ForcedChainLength > 0) and the fallback when the table drafts nothing.
+				const superslm::SchemaEntry* Entry = TS.SchemaIndex >= 0 ? Schemas.ByIndex(static_cast<size_t>(TS.SchemaIndex)) : nullptr;
+				const uint32_t Walk0 = SslmGpuSeqWalkStateForG5Bridge(TS.Handle);
+				if (Count > 0 && A.DraftTable && Entry != nullptr && Walk0 != kSslmGpuDfaWalkStateUnused)
+				{
+					const FGpuScm1Automaton Automaton(Schemas, *Entry);
+					SuperSLMCore::FDraftLimits Limits;
+					Limits.MaxPrefillChunkBudget = Cap + 1;
+					Limits.RemainingAllowance = Cap;
+					TArray<int32, TInlineAllocator<8>> TableDraft;
+					for (const int32_t Id : SuperSLMCore::BuildDraft(A.DraftTable.get(), Automaton, Walk0, Limits))
+					{
+						if (TS.StopTokenIds.Contains(Id) || TableDraft.Num() >= Cap)
+						{
+							break;
+						}
+						TableDraft.Add(Id);
+					}
+					if (TableDraft.Num() > 0)
+					{
+						Tokens.SetNum(1); // the pending token
+						Tokens.Append(TableDraft);
+					}
+				}
+			}
+		}
+#if WITH_DEV_AUTOMATION_TESTS
+		if (A.RowsKind == ERowsKind::Exact && bTestNoDraftArmed.exchange(false))
+		{
+			// ArmNoDraftStep() (ruling 56 (6)): as if the forced chain were empty and no draft table were loaded.
+			Tokens.SetNum(FMath::Min(Tokens.Num(), 1));
+			ForcedChain = 0;
+		}
+#endif
+#if WITH_DEV_AUTOMATION_TESTS
+		if (A.RowsKind == ERowsKind::Exact)
+		{
+			// Ruling 59e point 1: what this open proposes (the ids after the pending token) and what CPU Exact would draft from
+			// the same walk state -- BuildDraft from the state right after the pending token, gated as CPU Exact gates it (a
+			// non-empty forced chain: that state is forced), up to the same room.
+			TS.TestRowsProposed.Reset();
+			for (int32 I = 1; I < Tokens.Num(); ++I)
+			{
+				TS.TestRowsProposed.Add(Tokens[I]);
+			}
+			TS.TestRowsCpuDraft.Reset();
+			TS.bTestRowsTableReached = static_cast<bool>(A.DraftTable);
+			const superslm::SchemaEntry* CpuEntry = TS.SchemaIndex >= 0 ? Schemas.ByIndex(static_cast<size_t>(TS.SchemaIndex)) : nullptr;
+			const int32 CpuRoom = FMath::Min(FMath::Min(A.RowsCount, static_cast<int32>(GpuRows::MaxRows)) - 1, TS.MaxNewTokens - TS.Produced - 1);
+			const uint32_t Walk0 = SslmGpuSeqWalkStateForG5Bridge(TS.Handle);
+			if (A.DraftTable && CpuEntry != nullptr && CpuRoom > 0 && ForcedChain > 0 && Walk0 != kSslmGpuDfaWalkStateUnused)
+			{
+				const FGpuScm1Automaton CpuAutomaton(Schemas, *CpuEntry);
+				SuperSLMCore::FDraftLimits CpuLimits;
+				CpuLimits.MaxPrefillChunkBudget = CpuRoom + 1;
+				CpuLimits.RemainingAllowance = CpuRoom;
+				for (const int32_t Id : SuperSLMCore::BuildDraft(A.DraftTable.get(), CpuAutomaton, Walk0, CpuLimits))
+				{
+					if (TS.StopTokenIds.Contains(Id))
+					{
+						break;
+					}
+					TS.TestRowsCpuDraft.Add(Id);
+				}
+			}
+		}
+#endif
+		if (A.RowsKind == ERowsKind::Exact && Tokens.Num() < 2)
+		{
+			return FallBackToOff(TS, false, ForcedChain, 0); // ruling 42 S2: no draft runs as Off's one-row step
+		}
+		SslmGpuRowsSpec Spec = {};
+		Spec.struct_size = static_cast<uint32_t>(sizeof(SslmGpuRowsSpec));
+		Spec.kind = A.RowsKind == ERowsKind::Prompt ? SSLM_GPU_ROWS_PROMPT : SSLM_GPU_ROWS_EXACT_DRAFT;
+		Spec.tokens = Tokens.GetData();
+		Spec.count = Tokens.Num();
+		Spec.flags = 0;
+		int32_t Admitted = 0;
+		FGpuStatus St;
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Embed", SuperSLMGpuChannel);
+			if (!TakeRowsFault(A.RowsKind == ERowsKind::Prompt ? 0 : 1, St))
+			{
+				St = sslm_gpu_seq_embed_rows(Ctx, TS.Handle, &Spec, &Admitted);
+			}
+		}
+		if (St != FGpuStatus::SSLM_OK)
+		{
+			if (A.RowsKind == ERowsKind::Exact)
+			{
+				// Ruling 42 S1: a refused Exact embed runs Off's step (a device loss faults there).
+				UE_LOG(LogSuperSLM, Warning, TEXT("SuperSLM GPU: the Exact open's embed (sslm_gpu_seq_embed_rows) returned %s; the step runs as Off's one-row step (ruling 42 S1)."),
+					*GpuStatusText(St));
+				return FallBackToOff(TS, true, ForcedChain, Tokens.Num() - 1);
+			}
+			FaultResult(TS, R, St, TEXT("sslm_gpu_seq_embed_rows"));
+			return false;
+		}
+		TS.RowsOpen = Admitted;
+		TS.RowsKind = A.RowsKind;
+		TS.RowsLayersDone = 0;
+		TS.bRowsLastPrompt = A.bLastPrompt;
+		TS.RowsDrafts.Reset();
+		TS.RowsForcedChain = ForcedChain;
+		TS.RowsDraftCount = A.RowsKind == ERowsKind::Exact ? Tokens.Num() - 1 : -1;
+		if (A.RowsKind == ERowsKind::Prompt)
+		{
+			if (Admitted != Tokens.Num())
+			{
+				// The planner fed these rows as the prompt's next tokens; a short admission is a plugin defect (the
+				// activation pre-check prices the whole prompt), so the chunk is abandoned and the sequence stopped.
+				DropRowsAfterFailure(TS);
+				R.Kind = EResultKind::Fault;
+				R.Fault = ESuperSLMGpuFaultReason::RecoverablePerSequenceRejection;
+				R.Message = FString::Printf(TEXT("sslm_gpu_seq_embed_rows admitted %d of %d prompt rows"), static_cast<int32>(Admitted), Tokens.Num());
+				StopWith(TS, R);
+				return false;
+			}
+			TS.ContextUsed += Admitted;
+		}
+		else
+		{
+			for (int32 I = 1; I < Admitted; ++I)
+			{
+				TS.RowsDrafts.Add(Tokens[I]);
+			}
+		}
+		TS.PinnedAdapter = TS.BoundAdapter; // fixed for the chunk from its first slice (§4.4)
+		TS.bArmed = false;                  // embed_rows cleared the engine's ready flag
+		TRACE_COUNTER_SET(SuperSLMGpuRowsPerChunk, static_cast<int64>(Admitted));
+		return true;
+	}
+
+	// One slice of Layers layers on the open chunk: sslm_decode_step_gpu at Layers x DispatchesPerLayer with the chunk's
+	// adapter, then the drain. The drain that finishes the chunk's last layer closes it (the engine's close). A guard
+	// refusal of an Exact close changes nothing and is retried by the next sslm_gpu_ready (ruling 38). OutCloseUs is
+	// that drain's wall time (an Exact close's host finish, HostFinishUs). Submission thread.
+	FGpuStatus RunRowsLayers(FThreadSlot& TS, int32 Layers, bool& bOutClosed, double& OutCloseUs)
+	{
+		bOutClosed = false;
+		OutCloseUs = 0.0;
+		const double Start = FPlatformTime::Seconds();
+		FGpuStatus St;
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Submit", SuperSLMGpuChannel);
+#if WITH_DEV_AUTOMATION_TESTS
+			// Ruling 45: the slice that runs an Exact chunk's last layer is its close (the logits stage included).
+			TestOpenTickCall(TS.RowsLayersDone + Layers >= NumHiddenLayers && TS.RowsKind == ERowsKind::Exact
+				? ESuperSLMGpuTickCallKind::ExactClose : ESuperSLMGpuTickCallKind::RowsSlice);
+#endif
+			CountSubmission();
+			St = sslm_decode_step_gpu(Ctx, TS.Handle, TS.PinnedAdapter, static_cast<uint32>(Layers) * DispatchesPerLayer);
+		}
+		NoteLayer1Status(St);
+		if (St != FGpuStatus::SSLM_OK)
+		{
+			return St;
+		}
+		const bool bLast = TS.RowsLayersDone + Layers >= NumHiddenLayers;
+		const double DrainStart = FPlatformTime::Seconds();
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Drain", SuperSLMGpuChannel);
+			for (int32 Attempt = 0; Attempt < 4; ++Attempt)
+			{
+				int32_t Ready = 0;
+				FGpuStatus Drained = FGpuStatus::SSLM_OK;
+				St = sslm_gpu_ready(Ctx, TS.Handle, 1, &Ready, &Drained);
+				NoteLayer1Status(St);
+				if (St == FGpuStatus::SSLM_OK)
+				{
+					St = Drained;
+					NoteLayer1Status(Drained);
+				}
+				if (!(St == FGpuStatus::SSLM_BUSY && bLast && TS.RowsKind == ERowsKind::Exact))
+				{
+					break;
+				}
+			}
+		}
+		OutCloseUs = (FPlatformTime::Seconds() - DrainStart) * 1.0e6;
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Readback", SuperSLMGpuChannel);
+		RecordGpuBusy();
+		TRACE_COUNTER_SET(SuperSLMGpuRowsSliceMs, (FPlatformTime::Seconds() - Start) * 1000.0);
+		if (St != FGpuStatus::SSLM_OK)
+		{
+			return St;
+		}
+		TS.RowsLayersDone = FMath::Min(NumHiddenLayers, TS.RowsLayersDone + Layers);
+		bOutClosed = TS.RowsLayersDone >= NumHiddenLayers;
+		return St;
+	}
+
+	// The chunk closed. A prompt chunk leaves its last row at full depth with no finish, the state one-row leaves after
+	// a prompt token (§5.2, L2): after the prompt's last token the sequence is primed. An Exact close committed rows
+	// 0 .. a-1 (sslm_gpu_seq_last_rows_committed) and produced row a-1's token (sslm_gpu_seq_rows_produced, -2 at a
+	// dead end): the a - 1 committed drafts are delivered as forced ids, then the produced token, in one result
+	// (§4.7; P2's multi-id delivery, ruling 40). Submission thread.
+	void CloseRows(FThreadSlot& TS, const FAction& A, FActionResult& R, double CloseUs)
+	{
+		if (TS.RowsKind == ERowsKind::Prompt)
+		{
+			ClearRows(TS);
+			PromptTokenDone(TS, A, R);
+			return;
+		}
+		int32_t Committed = 0;
+		NoteLayer1Status(sslm_gpu_seq_last_rows_committed(TS.Handle, &Committed));
+		int32_t Produced = -1;
+		const FGpuStatus ProducedSt = sslm_gpu_seq_rows_produced(TS.Handle, &Produced);
+		const TArray<int32, TInlineAllocator<8>> Drafts = TS.RowsDrafts;
+		ClearRows(TS);
+		// Ruling 37, 39 Q6: the close's host finish, report-only (the trace counter; never a chooser input).
+		TRACE_COUNTER_SET(SuperSLMGpuHostFinishUs, static_cast<int64>(CloseUs));
+		LastHostFinishMs.store(CloseUs / 1000.0);
+		TS.ContextUsed += FMath::Max(0, static_cast<int32>(Committed));
+		for (int32 I = 0; I < FMath::Min(static_cast<int32>(Committed) - 1, Drafts.Num()); ++I)
+		{
+			R.JumpIds.Add(GpuJumpCore::FDeliveredId{Drafts[I], false}); // verified: the model's own token, never forced
+			TS.LastToken = Drafts[I];
+			TS.Produced += 1;
+		}
+		FActionResult Own;
+		if (ProducedSt != FGpuStatus::SSLM_OK)
+		{
+			FaultResult(TS, Own, ProducedSt, TEXT("the Exact close's finish (sslm_gpu_seq_rows_produced)"));
+		}
+		else
+		{
+			RecordToken(TS, Own, Produced);
+		}
+		if (R.JumpIds.Num() == 0)
+		{
+			Own.JumpIds.Reset();
+			R = Own;
+			return;
+		}
+		R.bSchemaAccepting = Own.bSchemaAccepting;
+		R.bHasWalkState = Own.bHasWalkState;
+		R.WalkState = Own.WalkState;
+		if (Own.Kind == EResultKind::Token)
+		{
+			R.JumpIds.Add(GpuJumpCore::FDeliveredId{Own.Token, false});
+			R.Kind = EResultKind::Token;
+			R.Token = Own.Token;
+			return;
+		}
+		// The drafts were committed and are delivered; the action then ended at a dead end or a fault.
+		R.Kind = EResultKind::Token;
+		R.Token = R.JumpIds.Last().Token;
+		R.JumpEnd = Own.Kind;
+		R.Fault = Own.Fault;
+		R.Message = Own.Message;
+	}
+
+	// One RowsSlice action (either path): opens the chunk on its first slice, runs the slice's layers, and closes it
+	// on the slice that runs the last layer. Every slice of a chunk passes the adapter its first slice passed. A
+	// failed slice stops the sequence with the chunk gone. Submission thread.
+	void RunRowsSlice(const FAction& A, FActionResult& R)
+	{
+		FThreadSlot& TS = ThreadSlots[A.Slot];
+		if (A.bOpenRows)
+		{
+			if (TS.RowsOpen > 0)
+			{
+				DropRowsAfterFailure(TS); // a defect: the planner opens a chunk only with none open
+				UE_LOG(LogSuperSLM, Error, TEXT("SuperSLM GPU: a chunk was opened on a sequence that still had one open (plugin defect); the old one was abandoned."));
+			}
+			if (!OpenRows(TS, A, R))
+			{
+				return;
+			}
+			if (TS.bRowsFellBack)
+			{
+				RunFallenBackSlice(A, R);
+				return;
+			}
+		}
+		else if (TS.bRowsFellBack)
+		{
+			RunFallenBackSlice(A, R);
+			return;
+		}
+		else if (TS.RowsOpen == 0)
+		{
+			R.Kind = EResultKind::Fault;
+			R.Fault = ESuperSLMGpuFaultReason::RecoverablePerSequenceRejection;
+			R.Message = TEXT("a chunk slice found no chunk open (plugin defect)");
+			StopWith(TS, R);
+			return;
+		}
+		bool bClosed = false;
+		double CloseUs = 0.0;
+		const FGpuStatus St = RunRowsLayers(TS, A.Layers, bClosed, CloseUs);
+		if (St != FGpuStatus::SSLM_OK)
+		{
+			DropRowsAfterFailure(TS);
+			FaultResult(TS, R, St, TEXT("sslm_decode_step_gpu (a chunk slice)"));
+			return;
+		}
+		if (bClosed != A.bCloseRows)
+		{
+			UE_LOG(LogSuperSLM, Error, TEXT("SuperSLM GPU: a chunk slice %s the chunk the planner %s (plugin defect)."),
+				bClosed ? TEXT("closed") : TEXT("left open"), A.bCloseRows ? TEXT("closes") : TEXT("keeps open"));
+		}
+		if (bClosed)
+		{
+			const int32 ForcedChain = TS.RowsForcedChain;
+			const int32 DraftCount = TS.RowsDraftCount;
+			CloseRows(TS, A, R, CloseUs);
+			R.RowsForcedChain = ForcedChain;
+			R.RowsDraftCount = DraftCount;
+			CopyTestRowsOpen(TS, R);
+			return;
+		}
+		R.Kind = EResultKind::Progress;
 	}
 
 	// Plugin paging plan §3.4 "Build pace" (K7, UP-11): one build-seat turn. One prefix token, through
@@ -2088,6 +3537,9 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		const TCHAR* Where = TEXT("sslm_gpu_prefix_prefill");
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.PrefixBuild", SuperSLMGpuChannel);
+#if WITH_DEV_AUTOMATION_TESTS
+			TestOpenTickCall(ESuperSLMGpuTickCallKind::Other); // ruling 45: a prefix build turn
+#endif
 			CountSubmission();
 			St = sslm_gpu_prefix_prefill(Ctx, Prefix->Handle, &Token, 1, static_cast<int32_t>(A.PrefixKind), FullTokenBudget(), &Consumed);
 		}
@@ -2133,6 +3585,9 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		FGpuStatus St;
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Submit", SuperSLMGpuChannel);
+#if WITH_DEV_AUTOMATION_TESTS
+			TestOpenTickCall(ESuperSLMGpuTickCallKind::OneCallStep); // ruling 45: a OneCall prompt token, whole depth
+#endif
 			CountSubmission();
 			St = sslm_decode_step_gpu(Ctx, TS.Handle, TS.BoundAdapter, FullTokenBudget());
 		}
@@ -2204,9 +3659,15 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			// never embed (D-SLM7256 rules 1-2). The same holds after a restore, since "primed"
 			// travels in the plugin's own save wrapper.
 			TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Finish", SuperSLMGpuChannel);
+#if WITH_DEV_AUTOMATION_TESTS
+			const double TestFinishStartUs = TestOpenFinishCall(); // ruling 46: the primed finish is its own call
+#endif
 			const double Start = FPlatformTime::Seconds();
 			St = SslmGpuSeqFinishTokenForG5Bridge(Ctx, TS.Handle, &Token);
 			const double FinishMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+#if WITH_DEV_AUTOMATION_TESTS
+			TestEndFinishCall(TestFinishStartUs);
+#endif
 			LastHostFinishMs.store(FinishMs);
 			TRACE_COUNTER_SET(SuperSLMGpuHostFinishMs, FinishMs);
 			TS.bPrimed = false;
@@ -2217,16 +3678,17 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			{
 				return;
 			}
-			// The bridge takes its finish-only shortcut when Layer 1's ready_for_logits is set.
-			// The plugin calls no prefill verb, and the two other events that set it -- a schema
-			// dead end and, at 1.7.0, a hook that breaks its exactly-once contract -- both stop
-			// the sequence (RecordToken(), FaultResult()), so no live plugin sequence reaches this
-			// call with it set, and the bridge always embeds TS.LastToken, drives it to depth and
-			// finishes. One fused Layer-1 call does embed+decode+drain, so Submit is the honest
+			// The bridge takes its finish-only shortcut when Layer 1's ready_for_logits is set. The
+			// flag reaches the decode bridge set only through that shortcut (ArmedFinish()); here, with
+			// the slot not armed (the branch above), the flag is clear, and the bridge embeds
+			// TS.LastToken, drives it to depth and finishes. One fused Layer-1 call does embed+decode+drain, so Submit is the honest
 			// scope for the whole call rather than a separately-timed Embed (there is no boundary
 			// Layer 1 exposes between them here).
 			{
 				TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Submit", SuperSLMGpuChannel);
+#if WITH_DEV_AUTOMATION_TESTS
+				TestOpenTickCall(ESuperSLMGpuTickCallKind::OneCallStep); // ruling 45: a OneCall token, one fused call
+#endif
 				CountSubmission();
 				St = SslmGpuSeqDecodeStepForG5Bridge(Ctx, TS.Handle, TS.LastToken, FullTokenBudget(), &Token);
 			}
@@ -2242,6 +3704,264 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		RecordToken(TS, R, Token);
 	}
 
+	// Ruling 48 (erratum E-13): one calibration job, on the throwaway sequence. Whole tokens (no frame budget) are each
+	// one slice of every layer and its finish (ruling 56 (1): the finish its own call, so F is measured). A slice (ruling 50) is the
+	// token's embed on its first slice, Layers layers, and the logits finish (its own call, a Finish record) when bFinish;
+	// Layers 0 is a finish-only slice, the finish run on its own when it does not fit with the last layers. Each token's time is the delta of the engine's cumulative
+	// GPU-busy counter (rulings 45a, 46), which counts the decode and the finish. Submission thread.
+	void RunCalibrationStep(FJob::FCalibrationStep& C)
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.RowCostCalibration", SuperSLMGpuChannel);
+		if (CalSeq == nullptr)
+		{
+			C.Status = sslm_gpu_seq_create(Ctx, Model, FMath::Max<int64>(kRowCostCalibrationSequenceCap, C.SeqCap), &CalSeq);
+			NoteLayer1Status(C.Status);
+			if (C.Status != FGpuStatus::SSLM_OK || CalSeq == nullptr)
+			{
+				CalSeq = nullptr;
+				C.bNoSequence = true;
+				return;
+			}
+		}
+		if (C.bWhole)
+		{
+			for (int32 T = 0; T < C.WholeTokens; ++T)
+			{
+				if (FPlatformTime::Seconds() > C.Deadline)
+				{
+					C.bTimedOut = true;
+					return;
+				}
+				// Ruling 56 (1): a whole token is one slice of every layer, then its finish as its own call, so F is
+				// measured at B = 0 too.
+				FJob::FCalibrationStep Token;
+				Token.Layers = NumHiddenLayers;
+				Token.bEmbed = true;
+				Token.bFinish = true;
+				Token.Attempt = C.Attempt;
+				RunCalibrationStep(Token);
+				C.Status = Token.Status;
+				if (C.Status != FGpuStatus::SSLM_OK)
+				{
+					return;
+				}
+				C.TokenUs.Add(Token.SliceUs);
+				C.WholeFinishUs.Add(Token.FinishUs);
+				if (C.WholeWidenMask != 0 && T + 1 == C.WholeWidenAfter)
+				{
+					for (const int32 M : kWidenWarmUpRows)
+					{
+						if ((C.WholeWidenMask >> M & 1u) == 0)
+						{
+							continue; // ruling 57 F5: not a width the chooser can pick
+						}
+						if (!RunWidenWarmUp(C, M))
+						{
+							return;
+						}
+					}
+				}
+			}
+			return;
+		}
+		if (C.WidenRows > 0)
+		{
+			(void)RunWidenWarmUp(C, C.WidenRows); // ruling 56 (2): one widened warm-up, untimed
+			return;
+		}
+		const double Before = superslm_gpu::CumulativeGpuBusyUs();
+		if (C.FillRows > 0)
+		{
+			// Ruling 54 (phase 2): the filler read to P2, a prompt chunk of FillRows zeros opened by its first slice, then
+			// Layers layers of it; the drain that finishes its last layer closes it (a prompt chunk: no finish).
+			if (C.bFillOpen)
+			{
+				int32_t Zeros[GpuRows::MaxRows] = {};
+				SslmGpuRowsSpec Spec = {};
+				Spec.struct_size = static_cast<uint32_t>(sizeof(SslmGpuRowsSpec));
+				Spec.kind = SSLM_GPU_ROWS_PROMPT;
+				Spec.tokens = Zeros;
+				Spec.count = FMath::Min(C.FillRows, static_cast<int32>(GpuRows::MaxRows));
+				Spec.flags = 0;
+				int32_t Admitted = 0;
+				C.Status = sslm_gpu_seq_embed_rows(Ctx, CalSeq, &Spec, &Admitted);
+				NoteLayer1Status(C.Status);
+				if (C.Status != FGpuStatus::SSLM_OK)
+				{
+					return;
+				}
+				if (Admitted != Spec.count)
+				{
+					C.Status = FGpuStatus::SSLM_GPU_CONTEXT_CAP_EXCEEDED; // the throwaway sequence is sized for P2; a short admission fails phase 2
+					return;
+				}
+			}
+#if WITH_DEV_AUTOMATION_TESTS
+			TestOpenCalibrationCall(C.Layers, C.Attempt, C.FillRows); // ruling 54: a phase-2 filler slice
+#endif
+			CountSubmission();
+			C.Status = sslm_decode_step_gpu(Ctx, CalSeq, nullptr, static_cast<uint32>(C.Layers) * DispatchesPerLayer);
+			NoteLayer1Status(C.Status);
+			if (C.Status == FGpuStatus::SSLM_OK)
+			{
+				int32_t Ready = 0;
+				FGpuStatus Drained = FGpuStatus::SSLM_OK;
+				C.Status = sslm_gpu_ready(Ctx, CalSeq, 1, &Ready, &Drained);
+				NoteLayer1Status(C.Status);
+				if (C.Status == FGpuStatus::SSLM_OK)
+				{
+					C.Status = Drained;
+					NoteLayer1Status(C.Status);
+				}
+			}
+			C.SliceUs = superslm_gpu::CumulativeGpuBusyUs() - Before;
+			return;
+		}
+		if (C.bEmbed)
+		{
+			C.Status = sslm_gpu_seq_embed_token(Ctx, CalSeq, 0);
+			NoteLayer1Status(C.Status);
+			if (C.Status != FGpuStatus::SSLM_OK)
+			{
+				return;
+			}
+		}
+		if (C.Layers > 0)
+		{
+#if WITH_DEV_AUTOMATION_TESTS
+			TestOpenCalibrationCall(C.Layers, C.Attempt); // ruling 48: one calibration slice
+#endif
+			CountSubmission();
+			C.Status = sslm_decode_step_gpu(Ctx, CalSeq, nullptr, static_cast<uint32>(C.Layers) * DispatchesPerLayer);
+			NoteLayer1Status(C.Status);
+		}
+		if (C.Layers > 0 && C.Status == FGpuStatus::SSLM_OK)
+		{
+			int32_t Ready = 0;
+			FGpuStatus Drained = FGpuStatus::SSLM_OK;
+			C.Status = sslm_gpu_ready(Ctx, CalSeq, 1, &Ready, &Drained);
+			NoteLayer1Status(C.Status);
+			if (C.Status == FGpuStatus::SSLM_OK)
+			{
+				C.Status = Drained;
+				NoteLayer1Status(C.Status);
+			}
+		}
+		if (C.Status != FGpuStatus::SSLM_OK)
+		{
+			return;
+		}
+		if (C.bFinish)
+		{
+			int32_t Token = -1;
+#if WITH_DEV_AUTOMATION_TESTS
+			const double TestFinishStartUs = TestOpenFinishCall(); // ruling 48: the calibration token's finish is its own call
+			if (bTestTickGpuActive && bTestTickCallOpen)
+			{
+				TestTickCalls.Last().Layers = 0; // ruling 51 (F7): the calibration token's own Finish carries its attempt
+				TestTickCalls.Last().CalibrationAttempt = C.Attempt;
+			}
+#endif
+			const double FinishBefore = superslm_gpu::CumulativeGpuBusyUs();
+			C.Status = SslmGpuSeqFinishTokenForG5Bridge(Ctx, CalSeq, &Token);
+			C.FinishUs = superslm_gpu::CumulativeGpuBusyUs() - FinishBefore; // ruling 56 (1): F on its own
+#if WITH_DEV_AUTOMATION_TESTS
+			TestEndFinishCall(TestFinishStartUs);
+#endif
+			NoteLayer1Status(C.Status);
+			if (C.Status != FGpuStatus::SSLM_OK)
+			{
+				return;
+			}
+		}
+		C.SliceUs = superslm_gpu::CumulativeGpuBusyUs() - Before;
+	}
+
+	// Ruling 56 (2): one widened warm-up on the throwaway sequence -- a prompt chunk of M zero rows, one layer of it, then
+	// the chunk abandoned (sslm_gpu_seq_rows_abandon restores the sequence as it was before the embed), so the widened row
+	// kernel's first-use cost lands at load. Untimed: nothing of it is a token's time or p. A failure other than a device
+	// loss is not the calibration's: the warm-up is skipped (WidenStatus says why) and that kernel stays cold. Returns
+	// false when the step must stop (C.Status set: a loss, or an abandon that failed and left the chunk open). Submission
+	// thread.
+	bool RunWidenWarmUp(FJob::FCalibrationStep& C, int32 M)
+	{
+		int32_t Zeros[GpuRows::MaxRows] = {};
+		SslmGpuRowsSpec Spec = {};
+		Spec.struct_size = static_cast<uint32_t>(sizeof(SslmGpuRowsSpec));
+		Spec.kind = SSLM_GPU_ROWS_PROMPT;
+		Spec.tokens = Zeros;
+		Spec.count = FMath::Clamp(M, 1, static_cast<int32>(GpuRows::MaxRows));
+		Spec.flags = 0;
+		int32_t Admitted = 0;
+		FGpuStatus St = sslm_gpu_seq_embed_rows(Ctx, CalSeq, &Spec, &Admitted);
+		NoteLayer1Status(St);
+		const bool bOpened = St == FGpuStatus::SSLM_OK;
+		if (bOpened && Admitted != Spec.count)
+		{
+			St = FGpuStatus::SSLM_GPU_CONTEXT_CAP_EXCEEDED; // a short admission: not the width asked for
+		}
+		else if (bOpened)
+		{
+#if WITH_DEV_AUTOMATION_TESTS
+			TestOpenCalibrationCall(1, C.Attempt, Spec.count); // ruling 56 (2): a widened warm-up, one layer of M rows
+#endif
+			CountSubmission();
+			St = sslm_decode_step_gpu(Ctx, CalSeq, nullptr, DispatchesPerLayer);
+			NoteLayer1Status(St);
+			if (St == FGpuStatus::SSLM_OK)
+			{
+				int32_t Ready = 0;
+				FGpuStatus Drained = FGpuStatus::SSLM_OK;
+				St = sslm_gpu_ready(Ctx, CalSeq, 1, &Ready, &Drained);
+				NoteLayer1Status(St);
+				if (St == FGpuStatus::SSLM_OK)
+				{
+					St = Drained;
+					NoteLayer1Status(St);
+				}
+			}
+		}
+		if (St == FGpuStatus::SSLM_DEVICE_LOST)
+		{
+			C.Status = St;
+			return false;
+		}
+		if (bOpened)
+		{
+			const FGpuStatus Abandoned = sslm_gpu_seq_rows_abandon(Ctx, CalSeq);
+			NoteLayer1Status(Abandoned);
+			if (Abandoned != FGpuStatus::SSLM_OK)
+			{
+				C.Status = Abandoned;
+				return false;
+			}
+		}
+		if (St == FGpuStatus::SSLM_OK)
+		{
+			C.WidenRanMask |= 1u << Spec.count;
+		}
+		else
+		{
+			C.WidenStatus = St;
+		}
+		return true;
+	}
+
+	// Ruling 49 as amended by 59b point 4: the one product read of the GPU-busy counter outside the calibration. A tick job's
+	// GPU time, for the cold-start guard's feedback only (it sizes layers; never rows, tokens or a timing that is kept).
+	// The process-wide Layer-1 lock is held, so no other caller's work lands in the delta. Submission thread.
+	void MeasureTickJobForLayerSizing(FJob& Job)
+	{
+		if (!Job.bTickJob)
+		{
+			ExecuteTickJob(Job);
+			return;
+		}
+		const double Before = superslm_gpu::CumulativeGpuBusyUs();
+		ExecuteTickJob(Job);
+		Job.GpuBusyUs = superslm_gpu::CumulativeGpuBusyUs() - Before;
+	}
+
 	void ExecuteTickJob(FJob& Job)
 	{
 		// Runs on the dedicated submission thread (already named "SuperSLM GPU Submission",
@@ -2249,6 +3969,16 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		// work off the game thread without any extra bookkeeping here.
 		TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.SubmissionJob", SuperSLMGpuChannel);
 		Job.Results.SetNum(Job.Actions.Num());
+		if (Job.Calibration.bActive && !Job.Calibration.bRider)
+		{
+			RunCalibrationStep(Job.Calibration); // ruling 48: a calibration job carries nothing else
+			if (Job.Calibration.Status == FGpuStatus::SSLM_DEVICE_LOST)
+			{
+				// Ruling 51 F3: a device loss is classified as Configure()'s warm-up does; a confirmed one is terminal.
+				(void)Classify(Job.Calibration.Status);
+			}
+			return;
+		}
 
 		// Round 2, "Terminal loss never waits": once a call in this job confirms a terminal loss
 		// (Classify()), the job stops executing; every action not yet run keeps its Skipped result.
@@ -2265,7 +3995,8 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				RunPrefixBuildTurn(A, Job.Results[I]); // the build seat's place in the one-call rotation (K7)
 				continue;
 			}
-			if ((A.Kind != EActionKind::OneCallPromptToken && A.Kind != EActionKind::OneCallToken) || !ActionIsLive(A))
+			const bool bOneCallRows = A.Kind == EActionKind::RowsSlice && !A.bComposed;
+			if ((A.Kind != EActionKind::OneCallPromptToken && A.Kind != EActionKind::OneCallToken && !bOneCallRows) || !ActionIsLive(A))
 			{
 				continue;
 			}
@@ -2277,7 +4008,11 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			{
 				continue;
 			}
-			if (A.Kind == EActionKind::OneCallPromptToken)
+			if (bOneCallRows)
+			{
+				RunRowsSlice(A, Job.Results[I]); // MR6 (§5.2): one slice of a OneCall chunk
+			}
+			else if (A.Kind == EActionKind::OneCallPromptToken)
 			{
 				RunOneCallPrompt(A, Job.Results[I]);
 			}
@@ -2289,6 +4024,8 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 
 		// Composed: finish-only primed steps, embeds, then one decode call for every slice.
 		TArray<int32, TInlineAllocator<16>> SliceActions;
+		TArray<int32, TInlineAllocator<16>> SoloSlices; // ruling 43 N2: OneCall one-row slices, each its own call
+		int32 ShortLast = INDEX_NONE; // ruling 59.1: the one short slice the batch holds, after every slice that ends its token
 		for (int32 I = 0; I < Job.Actions.Num(); ++I)
 		{
 			if (bTerminalLoss.load())
@@ -2296,7 +4033,8 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				break;
 			}
 			const FAction& A = Job.Actions[I];
-			if ((A.Kind != EActionKind::ComposedSlice && A.Kind != EActionKind::ComposedFinishOnly) || !ActionIsLive(A))
+			const bool bComposedRows = A.Kind == EActionKind::RowsSlice && A.bComposed;
+			if ((A.Kind != EActionKind::ComposedSlice && A.Kind != EActionKind::ComposedFinishOnly && !bComposedRows) || !ActionIsLive(A))
 			{
 				continue;
 			}
@@ -2310,6 +4048,14 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			}
 			FThreadSlot& TS = ThreadSlots[A.Slot];
 			FActionResult& R = Job.Results[I];
+			if (bComposedRows)
+			{
+				// MR6 (§5.3): a composed chunk's slice, its own submission (one per member, as the batch's are): the
+				// batch's running remainder would hand an earlier member layers the planner billed to another, since
+				// a chunk's slice is billed in units, not layers (build-mr6.md).
+				RunRowsSlice(A, R);
+				continue;
+			}
 			if (A.Kind == EActionKind::ComposedFinishOnly)
 			{
 				if (TS.bArmed)
@@ -2340,45 +4086,58 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				TS.ContextUsed += 1;
 				TS.PinnedAdapter = TS.BoundAdapter;
 			}
-			SliceActions.Add(I);
+			if (A.bBatchLast)
+			{
+				ShortLast = I; // ruling 59.1: joins the batch last
+				continue;
+			}
+			(A.bOneCallRow || !A.bEndsToken ? SoloSlices : SliceActions).Add(I); // ruling 59.1: any other short slice runs alone
+		}
+		if (ShortLast != INDEX_NONE)
+		{
+			// Ruling 59.1: last in the batch the engine's remainder is exactly its planned layers; alone, its own call.
+			(SliceActions.Num() > 0 ? SliceActions : SoloSlices).Add(ShortLast);
 		}
 		if (bTerminalLoss.load())
 		{
 			SliceActions.Reset(); // no decode call, and no finish, on a lost device
+			SoloSlices.Reset();
 		}
 
-		if (SliceActions.Num() == 1)
+		// One slice's own decode call at its planned layers (the batch's running remainder never applies to it).
+		auto RunSoloSlice = [this, &Job](int32 I)
 		{
-			const int32 I = SliceActions[0];
 			const FAction& A = Job.Actions[I];
 			FThreadSlot& TS = ThreadSlots[A.Slot];
-			FActionResult& R = Job.Results[I];
-			FGpuStatus St;
-			{
-				TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Submit", SuperSLMGpuChannel);
-				CountSubmission();
-				St = sslm_decode_step_gpu(Ctx, TS.Handle, TS.PinnedAdapter, static_cast<uint32>(A.Layers) * DispatchesPerLayer);
-			}
-			if (St == FGpuStatus::SSLM_OK)
-			{
-				int32_t Ready = 0;
-				FGpuStatus Drained = FGpuStatus::SSLM_OK;
-				{
-					TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Drain", SuperSLMGpuChannel);
-					St = sslm_gpu_ready(Ctx, TS.Handle, 1, &Ready, &Drained);
-					NoteLayer1Status(St);
-				}
-				if (St == FGpuStatus::SSLM_OK)
-				{
-					St = Drained;
-				}
-				TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Readback", SuperSLMGpuChannel);
-				RecordGpuBusy();
-			}
+#if WITH_DEV_AUTOMATION_TESTS
+			// Ruling 45: a OneCall sequence's one-row slice, or a Composed slice run solo (the stage's only member).
+			TestSoloCallKind = A.bOneCallRow ? ESuperSLMGpuTickCallKind::OneCallStep : ESuperSLMGpuTickCallKind::ComposedSolo;
+#endif
+			const FGpuStatus St = DecodeOneRowLayers(TS, A.Layers);
 			if (St != FGpuStatus::SSLM_OK)
 			{
-				FaultResult(TS, R, St, TEXT("sslm_decode_step_gpu"));
+				FaultResult(TS, Job.Results[I], St, TEXT("sslm_decode_step_gpu"));
 			}
+			else
+			{
+				CheckLayerAfter(A, Job.Results[I]); // ruling 59.1
+			}
+		};
+		for (int32 I : SoloSlices)
+		{
+			if (bTerminalLoss.load())
+			{
+				break;
+			}
+			RunSoloSlice(I);
+		}
+		if (bTerminalLoss.load())
+		{
+			SliceActions.Reset();
+		}
+		if (SliceActions.Num() == 1)
+		{
+			RunSoloSlice(SliceActions[0]);
 		}
 		else if (SliceActions.Num() > 1)
 		{
@@ -2406,6 +4165,9 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			FGpuStatus CallStatus;
 			{
 				TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Submit", SuperSLMGpuChannel);
+#if WITH_DEV_AUTOMATION_TESTS
+				TestOpenTickCall(ESuperSLMGpuTickCallKind::Batch, SliceActions.Num()); // ruling 45: one call, every member
+#endif
 				CountSubmission(SliceActions.Num());
 				CallStatus = sslm_decode_step_batch_gpu(Ctx, Seqs.GetData(), SliceAdapters.GetData(),
 					static_cast<uint32>(Seqs.Num()), Budget, Statuses.GetData());
@@ -2427,10 +4189,15 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				{
 					FaultResult(ThreadSlots[A.Slot], Job.Results[SliceActions[K]], St, TEXT("sslm_decode_step_batch_gpu"));
 				}
+				else
+				{
+					CheckLayerAfter(A, Job.Results[SliceActions[K]]); // ruling 59.1
+				}
 			}
 		}
 
-		for (int32 I : SliceActions)
+		SoloSlices.Append(SliceActions);
+		for (int32 I : SoloSlices)
 		{
 			if (bTerminalLoss.load())
 			{
@@ -2468,6 +4235,16 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				Job.Results[I].Armed = ThreadSlots[A.Slot].bArmed ? 1 : 0;    // and the armed mirror (K7)
 			}
 		}
+
+		// Ruling 54: phase 2's slice rides the tick job after the generations' work, in the room they left.
+		if (Job.Calibration.bActive && Job.Calibration.bRider && !bTerminalLoss.load())
+		{
+			RunCalibrationStep(Job.Calibration);
+			if (Job.Calibration.Status == FGpuStatus::SSLM_DEVICE_LOST)
+			{
+				(void)Classify(Job.Calibration.Status); // ruling 51 F3, as a phase-1 slice
+			}
+		}
 	}
 
 	// ------------------------------------------------------------------ teardown
@@ -2503,6 +4280,18 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				TS.BoundAdapter = nullptr;
 				TS.PinnedAdapter = nullptr;
 			}
+		}
+		// Ruling 48 (erratum E-13): the calibration's throwaway (dedicated) sequence, with the other sequences. It is not
+		// one of the pool's slots, so the teardown record's per-slot lists do not name it.
+		if (CalSeq != nullptr)
+		{
+			const FGpuStatus St = sslm_gpu_seq_release(Ctx, CalSeq);
+			NoteLayer1Status(St);
+			if (St != FGpuStatus::SSLM_OK)
+			{
+				UE_LOG(LogSuperSLM, Error, TEXT("GPU teardown: sslm_gpu_seq_release refused the row-cost calibration's sequence (%s)."), *GpuStatusText(St));
+			}
+			CalSeq = nullptr;
 		}
 		// Plugin paging plan §3.4 "Pool and sequences" (K7): every prefix, after the sequences and
 		// before the pool, which refuses its destroy while a prefix drawn from it is live.
@@ -2819,6 +4608,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		S.PlanBeginLimit = 0;
 		S.TokensIssued = 0;
 		S.PlanLayerPos = 0;
+		ClearPlanRows(S); // ruling 42 M2: a chunk the planner left open dies with the generation
 		S.bSchemaAccepting = false;
 		DropPendingEvents(S);
 		S.ActiveGenerationOpLogIndex = INDEX_NONE;
@@ -2928,13 +4718,20 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			if (St == FGpuStatus::SSLM_OK && bPooled)
 			{
 				// Plugin paging plan §3.4, §3.5 (K7): the holder rests at origin 0 with its own budget (or,
-				// normalized, SequenceBudget), and a reset clears the engine's ready flag. A negative
-				// in-place limit keeps the holder's limit as it stands (a deferred recycle, K6 review C1).
+				// normalized, SequenceBudget). A negative in-place limit keeps the holder's limit as it stands (a
+				// deferred recycle, K6 review C1).
 				const int64 LimitAfter = bNormalized ? LimitNormalized : LimitInPlace;
 				if (LimitAfter >= 0)
 				{
 					TS.Limit = LimitAfter;
 				}
+			}
+			if (St == FGpuStatus::SSLM_OK)
+			{
+				// A reset clears the engine's ready flag in either mode, so the mirror is cleared with it. Since ruling 40 a
+				// schema dead end arms the mirror in every mode (RecordToken()), so a dedicated sequence returned after a dead
+				// end would otherwise keep a stale armed flag: its next generation's first finish-only step would take the ready
+				// shortcut (ArmedFinish()) on an engine that is not ready and embed the previous generation's last token.
 				TS.bArmed = false;
 			}
 			if (Async.IsValid())
@@ -2982,6 +4779,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			TS.MaxNewTokens = 0;
 			TS.StopTokenIds.Reset();
 			TS.PinnedAdapter = nullptr;
+			ClearRows(TS); // the reset closed any chunk (multi-row plan §4.6)
 			if (Async.IsValid())
 			{
 				// Ruling 2026-09-26: the walk after the reset (rewound to the schema's start, or
@@ -3466,14 +5264,28 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	void AdmitPooledAdoptOp(int32 SlotIndex, FLifecycleOpEntry& Entry)
 	{
 		Entry.bSubmitted = true;
-		const FGpuPrefixEntry* Prefix = Prefixes.Find(Entry.AdoptPrefixId);
-		if (Prefix == nullptr || Prefix->bReleased || Prefix->Phase != ESuperSLMPrefixPhase::Ready)
+#if SUPERSLM_WITH_PREFIX_CACHE
+		// Precache U6, edit 6 (§5.11 (b)): a cache lease, pinned since the call, is admitted against its entry (region A).
+		const bool bCacheLease = Entry.CacheAdopt.Token != 0;
+		const uint64 CacheEngine = Entry.CacheAdopt.Engine;
+#else
+		const bool bCacheLease = false;
+		const uint64 CacheEngine = 0;
+#endif
+		const FGpuPrefixEntry* Prefix = bCacheLease ? nullptr : Prefixes.Find(Entry.AdoptPrefixId);
+		if (!bCacheLease && (Prefix == nullptr || Prefix->bReleased || Prefix->Phase != ESuperSLMPrefixPhase::Ready))
 		{
 			LastLifecycleRequestError = TEXT("Malformed: the prefix was released, or its build failed, before the adopt reached the head of the sequence's queue; nothing was posted");
 			ResolveEntry(Entry, ESuperSLMRestoreResult::Malformed);
 			return;
 		}
+#if SUPERSLM_WITH_PREFIX_CACHE
+		const SuperSLMPaging::FAdmission Admission = bCacheLease
+			? Ledger.AdmitAdoptCacheEntry(SlotIndex, Entry.CacheAdopt.EntryKey, Entry.CacheAdopt.Length)
+			: Ledger.AdmitAdoptPrefix(SlotIndex, Prefix->Node);
+#else
 		const SuperSLMPaging::FAdmission Admission = Ledger.AdmitAdoptPrefix(SlotIndex, Prefix->Node);
+#endif
 		if (Admission.Outcome == SuperSLMPaging::EPageAdmit::KvModeMismatch)
 		{
 			LastLifecycleRequestError = TEXT("KvModeMismatch: the holder is a whole-reserve sequence, which cannot adopt until a reset has normalized it");
@@ -3495,20 +5307,25 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		// The holder keeps its own budget; its origin becomes the prefix's length (an adopt that faults
 		// after the share leaves it reset: origin 0, the shape FinalizeAdoptOp() then applies to the
 		// ledger, so the two limits agree; K7 review S1).
+#if SUPERSLM_WITH_PREFIX_CACHE
+		const int64 Length = bCacheLease ? Entry.CacheAdopt.Length : Prefix->Length;
+#else
+		const int64 Length = Prefix->Length;
+#endif
 		SuperSLMPaging::FHolderShape Shape = Ledger.SlotShape(SlotIndex);
-		Shape.Origin = Prefix->Length;
+		Shape.Origin = Length;
 		const int64 LimitAfter = LedgerHolderLimit(Shape);
 		Shape.Origin = 0;
 		const int64 LimitReset = LedgerHolderLimit(Shape);
-		const int64 PrefixId = Prefix->Id;
-		const int64 Length = Prefix->Length;
-		const bool bReady = Prefix->bReady;
+		const int64 PrefixId = Entry.AdoptPrefixId;
+		const bool bReady = bCacheLease ? false : Prefix->bReady; // a cache lease's: read from the engine after the adopt
 		Entry.Async = MakeShared<FLifecycleAsyncState>();
 		TSharedPtr<FLifecycleAsyncState> Async = Entry.Async;
 		TSharedPtr<FJob> Job = MakeShared<FJob>();
-		Job->Custom = [this, SlotIndex, PrefixId, Length, bReady, LimitAfter, LimitReset, Async]()
+		Job->Custom = [this, SlotIndex, PrefixId, Length, bReady, CacheEngine, LimitAfter, LimitReset, Async]()
 		{
 			FThreadSlot& TS = ThreadSlots[SlotIndex];
+			bool bReadyAfter = bReady;
 #if WITH_DEV_AUTOMATION_TESTS
 			const FGpuStatus Forced = TakeTestStatus(&TestNextAdoptStatus);
 			const FGpuStatus FaultAfterShare = TakeTestStatus(&TestAdoptFaultAfterShare);
@@ -3516,13 +5333,16 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			const FGpuStatus Forced = FGpuStatus::SSLM_OK;
 			const FGpuStatus FaultAfterShare = FGpuStatus::SSLM_OK;
 #endif
-			const FThreadPrefix* ThreadPrefix = ThreadPrefixes.Find(PrefixId);
+			// A cache lease's engine handle is the cache's, live while the adopt pin holds; a subsystem prefix's is the thread's.
+			const FThreadPrefix* ThreadPrefix = CacheEngine != 0 ? nullptr : ThreadPrefixes.Find(PrefixId);
+			SslmGpuPrefixHandle* PrefixHandle = CacheEngine != 0 ? reinterpret_cast<SslmGpuPrefixHandle*>(static_cast<UPTRINT>(CacheEngine))
+				: (ThreadPrefix != nullptr ? ThreadPrefix->Handle : nullptr);
 			FGpuStatus St;
 			if (Forced != FGpuStatus::SSLM_OK)
 			{
 				St = Forced; // §3.9: the engine is left as the refusal would leave it (unchanged)
 			}
-			else if (TS.Handle == nullptr || ThreadPrefix == nullptr || ThreadPrefix->Handle == nullptr)
+			else if (TS.Handle == nullptr || PrefixHandle == nullptr)
 			{
 				St = FGpuStatus::SSLM_GPU_PREFIX_REJECTED;
 			}
@@ -3530,7 +5350,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			{
 				superslm_gpu::harness::Device& Device = superslm_gpu::harness::GetDevice();
 				const uint64 Before = Device.submission_counter();
-				St = sslm_gpu_seq_adopt_prefix(Ctx, TS.Handle, ThreadPrefix->Handle);
+				St = sslm_gpu_seq_adopt_prefix(Ctx, TS.Handle, PrefixHandle);
 				// The singleton advances this counter after ExecuteCommandLists, including an
 				// upload whose later Signal/wait fails. Empty/aligned adopts issue no submission.
 				// The worker holds the process-wide Layer-1 lock across both observations.
@@ -3554,12 +5374,20 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				const int64_t* EngineLength = SslmGpuSeqHandleContextLengthForBench(TS.Handle);
 				Async->bAdoptResetByFault = EngineLength != nullptr && *EngineLength == 0 && TS.ContextUsed != 0;
 			}
+			if (St == FGpuStatus::SSLM_OK && CacheEngine != 0)
+			{
+				// The cache keeps no ready flag of its own: the adopted sequence's is the prefix's (§3.4 "The armed flag").
+				int32_t Ready = 0;
+				const FGpuStatus ReadySt = sslm_gpu_seq_ready_for_logits(Ctx, TS.Handle, &Ready);
+				NoteLayer1Status(ReadySt);
+				bReadyAfter = ReadySt == FGpuStatus::SSLM_OK && Ready != 0;
+			}
 			Async->AdoptStatus = St;
 			if (St == FGpuStatus::SSLM_OK || Async->bAdoptResetByFault)
 			{
 				const bool bAdopted = St == FGpuStatus::SSLM_OK;
 				TS.ContextUsed = bAdopted ? Length : 0;
-				TS.bArmed = bAdopted && bReady;
+				TS.bArmed = bAdopted && bReadyAfter;
 				TS.Limit = bAdopted ? LimitAfter : LimitReset;
 				TS.bPrimed = false;
 				TS.bStopped = false;
@@ -4278,6 +6106,16 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		Request.Payload = SuperSLMPaging::ERestorePayload::Budget;
 		Request.Budget = Entry.RestoreBudget;
 		Request.Origin = Entry.RestoreOrigin;
+#if SUPERSLM_WITH_PREFIX_CACHE
+		if (Entry.CacheAdopt.Token != 0)
+		{
+			// Precache plan §5.11 (b): a cache entry hint, keyed by entry, pre-charged as paging §3.2 specifies.
+			Request.Hint = SuperSLMPaging::EHintKind::CacheEntry;
+			Request.HintEntry = Entry.CacheAdopt.EntryKey;
+			Request.HintEntryLength = Entry.CacheAdopt.Length;
+		}
+		else
+#endif
 		if (const FGpuPrefixEntry* Hint = FindReadyPrefix(Entry.RestoreHintPrefixId))
 		{
 			Request.Hint = SuperSLMPaging::EHintKind::Prefix;
@@ -4340,6 +6178,26 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		return true;
 	}
 
+	// The restored sequence's ready_for_logits, read on the submission thread before the thread slot is touched, so a
+	// refusal leaves the slot's warm holder in place. TS.bArmed follows it (the armed invariant; kept from P2's review
+	// N2 by ruling 40). False, with the status in Async, when the read fails.
+	bool ReadRestoredArmed(SslmGpuSequenceHandle* Fresh, FLifecycleAsyncState& Async, bool& bOutReady)
+	{
+		int32_t Ready = 0;
+		const FGpuStatus St = sslm_gpu_seq_ready_for_logits(Ctx, Fresh, &Ready);
+		NoteLayer1Status(St);
+		if (St != FGpuStatus::SSLM_OK)
+		{
+			Async.RestoreStatus = St;
+			Async.RestoreWhere = TEXT("sslm_gpu_seq_ready_for_logits (restore)");
+			return false;
+		}
+		bOutReady = Ready != 0;
+		Async.bRestoreGetterRead = true;
+		Async.bRestoreGetterReady = bOutReady;
+		return true;
+	}
+
 	// The admitted pooled restore's job: sslm_gpu_seq_restore_into_pool (restore-first: the slot's
 	// warm holder is released only once the new one is restored, bound and checked), with the hint's
 	// handle. The thread slot takes the payload's shape: its limit from the header's budget and
@@ -4365,7 +6223,14 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		const int32 RestoreMaxNewTokens = Entry.RestoreContents.MaxNewTokensRemaining;
 		const TArray<int32> RestoreStopTokenIds = Entry.RestoreContents.StopTokenIds;
 		const int64 HintId = Entry.RestoreHintPrefixId;
+#if SUPERSLM_WITH_PREFIX_CACHE
+		// Precache plan §5.11 (b): a cache lease's engine handle, live while the hint's pin holds (until the op resolves).
+		const uint64 HintCacheEngine = Entry.CacheAdopt.Token != 0 ? Entry.CacheAdopt.Engine : 0;
+#else
+		const uint64 HintCacheEngine = 0;
+#endif
 		const bool bReady = Entry.bRestoreReady;
+		const int32 RestoreInFlightIssued = Entry.RestoreInFlightIssued;
 		SuperSLMPaging::FHolderShape Shape;
 		Shape.Mode = SuperSLMPaging::EHolderMode::Budget;
 		Shape.Budget = Entry.RestoreBudget;
@@ -4373,11 +6238,13 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		const int64 LimitAfter = LedgerHolderLimit(Shape);
 		TSharedPtr<FJob> Job = MakeShared<FJob>();
 		Job->Custom = [this, SlotIndex, Gen, SchemaIndex, RestoreAdapterHandle, Blob = MoveTemp(Blob), Layer1Offset, Layer1Size, Async, RestoreLastToken, bRestoreStopped,
-			bRestorePrimed, RestoreContextUsed, RestoreMaxNewTokens, RestoreStopTokenIds, HintId, bReady, LimitAfter]()
+			bRestorePrimed, RestoreContextUsed, RestoreMaxNewTokens, RestoreStopTokenIds, HintId, HintCacheEngine, bReady, LimitAfter, RestoreInFlightIssued]()
 		{
 			SslmGpuSequenceHandle* Fresh = nullptr;
 			uint32_t SharedPages = 0;
 			const FThreadPrefix* HintPrefix = HintId != 0 ? ThreadPrefixes.Find(HintId) : nullptr;
+			SslmGpuPrefixHandle* HintHandle = HintCacheEngine != 0 ? reinterpret_cast<SslmGpuPrefixHandle*>(static_cast<UPTRINT>(HintCacheEngine))
+				: (HintPrefix != nullptr ? HintPrefix->Handle : nullptr);
 #if WITH_DEV_AUTOMATION_TESTS
 			const FGpuStatus Forced = TakeTestStatus(&TestNextRestoreStatus);
 #else
@@ -4385,7 +6252,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 #endif
 			Async->RestoreStatus = Forced != FGpuStatus::SSLM_OK ? Forced
 				: sslm_gpu_seq_restore_into_pool(Ctx, Model, Pool, Blob->GetData() + Layer1Offset, static_cast<size_t>(Layer1Size),
-					HintPrefix != nullptr ? HintPrefix->Handle : nullptr, &Fresh, &SharedPages);
+					HintHandle, &Fresh, &SharedPages);
 			NoteLayer1Status(Async->RestoreStatus);
 			if (Async->RestoreStatus != FGpuStatus::SSLM_OK || Fresh == nullptr)
 			{
@@ -4422,6 +6289,13 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				}
 				Async->bAdapterBound = true;
 			}
+			bool bGetterReady = bReady;
+			if (!ReadRestoredArmed(Fresh, *Async, bGetterReady))
+			{
+				NoteLayer1Status(sslm_gpu_seq_release(Ctx, Fresh));
+				SnapshotPoolStatsOnThread();
+				return;
+			}
 			FThreadSlot& TS = ThreadSlots[SlotIndex];
 			if (TS.Handle != nullptr)
 			{
@@ -4441,7 +6315,10 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			TS.MaxNewTokens = RestoreMaxNewTokens;
 			TS.StopTokenIds = RestoreStopTokenIds;
 			TS.Limit = LimitAfter;
-			TS.bArmed = bReady;
+			TS.bArmed = bGetterReady;
+			// The carried ids are tokens this generation already produced (P2's review B2, kept): the thread's allowance
+			// counts them, so an Exact chunk's drafts stop where the unsaved run's did.
+			TS.Produced = FMath::Max(0, RestoreInFlightIssued);
 			Async->SharedPages = SharedPages;
 			Async->WalkState = SslmGpuSeqWalkStateForG5Bridge(Fresh);
 			Async->FreshHandle = Fresh;
@@ -4651,9 +6528,38 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		S.Generated.Reset();
 		S.Generated.Reserve(Entry.Request.MaxNewTokens);
 		S.Phase = ESuperSLMSequencePhase::Prefilling;
+		ClearPlanRows(S); // ruling 42 M2: a new generation never continues an old chunk
+		// Multi-row GPU plan §4.7, §5.2 (MR6; ruling 39 Q3, Q4; 7.11): Exact runs as EXACT_DRAFT chunks on the OneCall
+		// path when a schema is bound and the chooser's plan runs it; otherwise it runs Off's loop, the same tokens.
+		// Composed sequences run Exact as Off (Q3). With no M in 2..8 fitting the logits stage (Q4), or no device-resident
+		// logits head (7.11 (b)), it runs as Off with the reason logged once per session (and, for Q4, counted).
+		const bool bExactChosen = Entry.Request.SchemaJumpForward == ESuperSLMSchemaJumpForward::Exact;
+		S.bExactRows = bExactChosen && MultiRowOn() && RowsPlan.bExactOn && ExactSlices.Num() > 0 && !S.Schema.IsNone()
+			&& S.Path == ESuperSLMGpuDecodePath::OneCall;
+		if (bExactChosen && MultiRowOn() && !RowsPlan.bExactOn)
+		{
+			if (RowsPlan.ExactReason == GpuRows::EExactReason::FellBackToOff)
+			{
+				TRACE_COUNTER_INCREMENT(SuperSLMGpuExactFellBackToOff);
+			}
+			if (!bExactFellBackLogged)
+			{
+				bExactFellBackLogged = true;
+				UE_LOG(LogSuperSLM, Display, TEXT("SuperSLM GPU: schema jump-forward Exact runs as Off on this configuration (%s); the tokens are the same."),
+					RowsPlan.ExactReason == GpuRows::EExactReason::NoDeviceHead
+						? TEXT("the model is mapped without its device-resident logits head")
+						: TEXT("no chunk of 2 to 8 rows fits the frame budget with the logits stage (ExactFellBackToOff)"));
+			}
+		}
+		S.ForcedTokenCount = 0;
+		// A prompt chunk clears the engine's ready flag, which a one-row suffix keeps: an armed sequence reads its
+		// prompt one row at a time (§4.1).
+		S.bNoPromptRows = !MultiRowOn() || S.bArmedMirror;
 		// K7 review S1: the limit the check above read is the one the generation's steps check.
 		S.PlanBeginLimit = IsPooled() ? Ledger.SlotLimit(SlotIndex) : 0;
 		S.PromptPlanned = 0;
+		S.PosBase = S.ContextUsedMirror; // E-14: the generation's positions start at the applied context
+		S.ExactExtraBound = 0;
 		S.BeginWallSeconds = FPlatformTime::Seconds();
 		S.FirstTokenMs = -1.0;
 		if (bEmptyPrompt)
@@ -4685,6 +6591,34 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		// The plugin saves only at a token boundary (plan §5): a composed token in flight is
 		// carried to full depth now, fire-and-forget on the same submission-thread FIFO, so the
 		// combined walk-read+save job below (enqueued after it) runs once it has completed.
+		// Multi-row GPU plan §5.4 (MR6; 9.4): a chunk the planner left open is abandoned by the save job below, before it
+		// saves (sslm_gpu_seq_save refuses SSLM_GPU_ROWS_CHUNK_OPEN), and its rows are re-fed: a prompt chunk's rows go
+		// back to the prompt, an Exact chunk's token back to the planner. Every slice planned so far is already queued
+		// ahead of the save job, and no new one is planned while the save is the slot's front.
+		const bool bAbandonRows = S.PlanRows > 0;
+		if (bAbandonRows)
+		{
+			if (S.PlanRowsKind == ERowsKind::Prompt)
+			{
+				S.PromptPlanned = S.PlanRowsPromptStart;
+			}
+			else
+			{
+				S.TokensIssued -= 1;
+				if (S.PlanRowsKind == ERowsKind::Exact)
+				{
+					// E-14 (ruling 55 F1): an abandoned Exact chunk never closes, so the bound its open counted goes now.
+					S.ExactExtraBound = FMath::Max<int64>(0, S.ExactExtraBound - FMath::Max(0, S.PlanRows - 1));
+				}
+			}
+#if WITH_DEV_AUTOMATION_TESTS
+			if (RowsRecords.IsValidIndex(S.PlanRowsRecord))
+			{
+				RowsRecords[S.PlanRowsRecord].bAbandonedChunk = true;
+			}
+#endif
+			ClearPlanRows(S);
+		}
 		if (S.PlanLayerPos > 0)
 		{
 			TSharedPtr<FJob> ForceJob = MakeShared<FJob>();
@@ -4716,11 +6650,37 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		TSharedPtr<FLifecycleAsyncState> Async = Entry.Async;
 		TSharedPtr<FJob> Job = MakeShared<FJob>();
 		FSuperSLMGpuSubsystemState* St8 = this;
-		Job->Custom = [St8, SlotIndex, Async]()
+		Job->Custom = [St8, SlotIndex, Async, bAbandonRows]()
 		{
 			// Runs on the submission thread, after the force-finish job above (strict FIFO order
 			// on the same Queue) -- Layer 1's state is final by the time this runs.
 			FThreadSlot& TS = St8->ThreadSlots[SlotIndex];
+			if (TS.RowsOpen > 0)
+			{
+				// MR6 (§5.4): the open chunk is rolled back to its entry state, so the save is the one-row run's at
+				// the same prompt position (9.4).
+				Async->bAbandonedRows = true;
+				Async->AbandonStatus = sslm_gpu_seq_rows_abandon(St8->Ctx, TS.Handle);
+				St8->NoteLayer1Status(Async->AbandonStatus);
+				if (Async->AbandonStatus != FGpuStatus::SSLM_OK)
+				{
+					Async->SaveStatus = Async->AbandonStatus;
+					return;
+				}
+				if (TS.RowsKind == ERowsKind::Prompt)
+				{
+					TS.ContextUsed -= TS.RowsOpen;
+				}
+				ClearRows(TS);
+				TS.bArmed = false; // the abandon restored the entry's ready flag, which the planner never opens a chunk over
+			}
+			else if (bAbandonRows)
+			{
+				// The chunk was never opened on the thread: the sequence had stopped, or the step fell back to Off's and
+				// its closing slice (the only one that does device work) had not run (ruling 42a). Nothing ran.
+				Async->bAbandonedRows = true;
+				ClearRows(TS);
+			}
 			size_t Size = 0;
 			St8->NoteLayer1Status(sslm_gpu_seq_save(St8->Ctx, TS.Handle, nullptr, &Size)); // K6 review S2: the size query
 			if (Size == 0)
@@ -4774,8 +6734,15 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			return;
 		}
 
-		struct FCarried { uint8 Kind; uint8 Fault; int32 Token; int32 Delay; };
-		TArray<FCarried> Carried;
+		// The carry (kept from P2 by ruling 40): one carried event per delivered id, each with its result's delay and
+		// kind; a pending Exact close's ids are all carried. Every other result is one event, as before
+		// (GpuJumpCore::CarryPending()). Version 1 carries no forced bit; no 1.4 result delivers a forced id, so none is
+		// lost.
+		std::vector<GpuJumpCore::FPendingResult> PendingResults;
+		// The planner counted one issued token per pending action; an Exact close's extra ids are counted when it
+		// applies (ApplyJumpResult()). The carry splits them into one event per id, which the restore applies one id
+		// at a time, so the in-flight count written below takes the extra ids now.
+		int32 PendingExtraIds = 0;
 		for (const FPendingEvent& E : S.Pending)
 		{
 			const FActionResult& R = E.Job->Results[E.ResultIndex];
@@ -4783,13 +6750,33 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			{
 				continue;
 			}
-			FCarried C;
-			C.Kind = static_cast<uint8>(R.Kind);
-			C.Fault = static_cast<uint8>(R.Fault);
-			C.Token = R.Token;
-			C.Delay = static_cast<int32>(FMath::Max<int64>(1, E.ApplyTick - TickIndex));
-			Carried.Add(C);
+			GpuJumpCore::FPendingResult P;
+			P.Kind = static_cast<uint8>(R.Kind);
+			P.Fault = static_cast<uint8>(R.Fault);
+			P.ApplyTick = E.ApplyTick;
+			if (R.JumpIds.Num() > 0)
+			{
+				for (const GpuJumpCore::FDeliveredId& Id : R.JumpIds)
+				{
+					P.Ids.push_back(Id);
+				}
+				PendingExtraIds += R.JumpIds.Num() - 1;
+				PendingResults.push_back(P);
+				if (R.JumpEnd != EResultKind::Skipped)
+				{
+					// The action ended after its ids: its end is one more event, at the same delay, with no token.
+					GpuJumpCore::FPendingResult EndEvent;
+					EndEvent.Kind = static_cast<uint8>(R.JumpEnd);
+					EndEvent.Fault = static_cast<uint8>(R.Fault);
+					EndEvent.ApplyTick = E.ApplyTick;
+					PendingResults.push_back(EndEvent);
+				}
+				continue;
+			}
+			P.Ids.push_back(GpuJumpCore::FDeliveredId{R.Token, false});
+			PendingResults.push_back(P);
 		}
+		const std::vector<GpuJumpCore::FCarriedEvent> Carried = GpuJumpCore::CarryPending(PendingResults, TickIndex);
 
 		SuperSLMSaveBlob::FContents Contents;
 		Contents.Backend = ESuperSLMBackend::GPU;
@@ -4844,28 +6831,20 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			Contents.SchemaName = UTF8_TO_TCHAR(std::string(SchemaEntry->name).c_str());
 		}
 
+		// The wrapper extension, through the core's codec: version 1, 1.3.0's layout byte for byte (ruling 39 Q8).
+		GpuJumpCore::FWrapperExt Header;
+		Header.Version = GpuJumpCore::WrapperExtVersion1;
+		Header.Path = static_cast<uint8>(S.Path);
+		Header.bPrimed = Async.bPrimed;
+		Header.bStopped = Async.bStopped;
+		Header.LastToken = Async.LastToken;
+		Header.InFlightIssued = S.TokensIssued - S.Generated.Num() + PendingExtraIds;
+		Header.Carried = Carried;
+		std::vector<uint8_t> HeaderBytes;
+		GpuJumpCore::EncodeWrapperExt(Header, HeaderBytes);
 		TArray<uint8> Ext;
-		auto PutU8 = [&Ext](uint8 V) { Ext.Add(V); };
-		auto PutU32 = [&Ext](uint32 V) { for (int32 B = 0; B < 4; ++B) { Ext.Add(static_cast<uint8>(V >> (8 * B))); } };
+		Ext.Append(HeaderBytes.data(), static_cast<int32>(HeaderBytes.size()));
 		auto PutU64 = [&Ext](uint64 V) { for (int32 B = 0; B < 8; ++B) { Ext.Add(static_cast<uint8>(V >> (8 * B))); } };
-		PutU32(kWrapperExtMagic);
-		PutU32(kWrapperExtVersion);
-		PutU8(static_cast<uint8>(S.Path));
-		PutU8(Async.bPrimed ? 1 : 0);
-		PutU8(Async.bStopped ? 1 : 0);
-		PutU8(0);
-		PutU32(static_cast<uint32>(Async.LastToken));
-		PutU32(static_cast<uint32>(S.TokensIssued - S.Generated.Num()));
-		PutU32(static_cast<uint32>(Carried.Num()));
-		for (const FCarried& C : Carried)
-		{
-			PutU8(C.Kind);
-			PutU8(C.Fault);
-			PutU8(0);
-			PutU8(0);
-			PutU32(static_cast<uint32>(C.Token));
-			PutU32(static_cast<uint32>(C.Delay));
-		}
 		PutU64(static_cast<uint64>(Async.Layer1Bytes.Num()));
 
 		// Row 19 (D-SLM7763): the header and the carried events above are this finalize's snapshot
@@ -4942,6 +6921,10 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		if (IsPooled() && bWaitsForSlotJob && (Ledger.SlotHasJob(SlotIndex) || HasUnadmittedRecycle(SlotIndex))) // K6 review C1: and a deferred recycle
 		{
 			return;
+		}
+		if (Entry.Kind == ELifecycleOpKind::Save && S.bPlanAwaitClose)
+		{
+			return; // ruling 43 N1: an Exact close below one row is applied first, so the save sees whether Off's token is in flight
 		}
 		switch (Entry.Kind)
 		{
@@ -5130,9 +7113,23 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		// change of pin (plan §4, §12 decision 13).
 		const FString CompiledTag = SuperSLMSaveBlob::CompiledLayer1Tag();
 #if SUPERSLM_WITH_PREFIX_CACHE
-		// Precache plan §5.8: the shipped compatibility table admits a named predecessor's saves.
+		// Precache plan §5.8: the shipped compatibility table admits a named predecessor's saves. The table's magic
+		// check reads the Layer-1 bytes, so this subsystem's own 'SLUG' section (FinalizeSaveOp(): a 24-byte head,
+		// 12 bytes per carried event, the u64 Layer-1 length) is skipped first; a payload without it is checked whole.
+		int64 Layer1Offset = 0;
+		if (Payload != nullptr && PayloadBytes >= 32 && Payload[0] == 'S' && Payload[1] == 'L' && Payload[2] == 'U' && Payload[3] == 'G')
+		{
+			uint32 CarriedCount = 0;
+			for (int32 B = 0; B < 4; ++B)
+			{
+				CarriedCount |= static_cast<uint32>(Payload[20 + B]) << (8 * B);
+			}
+			const int64 SectionBytes = 24 + 12 * static_cast<int64>(CarriedCount) + 8;
+			Layer1Offset = SectionBytes <= PayloadBytes ? SectionBytes : 0;
+		}
 		if (SuperSLMCore::CheckSaveLayer1(std::string(TCHAR_TO_UTF8(*CompiledTag)), std::string(TCHAR_TO_UTF8(*Contents.Layer1Tag)),
-				std::string(TCHAR_TO_UTF8(*Contents.Layer1Commit)), Payload, PayloadBytes > 0 ? static_cast<size_t>(PayloadBytes) : 0)
+				std::string(TCHAR_TO_UTF8(*Contents.Layer1Commit)), Payload + Layer1Offset,
+				PayloadBytes > Layer1Offset ? static_cast<size_t>(PayloadBytes - Layer1Offset) : 0)
 			== SuperSLMCore::ESaveLayer1Check::Layer1Mismatch)
 #else
 		if (Contents.Layer1Tag != CompiledTag)
@@ -5164,33 +7161,39 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		int64 Cursor = 0;
 		bool bBad = false;
 		auto Need = [&](int64 N) { if (Cursor + N > PayloadBytes) { bBad = true; } return !bBad; };
-		auto GetU8 = [&]() -> uint8 { return Need(1) ? Payload[Cursor++] : 0; };
-		auto GetU32 = [&]() -> uint32 { uint32 V = 0; if (Need(4)) { for (int32 B = 0; B < 4; ++B) { V |= static_cast<uint32>(Payload[Cursor + B]) << (8 * B); } Cursor += 4; } return V; };
 		auto GetU64 = [&]() -> uint64 { uint64 V = 0; if (Need(8)) { for (int32 B = 0; B < 8; ++B) { V |= static_cast<uint64>(Payload[Cursor + B]) << (8 * B); } Cursor += 8; } return V; };
-		const uint32 Magic = GetU32();
-		const uint32 Version = GetU32();
-		const uint8 PathByte = GetU8();
-		const bool bPrimed = GetU8() != 0;
-		const bool bStopped = GetU8() != 0;
-		GetU8();
-		const int32 LastToken = static_cast<int32>(GetU32());
-		const int32 InFlightIssued = static_cast<int32>(GetU32());
-		const uint32 CarriedCount = GetU32();
-		if (bBad || Magic != kWrapperExtMagic || Version != kWrapperExtVersion || PathByte > 1 || CarriedCount > 1u << 20)
+		// The core codec reads version 1 (1.3.0's layout, every save 1.3 and 1.4 write). Version 2 was written only by
+		// a Canonical GPU generation of the unreleased P2, and Canonical is removed in 1.4: it is refused by name
+		// (ruling 39 Q8).
+		GpuJumpCore::FWrapperExt Ext;
+		size_t ExtBytes = 0;
+		const size_t PayloadSize = static_cast<size_t>(FMath::Max<int64>(PayloadBytes, 0));
+		if (GpuJumpCore::IsCanonicalWrapperExt(Payload, PayloadSize))
+		{
+			LastLifecycleRequestError = TEXT("the blob was saved by a Canonical GPU generation (GPU wrapper version 2); Canonical was removed in SuperSLM-Unreal 1.4, so the save cannot be restored");
+			UE_LOG(LogSuperSLM, Warning, TEXT("GPU restore refused: %s."), *LastLifecycleRequestError);
+			return FSuperSLMLifecycleOpHandle();
+		}
+		if (!GpuJumpCore::DecodeWrapperExt(Payload, PayloadSize, Ext, ExtBytes))
 		{
 			LastLifecycleRequestError = TEXT("the blob's GPU section is malformed or from an unsupported plugin version");
 			return FSuperSLMLifecycleOpHandle();
 		}
+		Cursor = static_cast<int64>(ExtBytes);
+		const uint8 PathByte = Ext.Path;
+		const bool bPrimed = Ext.bPrimed;
+		const bool bStopped = Ext.bStopped;
+		const int32 LastToken = Ext.LastToken;
+		const int32 InFlightIssued = Ext.InFlightIssued;
 		TArray<FLifecycleOpEntry::FRestoreCarried> Carried;
-		for (uint32 I = 0; I < CarriedCount && !bBad; ++I)
+		Carried.Reserve(static_cast<int32>(Ext.Carried.size()));
+		for (const GpuJumpCore::FCarriedEvent& E : Ext.Carried)
 		{
 			FLifecycleOpEntry::FRestoreCarried C;
-			C.Kind = static_cast<EResultKind>(GetU8());
-			C.Fault = static_cast<ESuperSLMGpuFaultReason>(GetU8());
-			GetU8();
-			GetU8();
-			C.Token = static_cast<int32>(GetU32());
-			C.Delay = static_cast<int32>(GetU32());
+			C.Kind = static_cast<EResultKind>(E.Kind);
+			C.Fault = static_cast<ESuperSLMGpuFaultReason>(E.Fault);
+			C.Token = E.Token;
+			C.Delay = E.Delay;
 			Carried.Add(C);
 		}
 		const uint64 Layer1Bytes = GetU64();
@@ -5362,6 +7365,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		const int64 RestoreContextUsed = Entry.RestoreContents.ContextUsed;
 		const int32 RestoreMaxNewTokens = Entry.RestoreContents.MaxNewTokensRemaining;
 		const TArray<int32> RestoreStopTokenIds = Entry.RestoreContents.StopTokenIds;
+		const int32 RestoreInFlightIssued = Entry.RestoreInFlightIssued;
 		FSuperSLMGpuSubsystemState* St8 = this;
 		TSharedPtr<FJob> Job = MakeShared<FJob>();
 		// On the submission thread, after every queued job: nothing is Submitted there, so Layer
@@ -5373,7 +7377,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		// to clear a busy condition -- so it could only ever stall to the same failure (finding 8,
 		// T-2885 review).
 		Job->Custom = [St8, SlotIndex, Gen, SchemaIndex, RestoreAdapterHandle, Blob = MoveTemp(Blob), Layer1Offset, Layer1Size, Async,
-			RestoreLastToken, bRestoreStopped, RestoreContextUsed, RestoreMaxNewTokens, RestoreStopTokenIds]()
+			RestoreLastToken, bRestoreStopped, RestoreContextUsed, RestoreMaxNewTokens, RestoreStopTokenIds, RestoreInFlightIssued]()
 		{
 			SslmGpuSequenceHandle* Fresh = nullptr;
 #if WITH_DEV_AUTOMATION_TESTS
@@ -5422,6 +7426,12 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				}
 				Async->bAdapterBound = true;
 			}
+			bool bGetterReady = false;
+			if (!St8->ReadRestoredArmed(Fresh, *Async, bGetterReady))
+			{
+				St8->NoteLayer1Status(sslm_gpu_seq_release(St8->Ctx, Fresh));
+				return;
+			}
 			FThreadSlot& TS = St8->ThreadSlots[SlotIndex];
 			if (TS.Handle != nullptr)
 			{
@@ -5442,16 +7452,20 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			TS.ContextUsed = RestoreContextUsed;
 			TS.MaxNewTokens = RestoreMaxNewTokens;
 			TS.StopTokenIds = RestoreStopTokenIds;
+			TS.bArmed = bGetterReady; // the armed invariant: the mirror is the engine's ready flag (ruling 40)
+			// The carried ids are tokens this generation already produced (P2's review B2, kept): the thread's allowance
+			// counts them, so an Exact chunk's drafts stop where the unsaved run's did.
+			TS.Produced = FMath::Max(0, RestoreInFlightIssued);
 			// Ruling 2026-09-26: the restored walk ('SLM5' carries it), stored by FinalizeRestoreOp().
 			Async->WalkState = SslmGpuSeqWalkStateForG5Bridge(Fresh);
 			Async->FreshHandle = Fresh;
 		};
 		// bPrimed is applied on the thread above (needed for RunOneCallToken's own bPrimed-gated
 		// branch); bStopped/LastToken/ContextUsed/MaxNewTokens/StopTokenIds are applied there too,
-		// by value, above. TokensIssued/Produced start at their FThreadSlot defaults (0), matching
-		// FinalizeRestoreOp()'s own S.Request.MaxNewTokens = MaxNewTokensRemaining on the game
-		// side: both sides count NEW tokens produced since restore against the REMAINING budget,
-		// not the original one.
+		// by value, above. Both sides count the tokens produced since the save's applied count
+		// against the REMAINING budget (FinalizeRestoreOp()'s S.Request.MaxNewTokens =
+		// MaxNewTokensRemaining): the carried tokens, already produced, start the thread's count
+		// (Produced) and the game's issued count (TokensIssued).
 		Async->bPrimed = Entry.bRestorePrimed;
 		Async->Job = Enqueue(Job);
 		JobsPostedByKind[static_cast<int32>(EGpuPagedJobKind::Restore)] += 1; // plugin paging plan §3.9 (K6)
@@ -5557,6 +7571,13 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		// §3.4 "The armed flag": the restored holder is armed exactly when the payload's ready word
 		// says its last write was a prefill arc (pooled); a dedicated restore's mirror stays false.
 		S.bArmedMirror = Entry.bRestorePooled && Entry.bRestoreReady;
+		// The restore job set TS.bArmed from the engine's ready reading, in both modes (kept from P2's review N2 by
+		// ruling 40), so the game's mirror follows that reading, and an empty-prompt begin after a dedicated ready
+		// restore is accepted.
+		if (Async.bRestoreGetterRead)
+		{
+			S.bArmedMirror = Async.bRestoreGetterReady;
+		}
 		S.OpLog.Reset();
 		S.OpFront = 0;
 		S.bVended = true;
@@ -5573,6 +7594,12 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		S.Request.PromptTokens = Entry.RestoreContents.PromptRemaining;
 		S.PromptPlanned = 0;
 		S.bPlanPrimed = Entry.bRestorePrimed;
+		// The wrapper carries no schema jump-forward setting, so a restored generation continues as Off (the same
+		// tokens Exact gives), and it reads its remaining prompt by rows unless multi-row is off or the restored
+		// holder is armed (MR6).
+		S.bExactRows = false;
+		S.ForcedTokenCount = 0;
+		S.bNoPromptRows = !MultiRowOn() || S.bArmedMirror;
 		S.TokensIssued = Entry.RestoreInFlightIssued;
 		S.Schema.Index = Entry.RestoreSchemaIndex;
 		S.SchemaName = Entry.RestoreContents.SchemaName;
@@ -5736,6 +7763,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		S.Phase = ESuperSLMSequencePhase::Faulted;
 		S.LastOutcome = Outcome;
 		S.LastFault = Reason;
+		ClearPlanRows(S); // ruling 42 M2: no stale slice is planned for a later generation, and no adapter stays pinned
 		DropPendingEvents(S);
 		S.ActiveGenerationOpLogIndex = INDEX_NONE;
 		UE_LOG(LogSuperSLM, Warning, TEXT("GPU sequence %lld faulted: %s"), S.Id, *Message);
@@ -5744,7 +7772,12 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	void Complete(FGameSlot& S)
 	{
 		S.Phase = ESuperSLMSequencePhase::Complete;
+		ClearPlanRows(S); // ruling 42 M2 (a chunk planned past the generation's last token never runs)
 		DropPendingEvents(S);
+		// Ruling 59d point 1: the tokens issued past the generation's end (an Exact chunk counts one issued token for its several
+		// ids, so the planner may open one beyond MaxNew while ids are in flight) never apply: the dropped work is no longer
+		// issued, and a completed generation ends with TokensIssued == Generated, as the one-row twin does.
+		S.TokensIssued = S.Generated.Num();
 		S.ActiveGenerationOpLogIndex = INDEX_NONE;
 	}
 
@@ -5763,9 +7796,54 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		}
 	}
 
+	// Multi-row GPU plan §4.7 (MR6; P2's delivery, kept by ruling 40): applies an Exact close's ids in order, each once,
+	// counting the committed drafts (forced); then how the action ended after them. The planner charged one issued
+	// token for the chunk; each further id applied corrects the count here (ruling 59d), so HasWork() and a save read the
+	// ids issued.
+	void ApplyJumpResult(FGameSlot& S, const FActionResult& R)
+	{
+		ConfirmPendingBind(S, R);
+		S.Phase = ESuperSLMSequencePhase::Decoding;
+		S.bSchemaAccepting = R.bSchemaAccepting;
+		if (R.bHasWalkState)
+		{
+			S.WalkState = R.WalkState;
+		}
+		if (S.FirstTokenMs < 0.0 && S.BeginWallSeconds > 0.0)
+		{
+			S.FirstTokenMs = (FPlatformTime::Seconds() - S.BeginWallSeconds) * 1000.0;
+		}
+		for (int32 IdIndex = 0; IdIndex < R.JumpIds.Num(); ++IdIndex)
+		{
+			const GpuJumpCore::FDeliveredId& Id = R.JumpIds[IdIndex];
+			// Ruling 59d point 1: the planner charged one issued token for the chunk (its first id); each further id is
+			// counted as it is applied, so a generation that completes part-way through the ids (MaxNew, a stop id) ends with
+			// TokensIssued == Generated, as the one-row twin does (the save's InFlightIssued; HasWork()).
+			S.TokensIssued += IdIndex > 0 ? 1 : 0;
+			S.Generated.Add(Id.Token);
+			S.ForcedTokenCount += Id.bForced ? 1 : 0;
+			TRACE_COUNTER_INCREMENT(SuperSLMGpuTokensDelivered);
+			S.LastOutcome = ESuperSLMDecodeOutcome::TokenProduced;
+			if (S.Generated.Num() >= S.Request.MaxNewTokens || S.Request.StopTokenIds.Contains(Id.Token))
+			{
+				Complete(S);
+				return;
+			}
+		}
+		if (R.JumpEnd == EResultKind::DeadEnd)
+		{
+			FaultSlot(S, ESuperSLMDecodeOutcome::SchemaDeadEnd, ESuperSLMGpuFaultReason::None, R.Message);
+		}
+		else if (R.JumpEnd == EResultKind::Fault)
+		{
+			FaultSlot(S, ESuperSLMDecodeOutcome::Generating, R.Fault, R.Message);
+		}
+	}
+
 	// Applies one result to its sequence. Results arrive in order per sequence.
 	void ApplyResult(FGameSlot& S, const FPendingEvent& E, const FActionResult& R)
 	{
+		(void)E;
 		// Plugin paging plan §3.4 (K6): the slot's ContextUsed mirror, from every result whose
 		// action ran (the stale-result filter already dropped the others).
 		if (R.ContextUsed >= 0)
@@ -5779,7 +7857,19 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		switch (R.Kind)
 		{
 			case EResultKind::Skipped:
+				return;
 			case EResultKind::Progress:
+				if (R.bRowsFellBack && R.RowsFallbackLayers > 0)
+				{
+					// Ruling 43 N1: the Exact close fell back below one row and ran Off's first one-row slice; the rest of
+					// Off's token is planned as one-row slices of l(1) (ruling 42 R1), and its last slice delivers it.
+					S.PlanLayerPos = R.RowsFallbackLayers;
+					S.PlanTokenPos = FMath::Max<int64>(0, NextPosition(S) - 1); // E-14: the pending token's position
+					S.bPlanInPrompt = false;
+					S.TokenRequestTick = TickIndex;
+					S.TokenRequestWall = FPlatformTime::Seconds();
+					S.TokenRequestSim = SimSeconds;
+				}
 				return;
 			case EResultKind::PrefillOk:
 				ConfirmPendingBind(S, R);
@@ -5789,6 +7879,11 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				}
 				return;
 			case EResultKind::Token:
+				if (R.JumpIds.Num() > 0)
+				{
+					ApplyJumpResult(S, R); // MR6 (§4.7): an Exact close's ids, in order
+					return;
+				}
 				ConfirmPendingBind(S, R);
 				S.Phase = ESuperSLMSequencePhase::Decoding;
 				S.Generated.Add(R.Token);
@@ -5976,7 +8071,31 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				const FPendingEvent E = S.Pending[0];
 				S.Pending.RemoveAt(0, 1, EAllowShrinking::No);
 				LogEventRemoved(E, false, TickWall);
+				if (E.Job->Actions.IsValidIndex(E.ResultIndex))
+				{
+					const FAction& Applied = E.Job->Actions[E.ResultIndex];
+					if (Applied.Kind == EActionKind::RowsSlice && Applied.RowsKind == ERowsKind::Exact && Applied.bCloseRows)
+					{
+						S.bPlanAwaitClose = false; // ruling 43 N1: the close's result is in
+						// E-14 (ruling 55 F1): the close's result is in, so the bound its open counted for the drafts goes;
+						// the drafts it committed reach TokensIssued through ApplyJumpResult(), which would otherwise count
+						// them twice.
+						S.ExactExtraBound = FMath::Max<int64>(0, S.ExactExtraBound - Applied.PosExtraBound);
+					}
+				}
+#if WITH_DEV_AUTOMATION_TESTS
+				const int32 GeneratedBefore = S.Generated.Num();
+#endif
 				ApplyResult(S, E, E.Job->Results[E.ResultIndex]);
+#if WITH_DEV_AUTOMATION_TESTS
+				if (bRowsRecording && E.Job->Actions.IsValidIndex(E.ResultIndex) && E.Job->Actions[E.ResultIndex].Kind == EActionKind::RowsSlice &&
+					E.Job->Actions[E.ResultIndex].RowsKind == ERowsKind::Exact && E.Job->Actions[E.ResultIndex].bCloseRows)
+				{
+					TestExactApplySamples.Add(TPair<int64, FIntVector4>(S.Id, FIntVector4(S.Generated.Num(), static_cast<int32>(NextPosition(S)),
+						static_cast<int32>(S.ExactExtraBound), S.PlanRows > 0 || S.PlanLayerPos > 0 ? 1 : 0))); // W: a chunk open or a token in flight (a fallback's)
+				}
+				NoteRecordDelivery(S, E, GeneratedBefore);
+#endif
 				if (S.Phase == ESuperSLMSequencePhase::Complete || S.Phase == ESuperSLMSequencePhase::Faulted)
 				{
 					break; // Complete()/FaultSlot() dropped the rest
@@ -5989,9 +8108,15 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	// a one-call prompt or decode token, a composed embed (PlanLayerPos == 0, prompt or decode), or
 	// a primed finish-only step. A composed token in flight (PlanLayerPos > 0) is not a boundary and
 	// is never held, so back-pressure never moves an in-flight token's T+K. Game-side fields only.
+	// MR6 (§5.2-§5.3): a sequence with a chunk open is mid-token on either path -- its next slice always continues.
 	static bool AtTokenBoundary(const FGameSlot& S)
 	{
-		return S.Path == ESuperSLMGpuDecodePath::OneCall || S.bPlanPrimed || S.PlanLayerPos == 0;
+		if (S.PlanRows > 0)
+		{
+			return false;
+		}
+		// A one-row token in flight is not a boundary on either path (OneCall slices one below one row, ruling 42 R1).
+		return S.bPlanPrimed || S.PlanLayerPos == 0;
 	}
 
 	// Ruling 2026-09-26 (renamed from NextTickWouldWait(); Tick() no longer waits, so this predicts
@@ -6111,7 +8236,16 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	bool HasWork(const FGameSlot& S) const
 	{
 		return PlanningOpen(S) &&
-			(PromptLeft(S) || S.PlanLayerPos > 0 || S.bPlanPrimed || S.TokensIssued < S.Request.MaxNewTokens);
+			(PromptLeft(S) || S.PlanLayerPos > 0 || S.PlanRows > 0 || S.bPlanPrimed || IssuedBound(S) < S.Request.MaxNewTokens);
+	}
+
+	// Run 5 (R42_S5's diagnosis): the tokens a sequence may have issued -- TokensIssued plus the drafts its Exact chunks not
+	// yet applied may still commit (ExactExtraBound, E-14). An Exact chunk counts one issued token for several ids, so
+	// against TokensIssued alone the planner, K ticks ahead, opened chunks past MaxNew that the completion then dropped.
+	// Against the bound it waits for those closes instead; tokens are unchanged.
+	int64 IssuedBound(const FGameSlot& S) const
+	{
+		return static_cast<int64>(S.TokensIssued) + FMath::Max<int64>(0, S.ExactExtraBound);
 	}
 
 	void AddEvent(FGameSlot& S, EEventKind Kind, const TSharedPtr<FJob>& Job, int32 ResultIndex, int64 RequestTick, double RequestWall, double RequestSim)
@@ -6197,10 +8331,1430 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		AddEvent(S, EEventKind::Prefill, Job, Index, RequestTick, RequestWall, RequestSim);
 	}
 
+	// --- Multi-row GPU plan §5.2-§5.4 (MR6): the planner's chunks ---
+
+	// The planner's chunk is gone: closed (its last slice planned) or abandoned (a save).
+	static void ClearPlanRows(FGameSlot& S)
+	{
+		S.PlanRowsKind = ERowsKind::None;
+		S.PlanRows = 0;
+		S.PlanRowsLayer = 0;
+		S.PlanRowsPerSlice = 0;
+		S.PlanRowsSlice = 0;
+		S.PlanRowsPromptStart = 0;
+		S.PlanRowsRecord = INDEX_NONE;
+		S.PlanRowsFirstRecord = INDEX_NONE;
+		S.bPlanAwaitClose = false;
+		S.PlanRowsEndPos = 0;
+		S.PlanExactSlices.Reset();
+	}
+
+	// §5.3: the one-row-layer units an l-layer slice of an M-row chunk uses: ceil(l x C(M) x (1000 + m) / (C(1) x
+	// 1000)), the chooser's own integer rule.
+	int32 RowsUnits(int32 Rows, int32 Layers) const
+	{
+		const int64 C1 = FMath::Max<int64>(1, RowsPlan.RowCostUs);
+		const int64 Num = static_cast<int64>(Layers) * RowsPlan.CostUs[Rows - 1] * (1000 + static_cast<int64>(Config.GpuRowsMarginPerMille));
+		const int64 Den = C1 * 1000;
+		return static_cast<int32>((Num + Den - 1) / Den);
+	}
+
+	// §5.3: the most layers a composed slice of an M-row chunk takes: the most whose units fit LayersPerTick and, with
+	// the frame budget set, whose price fits it (l(M)); 0 when not even one layer fits.
+	int32 ComposedRowsLayers(int32 Rows, const GpuRows::FChooserPlan& At) const
+	{
+		int32 Best = 0;
+		const bool bKnob = Config.SchemaJumpGpuFrameBudgetMs != 0.0;
+		for (int32 L = 1; L <= NumHiddenLayers; ++L)
+		{
+			if (RowsUnits(Rows, L) > LayersPerTick || (bKnob && L > At.LayersPerSlice[Rows - 1]))
+			{
+				break;
+			}
+			Best = L;
+		}
+		return Best;
+	}
+
+	// The rows a prompt chunk takes now, k = the prompt tokens left: min(k, M) for the path's M (OneCall's M_max,
+	// Composed's rows), and 1 -- one-row -- when k is 1, multi-row is off, the sequence is armed, or that many rows
+	// have no admissible slice (§5.2: only k = 1 goes one-row).
+	int32 PromptRowsFor(const FGameSlot& S)
+	{
+		if (S.bNoPromptRows || !MultiRowOn())
+		{
+			return 1;
+		}
+		const int32 Left = S.Request.PromptTokens.Num() - S.PromptPlanned;
+		const int32 PathRows = S.Path == ESuperSLMGpuDecodePath::OneCall ? RowsPlan.MMax : RowsPlan.ComposedRows;
+		const int32 Rows = FMath::Min(Left, FMath::Min(PathRows, static_cast<int32>(GpuRows::MaxRows)));
+		if (Rows < 2)
+		{
+			return 1;
+		}
+		// E-14: priced at the chunk's last row's position.
+		const GpuRows::FChooserPlan At = PlanAt(NextPosition(S) + Rows - 1).Plan;
+		const int32 PerSlice = S.Path == ESuperSLMGpuDecodePath::OneCall ? At.LayersPerSlice[Rows - 1] : ComposedRowsLayers(Rows, At);
+		return PerSlice > 0 ? Rows : 1;
+	}
+
+	// MR6's seam: one record per action the planner issues for a recorded sequence (game thread). Kind is
+	// ESuperSLMGpuRowsActionKind's value. Returns the record's index, INDEX_NONE when not recording.
+	int32 RecordAction(const FGameSlot& S, FAction& Act, uint8 Kind, int32 Rows, int32 FirstLayer, int32 Layers, bool bOpened, bool bClosed, int32 PromptConsumed)
+	{
+#if WITH_DEV_AUTOMATION_TESTS
+		if (!bRowsRecording)
+		{
+			return INDEX_NONE;
+		}
+		FSuperSLMGpuRowsActionRecord Rec;
+		Rec.SequenceId = S.Id;
+		Rec.ActionIndex = RowsRecordCount++;
+		Rec.Tick = TickIndex;
+		Rec.Kind = static_cast<ESuperSLMGpuRowsActionKind>(Kind);
+		Rec.Rows = Rows;
+		Rec.FirstLayer = FirstLayer;
+		Rec.Layers = Layers;
+		Rec.bOpenedChunk = bOpened;
+		Rec.bClosedChunk = bClosed;
+		Rec.PromptTokensConsumed = PromptConsumed;
+		Rec.AdapterId = static_cast<int32>(S.PlanRows > 0 ? S.PlanAdapterId : (S.bPendingBindConfirm ? S.PendingBindAdapterId : S.ActiveAdapterId));
+		Act.RowsRecord = RowsRecords.Add(MoveTemp(Rec));
+		return Act.RowsRecord;
+#else
+		(void)S; (void)Act; (void)Kind; (void)Rows; (void)FirstLayer; (void)Layers; (void)bOpened; (void)bClosed; (void)PromptConsumed;
+		return INDEX_NONE;
+#endif
+	}
+
+#if WITH_DEV_AUTOMATION_TESTS
+	// MR6's seam (ruling 40): the ids E's result appended to the output when it was applied (one result per action),
+	// and whether it met a schema dead end, on the action's record. Game thread.
+	void NoteRecordDelivery(const FGameSlot& S, const FPendingEvent& E, int32 GeneratedBefore)
+	{
+		if (!E.Job.IsValid() || !E.Job->Actions.IsValidIndex(E.ResultIndex))
+		{
+			return;
+		}
+		const int32 Record = E.Job->Actions[E.ResultIndex].RowsRecord;
+		if (!RowsRecords.IsValidIndex(Record))
+		{
+			return;
+		}
+		FSuperSLMGpuRowsActionRecord& Rec = RowsRecords[Record];
+		const FAction& Act = E.Job->Actions[E.ResultIndex];
+		for (int32 I = FMath::Max(0, GeneratedBefore); I < S.Generated.Num(); ++I)
+		{
+			Rec.DeliveredTokens.Add(S.Generated[I]);
+		}
+		const FActionResult& R = E.Job->Results[E.ResultIndex];
+		Rec.bDeadEnd = R.Kind == EResultKind::DeadEnd || (R.JumpIds.Num() > 0 && R.JumpEnd == EResultKind::DeadEnd);
+		if (Act.Kind != EActionKind::RowsSlice || Act.RowsKind != ERowsKind::Exact)
+		{
+			return;
+		}
+		// Ruling 42 S5: what the chunk's open read, on its opening slice's record.
+		const int32 First = RowsRecords.IsValidIndex(Act.RowsFirstRecord) ? Act.RowsFirstRecord : Record;
+		RowsRecords[First].ForcedChainCount = R.RowsForcedChain;
+		RowsRecords[First].DraftCount = R.RowsDraftCount;
+		RowsRecords[First].ProposedTokens = R.TestRowsProposed; // ruling 59e point 1
+		RowsRecords[First].CpuDraftTokens = R.TestRowsCpuDraft;
+		RowsRecords[First].bDraftTableReached = R.bTestRowsTableReached;
+		if (R.bRowsFellBack)
+		{
+			// Ruling 42a: the chunk did no device work until its close, which ran Off's whole-token step -- below one row
+			// (ruling 43 N1) Off's first one-row slice, the rest of the token recorded as the one-row slices that follow.
+			for (int32 I = First; I < Record; ++I)
+			{
+				if (RowsRecords[I].SequenceId == Rec.SequenceId && RowsRecords[I].Kind == ESuperSLMGpuRowsActionKind::ExactRows)
+				{
+					RowsRecords[I].Layers = 0;
+				}
+			}
+			Rec.Rows = 1;
+			Rec.FirstLayer = 0;
+			Rec.Layers = R.RowsFallbackLayers > 0 ? R.RowsFallbackLayers : NumHiddenLayers;
+			Rec.bFellBack = true;
+		}
+	}
+#endif
+
+	// Ruling 42 M1, R1: the most layers one row may take in one tick -- l(1) with multi-row on and the knob set (B_eff
+	// below a whole row's price makes it less than L), else no cap (1.17).
+	int32 OneRowLayerCap() const
+	{
+		const bool bKnob = Config.SchemaJumpGpuFrameBudgetMs != 0.0;
+		return MultiRowOn() && bKnob && RowsPlan.LayersPerSlice[0] > 0 ? RowsPlan.LayersPerSlice[0] : MAX_int32;
+	}
+
+	// Ruling 42 R1: OneCall one-row tokens are sliced (1.17's composed slicing, l(1) layers per tick) when B_eff is
+	// below one row's price; else they stay whole, as in 1.17.
+	bool OneCallSlicesOneRow() const
+	{
+		return OneRowLayerCap() < NumHiddenLayers;
+	}
+
+	// One slice of a one-row token, 1.17's composed slicing (a prompt token is sliced like a decode token, without a
+	// finish, D-SLM7379): it embeds on the token's first slice (the caller has already planned the adapter bind and
+	// logged the start), and the slice that reaches the last layer finishes it. Used by Composed and, below one row,
+	// by OneCall (ruling 42 R1); the action runs in the job's composed phase either way. Game thread.
+	void PlanOneRowSlice(FGameSlot& S, const TSharedPtr<FJob>& Job, FAction&& Base, int32 Layers, double Now,
+		int32& OneRowSlices, TArray<int32, TInlineAllocator<16>>& OneRowSliceRecords)
+	{
+		FAction A = MoveTemp(Base);
+		A.Kind = EActionKind::ComposedSlice;
+		A.Layers = Layers;
+		A.bEmbed = S.PlanLayerPos == 0;
+		A.bOneCallRow = S.Path == ESuperSLMGpuDecodePath::OneCall; // ruling 43 N2: its own decode call
+		if (A.bEmbed)
+		{
+			S.PlanTokenPos = NextPosition(S); // E-14: the position its slices are priced at
+			S.TokenRequestTick = TickIndex;
+			S.TokenRequestWall = Now;
+			S.TokenRequestSim = SimSeconds;
+			S.bPlanInPrompt = PromptLeft(S);
+			if (S.bPlanInPrompt)
+			{
+				S.PlanPromptIndex = S.PromptPlanned++;
+				FillPrompt(S, A, S.PlanPromptIndex);
+			}
+			else
+			{
+				S.TokensIssued += 1;
+			}
+		}
+		else
+		{
+			A.bPrompt = S.bPlanInPrompt;
+		}
+		const int32 FirstLayer = S.PlanLayerPos;
+		AddJobPrice(*Job, 1, Layers, S.PlanTokenPos); // run 5: the feedback guard
+		S.PlanLayerPos += Layers;
+		A.bEndsToken = S.PlanLayerPos >= NumHiddenLayers; // run 5: batchable when it is, or as the batch's one short member, last
+		if (!A.bEndsToken && !A.bOneCallRow && !bTickShortBatched)
+		{
+			A.bBatchLast = true; // ruling 59.1: the first short slice of the tick goes last in the batch
+			bTickShortBatched = true;
+		}
+		A.ExpectLayerAfter = S.PlanLayerPos; // ruling 59.1
+		const bool bTokenDone = S.PlanLayerPos == NumHiddenLayers;
+		A.bFinish = bTokenDone && !S.bPlanInPrompt;
+		if (A.bFinish)
+		{
+			AddJobFinishPrice(*Job, S.PlanTokenPos); // ruling 59b H3
+		}
+		const int32 Index = Job->Actions.Add(MoveTemp(A));
+		const int32 Record = RecordAction(S, Job->Actions[Index], 0, 1, FirstLayer, Layers, false, false, bTokenDone && S.bPlanInPrompt ? 1 : 0);
+		if (!Job->Actions[Index].bOneCallRow && (Job->Actions[Index].bEndsToken || Job->Actions[Index].bBatchLast)) // ruling 43 N2: a OneCall slice is never batched; 59.1: a short one only last
+		{
+			++OneRowSlices;
+			if (Record != INDEX_NONE)
+			{
+				OneRowSliceRecords.Add(Record);
+			}
+		}
+		if (bTokenDone)
+		{
+			S.PlanLayerPos = 0;
+			if (S.bPlanInPrompt)
+			{
+				S.bPlanInPrompt = false;
+				if (S.PlanPromptIndex == S.Request.PromptTokens.Num() - 1)
+				{
+					PromptCompleted(S, Job->Actions[Index], Job, Index, S.TokenRequestTick, S.TokenRequestWall, S.TokenRequestSim);
+				}
+			}
+			else
+			{
+				AddTokenEvent(S, Job, Index, S.TokenRequestTick, S.TokenRequestWall, S.TokenRequestSim);
+			}
+		}
+	}
+
+	// Plans one slice of a chunk into Job: the opening slice (Open: a prompt chunk of Rows rows, or an Exact chunk) or
+	// the next slice of the chunk the planner has open on S. Layers is the slice's layer count (for an Exact chunk
+	// the schedule's). The slice that reaches the last layer closes the chunk: a prompt chunk's close finishes its
+	// rows (and primes the sequence when the prompt's last token is among them; its Prefill event), an Exact close
+	// delivers its ids (its token event, requested at the close's tick: the chunk's whole schedule is its token).
+	// Returns the action's index. Game thread.
+	int32 PlanRowsSlice(FGameSlot& S, int32 SlotIndex, const TSharedPtr<FJob>& Job, FAction&& Base, ERowsKind OpenKind, int32 OpenRows,
+		int32 Layers, double Now)
+	{
+		FAction A = MoveTemp(Base);
+		A.Kind = EActionKind::RowsSlice;
+		A.Slot = SlotIndex;
+		A.Gen = S.Gen;
+		A.bComposed = S.Path == ESuperSLMGpuDecodePath::Composed;
+		const bool bOpen = OpenKind != ERowsKind::None;
+		AddJobPrice(*Job, bOpen ? OpenRows : S.PlanRows, Layers, bOpen ? NextPosition(S) + OpenRows - 1 : S.PlanRowsEndPos); // run 5
+		if (bOpen)
+		{
+			// The adapter the chunk is pinned to from its first slice (§4.4): a bind this action carries, else the bound one.
+			S.PlanAdapterId = S.bPendingBindConfirm ? S.PendingBindAdapterId : S.ActiveAdapterId;
+			S.PlanRowsEndPos = NextPosition(S) + OpenRows - 1; // E-14: the chunk's slices are priced at its last row
+			if (OpenKind == ERowsKind::Exact)
+			{
+				S.ExactExtraBound += OpenRows - 1; // the drafts it may commit, corrected at its close
+			}
+			S.PlanRowsKind = OpenKind;
+			S.PlanRows = OpenRows;
+			S.PlanRowsLayer = 0;
+			S.PlanRowsSlice = 0;
+			S.TokenRequestTick = TickIndex;
+			S.TokenRequestWall = Now;
+			S.TokenRequestSim = SimSeconds;
+			A.bOpenRows = true;
+			A.RowsCount = OpenRows;
+			if (OpenKind == ERowsKind::Prompt)
+			{
+				S.PlanRowsPromptStart = S.PromptPlanned;
+				if (S.PromptPlanned == 0)
+				{
+					FillPrompt(S, A, 0); // the prompt's first token carries the generation's limits
+				}
+				A.bPrompt = true;
+				A.bLastPrompt = false;
+				for (int32 I = 0; I < OpenRows; ++I)
+				{
+					A.RowsTokens.Add(S.Request.PromptTokens[S.PromptPlanned + I]);
+				}
+				S.PromptPlanned += OpenRows;
+			}
+			else
+			{
+				S.TokensIssued += 1;
+			}
+		}
+		A.RowsKind = S.PlanRowsKind;
+		A.bPrompt = S.PlanRowsKind == ERowsKind::Prompt;
+		A.Layers = Layers;
+		const int64 PendingPos = S.PlanRowsEndPos - S.PlanRows + 1; // E-14: the pending token's position (row 0)
+		if (S.PlanRowsKind == ERowsKind::Exact && OneCallSlicesOneRowAt(PendingPos))
+		{
+			A.RowsFallbackLayers = ColdLayers(OneRowLayerCapAt(PendingPos)); // ruling 43 N1: a fallback's close runs Off's first one-row slice (run 5: at the ramp's layers)
+		}
+		else if (S.PlanRowsKind == ERowsKind::Exact && IsCold())
+		{
+			// Ruling 59c point 6: at or above one row a fallback's close runs Off's whole token; on a cold tick it runs Off's
+			// first one-row slice at the ramp's layers instead (the rest as the one-row slices that follow, as below one row).
+			const int32 Cut = ColdOneRowCap(OneRowLayerCapAt(PendingPos));
+			A.RowsFallbackLayers = Cut < NumHiddenLayers ? Cut : 0;
+		}
+		const int32 FirstLayer = S.PlanRowsLayer;
+		S.PlanRowsLayer += Layers;
+		S.PlanRowsSlice += 1;
+		A.bCloseRows = S.PlanRowsLayer >= NumHiddenLayers;
+		if (A.bCloseRows && S.PlanRowsKind == ERowsKind::Exact)
+		{
+			AddJobLogitsPrice(*Job, S.PlanRows, S.PlanRowsEndPos); // ruling 59b H3: the close's logits stage
+			A.PosExtraBound = S.PlanRows - 1; // E-14: what its open counted, for the close's apply to correct
+		}
+		const ERowsKind Kind = S.PlanRowsKind;
+		const int32 Rows = S.PlanRows;
+		const bool bClose = A.bCloseRows;
+		const int32 Index = Job->Actions.Add(MoveTemp(A));
+		const int32 Record = RecordAction(S, Job->Actions[Index], static_cast<uint8>(Kind == ERowsKind::Prompt ? 1 : 2), Rows, FirstLayer, Layers, bOpen, bClose,
+			bClose && Kind == ERowsKind::Prompt ? Rows : 0);
+		S.PlanRowsRecord = Record;
+		if (bOpen)
+		{
+			S.PlanRowsFirstRecord = Record;
+		}
+		Job->Actions[Index].RowsFirstRecord = S.PlanRowsFirstRecord;
+		if (!bClose)
+		{
+			return Index;
+		}
+		if (Kind == ERowsKind::Prompt)
+		{
+			const bool bLast = !PromptLeft(S);
+			ClearPlanRows(S);
+			if (bLast)
+			{
+				PromptCompleted(S, Job->Actions[Index], Job, Index, S.TokenRequestTick, S.TokenRequestWall, S.TokenRequestSim);
+			}
+		}
+		else
+		{
+			ClearPlanRows(S);
+			S.bPlanAwaitClose = Job->Actions[Index].RowsFallbackLayers > 0; // ruling 43 N1
+			AddTokenEvent(S, Job, Index, TickIndex, Now, SimSeconds);
+		}
+		return Index;
+	}
+
+	// The Exact schedule for MX rows under plan P: slices of l(MX) layers. When the last slice cannot also carry the
+	// logits stage (D_x = D + 1), the last slice is cut to the most layers that fit with it. The engine runs the logits
+	// stage in the ready that finishes the last layer, so it is never a slice of its own; if not even one layer fits with
+	// it, no schedule exists (Out is empty) and Exact falls back to Off (build-mr6.md). Game thread.
+	void MakeExactSchedule(const GpuRows::FChooserPlan& P, int32 MX, TArray<int32, TInlineAllocator<16>>& Out) const
+	{
+		Out.Reset();
+		const int32 NumLayers = NumHiddenLayers;
+		if (!P.bValid || MX < 1 || MX > GpuRows::MaxRows || NumLayers <= 0)
+		{
+			return;
+		}
+		const int64 Room = P.BudgetUs - P.SceneUs;
+		const int64 Margin = 1000 + Config.GpuRowsMarginPerMille;
+		const int64 Rhs = Room * NumLayers * 1000;
+		auto FitsWithLogits = [&](int64 Layers)
+		{
+			return Layers * P.CostUs[MX - 1] * Margin + P.LogitsUs[MX - 1] * Margin * NumLayers <= Rhs;
+		};
+		const int32 PerSlice = P.LayersPerSlice[MX - 1];
+		if (PerSlice <= 0 || P.Ticks[MX - 1] <= 0)
+		{
+			return;
+		}
+		int32 Last = NumLayers - (P.Ticks[MX - 1] - 1) * PerSlice;
+		while (Last > 0 && !FitsWithLogits(Last))
+		{
+			--Last;
+		}
+		if (Last <= 0)
+		{
+			return;
+		}
+		int32 Before = NumLayers - Last;
+		while (Before > 0)
+		{
+			const int32 Slice = FMath::Min(PerSlice, Before);
+			Out.Add(Slice);
+			Before -= Slice;
+		}
+		Out.Add(Last);
+	}
+
+	// Erratum E-14 (ruling 53): the plan a slice that ends at position Pos is priced by -- the chooser at C(1, Pos) from
+	// the line (ChooseRowsPlanAt), the per-M ratios on top -- with the Exact schedule for the base plan's M_exact under
+	// it (empty when M_exact has none there). The base plan (C_a) when the line gives its C(1); the others are kept by
+	// C(1) until the plan is rebuilt or the line changes. Returned by value. Game thread.
+	FPricedPlan PlanAt(int64 Pos)
+	{
+		const int64 C1 = FMath::Max<int64>(1, GpuRowCost::RowCostAtUs(RowCostLine, FMath::Max<int64>(0, Pos)));
+		// At B = 0 the row price changes no plan (ruling 54): the base plan.
+		if (!RowsPlan.bValid || C1 == RowsPlan.RowCostUs || Config.SchemaJumpGpuFrameBudgetMs == 0.0)
+		{
+			FPricedPlan Base;
+			Base.Plan = RowsPlan;
+			Base.ExactSlices = ExactSlices;
+			return Base;
+		}
+		if (const FPricedPlan* Found = PricedPlans.Find(C1))
+		{
+			return *Found;
+		}
+		FPricedPlan Priced;
+		// Run 5 (E14_3): the context's growth since the line's anchor scales with a chunk's rows (each row attends over it).
+		Priced.Plan = GpuRows::ChooseRowsPlanAt(RowsInput, C1, FMath::Max<int64>(0, C1 - RowsPlan.RowCostUs));
+		if (RowsPlan.bExactOn && Priced.Plan.bValid && Priced.Plan.bMultiRowOn)
+		{
+			MakeExactSchedule(Priced.Plan, RowsPlan.MExact, Priced.ExactSlices);
+		}
+		PricedPlans.Add(C1, Priced);
+		return Priced;
+	}
+
+	// l(1) for a one-row slice that ends at Pos, as OneRowLayerCap() reads it (MAX_int32: no cap).
+	int32 OneRowLayerCapAt(int64 Pos)
+	{
+		const bool bKnob = Config.SchemaJumpGpuFrameBudgetMs != 0.0;
+		if (!MultiRowOn() || !bKnob)
+		{
+			return MAX_int32;
+		}
+		const int32 L1 = PlanAt(Pos).Plan.LayersPerSlice[0];
+		return L1 > 0 ? L1 : MAX_int32;
+	}
+
+	bool OneCallSlicesOneRowAt(int64 Pos)
+	{
+		return OneRowLayerCapAt(Pos) < NumHiddenLayers;
+	}
+
+	// Erratum E-14: the position the sequence's next embedded row takes, as the planner has planned it: the context at
+	// the generation's start, the prompt rows planned, the tokens issued less the first (the prompt's last token's finish
+	// embeds nothing), and the drafts an open or unapplied Exact chunk may still commit (an upper bound, corrected when
+	// its close applies); never below the applied context. Game thread.
+	static int64 NextPosition(const FGameSlot& S)
+	{
+		const int64 Planned = S.PosBase + S.PromptPlanned + FMath::Max(0, S.TokensIssued - 1) + S.ExactExtraBound;
+		return FMath::Max(Planned, S.ContextUsedMirror);
+	}
+
 	// Plans this tick's work into one job for the submission thread.
+	// Multi-row GPU plan §5.1 (MR6; ruling 39): the rows plan, from the configuration, the model's shape, the head the map
+	// left active, the vendored cost table's merged arrays (C18: never a measurement at run time) and RowCostIn, the row
+	// cost in use (ruling 48: the game's GpuRowCostMs, the calibrated price or the 6.2 ms default). Built at Configure(),
+	// and again when a calibration at a frame budget settles, before anything is planned with it (the first generation
+	// waits for it). bLog: log the plan's warnings (false for the provisional plan a pending calibration slices by).
+	// Game thread once the state is published.
+	void BuildRowsPlan(double RowCostIn, bool bLog)
+	{
+		const int32 NumLayers = NumHiddenLayers;
+		{
+			GpuRows::FChooserInput In;
+			for (int32 M = 0; M < GpuRows::MaxRows; ++M)
+			{
+				In.CostRatioPerMille[M] = superslm_gpu::kGpuRowsCostRatioPerMille[M];
+				In.LogitsRatioPerMille[M] = superslm_gpu::kGpuRowsLogitsRatioPerMille[M];
+			}
+			In.bTableMeasured = superslm_gpu::kGpuRowsCostTableMeasured && superslm_gpu::kGpuRowsLogitsRatioMeasured;
+			In.GpuRowCostMs = RowCostIn;
+			In.FrameBudgetMs = Config.SchemaJumpGpuFrameBudgetMs;
+			In.SceneGpuShareMs = Config.SceneGpuShareMs;
+			In.NominalTickMs = Config.NominalTickMs;
+			In.GpuRowsMarginPerMille = Config.GpuRowsMarginPerMille;
+			In.bGpuMultiRow = Config.bGpuMultiRow;
+			In.Layers = static_cast<uint32_t>(NumLayers);
+			In.LayersPerTick = static_cast<uint32_t>(ConfiguredLayersPerTick);
+			In.DispatchesPerLayer = DispatchesPerLayer;
+			In.bExactChosen = true; // the plan is per backend; a generation's setting picks Exact or Off at admission
+			In.bDeviceLogitsHead = bDeviceLogitsHead;
+			In.bShippingBuild = UE_BUILD_SHIPPING != 0;
+			RowsInput = In;
+			RowsPlan = GpuRows::ChooseRowsPlan(In);
+		}
+		PricedPlans.Reset();
+		ExactSlices.Reset();
+		if (RowsPlan.bValid && RowsPlan.bMultiRowOn && RowsPlan.bExactOn)
+		{
+			MakeExactSchedule(RowsPlan, RowsPlan.MExact, ExactSlices);
+			if (ExactSlices.Num() == 0)
+			{
+				RowsPlan.bExactOn = false;
+				RowsPlan.ExactReason = GpuRows::EExactReason::FellBackToOff;
+				RowsPlan.MExact = 0;
+			}
+		}
+		if (!bLog)
+		{
+			return;
+		}
+		if (RowsPlan.bBudgetBelowOneRow)
+		{
+			if (OneCallSlicesOneRow())
+			{
+				// Ruling 42 R1: below one row's price, one-row tokens are sliced at l(1) layers per tick (1.17's composed slicing).
+				UE_LOG(LogSuperSLM, Warning, TEXT("GPU Configure(): the frame budget leaves %lld us after the scene share, below one row's %lld us: one-row tokens are sliced, %d layers per tick (l(1), ruling 42 R1)."),
+					RowsPlan.BudgetUs - RowsPlan.SceneUs, RowsPlan.RowCostUs, RowsPlan.LayersPerSlice[0]);
+			}
+			else
+			{
+				UE_LOG(LogSuperSLM, Warning, TEXT("GPU Configure(): the frame budget leaves %lld us after the scene share, below one row's %lld us: one-row tokens run whole, %d layers per action is reported only (ruling 39 Q2)."),
+					RowsPlan.BudgetUs - RowsPlan.SceneUs, RowsPlan.RowCostUs, RowsPlan.LayersPerSlice[0]);
+			}
+		}
+		if (RowsPlan.TableStatus == GpuRows::ETableStatus::EstimatedFlagged)
+		{
+			UE_LOG(LogSuperSLM, Warning, TEXT("GPU Configure(): the vendored multi-row cost table is an estimate; the multi-row plan runs flagged in this development build (N4)."));
+		}
+		else if (RowsPlan.TableStatus == GpuRows::ETableStatus::EstimatedOneRow)
+		{
+			UE_LOG(LogSuperSLM, Display, TEXT("GPU Configure(): the vendored multi-row cost table is an estimate; a shipping build runs the one-row plan (N4)."));
+		}
+	}
+
+	// ------------------------------------------------------------------ ruling 48 (erratum E-13): the row cost
+
+	// The row cost settles on Source at Ms (C_a), with the line the planner prices each slice by (erratum E-14), and
+	// the plan is built from it.
+	void ApplyRowCost(GpuRowCost::ESource Source, double Ms, const GpuRowCost::FRowCostLine& Line)
+	{
+		RowCostSource = Source;
+		RowCostMs = Ms;
+		RowCostLine = Line;
+		bRowCostSlopeMeasured = false;
+		bRowCostPending = false;
+		RowCostFinishUs = -1; // ruling 56 (1): a calibrated price sets F after this
+		BuildRowsPlan(Ms, true);
+	}
+
+	// Erratum E-14 (ruling 53): the throwaway sequence's capacity: P2 + 16 with a frame budget (phase 2 reads to P2; ruling
+	// 60: its replacement runs and a spread retry go past it), within the model's context; the phase-1 floor without one.
+	int64 CalSeqCapFor() const
+	{
+		if (!(Config.SchemaJumpGpuFrameBudgetMs > 0.0))
+		{
+			return kRowCostCalibrationSequenceCap;
+		}
+		int64 Cap = FMath::Max<int64>(kRowCostCalibrationSequenceCap, GpuRowCost::LatePosition(Config.ContextCap) + kRowCostCalibrationLateMargin);
+		if (ModelContextCap > 0)
+		{
+			Cap = FMath::Min(Cap, ModelContextCap);
+		}
+		return Cap;
+	}
+
+	// Ruling 54: the default slope, as the log names it, in us per position.
+	double SlopeUsPerPosition(const GpuRowCost::FRowCostLine& Line) const
+	{
+		return Line.SlopeDenPos > 0 ? static_cast<double>(Line.SlopeNumUs) / static_cast<double>(Line.SlopeDenPos) : 0.0;
+	}
+
+	// Ruling 54, phase 2 (B > 0 only): from the throwaway sequence's current length, read filler rows to P2 - 3, then time
+	// one warm-up and 3 tokens ending at P2, each a slice riding a generation tick job in the room it leaves
+	// (PlanRowCostPhase2()). No wall-clock cap. A line whose P2 is not past pos_a has nothing to measure. Game thread
+	// (or the preparing thread before the state is published).
+	void StartRowCostPhase2()
+	{
+		CalP2Late = GpuRowCost::LatePosition(Config.ContextCap);
+		const int64 Tokens = GpuRowCost::kWarmUpRunsPerPosition + GpuRowCost::kTimedRunsPerPosition;
+		CalP2FillTarget = CalP2Late + 1 - Tokens;
+		if (!GpuRowCost::RunsPhase2(Config.SchemaJumpGpuFrameBudgetMs) || CalP2Late <= RowCostLine.AnchorPos || CalP2FillTarget < CalSeqLength)
+		{
+			bCalPhase2 = false;
+			return;
+		}
+		bCalPhase2 = true;
+		CalP2Epoch = GRowCostForgetEpoch.load();
+		CalP2Stage = CalSeqLength < CalP2FillTarget ? 0 : 1;
+		CalFillRows = 0;
+		CalFillLayerPos = 0;
+		CalP2Token = 0;
+		CalP2LayerPos = 0;
+		CalP2TokenUs = 0.0;
+		CalP2RunsUs.Reset();
+		bCalP2TokenUntimed = false;
+		CalP2ExtraWarmUps = 0;
+		CalP2ExtraRuns = 0; // ruling 60
+		bCalP2SpreadRetried = false;
+		RowCostLateDroppedRunsUs.Reset();
+		RowCostLateSpreadFailures = 0;
+	}
+
+	// Ruling 60 (5): the test hook's delay for this phase's next timed run (Phase 0: phase 1, 1: phase 2); 0 in a product
+	// build and when unarmed.
+	double TakeTimedRunDelayUs(int32 Phase)
+	{
+#if WITH_DEV_AUTOMATION_TESTS
+		const int32 I = CalTimedOrdinal[Phase]++;
+		return I < 32 && (GRowCostRunDelayMask[Phase].load() >> I & 1u) != 0 ? static_cast<double>(GRowCostRunDelayUs[Phase].load()) : 0.0;
+#else
+		(void)Phase;
+		return 0.0;
+#endif
+	}
+
+	// Ruling 60: removes DropMask's runs (and their finishes, when given) from a set, appending them to Dropped.
+	static void DropRuns(TArray<double>& Runs, TArray<double>* Finishes, uint32 DropMask, TArray<double>& Dropped)
+	{
+		for (int32 I = 0; I < Runs.Num() && I < 32; ++I)
+		{
+			if ((DropMask >> I & 1u) != 0)
+			{
+				Dropped.Add(Runs[I]);
+			}
+		}
+		for (int32 I = FMath::Min(Runs.Num(), 32) - 1; I >= 0; --I)
+		{
+			if ((DropMask >> I & 1u) != 0)
+			{
+				Runs.RemoveAt(I);
+				if (Finishes != nullptr && Finishes->IsValidIndex(I))
+				{
+					Finishes->RemoveAt(I);
+				}
+			}
+		}
+	}
+
+	// Ruling 60 (3): a timed set's runs, for the Display lines.
+	static FString RunsText(const TArray<double>& Runs)
+	{
+		FString S;
+		for (const double R : Runs)
+		{
+			S += FString::Printf(TEXT("%s%.1f"), S.IsEmpty() ? TEXT("") : TEXT(", "), R);
+		}
+		return S;
+	}
+
+	// Erratum E-16 (ruling 60): one of phase 2's timed runs. When the set holds its 3 runs it is checked: a run over 3 x
+	// the median is dropped and re-timed (the token count gives the late tokens back, so the planner times one more);
+	// a spread failure retries phase 2 once on the same sequence (not cached), and a second one fails it (cached); a
+	// clean set settles. An armed phase 2 (the seam) settles as before. Game thread.
+	void TakePhase2TimedRun(double RunUs)
+	{
+		RunUs += TakeTimedRunDelayUs(1);
+		CalP2RunsUs.Add(RunUs);
+		UE_LOG(LogSuperSLM, Display, TEXT("GPU GpuRowCost timed run for %s: phase 2, position %lld, %.1f us (run %d of the set; ruling 60)."),
+			*RowCostSubject(), CalSeqLength - 1, RunUs, CalP2RunsUs.Num());
+		if (CalP2RunsUs.Num() < GpuRowCost::kTimedRunsPerPosition)
+		{
+			return;
+		}
+		const bool bArmed = bCalArmLateByAttempt ? CalArmLateMaxUs.IsValidIndex(CalSettledAttempt) && CalArmLateMaxUs[CalSettledAttempt] != 0.0
+			: CalArmLateMaxUs.Num() > 0 && CalArmLateMaxUs[0] != 0.0;
+		const GpuRowCost::FRunSetCheck Check = bArmed ? GpuRowCost::FRunSetCheck() : GpuRowCost::CheckRunSet(CalP2RunsUs.GetData(), CalP2RunsUs.Num(), CalP2ExtraRuns);
+		if (Check.Step == GpuRowCost::ERunSet::Replace && CalSeqLength + Check.Drops + 1 < CalSeqCapFor())
+		{
+			const FString Before = RunsText(CalP2RunsUs);
+			DropRuns(CalP2RunsUs, nullptr, Check.DropMask, RowCostLateDroppedRunsUs);
+			CalP2ExtraRuns += Check.Drops;
+			CalP2Token -= Check.Drops;
+			UE_LOG(LogSuperSLM, Display, TEXT("GPU GpuRowCost for %s: phase 2's runs [%s] us have %d over %d x the median %.1f us, dropped; timing %d more (extra %d of at most %d; ruling 60)."),
+				*RowCostSubject(), *Before, Check.Drops, GpuRowCost::kOutlierFactor, Check.MedianUs, Check.Drops, CalP2ExtraRuns, GpuRowCost::kMaxOutlierExtraRuns);
+			return;
+		}
+		if (Check.Step != GpuRowCost::ERunSet::Price)
+		{
+			++RowCostLateSpreadFailures;
+			const FString Runs = RunsText(CalP2RunsUs);
+			const int64 Tokens = GpuRowCost::kWarmUpRunsPerPosition + GpuRowCost::kTimedRunsPerPosition;
+			if (!bCalP2SpreadRetried && CalSeqLength + Tokens + 1 < CalSeqCapFor())
+			{
+				bCalP2SpreadRetried = true;
+				CalP2Token = 0;
+				CalP2RunsUs.Reset();
+				CalP2ExtraRuns = 0;
+				CalP2ExtraWarmUps = 0;
+				UE_LOG(LogSuperSLM, Display, TEXT("GPU GpuRowCost for %s: phase 2's runs [%s] us still hold one over %d x the median %.1f us after the extra runs: a spread failure, not cached; phase 2 runs once more (ruling 60)."),
+					*RowCostSubject(), *Runs, GpuRowCost::kOutlierFactor, Check.MedianUs);
+				return;
+			}
+			FailRowCostPhase2(FString::Printf(TEXT("a spread failure%s: the timed runs [%s] us hold one over %d x the median %.1f us after the extra runs, ruling 60"),
+				bCalP2SpreadRetried ? TEXT(" again") : TEXT(" with no room left to retry"), *Runs, GpuRowCost::kOutlierFactor, Check.MedianUs));
+			return;
+		}
+		SettleRowCostPhase2();
+	}
+
+	// Ruling 54: a failed phase 2 keeps the default slope and warns once per model, adapter and head placement in this
+	// process (the cache keeps the failure). Game thread.
+	void FailRowCostPhase2(const FString& Why)
+	{
+		bCalPhase2 = false;
+		bool bWarn = true;
+		if (bArtifactHashKnown)
+		{
+			CacheRowCost(ArtifactHash, AdapterLuid, bDeviceLogitsHead, [&bWarn](FRowCostCacheEntry& E)
+			{
+				bWarn = !E.bLateFailed;
+				E.bLateFailed = true;
+			});
+		}
+		if (bWarn)
+		{
+			UE_LOG(LogSuperSLM, Warning, TEXT("GPU GpuRowCost late position for %s failed (%s); the line keeps the default slope, %.4f us per position from C_a %.1f ms at position %lld (ruling 54)."),
+				*RowCostSubject(), *Why, SlopeUsPerPosition(RowCostLine), static_cast<double>(RowCostLine.AnchorUs) / 1000.0, RowCostLine.AnchorPos);
+		}
+	}
+
+	// Ruling 54: phase 2's late tokens are done: C_b is their price (after the seam's late arm for the settled attempt);
+	// the measured line replaces the default slope when C(1, ContextCap) stays within the sanity range, and is cached.
+	void SettleRowCostPhase2()
+	{
+		bCalPhase2 = false;
+		const int64 LatePos = CalSeqLength - 1;
+		// Ruling 54 (reading 5): ArmRowCostCalibrationPositions() arms phase 2 with its first late entry;
+		// ArmRowCostCalibration() with the maximum of the attempt phase 1 used.
+		double Arm = 0.0;
+		if (bCalArmLateByAttempt)
+		{
+			Arm = CalArmLateMaxUs.IsValidIndex(CalSettledAttempt) ? CalArmLateMaxUs[CalSettledAttempt] : 0.0;
+		}
+		else if (CalArmLateMaxUs.Num() > 0)
+		{
+			Arm = CalArmLateMaxUs[0];
+		}
+		const int64 LateUs = Arm < 0.0 ? -1 : (Arm > 0.0 ? GpuRowCost::PriceUs(&Arm, 1) : GpuRowCost::PriceUs(CalP2RunsUs.GetData(), CalP2RunsUs.Num()));
+		if (LateUs < 0)
+		{
+			FailRowCostPhase2(TEXT("no GPU time was measured at the late position"));
+			return;
+		}
+		const GpuRowCost::FRowCostLine Line = GpuRowCost::LineFrom(RowCostLine.AnchorUs, RowCostLine.AnchorPos, LateUs, LatePos);
+		if (GpuRowCost::StepPhase2(RowCostLine.AnchorUs, RowCostLine.AnchorPos, LateUs, LatePos, Config.ContextCap) != GpuRowCost::EPhase2::Use)
+		{
+			FailRowCostPhase2(FString::Printf(TEXT("C_b %.1f ms at position %lld puts C(1, %lld) at %lld us, above %lld us"), static_cast<double>(LateUs) / 1000.0, LatePos,
+				Config.ContextCap, GpuRowCost::RowCostAtUs(Line, Config.ContextCap), GpuRowCost::kSanityMaxUs));
+			return;
+		}
+		RowCostLine = Line;
+		bRowCostSlopeMeasured = true;
+		RowCostLatePosition = LatePos;
+		RowCostLateUs = LateUs;
+		RowCostLateWarmUpRuns = GpuRowCost::kWarmUpRunsPerPosition;
+		RowCostLateRunsUs = CalP2RunsUs;
+		PricedPlans.Reset();
+		if (bArtifactHashKnown)
+		{
+			CacheRowCost(ArtifactHash, AdapterLuid, bDeviceLogitsHead, [&Line](FRowCostCacheEntry& E)
+			{
+				E.Line = Line;
+				E.bSlopeMeasured = true;
+			});
+		}
+		UE_LOG(LogSuperSLM, Log, TEXT("GPU GpuRowCost line for %s: C_a %.1f ms at position %lld, C_b %.1f ms at position %lld; the measured slope, %.4f us per position, replaces the default (rulings 53, 54)."),
+			*RowCostSubject(), static_cast<double>(Line.AnchorUs) / 1000.0, Line.AnchorPos, static_cast<double>(LateUs) / 1000.0, LatePos, SlopeUsPerPosition(Line));
+	}
+
+	// Ruling 54: phase 2's slice in flight, collected before this tick plans (game thread).
+	void CollectRowCostPhase2()
+	{
+		if (bCalPhase2 && CalP2Epoch != GRowCostForgetEpoch.load())
+		{
+			bCalPhase2 = false; // ruling 54 (reading 3): forgotten
+			CalJob.Reset();
+			return;
+		}
+		if (!bCalPhase2 || !CalJob.IsValid() || !CalJob->bDone.load(std::memory_order_acquire))
+		{
+			return;
+		}
+		const TSharedPtr<FJob> Done = MoveTemp(CalJob);
+		CalJob.Reset();
+		const FJob::FCalibrationStep& Step = Done->Calibration;
+		if (Done->bSkipped || Step.bNoSequence || Step.Status != FGpuStatus::SSLM_OK)
+		{
+			if (bTerminalLoss.load())
+			{
+				bCalPhase2 = false; // ruling 55 F5: no longer pending; a confirmed loss is the device-lost path's (ruling 51 F3)
+				return;
+			}
+			FailRowCostPhase2(Done->bSkipped ? FString(TEXT("the slice did not run"))
+				: Step.bNoSequence ? FString::Printf(TEXT("sslm_gpu_seq_create returned %s"), *GpuStatusText(Step.Status))
+				: GpuStatusText(Step.Status));
+			return;
+		}
+		if (Step.FillRows > 0)
+		{
+			if (Step.Layers > 0)
+			{
+				// Run 5: per one-row-equivalent layer (the slice's per-layer cost over r(FillRows)), so a fill of other rows scales it.
+					CalMaxFillLayerUs = FMath::Max(CalMaxFillLayerUs, Step.SliceUs / Step.Layers * 1000.0
+						/ static_cast<double>(FMath::Max<uint32>(1, RowsInput.CostRatioPerMille[FMath::Clamp(Step.FillRows, 1, static_cast<int32>(GpuRows::MaxRows)) - 1])));
+			}
+			CalFillLayerPos += Step.Layers;
+			if (CalFillLayerPos >= NumHiddenLayers)
+			{
+				CalSeqLength += CalFillRows;
+				CalFillRows = 0;
+				CalFillLayerPos = 0;
+				if (CalSeqLength >= CalP2FillTarget)
+				{
+					CalP2Stage = 1;
+				}
+			}
+			return;
+		}
+		CalP2TokenUs += Step.SliceUs;
+		CalP2LayerPos += Step.Layers;
+		const int32 Units = Step.Layers + (Step.bFinish ? 1 : 0);
+		if (Units > 0)
+		{
+			CalMaxUnitUs = FMath::Max(CalMaxUnitUs, Step.SliceUs / Units);
+		}
+		bCalFinishMeasured = bCalFinishMeasured || Step.bFinish;
+		if (!Step.bFinish)
+		{
+			return;
+		}
+		bool bTimed = false;
+		const double TokenUs = CalP2TokenUs;
+		if (bCalP2TokenUntimed && CalP2Token >= GpuRowCost::kWarmUpRunsPerPosition)
+		{
+			++CalP2ExtraWarmUps; // run 5: an extra warm-up, so the timed token it stood in for is still to come
+		}
+		else
+		{
+			bTimed = CalP2Token >= GpuRowCost::kWarmUpRunsPerPosition;
+			++CalP2Token;
+		}
+		bCalP2TokenUntimed = false;
+		++CalSeqLength;
+		CalP2LayerPos = 0;
+		CalP2TokenUs = 0.0;
+		if (bTimed)
+		{
+			TakePhase2TimedRun(TokenUs); // ruling 60: checked once the set holds its runs; settles a clean set
+		}
+	}
+
+	// Ruling 54: phase 2's next slice, riding Job (this tick's generation job) in LeftUs, the room the generations' slices
+	// left (B_eff less the scene share less their price). Sized as ruling 50 sizes a slice, from the largest per-unit
+	// cost measured so far, with the margin: a filler slice from the largest per-layer cost of a filler slice (before
+	// one is measured, the one-row unit times the table's r(M), half again for headroom), a late token's slice from p
+	// (its finish riding only once measured and when it fits). Nothing when no unit fits, unless the tick has no other
+	// work, which then takes one unit. One slice in flight at a time. Game thread.
+	void PlanRowCostPhase2(const TSharedPtr<FJob>& Job, int64 LeftUs, bool bTickEmpty)
+	{
+		if (!bCalPhase2 || CalJob.IsValid() || NumHiddenLayers <= 0)
+		{
+			return;
+		}
+		// Rulings 59b.2, 59c.5, 59g F1: while the ramp is above 1.0, phase 2 takes no room in a tick that carries other work --
+		// neither its untimed fill nor a warm-up token (the generations' work is already derated; phase 2 on top would take the
+		// warm leftover, about 1.5 x the room on a GPU that really is cold). It is held, which the liveness rule counts; an
+		// otherwise empty cold tick keeps 59c.5's derated untimed work.
+		if (IsCold() && !bTickEmpty)
+		{
+			bColdHeldWork = true;
+			return;
+		}
+		const double Margin = static_cast<double>(1000 + Config.GpuRowsMarginPerMille) / 1000.0;
+		const double Room = static_cast<double>(FMath::Max<int64>(0, LeftUs));
+		FJob::FCalibrationStep& C = Job->Calibration;
+		if (CalP2Stage == 0)
+		{
+			// Run 5 (59b M1): the fill is untimed, so the cold ramp derates its room like any slice's (one layer still runs on
+			// an otherwise empty tick, so the fill never stalls).
+			const double FillRoom = Room * 1000.0 / static_cast<double>(LayerScalePerMille());
+			int32 Rows = CalFillRows > 0 ? CalFillRows
+				: static_cast<int32>(FMath::Min<int64>(GpuRows::MaxRows, CalP2FillTarget - CalSeqLength));
+			if (Rows <= 0)
+			{
+				CalP2Stage = 1;
+				return;
+			}
+			if (CalFillRows == 0)
+			{
+				// Run 5 (R51_F2, ruling 59.2's "every tick within B"): a fill chunk opens no wider than one layer of it fits the
+				// room, down to one row. Ruling 54's minimum (one layer on an otherwise empty tick) then stays a single unit,
+				// never 8 rows' worth (2.1 ms at B = 1 ms on the 1.5B). Only how many rows a fill chunk takes; the fill target
+				// and every timed token are unchanged.
+				const double FillUnit = CalMaxFillLayerUs > 0.0 ? CalMaxFillLayerUs
+					: 1.5 * (CalMaxUnitUs > 0.0 ? CalMaxUnitUs : static_cast<double>(GpuRowCost::RowCostAtUs(RowCostLine, CalSeqLength + Rows - 1)) / NumHiddenLayers);
+				while (Rows > 1 && FillUnit * static_cast<double>(RowsInput.CostRatioPerMille[Rows - 1]) / 1000.0 * Margin > FillRoom)
+				{
+					--Rows;
+				}
+			}
+			double PerLayer = CalMaxFillLayerUs * static_cast<double>(RowsInput.CostRatioPerMille[Rows - 1]) / 1000.0; // run 5: at this fill's rows
+			if (!(PerLayer > 0.0))
+			{
+				const double Unit = CalMaxUnitUs > 0.0 ? CalMaxUnitUs
+					: static_cast<double>(GpuRowCost::RowCostAtUs(RowCostLine, CalSeqLength + Rows - 1)) / NumHiddenLayers;
+				PerLayer = Unit * static_cast<double>(RowsInput.CostRatioPerMille[Rows - 1]) / 1000.0 * 1.5;
+			}
+			int32 Layers = static_cast<int32>(FMath::Min<double>(NumHiddenLayers - CalFillLayerPos, FMath::FloorToDouble(FillRoom / (PerLayer * Margin))));
+			if (Layers <= 0)
+			{
+				if (!bTickEmpty)
+				{
+					return;
+				}
+				Layers = 1;
+			}
+			C.FillRows = Rows;
+			C.bFillOpen = CalFillRows == 0;
+			C.Layers = Layers;
+			CalFillRows = Rows;
+			Job->PricedUs += static_cast<double>(Layers) * PerLayer * Margin; // 59g: the rider priced at what phase 2 planned
+		}
+		else
+		{
+			// Run 5 (2026-10-27): the cold ramp never sizes a timed token, and a timed slice never runs
+			// while the ramp is above 1.0. A token's first slice decides what it is: a warm-up (untimed, derated like any
+			// slice), or on a cold tick an extra untimed warm-up in place of the timed one (it warms the GPU; the timed token is
+			// still to come), else timed. A timed token that meets a cold tick part-way becomes an extra warm-up too: its timing
+			// is discarded, never kept or cached. With no extra left (the sequence's room) a cold tick waits; the warm-ups
+			// already run have warmed the GPU by then.
+			const auto ExtraFits = [this]()
+			{
+				const int64 TokensLeft = GpuRowCost::kWarmUpRunsPerPosition + GpuRowCost::kTimedRunsPerPosition - CalP2Token;
+				return CalP2ExtraWarmUps < kCalP2MaxExtraWarmUps && CalSeqLength + TokensLeft + 1 < CalSeqCapFor();
+			};
+			if (CalP2LayerPos == 0)
+			{
+				bCalP2TokenUntimed = CalP2Token < GpuRowCost::kWarmUpRunsPerPosition || (IsCold() && ExtraFits());
+			}
+			else if (!bCalP2TokenUntimed && IsCold() && ExtraFits())
+			{
+				bCalP2TokenUntimed = true; // part-way: this token's timing is discarded; it counts as an extra warm-up
+			}
+			if (!bCalP2TokenUntimed && IsCold())
+			{
+				bColdHeldWork = true; // ruling 59c point 7: the cold rule held this tick's work
+				return;
+			}
+			const double SliceRoom = bCalP2TokenUntimed ? Room * 1000.0 / static_cast<double>(LayerScalePerMille()) : Room;
+			// Ruling 55 F3: never below the line's price per layer at P2 (p was measured at pos_a).
+			const double Unit = FMath::Max(CalMaxUnitUs, static_cast<double>(GpuRowCost::RowCostAtUs(RowCostLine, CalP2Late)) / NumHiddenLayers);
+			int64 Units = static_cast<int64>(FMath::FloorToDouble(SliceRoom / (Unit * Margin)));
+			if (Units <= 0)
+			{
+				if (!bTickEmpty)
+				{
+					return;
+				}
+				Units = 1;
+			}
+			const int32 LayersLeft = FMath::Max(0, NumHiddenLayers - CalP2LayerPos);
+			C.Layers = static_cast<int32>(FMath::Min<int64>(Units, LayersLeft));
+			C.bEmbed = CalP2LayerPos == 0 && C.Layers > 0;
+			C.bFinish = C.Layers == 0 || (C.Layers == LayersLeft && bCalFinishMeasured && C.Layers + 1 <= Units);
+			Job->PricedUs += static_cast<double>(C.Layers + (C.bFinish ? 1 : 0)) * Unit * Margin; // 59g: the rider priced at what phase 2 planned
+		}
+		C.bActive = true;
+		C.bRider = true;
+		C.Attempt = GpuRowCost::kMaxAttempts; // ruling 54: phase 2's calls carry attempt 2
+		C.SeqCap = CalSeqCapFor();
+		CalJob = Job;
+	}
+
+	FString RowCostSubject() const
+	{
+		return FString::Printf(TEXT("model %s on adapter %s"), *RowCostModelName, *AdapterName);
+	}
+
+	// Ruling 56 (2): a widened warm-up's outcome, logged (a skipped one says why, at Display -- rulings 57 F1, 57a: never a
+	// Warning, which automation counts as an error -- and the kit exports it; it is never the calibration's failure).
+	void NoteWidenWarmUp(int32 M, bool bRan, FGpuStatus Why) const
+	{
+		if (bRan)
+		{
+			UE_LOG(LogSuperSLM, Log, TEXT("GPU GpuRowCost load-time warm-up for %s: M = %d, one layer (ruling 56)."), *RowCostSubject(), M);
+		}
+		else
+		{
+			UE_LOG(LogSuperSLM, Display, TEXT("GPU GpuRowCost load-time warm-up for %s: M = %d skipped (%s; rulings 56, 57, 57a)."), *RowCostSubject(), M, *GpuStatusText(Why));
+		}
+	}
+
+	// Ruling 56 (1): F, the logits finish a token-ending one-row slice carries, at C(1) = C1 (us): phase 1's measurement
+	// (the max of its timed finishes), else g(1) x C(1) / 1000 from the cost table (the game's value, the default, the
+	// fallback). Within [0, C1].
+	int64 FinishPriceUs(int64 C1) const
+	{
+		const int64 F = RowCostFinishUs >= 0 ? RowCostFinishUs : GpuRows::DefaultFinishUs(RowsInput, C1);
+		return FMath::Clamp<int64>(F, 0, C1);
+	}
+
+	// Ruling 56 (1): the next one-row slice of a token that ends with its logits finish, LayersLeft layers left, priced at
+	// Pos (C(1, Pos) from the line): at most MaxLayers layers and AvailUnits units (a unit is C(1, Pos) / L, what l(1)
+	// counts). The slice that ends the token runs at most FinishSliceLayers layers beside the finish (its price
+	// l x (C - F) / L + F with the margin on the whole fits the room; at least 1). So it ends the token when the layers
+	// left are that few; otherwise it leaves exactly that many for the last slice. The ending slice uses
+	// ceil((l x (C - F) + F x L) / C) units; when that is more than the tick has left it waits, unless bMayOverrun (it
+	// is first in its share of the tick, so it always runs: no token is held forever). Returns the layers (0: none this
+	// tick) and, in OutUnits, the units the slice uses. Game thread.
+	// Ruling 56 (1), 58 (4): F in units of C(1, Pos) / L, rounded up (a finish-only step's units).
+	int32 FinishUnitsAt(int64 Pos)
+	{
+		const int64 C = FMath::Max<int64>(1, PlanAt(Pos).Plan.RowCostUs);
+		return static_cast<int32>((FinishPriceUs(C) * NumHiddenLayers + C - 1) / C);
+	}
+
+	int32 FinishingOneRowLayers(int64 Pos, int32 LayersLeft, int32 MaxLayers, int32 AvailUnits, bool bMayOverrun, int32& OutUnits)
+	{
+		OutUnits = 0;
+		if (LayersLeft <= 0 || MaxLayers <= 0 || AvailUnits <= 0 || NumHiddenLayers <= 0)
+		{
+			return 0;
+		}
+		const int64 L = NumHiddenLayers;
+		const int64 C = FMath::Max<int64>(1, GpuRowCost::RowCostAtUs(RowCostLine, FMath::Max<int64>(0, Pos)));
+		const int64 F = FinishPriceUs(C);
+		const int32 EndLayers = FMath::Max(1, FMath::Min(GpuRows::FinishSliceLayers(RowsInput, C, F), MaxLayers));
+		if (LayersLeft <= EndLayers)
+		{
+			const int32 Units = static_cast<int32>((static_cast<int64>(LayersLeft) * (C - F) + F * L + C - 1) / C);
+			if (Units > AvailUnits && !bMayOverrun)
+			{
+				return 0;
+			}
+			OutUnits = Units;
+			return LayersLeft;
+		}
+		const int32 Layers = FMath::Min3(MaxLayers, AvailUnits, LayersLeft - EndLayers);
+		OutUnits = Layers;
+		return Layers;
+	}
+
+	// The price of an attempt from its timed runs (GpuRowCost::PriceUs(): the max rounded up to 0.1 ms; -1 when it
+	// failed), after the test seam's arm for that attempt, if any: above 0 replaces the measured maximum, below 0 fails it.
+	int64 AttemptPriceUs(int32 Attempt, const TArray<double>& RunsUs) const
+	{
+		const double Arm = CalArmMaxUs.IsValidIndex(Attempt) ? CalArmMaxUs[Attempt] : 0.0;
+		if (Arm < 0.0)
+		{
+			return -1;
+		}
+		if (Arm > 0.0)
+		{
+			return GpuRowCost::PriceUs(&Arm, 1);
+		}
+		return GpuRowCost::PriceUs(RunsUs.GetData(), RunsUs.Num());
+	}
+
+	// Erratum E-16 (ruling 60): one of phase 1's timed runs, with its finish. When the set holds its 3 runs it is checked:
+	// a run over 3 x the median is dropped and re-timed (false: more timed runs are needed); a spread failure or a clean
+	// set ends the attempt (true; F is then the max of the kept runs' finishes). An armed attempt (the seam) is priced as
+	// before. Whichever thread owns the state.
+	bool TakePhase1TimedRun(double RunUs, double FinishUs, int32 WarmUpsRun)
+	{
+		RunUs += TakeTimedRunDelayUs(0);
+		CalRunsUs.Add(RunUs);
+		CalRunFinishUs.Add(FinishUs);
+		UE_LOG(LogSuperSLM, Display, TEXT("GPU GpuRowCost timed run for %s: phase 1, attempt %d, %.1f us (run %d of the set; ruling 60)."),
+			*RowCostSubject(), CalAttempt + 1, RunUs, CalRunsUs.Num());
+		if (CalRunsUs.Num() < kPhase1TimedRuns)
+		{
+			return false;
+		}
+		const bool bArmed = CalArmMaxUs.IsValidIndex(CalAttempt) && CalArmMaxUs[CalAttempt] != 0.0;
+		const GpuRowCost::FRunSetCheck Check = bArmed ? GpuRowCost::FRunSetCheck() : GpuRowCost::CheckRunSet(CalRunsUs.GetData(), CalRunsUs.Num(), CalExtraRuns);
+		const FString Before = RunsText(CalRunsUs);
+		if (Check.Step == GpuRowCost::ERunSet::Replace && CalSeqLength + Check.Drops < CalSeqCapFor())
+		{
+			DropRuns(CalRunsUs, &CalRunFinishUs, Check.DropMask, RowCostDroppedRunsUs);
+			CalExtraRuns += Check.Drops;
+			UE_LOG(LogSuperSLM, Display, TEXT("GPU GpuRowCost for %s: phase 1's runs [%s] us have %d over %d x the median %.1f us, dropped; timing %d more (extra %d of at most %d; ruling 60)."),
+				*RowCostSubject(), *Before, Check.Drops, GpuRowCost::kOutlierFactor, Check.MedianUs, Check.Drops, CalExtraRuns, GpuRowCost::kMaxOutlierExtraRuns);
+			return false;
+		}
+		CalFinishMaxUs = -1.0; // ruling 56 (1): F is the max of the kept runs' finishes
+		for (const double F : CalRunFinishUs)
+		{
+			CalFinishMaxUs = FMath::Max(CalFinishMaxUs, F);
+		}
+		const TArray<double> Runs = CalRunsUs;
+		if (Check.Step != GpuRowCost::ERunSet::Price)
+		{
+			EndCalibrationAttempt(-1, false, FString::Printf(TEXT("a spread failure: the timed runs [%s] us hold one over %d x the median %.1f us after the extra runs, ruling 60"),
+				*Before, GpuRowCost::kOutlierFactor, Check.MedianUs), WarmUpsRun, Runs, true);
+			return true;
+		}
+		EndCalibrationAttempt(AttemptPriceUs(CalAttempt, Runs), false, FString(), WarmUpsRun, Runs);
+		return true;
+	}
+
+	// An attempt ended: PriceUs (-1: it failed; Why says how), or the 2 s wall-clock cap passed (bTimedOut). A price
+	// outside the sanity range is retried once (GpuRowCost::Step()); a failure or a timeout is not. Ruling 60: a spread
+	// failure (bSpread) is retried once, apart from that retry, and falls back only on the second. Otherwise the
+	// calibration settles: on the price (logged, traced, kept for this model and adapter) or on the 6.2 ms default with a
+	// warning. Never refuses the model. Whichever thread owns the state (the preparing thread before it is published,
+	// the game thread after).
+	void EndCalibrationAttempt(int64 PriceUs, bool bTimedOut, const FString& Why, int32 WarmUpsRun, const TArray<double>& RunsUs, bool bSpread = false)
+	{
+		RowCostAttempts = CalAttempt + 1;
+		RowCostWarmUpRuns = WarmUpsRun;
+		RowCostRunsUs = RunsUs;
+		GpuRowCost::EStep Step = GpuRowCost::EStep::FallBack;
+		if (bSpread && !bTimedOut)
+		{
+			++RowCostSpreadFailures;
+			Step = bCalSpreadRetried ? GpuRowCost::EStep::FallBack : GpuRowCost::EStep::Retry;
+			bCalSpreadRetried = true;
+		}
+		else if (!bTimedOut)
+		{
+			Step = GpuRowCost::StepPhase1(CalRangeAttempt, PriceUs);
+			CalRangeAttempt += Step == GpuRowCost::EStep::Retry ? 1 : 0;
+		}
+		if (Step == GpuRowCost::EStep::Retry)
+		{
+			if (bSpread)
+			{
+				UE_LOG(LogSuperSLM, Log, TEXT("GPU GpuRowCost: attempt %d for %s was %s; not cached, measuring once more."), CalAttempt + 1, *RowCostSubject(), *Why);
+			}
+			else
+			{
+				UE_LOG(LogSuperSLM, Log, TEXT("GPU GpuRowCost: attempt %d for %s priced %lld us, outside [%lld, %lld] us; measuring once more (ruling 48)."),
+					CalAttempt + 1, *RowCostSubject(), PriceUs, GpuRowCost::kSanityMinUs, GpuRowCost::kSanityMaxUs);
+			}
+			++CalAttempt;
+			CalToken = 0;
+			CalLayerPos = 0;
+			CalTokenUs = 0.0;
+			CalRunsUs.Reset();
+			CalRunFinishUs.Reset(); // ruling 60: each attempt's set is its own
+			CalExtraRuns = 0;
+			CalFinishMaxUs = -1.0; // ruling 56 (1): F is the settling attempt's
+			CalWidenNext = 0; // ruling 56a: the widened warm-ups run once per M per phase-1 attempt
+			bCalWidened = false;
+			CalAttemptSlices = 0; // ruling 50: the retry's first slice is 1 layer again (p is kept)
+			CalStartSeconds = FPlatformTime::Seconds(); // ruling 54: the wall-clock cap is per attempt
+			return;
+		}
+		GRowCostCalibrationCount.fetch_add(1);
+		CalJob.Reset(); // a slice still in flight runs before anything planned from now on (the queue is FIFO)
+		const GpuRowCost::FChoice Choice = GpuRowCost::Choose(false, 0.0, true, Step == GpuRowCost::EStep::Use ? PriceUs : -1);
+		if (Choice.Source == GpuRowCost::ESource::Calibrated)
+		{
+			// Ruling 54: phase 1 settles C_a at pos_a (its last timed token's position), with the default slope; at B > 0
+			// phase 2 then measures the slope at P2 behind the generations.
+			CalSettledAttempt = CalAttempt;
+			const GpuRowCost::FRowCostLine Line = GpuRowCost::DefaultSlopeLine(PriceUs, FMath::Max<int64>(0, CalSeqLength - 1));
+			ApplyRowCost(Choice.Source, Choice.RowCostMs, Line);
+			// Ruling 56 (1): F, the max of the attempt's timed finishes.
+			RowCostFinishUs = CalFinishMaxUs >= 0.0 ? static_cast<int64>(FMath::CeilToDouble(CalFinishMaxUs)) : -1;
+			const int64 FinishUs = RowCostFinishUs;
+			if (bArtifactHashKnown)
+			{
+				CacheRowCost(ArtifactHash, AdapterLuid, bDeviceLogitsHead, [PriceUs, &Line, FinishUs](FRowCostCacheEntry& E)
+				{
+					E.PriceUs = PriceUs;
+					E.bFallBack = false;
+					E.Line = Line;
+					E.bSlopeMeasured = false;
+					E.bLateFailed = false;
+					E.FinishUs = FinishUs;
+				});
+			}
+			PendingRowCostTraceUs = PriceUs; // ruling 51 F10: the game thread writes the counter
+			const bool bPhase2 = GpuRowCost::RunsPhase2(Config.SchemaJumpGpuFrameBudgetMs);
+			UE_LOG(LogSuperSLM, Log, TEXT("GPU GpuRowCost calibrated for %s: %.1f ms (C_a, at position %lld), the max of %d runs rounded up to 0.1 ms (attempt %d of at most %d; ruling 48); the line grows by the default slope, %.4f us per position, %s (rulings 53, 54)."),
+				*RowCostSubject(), Choice.RowCostMs, Line.AnchorPos, RunsUs.Num(), RowCostAttempts, GpuRowCost::kMaxAttempts, SlopeUsPerPosition(Line),
+				bPhase2 ? TEXT("until the late position is measured behind the generations") : TEXT("with no frame budget (the late position is not measured)"));
+			UE_LOG(LogSuperSLM, Log, TEXT("GPU GpuRowCost finish for %s: %s; a slice that ends a token is priced l x (C(1, pos) - F) / L + F (ruling 56)."),
+				*RowCostSubject(), FinishUs >= 0 ? *FString::Printf(TEXT("F %lld us, the max of %d timed finishes"), FinishUs, RunsUs.Num())
+					: TEXT("not measured; F is g(1) x C(1) / 1000"));
+			if (bPhase2)
+			{
+				StartRowCostPhase2();
+			}
+			return;
+		}
+		ApplyRowCost(Choice.Source, Choice.RowCostMs, GpuRowCost::FlatLine(GpuRowCost::kDefaultRowCostUs));
+		const FString What = bTimedOut
+			? FString::Printf(TEXT("timed out (%.0f s of wall clock, rulings 48a and 51)"), CalTimeoutSeconds())
+			: bSpread
+				? FString::Printf(TEXT("failed on attempt %d with its second spread failure (%s)"), RowCostAttempts, *Why)
+			: PriceUs < 0
+				? FString::Printf(TEXT("failed on attempt %d (%s)"), RowCostAttempts, Why.IsEmpty() ? TEXT("no GPU time was measured") : *Why)
+				: FString::Printf(TEXT("priced %lld us on its retry, outside [%lld, %lld] us again"), PriceUs, GpuRowCost::kSanityMinUs, GpuRowCost::kSanityMaxUs);
+		UE_LOG(LogSuperSLM, Warning, TEXT("GPU GpuRowCost calibration for %s %s; the row cost is the %.1f ms default (ruling 48). It is not measured again in this process (ruling 51)."),
+			*RowCostSubject(), *What, Choice.RowCostMs);
+		if (bArtifactHashKnown)
+		{
+			CacheRowCost(ArtifactHash, AdapterLuid, bDeviceLogitsHead, [](FRowCostCacheEntry& E) // ruling 51 F2: warned once per process
+			{
+				E.PriceUs = 0;
+				E.bFallBack = true;
+				E.Line = GpuRowCost::FlatLine(GpuRowCost::kDefaultRowCostUs);
+				E.bSlopeMeasured = false;
+				E.FinishUs = -1;
+			});
+		}
+	}
+
+	// Ruling 51 F2: the calibration's wall-clock cap, 10 s with a frame budget (one slice per tick) and 2 s without.
+	double CalTimeoutSeconds() const
+	{
+		return Config.SchemaJumpGpuFrameBudgetMs > 0.0 ? kRowCostCalibrationTimeoutSecondsAtBudget : kRowCostCalibrationTimeoutSeconds;
+	}
+
+	// Ruling 51 F10: the trace counter's only writer, on the game thread (Tick()).
+	void PublishRowCostTrace()
+	{
+		if (PendingRowCostTraceUs > 0)
+		{
+			TRACE_COUNTER_SET(SuperSLMGpuCalibratedRowCostUs, PendingRowCostTraceUs);
+			PendingRowCostTraceUs = 0;
+		}
+	}
+
+	// Ruling 50: one slice of the token in flight, as the next tick job. An attempt's first slice is 1 layer; each later
+	// one carries max(1, floor(B / (p x margin))) units (the margin is ruling 51 F6's), B the room (B_eff less the scene share) and p the largest per-unit cost
+	// measured so far. A slice takes at most the layers the token has left; the logits finish rides with the last layers
+	// only once a finish has been measured and it fits in the units, and otherwise runs as its own slice (Layers 0). A
+	// single unit over B is still one slice (the ruling-43 case). CalLayerPos past the last layer means only the finish
+	// is left.
+	void IssueCalibrationSlice()
+	{
+		// Ruling 56 (2): after the warm-up tokens, before the first timed one, each widened row kernel the chooser can pick
+		// (ruling 57 F5: CalWidenMask; none with multi-row off) runs once, one layer of M zero rows in its own
+		// tick, when that layer fits the room at the per-layer cost with the finish taken out (ruling 57 F1): r(M) x
+		// CalMaxLayerUs x margin <= B / 2 (ruling 59.2). One that does not fit is skipped with a Display line (never over B; ruling 57a).
+		while (!bCalWidened && CalToken == kPhase1WarmUpRuns && CalLayerPos == 0)
+		{
+			if (CalWidenNext >= kWidenWarmUpCount || !MultiRowOn())
+			{
+				bCalWidened = true;
+				break;
+			}
+			const int32 M = kWidenWarmUpRows[CalWidenNext];
+			if ((CalWidenMask >> M & 1u) == 0)
+			{
+				++CalWidenNext; // ruling 57 F5: not a width the chooser can pick, so not warmed
+				continue;
+			}
+			const double LayerUs = CalMaxLayerUs * static_cast<double>(RowsInput.CostRatioPerMille[M - 1]) / 1000.0
+				* static_cast<double>(1000 + Config.GpuRowsMarginPerMille) / 1000.0;
+			// Ruling 59.2: skipped above HALF the room -- the other half absorbs the first use's excess, so the warm-up's tick stays
+			// within B (the warm-up is not exempt from it).
+			if (!(CalMaxLayerUs > 0.0) || CalRoomUs <= 0 || LayerUs * 2.0 > static_cast<double>(CalRoomUs))
+			{
+				UE_LOG(LogSuperSLM, Display, TEXT("GPU GpuRowCost load-time warm-up for %s: M = %d skipped, one layer is %.0f us with the margin (a layer measured at %.0f us, the finish taken out), over half the room of %lld us (rulings 56, 57, 57a, 59.2)."),
+					*RowCostSubject(), M, LayerUs, CalMaxLayerUs, CalRoomUs);
+				++CalWidenNext;
+				continue;
+			}
+			TSharedPtr<FJob> Job = MakeShared<FJob>();
+			Job->bTickJob = true;
+#if WITH_DEV_AUTOMATION_TESTS
+			Job->TestTick = TickIndex;
+#endif
+			FJob::FCalibrationStep& C = Job->Calibration;
+			C.bActive = true;
+			C.WidenRows = M;
+			C.Attempt = CalAttempt;
+			C.SeqCap = CalSeqCapFor();
+			CalJob = Enqueue(Job);
+			return;
+		}
+		int64 Units = 1;
+		if (CalAttemptSlices > 0 && CalMaxUnitUs > 0.0 && CalRoomUs > 0)
+		{
+			// Ruling 51 F6: with the plan's margin (GpuRowsMarginPerMille, 150 by default: p x 1.15).
+			const double MarginedUnitUs = CalMaxUnitUs * static_cast<double>(1000 + Config.GpuRowsMarginPerMille) / 1000.0;
+			Units = FMath::Max<int64>(1, static_cast<int64>(FMath::FloorToDouble(static_cast<double>(CalRoomUs) / MarginedUnitUs)));
+		}
+		TSharedPtr<FJob> Job = MakeShared<FJob>();
+		Job->bTickJob = true;
+#if WITH_DEV_AUTOMATION_TESTS
+		Job->TestTick = TickIndex; // ruling 45 (GetTickGpuBusyUs())
+#endif
+		FJob::FCalibrationStep& C = Job->Calibration;
+		C.bActive = true;
+		const int32 LayersLeft = FMath::Max(0, NumHiddenLayers - CalLayerPos);
+		C.Layers = static_cast<int32>(FMath::Min<int64>(Units, LayersLeft));
+		C.bEmbed = CalLayerPos == 0;
+		C.bFinish = C.Layers == 0 || (C.Layers == LayersLeft && bCalFinishMeasured && C.Layers + 1 <= Units);
+		C.Attempt = CalAttempt;
+		C.SeqCap = CalSeqCapFor(); // E-14: room for phase 2's read to P2 on the same sequence
+		++CalAttemptSlices;
+		CalJob = Enqueue(Job);
+	}
+
+	// Ruling 48: the calibration at a frame budget (SchemaJumpGpuFrameBudgetMs set), driven by Tick(). Each tick carries
+	// at most one slice, sized by ruling 50 from the costs measured so far (IssueCalibrationSlice()) -- so no tick holds
+	// more calibration than one slice, and the planner plans nothing else while it runs, so the first generation waits
+	// for the price it is planned with. Returns true while it holds the tick. Game thread.
+	bool RowCostCalibrationTick()
+	{
+		if (!bRowCostPending)
+		{
+			return false;
+		}
+		const double Now = FPlatformTime::Seconds();
+		if (CalStartSeconds <= 0.0)
+		{
+			CalStartSeconds = Now; // the first slice starts the 2 s clock
+		}
+		if (CalJob.IsValid() && CalJob->bDone.load(std::memory_order_acquire))
+		{
+			const TSharedPtr<FJob> Done = MoveTemp(CalJob);
+			CalJob.Reset();
+			const FJob::FCalibrationStep& Step = Done->Calibration;
+			if (Done->bSkipped || Step.bNoSequence || Step.Status != FGpuStatus::SSLM_OK)
+			{
+				const FString Why = Done->bSkipped ? FString(TEXT("the slice did not run"))
+					: Step.bNoSequence ? FString::Printf(TEXT("sslm_gpu_seq_create returned %s"), *GpuStatusText(Step.Status))
+					: GpuStatusText(Step.Status);
+				if (bTerminalLoss.load())
+				{
+					return true; // ruling 51 F3: a confirmed loss is the device-lost path's (the next Tick()), not a fallback
+				}
+				EndCalibrationAttempt(-1, false, Why, FMath::Min(CalToken, kPhase1WarmUpRuns), CalRunsUs);
+				return bRowCostPending; // a failure is never retried: settled, so this tick plans
+			}
+			if (Step.WidenRows > 0)
+			{
+				// Ruling 56 (2): a widened warm-up, untimed: nothing of it is the token's time or p.
+				NoteWidenWarmUp(Step.WidenRows, (Step.WidenRanMask >> Step.WidenRows & 1u) != 0, Step.WidenStatus);
+				++CalWidenNext;
+			}
+			else
+			{
+				CalTokenUs += Step.SliceUs;
+				CalLayerPos += Step.Layers;
+				// Ruling 50: p is the largest per-unit cost so far; a finish in the slice is one more unit.
+				const int32 Units = Step.Layers + (Step.bFinish ? 1 : 0);
+				if (Units > 0)
+				{
+					CalMaxUnitUs = FMath::Max(CalMaxUnitUs, Step.SliceUs / Units);
+				}
+				if (Step.Layers > 0)
+				{
+					// Ruling 57 F1: the per-layer cost, the slice's finish (timed on its own) taken out.
+					const double FinishPartUs = Step.bFinish ? FMath::Max(0.0, Step.FinishUs) : 0.0;
+					CalMaxLayerUs = FMath::Max(CalMaxLayerUs, FMath::Max(0.0, Step.SliceUs - FinishPartUs) / Step.Layers);
+				}
+				bCalFinishMeasured = bCalFinishMeasured || Step.bFinish;
+				if (Step.bFinish) // the token is done when its finish has run
+				{
+					const bool bTimed = CalToken >= kPhase1WarmUpRuns;
+					const double TokenUs = CalTokenUs;
+					++CalToken;
+					++CalSeqLength; // E-14: the token's position on the throwaway sequence
+					CalLayerPos = 0;
+					CalTokenUs = 0.0;
+					// Ruling 60: the set is checked once it holds its runs (a dropped run is re-timed by the next token); ruling
+					// 56 (1): F is the max of the kept runs' finishes.
+					if (bTimed && TakePhase1TimedRun(TokenUs, Step.FinishUs, kPhase1WarmUpRuns) && !bRowCostPending)
+					{
+						return false;
+					}
+				}
+			}
+		}
+		if (bCalForceTimeout || Now - CalStartSeconds > CalTimeoutSeconds())
+		{
+			bCalForceTimeout = false;
+			EndCalibrationAttempt(-1, true, FString(), FMath::Min(CalToken, kPhase1WarmUpRuns), CalRunsUs);
+			return false;
+		}
+		if (!CalJob.IsValid())
+		{
+			IssueCalibrationSlice();
+		}
+		return true;
+	}
+
+	// Ruling 56 (3), E14_4's diagnosis: a sequence that has work and gets no action for kStallTicks ticks in a row is a
+	// stall (a sequence served at all is served within a few ticks: BlockCount, the cap's K). Its planner state is logged
+	// once, as a Warning so a box run exports it; nothing is changed. Game thread, once per tick.
+	static constexpr int32 kStallTicks = 600;
+	void NoteStalls(const FJob& Job)
+	{
+		for (int32 SlotIndex = 0; SlotIndex < Slots.Num(); ++SlotIndex)
+		{
+			FGameSlot& S = Slots[SlotIndex];
+			bool bServed = false;
+			for (const FAction& A : Job.Actions)
+			{
+				bServed |= A.Slot == SlotIndex;
+			}
+			if (!S.bVended || bServed || !HasWork(S))
+			{
+				S.StallTicks = 0;
+				S.bStallWarned = false;
+				continue;
+			}
+			if (++S.StallTicks < kStallTicks || S.bStallWarned)
+			{
+				continue;
+			}
+			S.bStallWarned = true;
+			const FPendingEvent* Front = S.Pending.Num() > 0 ? &S.Pending[0] : nullptr;
+			const int64 Pos = NextPosition(S);
+			const int32 Cap = OneRowLayerCapAt(Pos);
+			UE_LOG(LogSuperSLM, Warning, TEXT("GPU planner stall (ruling 56, E14_4): sequence %lld has had work and no action for %d ticks: %s, phase %d, prompt %d of %d planned, ")
+				TEXT("tokens %d issued of %d (%d generated), layer %d, rows %d (kind %d, layer %d, slice %d, per slice %d, await close %d), primed %d, in prompt %d, held %d, ")
+				TEXT("%d pending (front: apply tick %lld, done %d), next position %lld, l(1) there %d; tick %lld, %d tick jobs outstanding (K %d), LayersPerTick %d, ")
+				TEXT("turn to Composed %d, phase 2 %d (stage %d, sequence length %lld, slice %s), row cost pending %d."),
+				S.Id, S.StallTicks, S.Path == ESuperSLMGpuDecodePath::OneCall ? TEXT("OneCall") : TEXT("Composed"), static_cast<int32>(S.Phase),
+				S.PromptPlanned, S.Request.PromptTokens.Num(), S.TokensIssued, S.Request.MaxNewTokens, S.Generated.Num(), S.PlanLayerPos,
+				S.PlanRows, static_cast<int32>(S.PlanRowsKind), S.PlanRowsLayer, S.PlanRowsSlice, S.PlanRowsPerSlice, S.bPlanAwaitClose ? 1 : 0,
+				S.bPlanPrimed ? 1 : 0, S.bPlanInPrompt ? 1 : 0, S.bHeldThisTick ? 1 : 0,
+				S.Pending.Num(), Front != nullptr ? Front->ApplyTick : -1LL,
+				Front != nullptr && Front->Job.IsValid() ? (Front->Job->bDone.load(std::memory_order_acquire) ? 1 : 0) : -1,
+				Pos, Cap == MAX_int32 ? -1 : Cap, TickIndex, OutstandingTickJobs.load(), Config.K, LayersPerTick,
+				bOneRowTurnToComposed ? 1 : 0, bCalPhase2 ? 1 : 0, CalP2Stage, CalSeqLength,
+				!CalJob.IsValid() ? TEXT("none") : CalJob->bDone.load(std::memory_order_acquire) ? TEXT("done") : TEXT("in flight"),
+				bRowCostPending ? 1 : 0);
+		}
+	}
+
 	void PlanAndIssue()
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Tick.Plan", SuperSLMGpuChannel);
+		CollectRowCostPhase2(); // ruling 54: phase 2's slice in flight, before this tick plans
 		// _ALWAYS: TCounter::Set() elides a value equal to its cached one, so a constant (K, LayersPerSlice)
 		// or one that settled before a capture began would record no sample in that capture. Once per
 		// tick; a no-op branch when CountersChannel is off. The same holds for DueTokens and the tick's
@@ -6212,8 +9766,12 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 #if WITH_DEV_AUTOMATION_TESTS
 		// Test access only: the delay is fixed when the job is created (ruling 2026-09-26, item 12).
 		Job->PostCallDelaySeconds = TestSubmissionDelaySeconds;
+		Job->TestTick = TickIndex; // ruling 45 (GetTickGpuBusyUs())
 #endif
 		const double Now = FPlatformTime::Seconds();
+		UpdateColdRamp(Now); // run 5 (rulings 59a, 59b): the finished jobs, then whether this tick follows an idle gap
+		bTickShortBatched = false; // ruling 59.1
+		bColdHeldWork = false;
 
 		// Ruling 2026-09-26, the global cap (finding 3): no new token starts, on either path, while
 		// K or more tick jobs are outstanding, read once here. Plan enqueues at most one tick job
@@ -6226,7 +9784,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		const bool bCapBinding = OutstandingTickJobsAtPlan >= Config.K;
 		auto IsDue = [this, bCapBinding](const FGameSlot& S, ESuperSLMGpuDecodePath Path)
 		{
-			return S.Path == Path && HasWork(S) && !(AtTokenBoundary(S) && (S.bHeldThisTick || bCapBinding));
+			return S.Path == Path && HasWork(S) && !S.bPlanAwaitClose && !(AtTokenBoundary(S) && (S.bHeldThisTick || bCapBinding));
 		};
 #if WITH_DEV_AUTOMATION_TESTS
 		FSuperSLMGpuPlanLogEntry* PlanLog = nullptr;
@@ -6270,6 +9828,16 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		// build seat's head prefix, so a build turn and a one-call token cost the same, the seat is
 		// served within BlockCount + 1 ticks, and MinimumK counts it (PrepareGpuState()). The cap
 		// holds the seat back like any new token.
+		// MR6's seam: the records of this tick's composed one-row slices, which run inside the batch call when there is
+		// more than one of them (bBatched). A OneCall one-row slice (ruling 42 R1) is never batched (ruling 43 N2).
+		TArray<int32, TInlineAllocator<16>> OneRowSliceRecords;
+		int32 OneRowSlices = 0;
+		// Ruling 43 N2: below one row, the units this tick's OneCall action uses, which Composed's share nets out.
+		int32 OneCallUnits = 0;
+		// Ruling 58 (4): at or above one row, the units the OneCall action bills although it is not sliced -- L for a whole
+		// token, a prompt token or a build turn (a whole token's l(C - F) + F x L over C is L), F's units for a finish-only
+		// step. 0 when OneCallUnits holds the action's units, or no action was planned.
+		int32 OneCallWholeUnits = 0;
 		TArray<int32, TInlineAllocator<16>> OneCallDue;
 		for (int32 SlotIndex = 0; SlotIndex < Slots.Num(); ++SlotIndex)
 		{
@@ -6284,8 +9852,41 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		{
 			OneCallDue.Add(BuildSeatIndex);
 		}
+		// Ruling 43 N2: below one row, l(1) units are the whole tick; while a Composed sequence is due too, the two paths
+		// take the contended ticks in turn, and on Composed's turn no OneCall action is planned.
+		// Erratum E-14 (ruling 53): the tick's shared budget is priced at the furthest position a due sequence's slice may
+		// end at this tick (its next position plus a chunk's rows), so no slice planned against it costs more than it was
+		// billed; a OneCall action is sized at its own end position.
+		int64 TickPos = 0;
+		for (const FGameSlot& Due1 : Slots)
+		{
+			if (IsDue(Due1, ESuperSLMGpuDecodePath::OneCall) || IsDue(Due1, ESuperSLMGpuDecodePath::Composed))
+			{
+				TickPos = FMath::Max<int64>(TickPos, NextPosition(Due1) + GpuRows::MaxRows - 1);
+			}
+		}
+		const bool bTickSlicesOneRow = OneCallSlicesOneRowAt(TickPos);
+		bool bComposedDue = false;
+		for (const FGameSlot& Other : Slots)
+		{
+			bComposedDue |= IsDue(Other, ESuperSLMGpuDecodePath::Composed);
+		}
+		bool bOneCallYields = false;
+		if (OneCallDue.Num() > 0 && bTickSlicesOneRow)
+		{
+			if (bComposedDue)
+			{
+				bOneCallYields = bOneRowTurnToComposed;
+				bOneRowTurnToComposed = !bOneRowTurnToComposed;
+			}
+		}
+		else if (OneCallDue.Num() > 0 && bComposedDue && bComposedOwedTurn)
+		{
+			bOneCallYields = true; // ruling 58 (4): the turn the previous tick's whole OneCall action owed Composed
+		}
+		bComposedOwedTurn = false;
 		int32 OneCallChosen = INDEX_NONE;
-		if (OneCallDue.Num() > 0)
+		if (OneCallDue.Num() > 0 && !bOneCallYields)
 		{
 			OneCallChosen = OneCallDue[0];
 			for (const int32 Candidate : OneCallDue)
@@ -6298,39 +9899,154 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			}
 			OneCallCursor = OneCallChosen;
 		}
-		if (OneCallChosen == BuildSeatIndex && BuildHead != nullptr)
+		if (OneCallChosen == BuildSeatIndex && BuildHead != nullptr && IsCold())
+		{
+			// Ruling 59c point 6: a build turn feeds one whole prefix token (sslm_gpu_prefix_prefill takes a whole token's
+			// dispatches, never part of one), so it cannot be sliced at the ramp's layers: on a cold tick it waits, and that
+			// wait is the cold rule holding work (an otherwise empty tick ends the ramp, so the seat is never held for good).
+			bColdHeldWork = true;
+		}
+		else if (OneCallChosen == BuildSeatIndex && BuildHead != nullptr)
 		{
 			PlanBuildTurn(*BuildHead, Job);
+			OneCallWholeUnits = NumHiddenLayers; // a build turn costs a one-call token
 		}
 		else if (OneCallChosen != INDEX_NONE)
 		{
 			const int32 SlotIndex = OneCallChosen;
 			FGameSlot& S = Slots[SlotIndex];
-			LogStarted(S.Id);
-			FAction A;
-			A.Slot = SlotIndex;
-			A.Gen = S.Gen;
-			WantsAdapterBind(S, A);
-			if (PromptLeft(S))
+			const int32 L = NumHiddenLayers;
+			if (S.PlanRows > 0 && S.PlanRowsKind == ERowsKind::Exact && S.PlanExactSlices.Num() == 0)
 			{
-				const int32 PromptIndex = S.PromptPlanned++;
-				A.Kind = EActionKind::OneCallPromptToken;
-				FillPrompt(S, A, PromptIndex);
-				const bool bLast = !PromptLeft(S);
-				const int32 Index = Job->Actions.Add(MoveTemp(A));
-				if (bLast)
+				// Ruling 51 F1: an open Exact chunk with no Exact schedule is a planner bug; the op fails, nothing is indexed.
+				FaultSlot(S, ESuperSLMDecodeOutcome::Generating, ESuperSLMGpuFaultReason::RecoverablePerSequenceRejection,
+					TEXT("internal error: an Exact chunk is open but the plan has no Exact schedule (ruling 51)"));
+			}
+			else if (S.PlanRows > 0)
+			{
+				// MR6 (§5.2): the open chunk's next slice -- l(M) layers of a prompt chunk, the schedule's next of an
+				// Exact chunk. A chunk-open sequence stays due and is served in the rotation like any other.
+				int32 Layers = S.PlanRowsKind == ERowsKind::Exact
+					? S.PlanExactSlices[FMath::Min(S.PlanRowsSlice, S.PlanExactSlices.Num() - 1)]
+					: ColdLayers(FMath::Min(S.PlanRowsPerSlice, L - S.PlanRowsLayer)); // run 5: the cold ramp
+				if (S.PlanRowsKind == ERowsKind::Exact && S.PlanRowsSlice < S.PlanExactSlices.Num() && IsCold())
 				{
-					PromptCompleted(S, Job->Actions[Index], Job, Index, TickIndex, Now, SimSeconds);
+					// Run 5 (59b M1): an Exact chunk open across an idle gap. Its schedule's next slice is split, the ramp's
+					// layers now and the rest as the slice after it (which keeps the close's logits stage when this was the
+					// last): rows, drafts and tokens are unchanged, only the ticks the chunk takes.
+					const int32 Cut = ColdLayers(Layers);
+					if (Cut < Layers)
+					{
+						S.PlanExactSlices[S.PlanRowsSlice] = Layers - Cut;
+						S.PlanExactSlices.Insert(Cut, S.PlanRowsSlice);
+						Layers = Cut;
+					}
 				}
+				// An Exact slice is sized to the room alone (its close adds the logits stage), so it takes the whole tick.
+				OneCallUnits = S.PlanRowsKind == ERowsKind::Exact ? OneRowLayerCapAt(TickPos) : RowsUnits(S.PlanRows, Layers);
+				PlanRowsSlice(S, SlotIndex, Job, FAction(), ERowsKind::None, 0, Layers, Now);
+			}
+			else if (S.PlanLayerPos > 0)
+			{
+				// Ruling 42 R1: a one-row token below one row, in flight: its next l(1) layers.
+				FAction A;
+				A.Slot = SlotIndex;
+				A.Gen = S.Gen;
+				const int32 Cap = ColdOneRowCap(OneRowLayerCapAt(S.PlanTokenPos)); // run 5: the cold ramp (59b M1: a whole token is sliced while cold)
+				int32 Layers = FMath::Min(Cap, L - S.PlanLayerPos);
+				OneCallUnits = Layers;
+				if (Cap < MAX_int32 && !S.bPlanInPrompt)
+				{
+					// Ruling 56 (1): the slice that ends the token carries its finish, priced with it.
+					Layers = FinishingOneRowLayers(S.PlanTokenPos, L - S.PlanLayerPos, Cap, Cap, true, OneCallUnits);
+				}
+				PlanOneRowSlice(S, Job, MoveTemp(A), Layers, Now, OneRowSlices, OneRowSliceRecords);
 			}
 			else
 			{
-				A.Kind = EActionKind::OneCallToken;
-				TakeBeginLimits(S, A);
-				const int32 Index = Job->Actions.Add(MoveTemp(A));
-				S.bPlanPrimed = false;
-				S.TokensIssued += 1;
-				AddTokenEvent(S, Job, Index, TickIndex, Now, SimSeconds);
+				LogStarted(S.Id);
+				FAction A;
+				A.Slot = SlotIndex;
+				A.Gen = S.Gen;
+				WantsAdapterBind(S, A);
+				const int32 PromptRows = PromptLeft(S) ? PromptRowsFor(S) : 0;
+				const int64 Pos = NextPosition(S); // E-14: where this action's first row goes
+				// E-14: an Exact chunk opens only when M_exact has a schedule at its last row's position; otherwise this
+				// token runs as Off's step (the same tokens).
+				TArray<int32, TInlineAllocator<16>> ExactHere;
+				if (PromptRows == 0 && S.bExactRows && !S.bPlanPrimed && ExactSlices.Num() > 0)
+				{
+					ExactHere = PlanAt(Pos + RowsPlan.MExact - 1).ExactSlices;
+				}
+				if (PromptRows >= 2)
+				{
+					// MR6 (§5.2): embed_rows(PROMPT, min(k, M_max)), then l(M) layers per slice until the close (E-14: l(M) at
+					// the chunk's last row's position).
+					S.PlanRowsPerSlice = PlanAt(Pos + PromptRows - 1).Plan.LayersPerSlice[PromptRows - 1];
+					const int32 FirstLayers = ColdLayers(FMath::Min(S.PlanRowsPerSlice, L)); // run 5: the cold ramp
+					OneCallUnits = RowsUnits(PromptRows, FirstLayers);
+					PlanRowsSlice(S, SlotIndex, Job, MoveTemp(A), ERowsKind::Prompt, PromptRows, FirstLayers, Now);
+				}
+				else if (PromptRows == 1 && (OneCallSlicesOneRowAt(Pos) || IsCold()))
+				{
+					// Ruling 42 R1: below one row, the prompt token is sliced at l(1) layers per tick (1.17's slicing); run 5
+					// (59b M1): so is a whole one on a cold tick, at the ramp's layers.
+					OneCallUnits = ColdOneRowCap(OneRowLayerCapAt(Pos));
+					PlanOneRowSlice(S, Job, MoveTemp(A), OneCallUnits, Now, OneRowSlices, OneRowSliceRecords);
+				}
+				else if (PromptRows == 1)
+				{
+					const int32 PromptIndex = S.PromptPlanned++;
+					A.Kind = EActionKind::OneCallPromptToken;
+					OneCallWholeUnits = L; // ruling 58 (4)
+					FillPrompt(S, A, PromptIndex);
+					const bool bLast = !PromptLeft(S);
+					const int32 Index = Job->Actions.Add(MoveTemp(A));
+					RecordAction(S, Job->Actions[Index], 0, 1, 0, L, false, false, 1);
+					if (bLast)
+					{
+						PromptCompleted(S, Job->Actions[Index], Job, Index, TickIndex, Now, SimSeconds);
+					}
+				}
+				else if (S.bExactRows && !S.bPlanPrimed && ExactSlices.Num() == 0)
+				{
+					// Ruling 51 F1: Exact admitted with no Exact schedule is a planner bug; the op fails, nothing is indexed.
+					FaultSlot(S, ESuperSLMDecodeOutcome::Generating, ESuperSLMGpuFaultReason::RecoverablePerSequenceRejection,
+						TEXT("internal error: the sequence was admitted for Exact but the plan has no Exact schedule (ruling 51)"));
+				}
+				else if (S.bExactRows && !S.bPlanPrimed && ExactHere.Num() > 0 && !IsCold())
+				{
+					// Run 5: an Exact chunk opens only off the cold ramp; on a cold tick this token runs as Off's step (the
+					// same tokens, the E-14 fallback), whose slices the ramp sizes.
+					// MR6 (§4.7; MR-D11): an Exact chunk of up to M_exact rows, [the pending token, the forced chain's
+					// drafts], sliced by the Exact schedule; its close delivers the committed drafts and the produced
+					// token.
+					if (const USuperSLMSubsystem* Cpu = CpuDrafts.Get())
+					{
+						A.DraftTable = FSuperSLMExactDraftProvider::Snapshot(*Cpu, ArtifactHash, S.Schema.Index);
+					}
+					OneCallUnits = OneRowLayerCapAt(TickPos); // an Exact slice is sized to the room alone
+					S.PlanExactSlices = ExactHere;
+					PlanRowsSlice(S, SlotIndex, Job, MoveTemp(A), ERowsKind::Exact, RowsPlan.MExact, ExactHere[0], Now);
+				}
+				else if (!S.bPlanPrimed && (OneCallSlicesOneRowAt(Pos) || IsCold()))
+				{
+					// Ruling 42 R1: below one row, a decode token is sliced at l(1) layers per tick (1.17's slicing); a
+					// primed finish-only step stays one action. Run 5 (59b M1): a whole one is too on a cold tick.
+					OneCallUnits = ColdOneRowCap(OneRowLayerCapAt(Pos));
+					PlanOneRowSlice(S, Job, MoveTemp(A), OneCallUnits, Now, OneRowSlices, OneRowSliceRecords);
+				}
+				else
+				{
+					A.Kind = EActionKind::OneCallToken;
+					OneCallWholeUnits = S.bPlanPrimed ? FinishUnitsAt(TickPos) : L; // ruling 58 (4)
+					TakeBeginLimits(S, A);
+					const int32 Index = Job->Actions.Add(MoveTemp(A));
+					RecordAction(S, Job->Actions[Index], 0, 1, 0, S.bPlanPrimed ? 0 : L, false, false, 0);
+					S.bPlanPrimed = false;
+					S.TokensIssued += 1;
+					AddTokenEvent(S, Job, Index, TickIndex, Now, SimSeconds);
+				}
 			}
 		}
 
@@ -6351,7 +10067,33 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		// per-tick "how many are due" figure §5.1 names (mirrors DeliveredTokens,
 		// TRACE_COUNTER_INCREMENT'd once per token actually applied, in ApplyResult()).
 		TRACE_COUNTER_SET_ALWAYS(SuperSLMGpuDueTokens, OneCallDue.Num() + Due.Num());
-		int32 Remaining = LayersPerTick;
+		// Ruling 42 M1 (§5.3): with multi-row on and the knob set, the tick's units are also capped by B_eff -- the units
+		// l(1) buys (a unit is one row-layer). With multi-row off, 1.17's LayersPerTick, uncapped (P4.4).
+		const int32 TickCap = OneRowLayerCapAt(TickPos);
+		const int32 WarmRemaining = FMath::Min(LayersPerTick, TickCap); // E-14: priced at TickPos
+		int32 Remaining = TickCap < MAX_int32 ? ColdLayers(WarmRemaining) : WarmRemaining; // run 5: only a capped tick is derated (59b H2)
+		const int32 ComposedShare = Remaining;
+		// Ruling 58 (4): the OneCall action is billed at its real cost, sliced or whole.
+		const int32 OneCallBilled = OneCallUnits > 0 ? OneCallUnits : OneCallWholeUnits;
+		// Ruling 58 (4): at or above one row, a OneCall action leaves Composed its whole share and the share's finish
+		// overrun (F's units) within l(1) -- the tick holds both. Then a first Composed ending slice may still overrun the
+		// share; otherwise it waits, and Composed is owed the next contended tick.
+		bool bWholeRoomy = false;
+		if (bTickSlicesOneRow)
+		{
+			Remaining = FMath::Max(0, Remaining - OneCallBilled); // ruling 43 N2: the OneCall action's units come first
+		}
+		else if (TickCap < MAX_int32 && OneCallBilled > 0)
+		{
+			const int64 Left = static_cast<int64>(TickCap) - OneCallBilled;
+			bWholeRoomy = Left >= static_cast<int64>(ComposedShare) + FinishUnitsAt(TickPos);
+			Remaining = static_cast<int32>(FMath::Clamp<int64>(Left, 0, Remaining));
+			bComposedOwedTurn = bComposedDue && !bWholeRoomy;
+		}
+		// Ruling 57 F3: the units Composed billed this tick, overruns included (phase 2's room); F2, F4: an ending slice or
+		// a finish-only step over what is left runs only when nothing else is billed in the tick (no OneCall action and
+		// nothing of Composed's yet).
+		int32 ComposedBilled = 0;
 		int32 Rotation = 0;
 		while (Rotation < Due.Num() && Due[Rotation] <= ComposedCursor)
 		{
@@ -6369,8 +10111,62 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			FAction A;
 			A.Slot = SlotIndex;
 			A.Gen = S.Gen;
+			// MR6 (§5.3): a chunk slice of l layers of M rows uses RowsUnits(M, l) of the tick's LayersPerTick units; a
+			// chunk that is open continues, one that would open opens when its first slice fits what is left.
+			const bool bRowsOpen = S.PlanRows > 0;
+			const int32 PromptRows = !bRowsOpen && !S.bPlanPrimed && S.PlanLayerPos == 0 && PromptLeft(S) ? PromptRowsFor(S) : 0;
+			if (bRowsOpen || PromptRows >= 2)
+			{
+				const int32 Rows = bRowsOpen ? S.PlanRows : PromptRows;
+				const int32 PerSlice = bRowsOpen ? S.PlanRowsPerSlice : ComposedRowsLayers(Rows, PlanAt(NextPosition(S) + Rows - 1).Plan); // E-14
+				int32 Layers = FMath::Min(PerSlice, NumHiddenLayers - (bRowsOpen ? S.PlanRowsLayer : 0));
+				while (Layers > 0 && RowsUnits(Rows, Layers) > Remaining)
+				{
+					--Layers;
+				}
+				if (Layers <= 0 && LayerScalePerMille() > 1000 && ComposedBilled == 0 && OneCallBilled == 0 && PerSlice > 0 &&
+					RowsUnits(Rows, 1) <= WarmRemaining)
+				{
+					Layers = 1; // run 5: the cold ramp never stops a tick that has nothing else billed; one layer runs
+				}
+				if (Layers <= 0)
+				{
+					continue; // served first on a later tick, when the whole LayersPerTick is left
+				}
+				if (!bComposedServed)
+				{
+					bComposedServed = true;
+					ComposedCursor = SlotIndex;
+				}
+				Remaining -= RowsUnits(Rows, Layers);
+				ComposedBilled += RowsUnits(Rows, Layers);
+				if (bRowsOpen)
+				{
+					PlanRowsSlice(S, SlotIndex, Job, MoveTemp(A), ERowsKind::None, 0, Layers, Now);
+				}
+				else
+				{
+					LogStarted(S.Id);
+					WantsAdapterBind(S, A);
+					S.PlanRowsPerSlice = PerSlice;
+					PlanRowsSlice(S, SlotIndex, Job, MoveTemp(A), ERowsKind::Prompt, Rows, Layers, Now);
+				}
+				continue;
+			}
 			if (S.bPlanPrimed)
 			{
+				// Ruling 56 (1): a finish-only step ends a token with no layers: F, in units of C(1) / L. Ruling 57 F4: it is
+				// gated as any slice is -- it waits when its units do not fit what the tick has left, unless nothing else is
+				// billed in the tick (F2's exception).
+				int32 FinishUnits = 0;
+				if (TickCap < MAX_int32)
+				{
+					FinishUnits = FinishUnitsAt(TickPos);
+					if (FinishUnits > Remaining && !(ComposedBilled == 0 && (OneCallBilled == 0 || bWholeRoomy)))
+					{
+						continue;
+					}
+				}
 				if (!bComposedServed)
 				{
 					bComposedServed = true;
@@ -6378,18 +10174,35 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				}
 				LogStarted(S.Id);
 				A.Kind = EActionKind::ComposedFinishOnly;
+				AddJobFinishPrice(*Job, TickPos); // ruling 59b H3: a finish-only step's F
 				TakeBeginLimits(S, A);
 				const int32 Index = Job->Actions.Add(MoveTemp(A));
+				RecordAction(S, Job->Actions[Index], 0, 1, NumHiddenLayers, 0, false, false, 0);
 				S.bPlanPrimed = false;
 				S.TokensIssued += 1;
 				AddTokenEvent(S, Job, Index, TickIndex, Now, SimSeconds);
+				Remaining = FMath::Max(0, Remaining - FinishUnits);
+				ComposedBilled += FinishUnits;
 				continue;
 			}
-			if (S.PlanLayerPos == 0 && !PromptLeft(S) && S.TokensIssued >= S.Request.MaxNewTokens)
+			if (S.PlanLayerPos == 0 && !PromptLeft(S) && IssuedBound(S) >= S.Request.MaxNewTokens)
 			{
 				continue;
 			}
-			const int32 Layers = FMath::Min3(Remaining, NumHiddenLayers - S.PlanLayerPos, LayersPerSliceFor(S));
+			// Ruling 42 M1: with multi-row on and the knob set, a one-row slice is also capped at l(1) (the pool already
+			// is); with multi-row off, 1.17's uncapped slices (P4.4).
+			const int64 SlicePos = S.PlanLayerPos > 0 ? S.PlanTokenPos : NextPosition(S); // E-14: at the token's position
+			const int32 Cap = ColdLayers(OneRowLayerCapAt(SlicePos)); // run 5: the cold ramp (uncapped passes through)
+			int32 Layers = FMath::Min(FMath::Min3(Remaining, NumHiddenLayers - S.PlanLayerPos, LayersPerSliceFor(S)), Cap);
+			int32 Units = Layers;
+			if (Cap < MAX_int32 && Layers > 0 && !(S.PlanLayerPos > 0 ? S.bPlanInPrompt : PromptLeft(S)))
+			{
+				// Ruling 56 (1): the slice that ends the token carries its finish, priced with it; an ending slice over what
+				// the tick has left runs only when nothing else is billed in the tick (ruling 57 F2), or first in a tick whose
+				// whole OneCall action leaves room for it (ruling 58 (4)).
+				Layers = FinishingOneRowLayers(SlicePos, NumHiddenLayers - S.PlanLayerPos, FMath::Min(LayersPerSliceFor(S), Cap),
+					FMath::Min(Remaining, Cap), ComposedBilled == 0 && (OneCallBilled == 0 || bWholeRoomy), Units);
+			}
 			if (Layers <= 0)
 			{
 				continue;
@@ -6399,55 +10212,24 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				bComposedServed = true;
 				ComposedCursor = SlotIndex;
 			}
-			A.Kind = EActionKind::ComposedSlice;
-			A.Layers = Layers;
-			A.bEmbed = S.PlanLayerPos == 0;
-			if (A.bEmbed)
+			if (S.PlanLayerPos == 0)
 			{
 				LogStarted(S.Id);
 				WantsAdapterBind(S, A);
-				S.TokenRequestTick = TickIndex;
-				S.TokenRequestWall = Now;
-				S.TokenRequestSim = SimSeconds;
-				S.bPlanInPrompt = PromptLeft(S);
-				if (S.bPlanInPrompt)
-				{
-					S.PlanPromptIndex = S.PromptPlanned++;
-					FillPrompt(S, A, S.PlanPromptIndex);
-				}
-				else
-				{
-					S.TokensIssued += 1;
-				}
 			}
-			else
-			{
-				A.bPrompt = S.bPlanInPrompt;
-			}
-			S.PlanLayerPos += Layers;
-			Remaining -= Layers;
-			const bool bTokenDone = S.PlanLayerPos == NumHiddenLayers;
-			A.bFinish = bTokenDone && !S.bPlanInPrompt;
-			const int32 Index = Job->Actions.Add(MoveTemp(A));
-			if (bTokenDone)
-			{
-				S.PlanLayerPos = 0;
-				if (S.bPlanInPrompt)
-				{
-					S.bPlanInPrompt = false;
-					if (S.PlanPromptIndex == S.Request.PromptTokens.Num() - 1)
-					{
-						PromptCompleted(S, Job->Actions[Index], Job, Index, S.TokenRequestTick, S.TokenRequestWall, S.TokenRequestSim);
-					}
-				}
-				else
-				{
-					AddTokenEvent(S, Job, Index, S.TokenRequestTick, S.TokenRequestWall, S.TokenRequestSim);
-				}
-			}
+			Remaining = FMath::Max(0, Remaining - Units);
+			ComposedBilled += Units;
+			PlanOneRowSlice(S, Job, MoveTemp(A), Layers, Now, OneRowSlices, OneRowSliceRecords);
 		}
 
 #if WITH_DEV_AUTOMATION_TESTS
+		if (OneRowSlices > 1)
+		{
+			for (const int32 Record : OneRowSliceRecords)
+			{
+				RowsRecords[Record].bBatched = true;
+			}
+		}
 		if (PlanLog != nullptr)
 		{
 			// Test access only (GetPlanLog()): the sequences this tick's Plan issued any action for.
@@ -6460,8 +10242,45 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 			}
 		}
 #endif
-		if (Job->Actions.Num() > 0)
+		// Ruling 54: phase 2 rides this tick in the room the generations left: l(1) units at TickPos (B_eff less the
+		// scene share, in one-row-layer units with the margin) less the OneCall action's units (a whole token: L) and
+		// Composed's, priced back to us.
+		if (bCalPhase2 && Config.SchemaJumpGpuFrameBudgetMs > 0.0 && NumHiddenLayers > 0)
 		{
+			const GpuRows::FChooserPlan AtTick = PlanAt(TickPos).Plan;
+			const int32 OneCallUsed = OneCallBilled; // ruling 58 (4): a whole token is L
+			const int32 ComposedUsed = ComposedBilled; // ruling 57 F3: the units billed, overruns included
+			const int64 LeftUnits = static_cast<int64>(AtTick.LayersPerSlice[0]) - OneCallUsed - ComposedUsed;
+			const int64 LeftUs = AtTick.bValid && LeftUnits > 0
+				? LeftUnits * AtTick.RowCostUs * (1000 + static_cast<int64>(Config.GpuRowsMarginPerMille)) / (static_cast<int64>(NumHiddenLayers) * 1000)
+				: 0;
+			PlanRowCostPhase2(Job, LeftUs, Job->Actions.Num() == 0);
+		}
+		if (RampApplies() && NumHiddenLayers > 0)
+		{
+			// Run 5: the warm price of a whole OneCall token this tick billed (sliced work is priced where it is planned).
+			const GpuRows::FChooserPlan AtPriced = PlanAt(TickPos).Plan;
+			const int64 Units = OneCallUnits > 0 ? 0 : OneCallWholeUnits; // sliced work is priced where it is planned (AddJobPrice)
+			if (AtPriced.bValid && Units > 0)
+			{
+				Job->PricedUs += static_cast<double>(Units * AtPriced.RowCostUs * (1000 + static_cast<int64>(Config.GpuRowsMarginPerMille))) /
+					static_cast<double>(static_cast<int64>(NumHiddenLayers) * 1000);
+			}
+		}
+		// Run 5: the cold ramp never stops progress. A cold tick the cold rule itself left empty (ruling 59c point 7: work it
+		// held back, nothing else planned) ends the ramp: the next tick plans warm.
+		if (Job->Actions.Num() == 0 && !Job->Calibration.bActive && IsCold() && bColdHeldWork)
+		{
+			ColdTick = kColdScaleTicks;
+			bColdRampYielded = true;
+		}
+		NoteStalls(*Job);
+		if (Job->Actions.Num() > 0 || Job->Calibration.bActive)
+		{
+			if (RampApplies())
+			{
+				RampJobs.Add(Job); // run 5: the cold ramp reads it once it is done
+			}
 			if (bTestHoldNextTickJob)
 			{
 				// Test access only (round 2, HoldNextTickJob()): the first tick job enqueued after the
@@ -6716,6 +10535,26 @@ void USuperSLMGpuSubsystem::TearDown()
 					LifecycleTombstones.Add(Pair.Key);
 				}
 			}
+#if SUPERSLM_WITH_PREFIX_CACHE
+			// Precache U6, wiring edit 4: the cache's handles are released while the submission thread still runs and before the
+			// ledger's epoch ends (region C is the ledger's). A drain first, so every lane job it posted has finished and is
+			// delivered. After a terminal loss or an unresponsive thread no Layer-1 call is made: the host is left, as the state is.
+			if (S.PrefixCache.Host)
+			{
+				if (!S.bTerminalLoss.load() && !S.bUnresponsive.load())
+				{
+					S.RunSync([]() {}, TEXT("prefix cache drain"));
+					TUniquePtr<FSuperSLMGpuPrefixCacheHost> Retired = SuperSLMGpuPrefixCacheGlue::BeforePoolDestroy(S);
+					RetiredPrefixCacheHost = TSharedPtr<FSuperSLMGpuPrefixCacheHost>(Retired.Release());
+				}
+				else
+				{
+					SuperSLMGpuPrefixCacheGlue::GGpuPrefixNextOpId = FMath::Max(SuperSLMGpuPrefixCacheGlue::GGpuPrefixNextOpId, S.PrefixCache.Host->PeekNextOpId());
+					(void)S.PrefixCache.Host.Release(); // never released under a lost or unresponsive device
+					S.PrefixCache.Posted.Reset();
+				}
+			}
+#endif
 			if (S.Ledger.IsConfigured())
 			{
 				S.Ledger.EndEpoch(SuperSLMPaging::EEpochEnd::Teardown);
@@ -6785,7 +10624,8 @@ namespace
 // sslm_gpu_kv_pool_create call. Both are read in pooled mode only.
 static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModelBytes* Model, const FSuperSLMGpuRuntimeConfig& Config,
 	const FString& ResolvedShaderDirectory, int32 PageCountPerturbation, uint32 PoolCreateStatusOverride,
-	FGpuConfigureDiagnostics& OutDiag, FSuperSLMGpuSubsystemState*& OutState)
+	FGpuConfigureDiagnostics& OutDiag, FSuperSLMGpuSubsystemState*& OutState,
+	const FString& ModelName, const TFunction<void(FSuperSLMGpuSubsystemState&)>& SeedState)
 {
 	OutState = nullptr;
 
@@ -6854,6 +10694,21 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 		return Fail(ESuperSLMGpuConfigureResult::InvalidFinishParallelTasks, FString::Printf(
 			TEXT("FinishParallelTasks %d must lie in [0, %d]: it is the most blocks one host token finish is split into; 0 or 1 runs it serially"),
 			Config.FinishParallelTasks, SuperSLMFinishHook::MaxFinishParallelTasks));
+	}
+	// Multi-row GPU plan §5.1 (MR6; ruling 39 Q2, Q9): the chooser's configuration fields. The plan is computed from
+	// them and the vendored cost table alone (C18), so a value outside their meaning is refused by name. A budget too
+	// small for one row is not one of these: it is valid, and warned below (ruling 39 Q2).
+	{
+		const bool bRowsBudgetOk = FMath::IsFinite(Config.SchemaJumpGpuFrameBudgetMs) && Config.SchemaJumpGpuFrameBudgetMs >= 0.0 &&
+			FMath::IsFinite(Config.GpuRowCostMs) && Config.GpuRowCostMs >= 0.0 && // ruling 48a: 0 is unset (calibrated or 6.2 ms)
+			FMath::IsFinite(Config.SceneGpuShareMs) && Config.SceneGpuShareMs >= 0.0 &&
+			FMath::IsFinite(Config.NominalTickMs) && Config.NominalTickMs > 0.0 &&
+			Config.GpuRowsMarginPerMille >= 0 && Config.GpuRowsMarginPerMille <= 1000000;
+		if (!bRowsBudgetOk)
+		{
+			return Fail(ESuperSLMGpuConfigureResult::InvalidSchemaJumpBudget, FString::Printf(TEXT("SchemaJumpGpuFrameBudgetMs, SceneGpuShareMs and GpuRowCostMs (0: unset) must be finite and not negative, NominalTickMs finite and positive, and GpuRowsMarginPerMille (%d) in [0, 1000000]: the multi-row plan is computed from them alone"),
+				Config.GpuRowsMarginPerMille));
+		}
 	}
 
 	// Host-side load: the view the GPU mapping is built from, and the facts every budget derives
@@ -6966,7 +10821,12 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 	S->ConfiguredDispatchBudget = Config.DispatchBudget;
 	S->ConfiguredMinimumK = Report.MinimumK;
 	S->ConfiguredK = Config.K;
-	SuperSLMRuntime::ReadArtifactHash(*Model, S->ArtifactHash);
+	S->bArtifactHashKnown = SuperSLMRuntime::ReadArtifactHash(*Model, S->ArtifactHash);
+	S->RowCostModelName = ModelName.IsEmpty() ? FString(TEXT("(unnamed)")) : ModelName;
+	if (SeedState)
+	{
+		SeedState(*S); // ruling 48: the caller's armed calibration seams, and (test builds) the records being kept
+	}
 
 	// The dead-end check's own copy of the SchemaMasks section (the view is freed below).
 	if (const superslm::SslmSectionView* Section = View->Section(superslm::SslmSectionType::SchemaMasks))
@@ -6998,6 +10858,8 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 	S->DeclaredModelBytes = static_cast<int64>(Layout.stride) * NumLayers + RopeBytes + static_cast<int64>(S->SchemaSectionBytes.size());
 	const int64 KvBytesPerSequence = static_cast<int64>(NumLayers) * Config.ContextCap * Cfg.num_key_value_heads * Cfg.head_dim * 2;
 	S->KvBytesPerSequence = KvBytesPerSequence;
+	S->KvHeads = static_cast<int32>(Cfg.num_key_value_heads);
+	S->KvHeadDim = static_cast<int32>(Cfg.head_dim);
 	// The device-local head buffers (src/gpu/gpu_1p0.cpp CreateDeviceLogitsBuffers): the head table
 	// (V x H, padded to a multiple of four bytes), the H x 4 input row and the V x 8 output row.
 	// The UPLOAD input row, the READBACK output row and the transient staging copy live outside
@@ -7038,8 +10900,14 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 		LedgerConfig.PrefixBlockCount = Config.PrefixBlockCount;
 		LedgerConfig.RestoreHeadroomBlocks = Config.RestoreHeadroomBlocks;
 		LedgerConfig.CacheGhostBlocks = Config.CacheGhostBlocks;
-		LedgerConfig.bCacheConfigured = false;
-		LedgerConfig.CacheRegionPages = FSuperSLMGpuSubsystemState::CacheRegionPages();
+#if SUPERSLM_WITH_PREFIX_CACHE
+		// Precache U6, wiring edit 1: a configured cache (ConfigurePrefixCache(), carried in by the seed) sizes region C before the
+		// ledger and the pool are made, as the CPU's ConfigureRegionC() does.
+		S->CacheRegionPagesValue = SuperSLMGpuPrefixCacheGlue::RegionCPagesFor(S->PrefixCache.Settings.BudgetBytes, static_cast<int64>(S->PageGeometry.page_bytes),
+			static_cast<int64>(S->PageGeometry.page_positions), Config.ContextCap);
+#endif
+		LedgerConfig.bCacheConfigured = S->CacheRegionPagesValue > 0;
+		LedgerConfig.CacheRegionPages = S->CacheRegionPages();
 		const SuperSLMPaging::ELedgerConfigure LedgerResult = S->Ledger.Configure(LedgerConfig);
 		FString LedgerRefusal;
 		ESuperSLMGpuConfigureResult LedgerRefusalResult = ESuperSLMGpuConfigureResult::KvPoolRefused;
@@ -7234,6 +11102,77 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 					}
 					S->NoteLayer1Status(sslm_gpu_seq_release(S->Ctx, Scratch));
 				}
+				// Ruling 59b L1: not when the table forces one row (a shipping build's estimated table, N4).
+				const bool bRowsPossible = S->Config.bGpuMultiRow &&
+					((superslm_gpu::kGpuRowsCostTableMeasured && superslm_gpu::kGpuRowsLogitsRatioMeasured) || UE_BUILD_SHIPPING == 0);
+				if (WarmSt == FGpuStatus::SSLM_OK && bRowsPossible)
+				{
+					// Run 5 (workhorse): the widened row kernels (H = 2, 4 and 8) and the context's row sets are built here
+					// too. Without it a calibration reused from earlier in the process (which runs no phase 1, so no ruling
+					// 56 (2) warm-up) left the first chunk of each width to build them inside a timed tick job -- 64 to 92 ms
+					// of host work while the GPU idled and its clocks fell. One scratch sequence per slot, each holding a
+					// chunk open at once (so the row-set pool reaches the most chunks a tick can have open), widths in
+					// turn; one layer each, then every chunk abandoned. Untimed and best-effort: only a device loss fails it.
+					constexpr int32 kWidths[] = {8, 4, 2};
+					const int32 N = FMath::Clamp(S->ThreadSlots.Num(), static_cast<int32>(UE_ARRAY_COUNT(kWidths)), static_cast<int32>(GpuRows::MaxRows));
+					TArray<SslmGpuSequenceHandle*, TInlineAllocator<GpuRows::MaxRows>> Seqs;
+					TArray<bool, TInlineAllocator<GpuRows::MaxRows>> Open;
+					for (int32 I = 0; I < N && WarmSt != FGpuStatus::SSLM_DEVICE_LOST; ++I)
+					{
+						SslmGpuSequenceHandle* Seq = nullptr;
+						FGpuStatus RowsSt = sslm_gpu_seq_create(S->Ctx, S->Model, 2 * GpuRows::MaxRows, &Seq);
+						S->NoteLayer1Status(RowsSt);
+						if (RowsSt != FGpuStatus::SSLM_OK || Seq == nullptr)
+						{
+							break;
+						}
+						Seqs.Add(Seq);
+						Open.Add(false);
+						int32_t Zeros[GpuRows::MaxRows] = {};
+						SslmGpuRowsSpec Spec = {};
+						Spec.struct_size = static_cast<uint32_t>(sizeof(SslmGpuRowsSpec));
+						Spec.kind = SSLM_GPU_ROWS_PROMPT;
+						Spec.tokens = Zeros;
+						Spec.count = kWidths[I % UE_ARRAY_COUNT(kWidths)];
+						Spec.flags = 0;
+						int32_t Admitted = 0;
+						RowsSt = sslm_gpu_seq_embed_rows(S->Ctx, Seq, &Spec, &Admitted);
+						S->NoteLayer1Status(RowsSt);
+						if (RowsSt != FGpuStatus::SSLM_OK)
+						{
+							continue;
+						}
+						Open.Last() = true;
+						const int32 WarmWidth = Spec.count;
+						S->CountSubmission();
+						RowsSt = sslm_decode_step_gpu(S->Ctx, Seq, nullptr, S->DispatchesPerLayer);
+						S->NoteLayer1Status(RowsSt);
+						if (RowsSt == FGpuStatus::SSLM_OK)
+						{
+							int32_t Ready = 0;
+							FGpuStatus Drained = FGpuStatus::SSLM_OK;
+							RowsSt = sslm_gpu_ready(S->Ctx, Seq, 1, &Ready, &Drained);
+							S->NoteLayer1Status(RowsSt);
+							RowsSt = RowsSt == FGpuStatus::SSLM_OK ? Drained : RowsSt;
+						}
+						if (RowsSt == FGpuStatus::SSLM_OK)
+						{
+							S->ConfigureWidenedMask |= 1u << WarmWidth;
+						}
+						if (RowsSt == FGpuStatus::SSLM_DEVICE_LOST)
+						{
+							WarmSt = RowsSt;
+						}
+					}
+					for (int32 I = 0; I < Seqs.Num(); ++I)
+					{
+						if (Open[I])
+						{
+							S->NoteLayer1Status(sslm_gpu_seq_rows_abandon(S->Ctx, Seqs[I]));
+						}
+						S->NoteLayer1Status(sslm_gpu_seq_release(S->Ctx, Seqs[I]));
+					}
+				}
 				return WarmSt;
 			};
 
@@ -7290,7 +11229,7 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 						"S %u + P %u + H %u + C %u pages), returning %s%s"),
 						Pages, Bytes, PageBytes, static_cast<int64>(S->PageGeometry.page_positions),
 						S->Ledger.RegionCapacity(SuperSLMPaging::ERegion::S), S->Ledger.RegionCapacity(SuperSLMPaging::ERegion::P),
-						S->Ledger.RegionCapacity(SuperSLMPaging::ERegion::H), FSuperSLMGpuSubsystemState::CacheRegionPages(),
+						S->Ledger.RegionCapacity(SuperSLMPaging::ERegion::H), S->CacheRegionPages(),
 						*GpuStatusText(St),
 						bPoolRefusal ? TEXT("; reduce BlockCount, SequenceBudget, PrefixBlockCount or RestoreHeadroomBlocks") : TEXT(""));
 					if (S->Pool != nullptr)
@@ -7353,6 +11292,17 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 			if (Dev.available && Dev.adapter)
 			{
 				Dev.adapter.As(&S->Adapter3);
+				// Ruling 48a (2, 3): the GPU adapter, by name for the calibration's log line and by LUID for its
+				// once-per-model-and-adapter key.
+				DXGI_ADAPTER_DESC1 Desc = {};
+				if (SUCCEEDED(Dev.adapter->GetDesc1(&Desc)))
+				{
+					S->AdapterName = FString(Desc.Description);
+					S->AdapterLuid = (static_cast<uint64>(static_cast<uint32>(Desc.AdapterLuid.HighPart)) << 32) | static_cast<uint64>(Desc.AdapterLuid.LowPart);
+					S->AdapterVendorId = static_cast<uint32>(Desc.VendorId);
+					S->AdapterDeviceId = static_cast<uint32>(Desc.DeviceId);
+					S->bAdapterIdsKnown = true;
+				}
 			}
 		});
 	}
@@ -7393,15 +11343,198 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 		UE_LOG(LogSuperSLM, Warning, TEXT("GPU Configure(): the device-resident head is %s."), *S->DeviceHeadStatus);
 	}
 
+	S->bDeviceLogitsHead = S->bDeviceHeadActive;
+	if (S->AdapterName.IsEmpty())
+	{
+		S->AdapterName = TEXT("(unnamed adapter)");
+	}
+	// Erratum E-13 (rulings 48 and 48a): the row cost the rows plan is built from. The game's GpuRowCostMs (> 0) wins and
+	// nothing is measured; with bCalibrateGpuRowCost false it is the 6.2 ms default; otherwise the price this process
+	// measured before for this artifact on this adapter, or a calibration now. With no frame budget the calibration runs
+	// here, whole tokens on the submission thread (this thread waits, as for every other Configure() job), and settles
+	// before Configure() returns. With a frame budget it runs one slice per tick from the first Tick() (Pending), on a
+	// provisional plan at 6.2 ms that only sizes its slices; nothing else is planned until it settles.
+	{
+		const double DefaultRowCostMs = static_cast<double>(GpuRowCost::kDefaultRowCostUs) / 1000.0;
+		FRowCostCacheEntry Cached;
+		if (Config.GpuRowCostMs > 0.0)
+		{
+			// Erratum E-14: the game's value is a flat line at its price (the chooser's cost conversion).
+			S->ApplyRowCost(GpuRowCost::ESource::Game, Config.GpuRowCostMs, GpuRowCost::ChooseLine(true, Config.GpuRowCostMs, true, false, GpuRowCost::FRowCostLine()).Line);
+		}
+		else if (!Config.bCalibrateGpuRowCost)
+		{
+			S->ApplyRowCost(GpuRowCost::ESource::Default, DefaultRowCostMs, GpuRowCost::FlatLine(GpuRowCost::kDefaultRowCostUs));
+		}
+		else if (S->bArtifactHashKnown && FindCachedRowCost(S->ArtifactHash, S->AdapterLuid, S->bDeviceLogitsHead, Cached))
+		{
+			if (Cached.bFallBack)
+			{
+				// Ruling 51 F2: the calibration fell back earlier in this process and warned then; not measured again.
+				S->ApplyRowCost(GpuRowCost::ESource::FallBack, DefaultRowCostMs, GpuRowCost::FlatLine(GpuRowCost::kDefaultRowCostUs));
+				UE_LOG(LogSuperSLM, Log, TEXT("GPU GpuRowCost for %s: the %.1f ms default; the calibration fell back earlier in this process (ruling 51)."),
+					*S->RowCostSubject(), S->RowCostMs);
+			}
+			else
+			{
+				// Erratum E-14: the cache holds both numbers, so a hit gives the same line. Ruling 55 F2 (keeping 54a.1): a
+				// slope still at the default is measured by phase 2 again at B > 0, on this state's own throwaway sequence,
+				// unless phase 2 failed for this key in this process (ForgetRowCostCalibrations() clears that). A measured
+				// line is re-checked under this ContextCap: C(1, cap) above 124 ms falls back to the default slope, with one
+				// warning per key.
+				GpuRowCost::FRowCostLine Line = Cached.Line;
+				bool bMeasured = Cached.bSlopeMeasured;
+				if (bMeasured && !GpuRowCost::LineInSanityRange(Line, S->Config.ContextCap))
+				{
+					const int64 CapUs = GpuRowCost::RowCostAtUs(Line, S->Config.ContextCap);
+					Line = GpuRowCost::DefaultSlopeLine(Cached.Line.AnchorUs, Cached.Line.AnchorPos);
+					bMeasured = false;
+					bool bWarn = true;
+					CacheRowCost(S->ArtifactHash, S->AdapterLuid, S->bDeviceLogitsHead, [&bWarn](FRowCostCacheEntry& E)
+					{
+						bWarn = !E.bCapWarned;
+						E.bCapWarned = true;
+					});
+					if (bWarn)
+					{
+						UE_LOG(LogSuperSLM, Warning, TEXT("GPU GpuRowCost late position for %s: the cached measured slope puts C(1, %lld) at %lld us under this ContextCap, above %lld us; the line keeps the default slope, %.4f us per position (ruling 55)."),
+							*S->RowCostSubject(), S->Config.ContextCap, CapUs, GpuRowCost::kSanityMaxUs, S->SlopeUsPerPosition(Line));
+					}
+				}
+				S->ApplyRowCost(GpuRowCost::ESource::Calibrated, static_cast<double>(Cached.PriceUs) / 1000.0, Line);
+				S->RowCostFinishUs = Cached.FinishUs; // ruling 56 (1): F with C_a
+				S->bRowCostSlopeMeasured = bMeasured;
+				S->PendingRowCostTraceUs = Cached.PriceUs; // ruling 51 F10: the game thread writes the counter
+				UE_LOG(LogSuperSLM, Log, TEXT("GPU GpuRowCost for %s: %.1f ms, calibrated earlier in this process (once per model artifact, GPU adapter and logits-head placement, rulings 48a and 51); slope %.4f us per position (%s)."),
+					*S->RowCostSubject(), S->RowCostMs, S->SlopeUsPerPosition(Line),
+					bMeasured ? TEXT("measured") : Cached.bLateFailed ? TEXT("the default; the late position failed earlier in this process")
+						: Cached.bSlopeMeasured ? TEXT("the default; the measured one is out of range under this ContextCap") : TEXT("the default"));
+				if (!Cached.bSlopeMeasured && !Cached.bLateFailed)
+				{
+					S->StartRowCostPhase2();
+				}
+			}
+		}
+		else
+		{
+			S->bRowCostPending = true;
+			S->RowCostMs = DefaultRowCostMs;
+			S->BuildRowsPlan(DefaultRowCostMs, false); // provisional: the slice room only (ruling 50)
+			S->CalWidenMask = S->WidenCandidateMask(); // ruling 57 F5: the chooser's candidate widths, at this plan
+			S->CalRoomUs = S->RowsPlan.bValid ? S->RowsPlan.BudgetUs - S->RowsPlan.SceneUs
+				: static_cast<int64>((Config.SchemaJumpGpuFrameBudgetMs - Config.SceneGpuShareMs) * 1000.0);
+			if (Config.SchemaJumpGpuFrameBudgetMs == 0.0)
+			{
+				S->CalStartSeconds = FPlatformTime::Seconds();
+				while (S->bRowCostPending)
+				{
+					if (S->bCalForceTimeout)
+					{
+						S->bCalForceTimeout = false; // the seam: as if the 2 s cap had passed before the first token
+						S->EndCalibrationAttempt(-1, true, FString(), 0, TArray<double>());
+						break;
+					}
+					TSharedPtr<FJob> Job = MakeShared<FJob>();
+					Job->bTickJob = true; // so the per-tick GPU seam records it (test builds)
+					Job->CallKind = TEXT("load-time call (row-cost calibration)");
+#if WITH_DEV_AUTOMATION_TESTS
+					Job->TestTick = S->TickIndex;
+#endif
+					FJob::FCalibrationStep& C = Job->Calibration;
+					C.bActive = true;
+					C.bWhole = true;
+					// Ruling 60: a set with dropped runs times only their replacements (no warm-up, no widened warm-up).
+					const int32 Need = S->CalRunsUs.Num() > 0 ? kPhase1TimedRuns - S->CalRunsUs.Num() : 0;
+					C.WholeTokens = Need > 0 ? Need : kPhase1WarmUpRuns + kPhase1TimedRuns;
+					C.WholeWidenMask = Need > 0 ? 0u : S->CalWidenMask; // rulings 56 (2), 56a, 57 F5: after the warm-up tokens, once per attempt
+					C.WholeWidenAfter = kPhase1WarmUpRuns;
+					C.SeqCap = S->CalSeqCapFor();
+					C.Attempt = S->CalAttempt;
+					C.Deadline = S->CalStartSeconds + kRowCostCalibrationTimeoutSeconds;
+					S->Enqueue(Job);
+					if (!S->Wait(*Job) || Job->bSkipped)
+					{
+						// Row 21: the device did not answer (or was lost): the state is unwound as Configure()'s other
+						// device failures are, an unresponsive one leaked rather than deleted under its thread.
+						const FString Why = S->UnresponsiveReason;
+						S->Shutdown();
+						if (!S->bUnresponsive.load())
+						{
+							delete S;
+						}
+						return Fail(ESuperSLMGpuConfigureResult::DeviceUnavailable, FString::Printf(TEXT("the GPU device did not respond during the row-cost calibration: %s"), *Why));
+					}
+					if (S->bTerminalLoss.load())
+					{
+						// Ruling 51 F3: a confirmed device loss during the calibration is Configure()'s DeviceUnavailable, as
+						// at the warm-up; never a fallback.
+						S->Shutdown();
+						delete S;
+						return Fail(ESuperSLMGpuConfigureResult::DeviceUnavailable, FString::Printf(TEXT("the GPU device was lost during the row-cost calibration (%s)"), *GpuStatusText(C.Status)));
+					}
+					S->CalSeqLength += C.TokenUs.Num(); // E-14: the tokens' positions on the throwaway sequence
+					if (C.WholeWidenMask != 0 && C.TokenUs.Num() >= kPhase1WarmUpRuns)
+					{
+						for (int32 W = 0; W < kWidenWarmUpCount; ++W)
+						{
+							if ((C.WholeWidenMask >> kWidenWarmUpRows[W] & 1u) != 0)
+							{
+								S->NoteWidenWarmUp(kWidenWarmUpRows[W], (C.WidenRanMask >> kWidenWarmUpRows[W] & 1u) != 0, C.WidenStatus);
+							}
+						}
+					}
+					const int32 First = Need > 0 ? 0 : kPhase1WarmUpRuns;
+					const int32 WarmUps = Need > 0 ? kPhase1WarmUpRuns : FMath::Min(C.TokenUs.Num(), kPhase1WarmUpRuns);
+					if (C.bNoSequence || C.Status != FGpuStatus::SSLM_OK || C.bTimedOut)
+					{
+						TArray<double> Runs = S->CalRunsUs;
+						for (int32 K = First; K < C.TokenUs.Num(); ++K)
+						{
+							Runs.Add(C.TokenUs[K]);
+						}
+						if (C.bTimedOut && !C.bNoSequence && C.Status == FGpuStatus::SSLM_OK)
+						{
+							S->EndCalibrationAttempt(-1, true, FString(), WarmUps, Runs);
+						}
+						else
+						{
+							S->EndCalibrationAttempt(-1, false, C.bNoSequence ? FString::Printf(TEXT("sslm_gpu_seq_create returned %s"), *GpuStatusText(C.Status))
+								: FString::Printf(TEXT("SslmGpuSeqDecodeStepForG5Bridge returned %s"), *GpuStatusText(C.Status)), WarmUps, Runs);
+						}
+					}
+					else
+					{
+						// Ruling 60: each timed run goes through the set's check; one that ends the attempt (a price, a spread
+						// failure, a retry) ends this job's runs too (ruling 56 (1): F is the max of the kept runs' finishes).
+						for (int32 K = First; K < C.TokenUs.Num(); ++K)
+						{
+							if (S->TakePhase1TimedRun(C.TokenUs[K], C.WholeFinishUs.IsValidIndex(K) ? C.WholeFinishUs[K] : -1.0, WarmUps))
+							{
+								break;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	S->DispatchCount = 0;
 	S->ThreadHitches = 0;
 	S->bActive = true;
 	OutState = S;
 
 	Report.Result = ESuperSLMGpuConfigureResult::Success;
+	const TCHAR* RowCostFrom = S->bRowCostPending ? TEXT("calibrating, one slice per tick; the plan follows it")
+		: S->RowCostSource == GpuRowCost::ESource::Game ? TEXT("the game's")
+		: S->RowCostSource == GpuRowCost::ESource::Calibrated ? TEXT("calibrated on this GPU")
+		: S->RowCostSource == GpuRowCost::ESource::FallBack ? TEXT("the default, calibration fell back")
+		: TEXT("the default");
 	Report.Message = FString::Printf(TEXT("GPU backend configured: %d layers, %u dispatches per layer, %d layers per tick, K %d (minimum %d), "
-		"%d sequences at context_cap %lld; logits head %s; host finish %s; shaders from %s"),
-		NumLayers, DispatchesPerLayer, LayersPerSlice, Config.K, Report.MinimumK, Config.BlockCount, Config.ContextCap,
+		"%d sequences at context_cap %lld; row cost %.1f ms (%s); multi-row %s (M_max %d at %d layers, Composed %d rows at %d layers, Exact %s); logits head %s; host finish %s; shaders from %s"),
+		NumLayers, DispatchesPerLayer, LayersPerSlice, Config.K, Report.MinimumK, Config.BlockCount, Config.ContextCap, S->RowCostMs, RowCostFrom,
+		S->MultiRowOn() ? TEXT("on") : TEXT("off"), S->RowsPlan.MMax, S->RowsPlan.MMaxLayers, S->RowsPlan.ComposedRows, S->RowsPlan.ComposedLayers,
+		S->RowsPlan.bExactOn ? *FString::Printf(TEXT("M %d in %d slices"), S->RowsPlan.MExact, S->ExactSlices.Num()) : TEXT("off"),
 		*S->DeviceHeadStatus,
 		SuperSLMFinishHook::ShouldInstall(Config.FinishParallelTasks) ? *FString::Printf(TEXT("split into at most %d ParallelFor tasks"), Config.FinishParallelTasks) : TEXT("serial"),
 		*S->ShaderDirectory);
@@ -7412,14 +11545,123 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 			"S %u, P %u, H %u, C %u"),
 			Config.SequenceBudget, S->PoolPageCount, static_cast<int64>(S->PageGeometry.page_positions), S->PoolBytes,
 			S->Ledger.RegionCapacity(SuperSLMPaging::ERegion::S), S->Ledger.RegionCapacity(SuperSLMPaging::ERegion::P),
-			S->Ledger.RegionCapacity(SuperSLMPaging::ERegion::H), FSuperSLMGpuSubsystemState::CacheRegionPages());
+			S->Ledger.RegionCapacity(SuperSLMPaging::ERegion::H), S->CacheRegionPages());
 	}
 	UE_LOG(LogSuperSLM, Log, TEXT("%s"), *Report.Message);
 	return Report;
 }
 
+namespace
+{
+	// Ruling 48 (erratum E-13): what a Configure() carries into the state it prepares, read before TearDown() frees the old
+	// one: the calibration seams the caller armed, and (test builds) the action and tick records StartRecording() began.
+	// Configure() no longer clears those; only StartRecording() does, so a cell can record the calibration a Configure()
+	// starts. Game thread.
+	TFunction<void(FSuperSLMGpuSubsystemState&)> MakeConfigureSeed(FSuperSLMGpuSubsystemState* Old, TArray<double> Arms, TArray<double> LateArms, bool bLateByAttempt, bool bForceTimeout)
+	{
+		struct FSeed
+		{
+			TArray<double> Arms;
+			TArray<double> LateArms;
+			bool bLateByAttempt = false;
+			bool bForceTimeout = false;
+#if WITH_DEV_AUTOMATION_TESTS
+			bool bRowsRecording = false;
+			int32 RowsRecordCount = 0;
+			TArray<FSuperSLMGpuRowsActionRecord> RowsRecords;
+			bool bTickGpuRecording = false;
+			TArray<FSuperSLMGpuTickGpuBusyRecord> TickGpuRecords;
+#endif
+		};
+		const TSharedRef<FSeed, ESPMode::ThreadSafe> Seed = MakeShared<FSeed, ESPMode::ThreadSafe>();
+		Seed->Arms = MoveTemp(Arms);
+		Seed->LateArms = MoveTemp(LateArms);
+		Seed->bLateByAttempt = bLateByAttempt;
+		Seed->bForceTimeout = bForceTimeout;
+#if WITH_DEV_AUTOMATION_TESTS
+		if (Old != nullptr)
+		{
+			Seed->bRowsRecording = Old->bRowsRecording;
+			Seed->RowsRecordCount = Old->RowsRecordCount;
+			Seed->RowsRecords = Old->RowsRecords;
+			FScopeLock Lock(&Old->TickGpuLock);
+			Seed->bTickGpuRecording = Old->bTickGpuRecording.load();
+			Seed->TickGpuRecords = Old->TickGpuRecords;
+		}
+#else
+		(void)Old;
+#endif
+		return [Seed](FSuperSLMGpuSubsystemState& S)
+		{
+			S.CalArmMaxUs = Seed->Arms;
+			S.CalArmLateMaxUs = Seed->LateArms;
+			S.bCalArmLateByAttempt = Seed->bLateByAttempt;
+			S.bCalForceTimeout = Seed->bForceTimeout;
+#if WITH_DEV_AUTOMATION_TESTS
+			S.bRowsRecording = Seed->bRowsRecording;
+			S.RowsRecordCount = Seed->RowsRecordCount;
+			S.RowsRecords = Seed->RowsRecords;
+			FScopeLock Lock(&S.TickGpuLock);
+			S.bTickGpuRecording.store(Seed->bTickGpuRecording);
+			S.TickGpuRecords = Seed->TickGpuRecords;
+#endif
+		};
+	}
+}
+
+// Precache U6, wiring edit 2: the cache settings ConfigurePrefixCache() set ride the Configure seed into the new state, so
+// region C is sized before its ledger and pool are made (PrepareGpuState()); the host is installed on the game thread once
+// the state is published (InstallGpuPrefixCache()).
+static TFunction<void(FSuperSLMGpuSubsystemState&)> WithPrefixCacheSettings(TFunction<void(FSuperSLMGpuSubsystemState&)> Seed,
+	const TSharedPtr<FSuperSLMGpuPrefixCacheSettings>& Pending)
+{
+#if SUPERSLM_WITH_PREFIX_CACHE
+	if (Pending.IsValid())
+	{
+		const FSuperSLMGpuPrefixCacheSettings Settings = *Pending;
+		return [Inner = MoveTemp(Seed), Settings](FSuperSLMGpuSubsystemState& S)
+		{
+			if (Inner)
+			{
+				Inner(S);
+			}
+			S.PrefixCache.Settings = Settings;
+		};
+	}
+#else
+	(void)Pending;
+#endif
+	return Seed;
+}
+
+static void InstallGpuPrefixCache(FSuperSLMGpuSubsystemState& S)
+{
+#if SUPERSLM_WITH_PREFIX_CACHE
+	S.PrefixCache.NotConfiguredReason.Reset();
+	if (S.PrefixCache.Settings.BudgetBytes <= 0)
+	{
+		return; // no cache this configuration
+	}
+	FString Error;
+	if (!SuperSLMGpuPrefixCacheGlue::Install(S, SuperSLMPrefixIdCounter(), S.PrefixCache.Settings, Error))
+	{
+		S.PrefixCache.Host.Reset();
+		S.PrefixCache.NotConfiguredReason = Error;
+		UE_LOG(LogSuperSLM, Display, TEXT("PrefixCache (GPU): Configure() refused (%s); this configuration runs without a GPU prefix cache."), *Error);
+	}
+#else
+	(void)S;
+#endif
+}
 FSuperSLMGpuConfigureReport USuperSLMGpuSubsystem::Configure(USuperSLMModel* Model, const FSuperSLMGpuRuntimeConfig& Config)
 {
+	TFunction<void(FSuperSLMGpuSubsystemState&)> Seed = MakeConfigureSeed(State, MoveTemp(NextRowCostCalibrationArms), MoveTemp(NextRowCostCalibrationLateArms),
+		bNextRowCostLateArmsByAttempt, bNextRowCostCalibrationTimeout);
+	Seed = WithPrefixCacheSettings(MoveTemp(Seed), PendingPrefixCacheSettings); // precache U6, wiring edit 2
+	NextRowCostCalibrationArms.Reset();
+	NextRowCostCalibrationLateArms.Reset();
+	bNextRowCostLateArmsByAttempt = false;
+	bNextRowCostCalibrationTimeout = false;
 	TearDown();
 	LastConfigureShaderDirectory.Reset();
 	LastPreMapLocalVideoMemoryBytes = -1;
@@ -7440,7 +11682,7 @@ FSuperSLMGpuConfigureReport USuperSLMGpuSubsystem::Configure(USuperSLMModel* Mod
 	NextConfigurePageCountPerturbation = 0;
 	NextPoolCreateStatusOverride = 0;
 	const FSuperSLMGpuConfigureReport Report = PrepareGpuState(Model != nullptr ? &Bytes : nullptr, Config, ResolveShaderDirectory(),
-		PageCountPerturbation, PoolCreateStatusOverride, Diag, S);
+		PageCountPerturbation, PoolCreateStatusOverride, Diag, S, Model != nullptr ? Model->GetName() : FString(), Seed);
 	LastConfigureShaderDirectory = Diag.ShaderDirectory;
 	LastPreMapLocalVideoMemoryBytes = Diag.PreMapLocalVideoMemoryBytes;
 	LastPostMapLocalVideoMemoryBytes = Diag.PostMapLocalVideoMemoryBytes;
@@ -7450,8 +11692,12 @@ FSuperSLMGpuConfigureReport USuperSLMGpuSubsystem::Configure(USuperSLMModel* Mod
 		// above every tombstoned id.
 		S->NextLifecycleOpHandleId = FirstHandleIdAfterTombstones();
 		State = S;
+		InstallGpuPrefixCache(*S); // precache U6, wiring edit 2
 		ConfiguredModel = Model;
 		RegisterConfigured(this);
+#if SUPERSLM_WITH_PREFIX_CACHE
+		ReRegisterPrefixSets(); // precache U7: the cooked sets registered with this subsystem, into the new configuration's cache
+#endif
 	}
 	return Report;
 }
@@ -7460,7 +11706,15 @@ void USuperSLMGpuSubsystem::BeginConfigure(USuperSLMModel* Model, const FSuperSL
 {
 	check(IsInGameThread());
 	// Game thread: the teardown of a prior state, the capture of the model's bytes, and the plugin
-	// manager's shader directory.
+	// manager's shader directory. Ruling 48: what the new state carries over is read first.
+	TFunction<void(FSuperSLMGpuSubsystemState&)> Seed = MakeConfigureSeed(State, MoveTemp(NextRowCostCalibrationArms), MoveTemp(NextRowCostCalibrationLateArms),
+		bNextRowCostLateArmsByAttempt, bNextRowCostCalibrationTimeout);
+	Seed = WithPrefixCacheSettings(MoveTemp(Seed), PendingPrefixCacheSettings); // precache U6, wiring edit 2
+	NextRowCostCalibrationArms.Reset();
+	NextRowCostCalibrationLateArms.Reset();
+	bNextRowCostLateArmsByAttempt = false;
+	bNextRowCostCalibrationTimeout = false;
+	const FString ModelName = Model != nullptr ? Model->GetName() : FString();
 	TearDown();
 	LastConfigureShaderDirectory.Reset();
 	LastPreMapLocalVideoMemoryBytes = -1;
@@ -7493,12 +11747,12 @@ void USuperSLMGpuSubsystem::BeginConfigure(USuperSLMModel* Model, const FSuperSL
 	// and this pool thread is the one that waits for them.
 	Async(EAsyncExecution::ThreadPool,
 		[WeakThis, Serial, bHasModel, Bytes = MoveTemp(Bytes), Hold = MoveTemp(Hold), Flight, Config, ShaderDirectory, PageCountPerturbation, PoolCreateStatusOverride,
-			OnDone = MoveTemp(OnDone)]() mutable
+			ModelName, Seed = MoveTemp(Seed), OnDone = MoveTemp(OnDone)]() mutable
 		{
 			FGpuConfigureDiagnostics Diag;
 			FSuperSLMGpuSubsystemState* Built = nullptr;
 			const FSuperSLMGpuConfigureReport Report = PrepareGpuState(bHasModel ? &Bytes : nullptr, Config, ShaderDirectory,
-				PageCountPerturbation, PoolCreateStatusOverride, Diag, Built);
+				PageCountPerturbation, PoolCreateStatusOverride, Diag, Built, ModelName, Seed);
 			{
 				FScopeLock ScopeLock(&Flight->Lock);
 				Flight->Prepared = Built;
@@ -7535,8 +11789,12 @@ void USuperSLMGpuSubsystem::BeginConfigure(USuperSLMModel* Model, const FSuperSL
 					{
 						S->NextLifecycleOpHandleId = Self->FirstHandleIdAfterTombstones(); // plugin paging plan §3.5 (K6)
 						Self->State = S;
+						InstallGpuPrefixCache(*S); // precache U6, wiring edit 2
 						Self->ConfiguredModel = Hold.IsValid() ? Hold->Get() : nullptr;
 						RegisterConfigured(Self);
+#if SUPERSLM_WITH_PREFIX_CACHE
+						Self->ReRegisterPrefixSets(); // precache U7, as Configure()
+#endif
 					}
 					Hold.Reset();
 					if (OnDone)
@@ -7694,6 +11952,13 @@ bool USuperSLMGpuSubsystem::IsSchemaAccepting(const FSuperSLMGpuSequence& Sequen
 {
 	const FGameSlot* S = State != nullptr ? State->FindSlot(Sequence) : nullptr;
 	return S != nullptr && S->bSchemaAccepting;
+}
+
+int64 USuperSLMGpuSubsystem::GetForcedTokenCount(const FSuperSLMGpuSequence& Sequence) const
+{
+	// Schema fast-decode plan rev 1.4.4, §6.1 (P2): counted at the apply, from each delivered id's kind.
+	const FGameSlot* S = State != nullptr ? State->FindSlot(Sequence) : nullptr;
+	return S != nullptr ? S->ForcedTokenCount : 0;
 }
 
 bool USuperSLMGpuSubsystem::SetLayersPerSlice(const FSuperSLMGpuSequence& Sequence, int32 LayersPerSlice, FString& OutError)
@@ -7944,7 +12209,9 @@ void USuperSLMGpuSubsystem::UnmapAdapter(const FSuperSLMGpuAdapterHandle& Adapte
 	}
 	for (const FGameSlot& S : State->Slots)
 	{
-		if (S.bVended && (S.ActiveAdapterId == Adapter.Id || (S.bSwapPending && S.RequestedAdapterId == Adapter.Id)))
+		// MR6 (§5.4, 7.12): an open chunk holds the adapter its first slice passed until it closes, as a token in flight.
+		if (S.bVended && (S.ActiveAdapterId == Adapter.Id || (S.bSwapPending && S.RequestedAdapterId == Adapter.Id)
+			|| (S.PlanRows > 0 && S.PlanAdapterId == Adapter.Id)))
 		{
 			UE_LOG(LogSuperSLM, Warning, TEXT("UnmapAdapter refused: GPU sequence %lld still uses this adapter; swap it away or return the sequence first."), S.Id);
 			return;
@@ -8099,6 +12366,8 @@ void USuperSLMGpuSubsystem::Tick(float DeltaSeconds)
 	TryRestoreConfiguredSchedule(); // R2-W3: a restore requested while the pool was still live
 	const double TickStart = FPlatformTime::Seconds();
 	State->TickIndex += 1;
+	// Ruling 41 (Q13): Exact's draft provider, the CPU subsystem of this game instance.
+	State->CpuDrafts = GetGameInstance() != nullptr ? GetGameInstance()->GetSubsystem<USuperSLMSubsystem>() : nullptr;
 	State->SimSeconds += FMath::Max(0.0, static_cast<double>(DeltaSeconds));
 
 	// Ruling 2026-09-26 (plan §2.5 row 21, §5): the tick never waits on the submission thread.
@@ -8125,18 +12394,40 @@ void USuperSLMGpuSubsystem::Tick(float DeltaSeconds)
 		State->BeginTeardownAfterLoss(); // round 2: never waits
 		return;
 	}
+#if SUPERSLM_WITH_PREFIX_CACHE
+	SuperSLMGpuPrefixCacheGlue::Pump(*State); // precache U6, wiring edit 3: the cache's lane jobs delivered, in the apply pass
+#endif
 	// The per-sequence software queue's own admission pass (D-SLM7421/D-SLM7457): polls every
 	// in-flight queued op for completion, advances each queue's own front past whatever just
 	// resolved, and admits the next eligible op per sequence (plus the subsystem-level restore
 	// queue) in global-request-ordinal order. Runs before decode planning, mirroring "the
 	// submission thread issues restores at the start of a tick, before that tick's slices" (§5)
 	// generalized to every op kind this queue now carries.
-	State->AdmitQueuedOps();
+	// Ruling 51 F1: while the row cost is pending at a frame budget nothing is admitted either, so no op is admitted on
+	// the provisional plan; the tick the calibration settles on admits before it plans.
+	const bool bAdmittedThisTick = !State->bRowCostPending;
+	if (bAdmittedThisTick)
+	{
+		State->AdmitQueuedOps();
+	}
 	{
 		FScopeLock Guard(&State->TimingLock);
 		State->GameTiming = State->CompletedTiming;
 	}
-	State->PlanAndIssue();
+	// Ruling 48 (erratum E-13): while the row cost is calibrated at a frame budget, the tick carries one calibration
+	// slice and plans nothing else, so the first generation waits for the price it is planned with.
+	if (!State->RowCostCalibrationTick())
+	{
+		if (!bAdmittedThisTick)
+		{
+			State->AdmitQueuedOps();
+		}
+		State->PlanAndIssue();
+	}
+#if SUPERSLM_WITH_PREFIX_CACHE
+	SuperSLMGpuPrefixCacheGlue::DispatchLaneJobs(*State); // precache U6, wiring edit 3: posted after the tick job
+#endif
+	State->PublishRowCostTrace(); // ruling 51 F10: the calibrated-price counter's only writer
 
 	// Read-only reporting of this tick's own game-thread cost -- the frame pays only issue and
 	// readback (plan §5); this never feeds a decode. The cumulative hitch counters (GameHitches,
@@ -8266,6 +12557,46 @@ FSuperSLMLifecycleOpHandle USuperSLMGpuSubsystem::RequestAdoptPrefix(const FSupe
 	}
 	if (State->IsPooled())
 	{
+#if SUPERSLM_WITH_PREFIX_CACHE
+		// Precache U6, edit 6 (§5.6): a cache lease is adopted through this same path once Ready; a returned or evicted
+		// one is refused PrefixLeaseEnded. The entry is pinned from here until the adopt resolves (ResolveEntry()).
+		{
+			SuperSLMGpuPrefixCacheGlue::FCacheAdopt CacheAdopt;
+			FString CacheError;
+			switch (SuperSLMGpuPrefixCacheGlue::BeginCacheAdopt(*State, Prefix.Id, CacheAdopt, CacheError))
+			{
+			case SuperSLMGpuPrefixCacheGlue::ECacheAdopt::NotReady:
+				State->LastLifecycleRequestError = FString(TEXT("Malformed: ")) + CacheError;
+				return FSuperSLMLifecycleOpHandle();
+			case SuperSLMGpuPrefixCacheGlue::ECacheAdopt::LeaseEnded:
+				State->LastLifecycleRequestError = CacheError; // begins "PrefixLeaseEnded:"
+				return FSuperSLMLifecycleOpHandle();
+			case SuperSLMGpuPrefixCacheGlue::ECacheAdopt::Adoptable:
+			{
+				FLifecycleOpEntry* CacheEntry = nullptr;
+				int32 CacheSlotIndex = INDEX_NONE;
+				const FSuperSLMLifecycleOpHandle CacheHandle = State->EnqueueSlotOp(Sequence, ELifecycleOpKind::AdoptPrefix, &CacheSlotIndex, &CacheEntry);
+				if (CacheEntry == nullptr)
+				{
+					SuperSLMGpuPrefixCacheGlue::EndCacheAdopt(*State, CacheAdopt.Token); // refused at the call: no pin kept
+					return CacheHandle;
+				}
+				CacheEntry->bPrefixOverload = true;
+				CacheEntry->AdoptPrefixId = Prefix.Id;
+				CacheEntry->CacheAdopt = CacheAdopt;
+				if (CacheEntry->Result != ESuperSLMRestoreResult::Pending)
+				{
+					SuperSLMGpuPrefixCacheGlue::EndCacheAdopt(*State, CacheAdopt.Token); // resolved at the call
+					CacheEntry->CacheAdopt.Token = 0;
+				}
+				State->TryAdmitImmediately(CacheSlotIndex);
+				return CacheHandle;
+			}
+			default:
+				break; // the subsystem's own prefix
+			}
+		}
+#endif
 		if (State->FindReadyPrefix(Prefix.Id) == nullptr)
 		{
 			State->LastLifecycleRequestError = TEXT("Malformed: the prefix is not a Ready GPU prefix of this subsystem (unknown, released, faulted, still building, or another backend's)");
@@ -8323,6 +12654,35 @@ FSuperSLMLifecycleOpHandle USuperSLMGpuSubsystem::RequestRestoreSequence(const T
 	if (Entry != nullptr)
 	{
 		Entry->RestoreHintPrefixId = Hint.Id;
+#if SUPERSLM_WITH_PREFIX_CACHE
+		// Precache plan §5.11 (b) *Adopt and hint* (PC-15 Q5; cell 8.15): a Ready cache lease is a hint. Its entry is
+		// adopt-pinned until the restore resolves (ResolveEntry()), the ledger pre-charges A for its shared pages
+		// (EHintKind::CacheEntry), and the job shares its full pages. A lease that is not Ready, or ended, is no hint:
+		// the restore is private (a hint is never a requirement).
+		SuperSLMGpuPrefixCacheGlue::FCacheAdopt CacheHint;
+		FString CacheError;
+		switch (SuperSLMGpuPrefixCacheGlue::BeginCacheAdopt(*State, Hint.Id, CacheHint, CacheError))
+		{
+		case SuperSLMGpuPrefixCacheGlue::ECacheAdopt::Adoptable:
+			Entry->RestoreHintPrefixId = 0;
+			if (Entry->Result == ESuperSLMRestoreResult::Pending)
+			{
+				Entry->CacheAdopt = CacheHint;
+			}
+			else
+			{
+				SuperSLMGpuPrefixCacheGlue::EndCacheAdopt(*State, CacheHint.Token); // resolved at the call: no pin kept
+			}
+			break;
+		case SuperSLMGpuPrefixCacheGlue::ECacheAdopt::NotReady:
+		case SuperSLMGpuPrefixCacheGlue::ECacheAdopt::LeaseEnded:
+			UE_LOG(LogSuperSLM, Display, TEXT("GPU restore: the hint (cache lease %lld) is not Ready; the restore runs unhinted."), Hint.Id);
+			Entry->RestoreHintPrefixId = 0;
+			break;
+		default:
+			break; // the subsystem's own prefix
+		}
+#endif
 		State->TryAdmitRestoreImmediately();
 	}
 	return Handle;
@@ -8494,6 +12854,11 @@ int32 USuperSLMGpuSubsystem::GetPendingLifecycleOperationCount(const FSuperSLMGp
 FString USuperSLMGpuSubsystem::GetLastLifecycleRequestError() const
 {
 	return State != nullptr ? State->LastLifecycleRequestError : FString();
+}
+
+double USuperSLMGpuSubsystem::GetGpuRowCostMs() const
+{
+	return IsGpuBackendActive() && !State->bRowCostPending ? State->RowCostMs : 0.0;
 }
 
 double USuperSLMGpuSubsystem::GetLastGpuBusyMs() const
@@ -8751,6 +13116,13 @@ bool USuperSLMGpuSubsystem::ReleasePrefix(const FSuperSLMPrefix& Prefix, FString
 		OutError = TEXT("ReleasePrefix is unsupported on a dedicated GPU subsystem: GPU prefixes need pooled mode (FSuperSLMGpuRuntimeConfig::SequenceBudget > 0)");
 		return false;
 	}
+#if SUPERSLM_WITH_PREFIX_CACHE
+	// Precache U6, edit 6: a cache lease is never released here; ReturnPrefix() ends it.
+	if (SuperSLMGpuPrefixCacheGlue::RefuseRelease(*State, Prefix, OutError))
+	{
+		return false;
+	}
+#endif
 	return State->ReleaseGpuPrefix(Prefix, OutError);
 }
 
@@ -9925,6 +14297,583 @@ bool FSuperSLMPagedGpuTestSeam::ArmAdoptFaultAfterShare(USuperSLMGpuSubsystem& G
 	S->TestAdoptFaultAfterShare.store(static_cast<uint32>(Status), std::memory_order_release);
 	return true;
 }
+
+// Multi-row GPU plan MR6 (red-suite-mr6.md; ruling 40): FSuperSLMGpuMultiRowTestAccess. Game thread.
+bool FSuperSLMGpuMultiRowTestAccess::IsBuilt() { return true; }
+
+bool FSuperSLMGpuMultiRowTestAccess::SetMultiRow(FSuperSLMGpuRuntimeConfig& Config, bool bOn)
+{
+	Config.bGpuMultiRow = bOn;
+	return true;
+}
+
+void FSuperSLMGpuMultiRowTestAccess::StartRecording(USuperSLMGpuSubsystem& Gpu)
+{
+	FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr)
+	{
+		return;
+	}
+	S->RowsRecords.Reset();
+	S->RowsRecordCount = 0;
+	S->TestExactApplySamples.Reset(); // ruling 59d point 6
+	S->bRowsRecording = true;
+	S->TestExactFallbackNoDraft.store(0);
+	S->TestExactFallbackOpenFailed.store(0);
+	{
+		FScopeLock TickLock(&S->TickGpuLock);
+		S->TickGpuRecords.Reset();
+		S->bTickGpuRecording.store(true);
+	}
+	FScopeLock Lock(&S->Layer1StatusLock);
+	S->Layer1StatusCounts.Reset();
+}
+
+// Ruling 48 (erratum E-13) and 48a: the row-cost calibration's seam. Game thread.
+bool FSuperSLMGpuMultiRowTestAccess::SetCalibrateGpuRowCost(FSuperSLMGpuRuntimeConfig& Config, bool bOn)
+{
+	Config.bCalibrateGpuRowCost = bOn;
+	return true;
+}
+
+bool FSuperSLMGpuMultiRowTestAccess::ArmRowCostCalibrationTimeout(USuperSLMGpuSubsystem& Gpu)
+{
+	Gpu.bNextRowCostCalibrationTimeout = true; // spent by the next Configure()
+	return true;
+}
+
+bool FSuperSLMGpuMultiRowTestAccess::GetRowCost(const USuperSLMGpuSubsystem& Gpu, FSuperSLMGpuRowCostRecord& Out)
+{
+	Out = FSuperSLMGpuRowCostRecord();
+	const FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr || !S->bActive)
+	{
+		return false;
+	}
+	if (S->bRowCostPending)
+	{
+		Out.Source = ESuperSLMGpuRowCostSource::Pending;
+		Out.PlanRowCostUs = -1;
+	}
+	else
+	{
+		switch (S->RowCostSource)
+		{
+			case GpuRowCost::ESource::Default:    Out.Source = ESuperSLMGpuRowCostSource::Default; break;
+			case GpuRowCost::ESource::Game:       Out.Source = ESuperSLMGpuRowCostSource::Game; break;
+			case GpuRowCost::ESource::Calibrated: Out.Source = ESuperSLMGpuRowCostSource::Calibrated; break;
+			case GpuRowCost::ESource::FallBack:   Out.Source = ESuperSLMGpuRowCostSource::FallBack; break;
+		}
+		Out.RowCostMs = S->RowCostMs;
+		Out.PlanRowCostUs = S->RowsPlan.bValid ? S->RowsPlan.RowCostUs : -1;
+	}
+	Out.Attempts = S->RowCostAttempts;
+	Out.WarmUpRuns = S->RowCostWarmUpRuns;
+	Out.TimedRunsUs = S->RowCostRunsUs;
+	Out.AdapterName = S->AdapterName;
+	// Erratum E-14 (rulings 53, 54): the line. A flat line has no positions; a calibrated one has pos_a, and P2 and C_b
+	// once phase 2 has settled.
+	if (!S->bRowCostPending)
+	{
+		const GpuRowCost::FRowCostLine& Line = S->RowCostLine;
+		const bool bCalibrated = S->RowCostSource == GpuRowCost::ESource::Calibrated;
+		Out.AnchorPosition = bCalibrated ? Line.AnchorPos : -1;
+		Out.SlopeUsPerPosition = S->SlopeUsPerPosition(Line);
+		Out.bSlopeMeasured = S->bRowCostSlopeMeasured;
+		// Ruling 56 (1): F as the planner prices it, at C_a.
+		Out.bFinishMeasured = S->RowCostFinishUs >= 0;
+		Out.FinishUs = S->FinishPriceUs(FMath::Max<int64>(1, Line.AnchorUs));
+	}
+	Out.LatePosition = S->RowCostLatePosition;
+	Out.LateRowCostUs = S->RowCostLateUs;
+	Out.LateWarmUpRuns = S->RowCostLateWarmUpRuns;
+	Out.LateTimedRunsUs = S->RowCostLateRunsUs;
+	Out.DroppedRunsUs = S->RowCostDroppedRunsUs; // ruling 60
+	Out.LateDroppedRunsUs = S->RowCostLateDroppedRunsUs;
+	Out.SpreadFailures = S->RowCostSpreadFailures;
+	Out.LateSpreadFailures = S->RowCostLateSpreadFailures;
+	Out.bLatePending = S->bCalPhase2 && S->CalP2Epoch == GRowCostForgetEpoch.load() && !S->bTerminalLoss.load(); // ruling 55 F5
+	return true;
+}
+
+bool FSuperSLMGpuMultiRowTestAccess::IsRowCostCalibrating(const USuperSLMGpuSubsystem& Gpu)
+{
+	return Gpu.State != nullptr && Gpu.State->bActive && Gpu.State->bRowCostPending;
+}
+
+double FSuperSLMGpuMultiRowTestAccess::GetPublicGpuRowCostMs(const USuperSLMGpuSubsystem& Gpu)
+{
+	return Gpu.GetGpuRowCostMs();
+}
+
+bool FSuperSLMGpuMultiRowTestAccess::ArmRowCostCalibration(USuperSLMGpuSubsystem& Gpu, const TArray<double>& AttemptMaxUs)
+{
+	Gpu.NextRowCostCalibrationArms = AttemptMaxUs; // spent by the next Configure()
+	// E-14 (ruling 54, reading 5): phase 2 takes the arm of the attempt phase 1 used (a flat line when armed).
+	Gpu.NextRowCostCalibrationLateArms = AttemptMaxUs;
+	Gpu.bNextRowCostLateArmsByAttempt = true;
+	return true;
+}
+
+void FSuperSLMGpuMultiRowTestAccess::ForgetRowCostCalibrations()
+{
+	FScopeLock Lock(&RowCostCacheLock());
+	RowCostCache().Reset(); // the lines, the fallbacks and phase 2's once-per-key warning
+	GRowCostCalibrationCount.store(0);
+	GRowCostForgetEpoch.fetch_add(1); // ruling 54 (reading 3): a phase 2 in flight is dropped
+}
+
+int32 FSuperSLMGpuMultiRowTestAccess::GetRowCostCalibrationCount()
+{
+	return GRowCostCalibrationCount.load();
+}
+
+bool FSuperSLMGpuMultiRowTestAccess::ArmRowCostRunDelay(int32 Phase, uint32 RunMask, double DelayUs)
+{
+	if (Phase != 1 && Phase != 2)
+	{
+		return false;
+	}
+	GRowCostRunDelayUs[Phase - 1].store(static_cast<int64>(FMath::Max(0.0, DelayUs)));
+	GRowCostRunDelayMask[Phase - 1].store(RunMask);
+	return true;
+}
+
+// Erratum E-14 (ruling 53; ruling 54, reading 5): the early entries arm phase 1's attempts, the first late entry phase 2.
+bool FSuperSLMGpuMultiRowTestAccess::ArmRowCostCalibrationPositions(USuperSLMGpuSubsystem& Gpu, const TArray<double>& EarlyMaxUs, const TArray<double>& LateMaxUs)
+{
+	Gpu.NextRowCostCalibrationArms = EarlyMaxUs; // spent by the next Configure()
+	Gpu.NextRowCostCalibrationLateArms = LateMaxUs;
+	Gpu.bNextRowCostLateArmsByAttempt = false;
+	return true;
+}
+
+int64 FSuperSLMGpuMultiRowTestAccess::GetRowCostAtUs(const USuperSLMGpuSubsystem& Gpu, int64 Position)
+{
+	const FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr || !S->bActive || S->bRowCostPending)
+	{
+		return -1;
+	}
+	return GpuRowCost::RowCostAtUs(S->RowCostLine, Position);
+}
+
+bool FSuperSLMGpuMultiRowTestAccess::DescribeSaveDiff(const USuperSLMGpuSubsystem& Gpu, const TArray<uint8>& A, const TArray<uint8>& B, FString& OutField, FString& OutValues,
+	int32& OutInFlightA, int32& OutInFlightB)
+{
+	OutField.Reset();
+	OutValues.Reset();
+	OutInFlightA = OutInFlightB = 0;
+	TArray<uint8> Live[2];
+	if (!GetLiveSaveBytes(Gpu, A, Live[0]) || !GetLiveSaveBytes(Gpu, B, Live[1]))
+	{
+		return false;
+	}
+	SuperSLMSaveBlob::FContents W[2];
+	GpuJumpCore::FWrapperExt X[2];
+	const uint8* L1[2] = {};
+	int64 L1Size[2] = {};
+	int64 L1Offset[2] = {};
+	const TArray<uint8>* Blobs[2] = { &A, &B };
+	for (int32 I = 0; I < 2; ++I)
+	{
+		// The header fields from the blob itself (the live view trims dead K/V, so its sizes no longer read); the body below
+		// from the live view, from the same offset.
+		const uint8* Payload = nullptr;
+		int64 PayloadBytes = 0;
+		FString Error;
+		size_t Consumed = 0;
+		if (!SuperSLMSaveBlob::Read(*Blobs[I], W[I], Payload, PayloadBytes, Error) ||
+			!GpuJumpCore::DecodeWrapperExt(Payload, static_cast<size_t>(PayloadBytes), X[I], Consumed) || static_cast<int64>(Consumed) + 8 > PayloadBytes)
+		{
+			return false;
+		}
+		uint64 Size = 0;
+		FMemory::Memcpy(&Size, Payload + Consumed, 8);
+		L1[I] = Payload + Consumed + 8;
+		L1Size[I] = FMath::Min<int64>(static_cast<int64>(Size), PayloadBytes - static_cast<int64>(Consumed) - 8);
+		L1Offset[I] = L1[I] - Blobs[I]->GetData();
+	}
+	OutInFlightA = X[0].InFlightIssued;
+	OutInFlightB = X[1].InFlightIssued;
+	auto Differ = [&](const TCHAR* Name, const FString& VA, const FString& VB)
+	{
+		if (OutField.IsEmpty() && VA != VB)
+		{
+			OutField = Name;
+			OutValues = FString::Printf(TEXT("%s / %s"), *VA, *VB);
+		}
+	};
+	auto Ints = [](const TArray<int32>& V) { FString Out; for (int32 X0 : V) { Out += FString::Printf(TEXT("%s%d"), Out.IsEmpty() ? TEXT("") : TEXT(","), X0); } return Out; };
+	auto Hash = [](const uint8* H) { return BytesToHex(H, 32); };
+	Differ(TEXT("wrapper Phase"), FString::FromInt((int32)W[0].Phase), FString::FromInt((int32)W[1].Phase));
+	Differ(TEXT("wrapper SpanKind"), FString::FromInt((int32)W[0].SpanKind), FString::FromInt((int32)W[1].SpanKind));
+	Differ(TEXT("wrapper ReadyForLogits"), FString::FromInt(W[0].bReadyForLogits), FString::FromInt(W[1].bReadyForLogits));
+	Differ(TEXT("wrapper Layer1Tag"), W[0].Layer1Tag, W[1].Layer1Tag);
+	Differ(TEXT("wrapper Layer1Commit"), W[0].Layer1Commit, W[1].Layer1Commit);
+	Differ(TEXT("wrapper ArtifactHash"), Hash(W[0].ArtifactHash), Hash(W[1].ArtifactHash));
+	Differ(TEXT("wrapper MaxNewTokensRemaining"), FString::FromInt(W[0].MaxNewTokensRemaining), FString::FromInt(W[1].MaxNewTokensRemaining));
+	Differ(TEXT("wrapper LayerBudget"), FString::FromInt(W[0].LayerBudget), FString::FromInt(W[1].LayerBudget));
+	Differ(TEXT("wrapper LayersDoneInToken"), FString::FromInt(W[0].LayersDoneInToken), FString::FromInt(W[1].LayersDoneInToken));
+	Differ(TEXT("wrapper ContextUsed"), LexToString(W[0].ContextUsed), LexToString(W[1].ContextUsed));
+	Differ(TEXT("wrapper HasAdapter"), FString::FromInt(W[0].bHasAdapter), FString::FromInt(W[1].bHasAdapter));
+	Differ(TEXT("wrapper AdapterHash"), Hash(W[0].AdapterHash), Hash(W[1].AdapterHash));
+	Differ(TEXT("wrapper PromptRemaining"), Ints(W[0].PromptRemaining), Ints(W[1].PromptRemaining));
+	Differ(TEXT("wrapper StopTokenIds"), Ints(W[0].StopTokenIds), Ints(W[1].StopTokenIds));
+	Differ(TEXT("wrapper SchemaName"), W[0].SchemaName, W[1].SchemaName);
+	Differ(TEXT("ext Path"), FString::FromInt(X[0].Path), FString::FromInt(X[1].Path));
+	Differ(TEXT("ext Primed"), FString::FromInt(X[0].bPrimed), FString::FromInt(X[1].bPrimed));
+	Differ(TEXT("ext Stopped"), FString::FromInt(X[0].bStopped), FString::FromInt(X[1].bStopped));
+	Differ(TEXT("ext LastToken"), FString::FromInt(X[0].LastToken), FString::FromInt(X[1].LastToken));
+	Differ(TEXT("ext InFlightIssued"), FString::FromInt(X[0].InFlightIssued), FString::FromInt(X[1].InFlightIssued));
+	Differ(TEXT("ext carried events"), FString::FromInt((int32)X[0].Carried.size()), FString::FromInt((int32)X[1].Carried.size()));
+	// Layer-1: the v4 header SLM5 and SLM6 share (gpu_1p0.cpp's kSlm6Off*), then the body.
+	struct FL1Field { const TCHAR* Name; int32 Off; int32 Bytes; };
+	static const FL1Field Fields[] = {
+		{TEXT("Layer-1 magic"), 0, 4}, {TEXT("Layer-1 layer_index"), 4, 4}, {TEXT("Layer-1 scale_m"), 8, 8}, {TEXT("Layer-1 scale_e"), 16, 8},
+		{TEXT("Layer-1 kv_saturation (diagnostic)"), 24, 8}, {TEXT("Layer-1 context_length"), 32, 8}, {TEXT("Layer-1 hidden_codes_size"), 40, 8},
+		{TEXT("Layer-1 workspace_size"), 48, 8}, {TEXT("Layer-1 model_hash"), 56, 32}, {TEXT("Layer-1 kv_landing_saturation (diagnostic)"), 88, 8},
+		{TEXT("Layer-1 k_channel_landing_saturation (diagnostic)"), 96, 8}, {TEXT("Layer-1 rope_q_saturation (diagnostic)"), 104, 8},
+		{TEXT("Layer-1 rope_k_saturation (diagnostic)"), 112, 8}, {TEXT("Layer-1 bound_schema_index"), 120, 4}, {TEXT("Layer-1 dfa_walk_state"), 124, 4},
+		{TEXT("Layer-1 ready"), 128, 4} };
+	for (const FL1Field& F : Fields)
+	{
+		if (F.Off + F.Bytes > L1Size[0] || F.Off + F.Bytes > L1Size[1])
+		{
+			break;
+		}
+		Differ(F.Name, BytesToHex(L1[0] + F.Off, F.Bytes), BytesToHex(L1[1] + F.Off, F.Bytes));
+	}
+	if (OutField.IsEmpty())
+	{
+		const int64 N = FMath::Min<int64>(Live[0].Num() - L1Offset[0], Live[1].Num() - L1Offset[1]);
+		for (int64 I = 132; I < N; ++I)
+		{
+			const uint8 VA = Live[0][L1Offset[0] + I], VB = Live[1][L1Offset[1] + I];
+			if (VA != VB)
+			{
+				OutField = FString::Printf(TEXT("Layer-1 body at +%lld (live)"), I);
+				OutValues = FString::Printf(TEXT("%u / %u"), VA, VB);
+				break;
+			}
+		}
+		if (OutField.IsEmpty() && Live[0].Num() - L1Offset[0] != Live[1].Num() - L1Offset[1])
+		{
+			OutField = TEXT("Layer-1 live size");
+			OutValues = FString::Printf(TEXT("%lld / %lld"), Live[0].Num() - L1Offset[0], Live[1].Num() - L1Offset[1]);
+		}
+	}
+	return true;
+}
+bool FSuperSLMGpuMultiRowTestAccess::GetSaveContextUsed(const TArray<uint8>& Blob, int64& OutContextUsed)
+{
+	OutContextUsed = -1;
+	SuperSLMSaveBlob::FContents W;
+	const uint8* Payload = nullptr;
+	int64 PayloadBytes = 0;
+	FString Error;
+	if (!SuperSLMSaveBlob::Read(Blob, W, Payload, PayloadBytes, Error))
+	{
+		return false;
+	}
+	OutContextUsed = W.ContextUsed;
+	return true;
+}
+
+bool FSuperSLMGpuMultiRowTestAccess::GetConfigureWidenedMask(const USuperSLMGpuSubsystem& Gpu, uint32& OutMask)
+{
+	OutMask = 0;
+	const FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr || !S->bActive)
+	{
+		return false;
+	}
+	OutMask = S->ConfigureWidenedMask;
+	return true;
+}
+
+int32 FSuperSLMGpuMultiRowTestAccess::GetOneRowLayersAt(const USuperSLMGpuSubsystem& Gpu, int64 Position)
+{
+	FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr || !S->bActive || S->bRowCostPending || !S->RowsPlan.bValid)
+	{
+		return -1;
+	}
+	// The chooser's plan at C(1, Position) (every budget, B = 0 included: there l(1) = L).
+	const int64 C1 = FMath::Max<int64>(1, GpuRowCost::RowCostAtUs(S->RowCostLine, Position));
+	return GpuRows::ChooseRowsPlanAt(S->RowsInput, C1).LayersPerSlice[0];
+}
+
+// Ruling 55 (F1): NextPosition(), the position the planner prices the sequence's next row at. It is already 0-based
+// and counts the committed rows (PosBase + the prompt rows planned + the tokens issued less the first, which embeds
+// nothing until the next step), plus the drafts an open or unapplied Exact chunk may still commit: quiet, that is
+// the prompt's length + the tokens produced - 1, so no conversion is needed.
+int64 FSuperSLMGpuMultiRowTestAccess::GetNextRowPosition(const USuperSLMGpuSubsystem& Gpu, const FSuperSLMGpuSequence& Sequence)
+{
+	const int32 Index = GpuSlotIndexOf(Gpu.State, Sequence);
+	if (Index == INDEX_NONE)
+	{
+		return -1;
+	}
+	return FSuperSLMGpuSubsystemState::NextPosition(Gpu.State->Slots[Index]);
+}
+
+// Ruling 56 (6): one shot, taken by the next Exact open on the submission thread.
+bool FSuperSLMGpuMultiRowTestAccess::ArmNoDraftStep(USuperSLMGpuSubsystem& Gpu)
+{
+	FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr || !S->bActive)
+	{
+		return false;
+	}
+	S->bTestNoDraftArmed.store(true);
+	return true;
+}
+
+// Ruling 57 (F1, F5): the suite's red stub, implemented here: the chooser's candidate widths for the widened warm-up.
+bool FSuperSLMGpuMultiRowTestAccess::GetWidenWarmUpRows(const USuperSLMGpuSubsystem& Gpu, TArray<int32>& OutRows)
+{
+	OutRows.Reset();
+	const FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr || !S->bActive)
+	{
+		return false;
+	}
+	for (const int32 M : kWidenWarmUpRows)
+	{
+		if ((S->CalWidenMask >> M & 1u) != 0)
+		{
+			OutRows.Add(M); // ascending: kWidenWarmUpRows is
+		}
+	}
+	return true;
+}
+
+// Ruling 56 (1): the chooser's FinishSliceLayers at C(1, Position) from the line and F as the planner prices it.
+int32 FSuperSLMGpuMultiRowTestAccess::GetFinishSliceLayersAt(const USuperSLMGpuSubsystem& Gpu, int64 Position)
+{
+	const FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr || !S->bActive || S->bRowCostPending || !S->RowsPlan.bValid)
+	{
+		return -1;
+	}
+	const int64 C1 = FMath::Max<int64>(1, GpuRowCost::RowCostAtUs(S->RowCostLine, FMath::Max<int64>(0, Position)));
+	return GpuRows::FinishSliceLayers(S->RowsInput, C1, S->FinishPriceUs(C1));
+}
+
+// Ruling 56 (5): a save's live state. The blob is SuperSLMSaveBlob's wrapper around [the GPU wrapper extension, a u64
+// Layer-1 size, the Layer-1 blob]. A dedicated 'SLM5' Layer-1 blob is its 120-byte header, the 12-byte tail, the
+// residual (hidden_codes_size at offset 40) and the K/V workspace (workspace_size at 48), laid out
+// [layer][K|V][kv_head][pos < cap][d] (int8); its live rows are [0, L'), L' = context_length (at 32) plus the row in
+// progress for a mid-token save (0 < layer_index (at 4) < L), as the engine's 'SLM6' writer counts them. Each run's
+// rows past L' are dropped; every other byte is kept in order. A pooled 'SLM6' blob already holds only [0, L').
+bool FSuperSLMGpuMultiRowTestAccess::GetLiveSaveBytes(const USuperSLMGpuSubsystem& Gpu, const TArray<uint8>& Blob, TArray<uint8>& OutLive)
+{
+	OutLive.Reset();
+	const FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr || S->NumHiddenLayers <= 0 || S->KvHeads <= 0 || S->KvHeadDim <= 0)
+	{
+		return false;
+	}
+	SuperSLMSaveBlob::FContents Contents;
+	const uint8* Payload = nullptr;
+	int64 PayloadBytes = 0;
+	FString Error;
+	if (!SuperSLMSaveBlob::Read(Blob, Contents, Payload, PayloadBytes, Error) || Contents.Backend != ESuperSLMBackend::GPU)
+	{
+		return false;
+	}
+	GpuJumpCore::FWrapperExt Ext;
+	size_t Consumed = 0;
+	if (!GpuJumpCore::DecodeWrapperExt(Payload, static_cast<size_t>(PayloadBytes), Ext, Consumed) || static_cast<int64>(Consumed) + 8 > PayloadBytes)
+	{
+		return false;
+	}
+	uint64 Layer1Size = 0;
+	FMemory::Memcpy(&Layer1Size, Payload + Consumed, 8);
+	const int64 Layer1Offset = (Payload - Blob.GetData()) + static_cast<int64>(Consumed) + 8;
+	if (Layer1Size < 132 || Layer1Offset + static_cast<int64>(Layer1Size) > Blob.Num())
+	{
+		return false;
+	}
+	const uint8* L1 = Blob.GetData() + Layer1Offset;
+	auto Get = [L1](int32 Off, auto Zero) { decltype(Zero) V = Zero; FMemory::Memcpy(&V, L1 + Off, sizeof(V)); return V; };
+	const uint32 Magic = Get(0, uint32(0));
+	if (Magic == 0x364D4C53u) // 'SLM6': [0, L') only
+	{
+		OutLive = Blob;
+		return true;
+	}
+	if (Magic != 0x354D4C53u) // 'SLM5'
+	{
+		return false;
+	}
+	const uint32 LayerIndex = Get(4, uint32(0));
+	const int64 ContextLength = Get(32, int64(0));
+	const uint64 Residual = Get(40, uint64(0));
+	const uint64 Workspace = Get(48, uint64(0));
+	const uint64 Runs = static_cast<uint64>(S->NumHiddenLayers) * 2u * static_cast<uint64>(S->KvHeads);
+	const uint64 D = static_cast<uint64>(S->KvHeadDim);
+	const uint64 WorkspaceStart = 132 + Residual;
+	if (WorkspaceStart + Workspace > Layer1Size || Workspace % (Runs * D) != 0)
+	{
+		return false;
+	}
+	const int64 Cap = static_cast<int64>(Workspace / (Runs * D));
+	const int64 Live = FMath::Clamp<int64>(ContextLength + (LayerIndex > 0 && LayerIndex < static_cast<uint32>(S->NumHiddenLayers) ? 1 : 0), 0, Cap);
+	const int64 Head = Layer1Offset + static_cast<int64>(WorkspaceStart);
+	OutLive.Append(Blob.GetData(), static_cast<int32>(Head));
+	for (uint64 Run = 0; Run < Runs; ++Run)
+	{
+		OutLive.Append(Blob.GetData() + Head + static_cast<int64>(Run * static_cast<uint64>(Cap) * D), static_cast<int32>(static_cast<uint64>(Live) * D));
+	}
+	const int64 After = Head + static_cast<int64>(Workspace);
+	OutLive.Append(Blob.GetData() + After, Blob.Num() - static_cast<int32>(After));
+	return true;
+}
+
+bool FSuperSLMGpuMultiRowTestAccess::GetTickGpuBusyUs(const USuperSLMGpuSubsystem& Gpu, TArray<FSuperSLMGpuTickGpuBusyRecord>& OutRecords)
+{
+	OutRecords.Reset();
+	FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr)
+	{
+		return true; // built; nothing recorded without a configured subsystem
+	}
+	FScopeLock Lock(&S->TickGpuLock);
+	OutRecords = S->TickGpuRecords;
+	return true;
+}
+
+int32 FSuperSLMGpuMultiRowTestAccess::GetLayer1StatusCount(const USuperSLMGpuSubsystem& Gpu, SslmGpuStatus Status)
+{
+	FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr)
+	{
+		return -1;
+	}
+	FScopeLock Lock(&S->Layer1StatusLock);
+	return S->Layer1StatusCounts.FindRef(static_cast<uint32>(Status));
+}
+
+bool FSuperSLMGpuMultiRowTestAccess::ArmRowsFault(USuperSLMGpuSubsystem& Gpu, ESuperSLMGpuRowsFaultPoint Point, SslmGpuStatus Status)
+{
+	FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr)
+	{
+		return false;
+	}
+	S->TestRowsFaultStatus.store(static_cast<int32>(Status));
+	S->TestRowsFaultPoint.store(static_cast<int32>(Point));
+	return true;
+}
+
+bool FSuperSLMGpuMultiRowTestAccess::GetExactFallbacks(const USuperSLMGpuSubsystem& Gpu, int32& OutNoDraft, int32& OutOpenFailed)
+{
+	OutNoDraft = OutOpenFailed = 0;
+	const FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr)
+	{
+		return false;
+	}
+	OutNoDraft = S->TestExactFallbackNoDraft.load();
+	OutOpenFailed = S->TestExactFallbackOpenFailed.load();
+	return true;
+}
+
+bool FSuperSLMGpuMultiRowTestAccess::IsAdapterMapped(const USuperSLMGpuSubsystem& Gpu, const FSuperSLMGpuAdapterHandle& Adapter)
+{
+	return Gpu.State != nullptr && Adapter.IsValid() && Gpu.State->Adapters.Contains(Adapter.Id);
+}
+
+TArray<FSuperSLMGpuRowsActionRecord> FSuperSLMGpuMultiRowTestAccess::GetActions(const USuperSLMGpuSubsystem& Gpu)
+{
+	return Gpu.State != nullptr ? Gpu.State->RowsRecords : TArray<FSuperSLMGpuRowsActionRecord>();
+}
+
+bool FSuperSLMGpuMultiRowTestAccess::IsChunkOpen(const USuperSLMGpuSubsystem& Gpu, const FSuperSLMGpuSequence& Sequence)
+{
+	const int32 Index = GpuSlotIndexOf(Gpu.State, Sequence);
+	return Index != INDEX_NONE && Gpu.State->Slots[Index].PlanRows > 0;
+}
+
+bool FSuperSLMGpuMultiRowTestAccess::GetRowsPlan(const USuperSLMGpuSubsystem& Gpu, int32& OutMMax, int32& OutMMaxLayers, int32& OutComposedRows, int32& OutComposedLayers, bool& OutMultiRowOn)
+{
+	OutMMax = OutMMaxLayers = OutComposedRows = OutComposedLayers = 0;
+	OutMultiRowOn = false;
+	const FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr || !S->bActive || !S->RowsPlan.bValid)
+	{
+		return false;
+	}
+	OutMMax = S->RowsPlan.MMax;
+	OutMMaxLayers = S->RowsPlan.MMaxLayers;
+	OutComposedRows = S->RowsPlan.ComposedRows;
+	OutComposedLayers = S->RowsPlan.ComposedLayers;
+	OutMultiRowOn = S->MultiRowOn();
+	return true;
+}
+
+// The ids a save now would carry: every applied-pending result whose job is done, one id per delivered id (an Exact
+// close's drafts and token), none for a dead end, a fault or a slice that delivers nothing. A result still on the
+// device counts nothing yet.
+bool FSuperSLMGpuMultiRowTestAccess::GetPlanCounts(const USuperSLMGpuSubsystem& Gpu, const FSuperSLMGpuSequence& Sequence, int32& OutTokensIssued, int64& OutExactExtraBound, bool& bOutAwaitClose)
+{
+	OutTokensIssued = 0;
+	OutExactExtraBound = 0;
+	bOutAwaitClose = false;
+	const int32 Index = GpuSlotIndexOf(Gpu.State, Sequence);
+	if (Index == INDEX_NONE)
+	{
+		return false;
+	}
+	const auto& Slot = Gpu.State->Slots[Index];
+	OutTokensIssued = Slot.TokensIssued;
+	OutExactExtraBound = Slot.ExactExtraBound;
+	bOutAwaitClose = Slot.bPlanAwaitClose;
+	return true;
+}
+
+bool FSuperSLMGpuMultiRowTestAccess::GetExactApplySamples(const USuperSLMGpuSubsystem& Gpu, int64 SequenceId, TArray<FIntVector4>& Out)
+{
+	Out.Reset();
+	const FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr)
+	{
+		return false;
+	}
+	for (const TPair<int64, FIntVector4>& P : S->TestExactApplySamples)
+	{
+		if (P.Key == SequenceId)
+		{
+			Out.Add(P.Value);
+		}
+	}
+	return true;
+}
+
+int32 FSuperSLMGpuMultiRowTestAccess::PendingResultIds(const USuperSLMGpuSubsystem& Gpu, const FSuperSLMGpuSequence& Sequence)
+{
+	const int32 Index = GpuSlotIndexOf(Gpu.State, Sequence);
+	if (Index == INDEX_NONE)
+	{
+		return -1;
+	}
+	int32 Ids = 0;
+	for (const auto& E : Gpu.State->Slots[Index].Pending)
+	{
+		if (!E.Job.IsValid() || !E.Job->bDone.load(std::memory_order_acquire) || !E.Job->Results.IsValidIndex(E.ResultIndex))
+		{
+			continue;
+		}
+		const auto& R = E.Job->Results[E.ResultIndex];
+		if (R.Kind == decltype(R.Kind)::Token)
+		{
+			Ids += R.JumpIds.Num() > 0 ? R.JumpIds.Num() : 1;
+		}
+	}
+	return Ids;
+}
 #endif // WITH_DEV_AUTOMATION_TESTS
 
 #else // SUPERSLMUNREAL_WITH_GPU == 0: the class exists for UnrealHeaderTool; no instance is created.
@@ -9957,6 +14906,7 @@ bool USuperSLMGpuSubsystem::SetSchema(const FSuperSLMGpuSequence&, const FSuperS
 FSuperSLMGpuSchemaHandle USuperSLMGpuSubsystem::GetBoundSchema(const FSuperSLMGpuSequence&) const { return FSuperSLMGpuSchemaHandle(); }
 uint32 USuperSLMGpuSubsystem::GetSchemaWalkState(const FSuperSLMGpuSequence&) const { return 0xFFFFFFFFu; }
 bool USuperSLMGpuSubsystem::IsSchemaAccepting(const FSuperSLMGpuSequence&) const { return false; }
+int64 USuperSLMGpuSubsystem::GetForcedTokenCount(const FSuperSLMGpuSequence&) const { return 0; }
 bool USuperSLMGpuSubsystem::SetLayersPerSlice(const FSuperSLMGpuSequence&, int32, FString& OutError) { OutError = TEXT("no GPU backend"); return false; }
 int32 USuperSLMGpuSubsystem::GetLayersPerSlice(const FSuperSLMGpuSequence&) const { return 0; }
 int32 USuperSLMGpuSubsystem::GetConfiguredK() const { return 0; }
@@ -9993,6 +14943,7 @@ ESuperSLMRestoreResult USuperSLMGpuSubsystem::GetRestoreResult(const FSuperSLMLi
 int32 USuperSLMGpuSubsystem::GetPendingLifecycleOperationCount(const FSuperSLMGpuSequence&) const { return 0; }
 FString USuperSLMGpuSubsystem::GetLastLifecycleRequestError() const { return FString(); }
 double USuperSLMGpuSubsystem::GetLastGpuBusyMs() const { return 0.0; }
+double USuperSLMGpuSubsystem::GetGpuRowCostMs() const { return 0.0; }
 FSuperSLMGpuTimingSnapshot USuperSLMGpuSubsystem::GetGpuTimingSnapshot() const { return {}; }
 double USuperSLMGpuSubsystem::GetLastHostFinishMs() const { return 0.0; }
 double USuperSLMGpuSubsystem::GetTimeToFirstTokenMs(const FSuperSLMGpuSequence&) const { return -1.0; }
@@ -10112,6 +15063,45 @@ bool FSuperSLMPagedGpuTestSeam::GetRetainedPrefixBookkeeping(const USuperSLMGpuS
 bool FSuperSLMPagedGpuTestSeam::ReadCompletedLayer1Timing(USuperSLMGpuSubsystem&, double& OutBusyMs) { OutBusyMs = 0.0; return false; }
 bool FSuperSLMPagedGpuTestSeam::SetNextLayer1StatusOverride(USuperSLMGpuSubsystem&, ESuperSLMPagedRequestKind, SslmGpuStatus) { return false; }
 bool FSuperSLMPagedGpuTestSeam::ArmAdoptFaultAfterShare(USuperSLMGpuSubsystem&, SslmGpuStatus) { return false; }
+bool FSuperSLMGpuMultiRowTestAccess::IsBuilt() { return false; }
+bool FSuperSLMGpuMultiRowTestAccess::SetMultiRow(FSuperSLMGpuRuntimeConfig& Config, bool bOn) { Config.bGpuMultiRow = bOn; return true; }
+void FSuperSLMGpuMultiRowTestAccess::StartRecording(USuperSLMGpuSubsystem&) {}
+TArray<FSuperSLMGpuRowsActionRecord> FSuperSLMGpuMultiRowTestAccess::GetActions(const USuperSLMGpuSubsystem&) { return TArray<FSuperSLMGpuRowsActionRecord>(); }
+bool FSuperSLMGpuMultiRowTestAccess::IsChunkOpen(const USuperSLMGpuSubsystem&, const FSuperSLMGpuSequence&) { return false; }
+bool FSuperSLMGpuMultiRowTestAccess::GetRowsPlan(const USuperSLMGpuSubsystem&, int32& OutMMax, int32& OutMMaxLayers, int32& OutComposedRows, int32& OutComposedLayers, bool& OutMultiRowOn)
+{
+	OutMMax = OutMMaxLayers = OutComposedRows = OutComposedLayers = 0;
+	OutMultiRowOn = false;
+	return false;
+}
+bool FSuperSLMGpuMultiRowTestAccess::GetPlanCounts(const USuperSLMGpuSubsystem&, const FSuperSLMGpuSequence&, int32& OutTokensIssued, int64& OutExactExtraBound, bool& bOutAwaitClose) { OutTokensIssued = 0; OutExactExtraBound = 0; bOutAwaitClose = false; return false; }
+bool FSuperSLMGpuMultiRowTestAccess::GetExactApplySamples(const USuperSLMGpuSubsystem&, int64, TArray<FIntVector4>& Out) { Out.Reset(); return false; }
+int32 FSuperSLMGpuMultiRowTestAccess::PendingResultIds(const USuperSLMGpuSubsystem&, const FSuperSLMGpuSequence&) { return -1; }
+bool FSuperSLMGpuMultiRowTestAccess::ArmRowsFault(USuperSLMGpuSubsystem&, ESuperSLMGpuRowsFaultPoint, SslmGpuStatus) { return false; }
+bool FSuperSLMGpuMultiRowTestAccess::GetExactFallbacks(const USuperSLMGpuSubsystem&, int32& OutNoDraft, int32& OutOpenFailed) { OutNoDraft = OutOpenFailed = 0; return false; }
+bool FSuperSLMGpuMultiRowTestAccess::IsAdapterMapped(const USuperSLMGpuSubsystem&, const FSuperSLMGpuAdapterHandle&) { return false; }
+int32 FSuperSLMGpuMultiRowTestAccess::GetLayer1StatusCount(const USuperSLMGpuSubsystem&, SslmGpuStatus) { return -1; }
+bool FSuperSLMGpuMultiRowTestAccess::GetTickGpuBusyUs(const USuperSLMGpuSubsystem&, TArray<FSuperSLMGpuTickGpuBusyRecord>& OutRecords) { OutRecords.Reset(); return false; }
+bool FSuperSLMGpuMultiRowTestAccess::SetCalibrateGpuRowCost(FSuperSLMGpuRuntimeConfig& Config, bool bOn) { Config.bCalibrateGpuRowCost = bOn; return true; }
+bool FSuperSLMGpuMultiRowTestAccess::ArmRowCostCalibrationTimeout(USuperSLMGpuSubsystem&) { return false; }
+bool FSuperSLMGpuMultiRowTestAccess::GetRowCost(const USuperSLMGpuSubsystem&, FSuperSLMGpuRowCostRecord& Out) { Out = FSuperSLMGpuRowCostRecord(); return false; }
+bool FSuperSLMGpuMultiRowTestAccess::IsRowCostCalibrating(const USuperSLMGpuSubsystem&) { return false; }
+double FSuperSLMGpuMultiRowTestAccess::GetPublicGpuRowCostMs(const USuperSLMGpuSubsystem&) { return -1.0; }
+bool FSuperSLMGpuMultiRowTestAccess::ArmRowCostCalibration(USuperSLMGpuSubsystem&, const TArray<double>&) { return false; }
+void FSuperSLMGpuMultiRowTestAccess::ForgetRowCostCalibrations() {}
+int32 FSuperSLMGpuMultiRowTestAccess::GetRowCostCalibrationCount() { return -1; }
+bool FSuperSLMGpuMultiRowTestAccess::ArmRowCostRunDelay(int32, uint32, double) { return false; }
+bool FSuperSLMGpuMultiRowTestAccess::ArmRowCostCalibrationPositions(USuperSLMGpuSubsystem&, const TArray<double>&, const TArray<double>&) { return false; }
+int64 FSuperSLMGpuMultiRowTestAccess::GetRowCostAtUs(const USuperSLMGpuSubsystem&, int64) { return -1; }
+int32 FSuperSLMGpuMultiRowTestAccess::GetOneRowLayersAt(const USuperSLMGpuSubsystem&, int64) { return -1; }
+bool FSuperSLMGpuMultiRowTestAccess::GetConfigureWidenedMask(const USuperSLMGpuSubsystem&, uint32& OutMask) { OutMask = 0; return false; }
+bool FSuperSLMGpuMultiRowTestAccess::GetSaveContextUsed(const TArray<uint8>&, int64& OutContextUsed) { OutContextUsed = -1; return false; }
+bool FSuperSLMGpuMultiRowTestAccess::DescribeSaveDiff(const USuperSLMGpuSubsystem&, const TArray<uint8>&, const TArray<uint8>&, FString& OutField, FString& OutValues, int32& OutInFlightA, int32& OutInFlightB) { OutField.Reset(); OutValues.Reset(); OutInFlightA = OutInFlightB = 0; return false; }
+int64 FSuperSLMGpuMultiRowTestAccess::GetNextRowPosition(const USuperSLMGpuSubsystem&, const FSuperSLMGpuSequence&) { return -1; }
+int32 FSuperSLMGpuMultiRowTestAccess::GetFinishSliceLayersAt(const USuperSLMGpuSubsystem&, int64) { return -1; }
+bool FSuperSLMGpuMultiRowTestAccess::GetLiveSaveBytes(const USuperSLMGpuSubsystem&, const TArray<uint8>&, TArray<uint8>& OutLive) { OutLive.Reset(); return false; }
+bool FSuperSLMGpuMultiRowTestAccess::ArmNoDraftStep(USuperSLMGpuSubsystem&) { return false; }
+bool FSuperSLMGpuMultiRowTestAccess::GetWidenWarmUpRows(const USuperSLMGpuSubsystem&, TArray<int32>& OutRows) { OutRows.Reset(); return false; }
 #endif // WITH_DEV_AUTOMATION_TESTS
 
 // Plugin paging plan (K6): the pooled verbs, with no GPU backend to configure.

@@ -14,6 +14,7 @@
 #include "SuperSLMRuntimeRegistry.h"
 #include "SuperSLMSchedulingTestAccess.h"
 #include "SuperSLMConfigureTestAccess.h"
+#include "SuperSLMExactDraftProvider.h"
 #include "SuperSLMSaveBlob.h"
 #include "SuperSLMSchemaJumpAbi.h"
 #include "SuperSLMSchemaJumpReviewTestAccess.h"
@@ -374,7 +375,7 @@ namespace
 	struct FJumpGeneration
 	{
 		// A schema-bound generation: its jobs read forcedness (when bReads) and it may take span jobs
-		// (Mode Exact or Canonical). False for an unbound generation, which runs today's loop.
+		// (Mode Exact). False for an unbound generation, which runs today's loop.
 		bool bActive = false;
 		SuperSLMCore::ESchemaJumpMode Mode = SuperSLMCore::ESchemaJumpMode::Off;
 		int32 SchemaIndex = INDEX_NONE; // the schema's index in the model's SCM1 section
@@ -1360,6 +1361,11 @@ int64 SuperSLMMintPrefixId()
 {
 	return GNextPrefixId++;
 }
+int64* SuperSLMPrefixIdCounter();
+int64* SuperSLMPrefixIdCounter()
+{
+	return &GNextPrefixId; // precache U6: the GPU cache host's ids (FSuperSLMPrefixCacheHost takes the counter)
+}
 
 // Schema fast-decode plan rev 1.3.6, review finding 1: the walk table, parsed over the pinned artifact
 // bytes. SchemaMasksTable::Parse keeps pointers INTO the section, so Pin must outlive Schemas, which
@@ -1472,10 +1478,8 @@ struct FSuperSLMSubsystemState
 	TArray<FSuperSLMSchemaWalkLoadRecord> WalkLoadRecords;
 	bool bHoldWalkLoad = false;
 	bool bWalkLoadPending = false;
-	// The forcedness reads made since StartRecording(), and the ground-truth counter of Canonical
-	// decode jobs planned while the engine reported a chain (review finding 4).
+	// The forcedness reads made since StartRecording().
 	TArray<FSuperSLMForcednessReadRecord> ForcednessReadRecords;
-	int32 CanonicalOpenChainDecodes = 0;
 #endif
 
 	// The walk table's schemas; an empty table (every ByIndex/ByName misses) until it is ready.
@@ -6281,9 +6285,10 @@ namespace
 		switch (Mode)
 		{
 			case ESuperSLMSchemaJumpForward::Exact: return SuperSLMCore::ESchemaJumpMode::Exact;
-			case ESuperSLMSchemaJumpForward::Canonical: return SuperSLMCore::ESchemaJumpMode::Canonical;
 			case ESuperSLMSchemaJumpForward::Off: break;
 		}
+		// Plugin 1.4 (errata E-11 (e); multi-row ruling 39 Q10): any other value, an older project's Canonical (2)
+		// included, is the default, Off.
 		return SuperSLMCore::ESchemaJumpMode::Off;
 	}
 
@@ -6292,7 +6297,6 @@ namespace
 		switch (Mode)
 		{
 			case SuperSLMCore::ESchemaJumpMode::Exact: return ESuperSLMSchemaJumpForward::Exact;
-			case SuperSLMCore::ESchemaJumpMode::Canonical: return ESuperSLMSchemaJumpForward::Canonical;
 			case SuperSLMCore::ESchemaJumpMode::Off: break;
 		}
 		return ESuperSLMSchemaJumpForward::Off;
@@ -6320,8 +6324,8 @@ namespace
 	}
 
 	// ActivateGenerate()'s last step: the generation's jump-forward state. A schema-bound generation
-	// is active: its jobs read forcedness when it can use the reads (canonical mode always, since its
-	// loop needs the chain; off and exact mode when the walk is known, for the table), and its mode is
+	// is active: its jobs read forcedness when it can use the reads (off and exact mode when the walk
+	// is known, for the table), and its mode is
 	// the request's (§6 P1-X "The setting": per generation, default Off). An unbound one runs today's
 	// loop whatever the request says.
 	void BeginJumpGeneration(FSuperSLMSubsystemState& S, FSlot& Slot, const FSuperSLMGenerationRequest& Request)
@@ -6366,7 +6370,7 @@ namespace
 				J.StartState = J.WalkState;
 			}
 		}
-		J.bReads = S.bForcednessReadsEnabled && (J.Mode == SuperSLMCore::ESchemaJumpMode::Canonical || J.bWalkKnown);
+		J.bReads = S.bForcednessReadsEnabled && J.bWalkKnown;
 	}
 
 	// Counts a forcedness read a job made (FSuperSLMSchemaJumpTestAccess::GetForcednessReadCount),
@@ -6399,6 +6403,21 @@ namespace
 		Record.WalkState = WalkState;
 #else
 		(void)S; (void)Slot; (void)JobId; (void)Result; (void)bRecordedAtWalkState; (void)WalkState;
+#endif
+	}
+
+	// The job hold (SetJobHold, AfterDecodeDelivery; ruling 40): a decode or prefill job carrying the sequence was
+	// delivered. The planner runs after Apply in this tick, so marking the hold here keeps the sequence's next job
+	// unplanned until the test releases it.
+	void NoteDecodeDeliveryHold(FSuperSLMSubsystemState& S, const FSlot& Slot)
+	{
+#if WITH_DEV_AUTOMATION_TESTS
+		if (FSuperSLMSubsystemState::FTestJobHold* Hold = S.TestJobHolds.Find(Slot.VendedId))
+		{
+			if (Hold->Point == ESuperSLMJobHoldPoint::AfterDecodeDelivery) { Hold->bHeld = true; }
+		}
+#else
+		(void)S; (void)Slot;
 #endif
 	}
 
@@ -6541,21 +6560,10 @@ namespace
 		{
 			return Plan;
 		}
-		if (J.Mode == SuperSLMCore::ESchemaJumpMode::Exact)
-		{
-			// Priced at its full drafted M: the pending token and the draft (§6 P1-X "Pricing").
-			Plan.ChunkBudget = 1 + Facts.DraftLength;
-			Plan.Draft.Append(Draft.data(), static_cast<int32>(Draft.size()));
-		}
-		else
-		{
-			Plan.ChunkBudget = SuperSLMCore::CanonicalSpanChunkBudget(Facts, Budget);
-			if (Plan.ChunkBudget <= 0)
-			{
-				Plan.Next = SuperSLMCore::EJumpNextJob::Decode;
-				return Plan;
-			}
-		}
+		// Exact, the one mode that takes a span (plugin 1.4 removes Canonical): priced at its full drafted M, the
+		// pending token and the draft (§6 P1-X "Pricing").
+		Plan.ChunkBudget = 1 + Facts.DraftLength;
+		Plan.Draft.Append(Draft.data(), static_cast<int32>(Draft.size()));
 		Plan.SnapshotVersion = J.SchemaIndex != INDEX_NONE ? S.DraftSnapshotVersion(J.SchemaIndex) : -1;
 		return Plan;
 	}
@@ -6564,7 +6572,7 @@ namespace
 	struct FSpanJobOutput
 	{
 		sslm_status Status = SSLM_OK;
-		TArray<int32> ForcedIds;      // out_forced: the forced (canonical) or confirmed (exact) ids
+		TArray<int32> ForcedIds;      // out_forced: the confirmed (exact) ids
 		FSequenceJobResult Result;    // stats and the forcedness read at the job's tail
 	};
 	using FSpanJobOutputRef = TSharedRef<FSpanJobOutput, ESPMode::ThreadSafe>;
@@ -6585,8 +6593,7 @@ namespace
 
 	// A span job's delivery for its owner, the generation still running: the ids reach the output
 	// once, in order (listeners, P1.5), each walked and counted toward MaxNewTokens; the committed
-	// rows are the engine's own count; the next job is a decode (or, in canonical mode, the rest of
-	// the chain). A status other than SSLM_OK ends the span job only: the sequence goes on to its
+	// rows are the engine's own count; the next job is a decode. A status other than SSLM_OK ends the span job only: the sequence goes on to its
 	// decode job, which ends the generation exactly as off's would (§6 P1-X "Statuses").
 	void ApplySpanResult(FSuperSLMSubsystemState& S, FSlot& Slot, int64 JobId, const FSpanJobOutput& Out)
 	{
@@ -6599,7 +6606,6 @@ namespace
 		}
 #endif
 		FJumpGeneration& J = Slot.Jump;
-		const bool bExact = J.Mode == SuperSLMCore::ESchemaJumpMode::Exact;
 		const int64 ContextBefore = Slot.ContextUsed;
 		const FSequenceJobResult& Tail = Out.Result;
 		const bool bTailRead = J.bActive && Tail.bForcedReadAttempted && Tail.bForcedRead;
@@ -6617,25 +6623,9 @@ namespace
 		if (Entry != nullptr)
 		{
 			const FScm1Automaton Transitions(S.WalkSchemas(), *Entry, J.StartState);
-			SuperSLMCore::FSpanWalkResult Walk;
-			if (bExact)
-			{
-				Walk = SuperSLMCore::WalkSpanResult(Transitions, S.ForcedObservations.FindOrAdd(J.SchemaIndex), J.WalkState,
-					Out.ForcedIds.GetData(), static_cast<size_t>(Count), Stops.data(), Stops.size(), bTailRead, bTailRead && Tail.ForcedCount > 0);
-			}
-			else
-			{
-				// Canonical: forced ids are not drafted, so nothing is recorded drafted through; the
-				// tail read is recorded at the state after the last id, as exact's is.
-				SuperSLMCore::FForcednessObservations Scratch;
-				Walk = SuperSLMCore::WalkSpanResult(Transitions, Scratch, J.WalkState,
-					Out.ForcedIds.GetData(), static_cast<size_t>(Count), Stops.data(), Stops.size(), false, false);
-				if (Walk.bWalkKnown && bTailRead)
-				{
-					S.ForcedObservations.FindOrAdd(J.SchemaIndex).RecordRead(Walk.State, Tail.ForcedCount > 0);
-					Walk.bReadRecorded = true;
-				}
-			}
+			const SuperSLMCore::FSpanWalkResult Walk = SuperSLMCore::WalkSpanResult(Transitions,
+				S.ForcedObservations.FindOrAdd(J.SchemaIndex), J.WalkState, Out.ForcedIds.GetData(), static_cast<size_t>(Count),
+				Stops.data(), Stops.size(), bTailRead, bTailRead && Tail.ForcedCount > 0);
 			AppendCount = Walk.AppendCount;
 			bReadRecorded = Walk.bReadRecorded;
 			J.bWalkKnown = Walk.bWalkKnown;
@@ -6739,10 +6729,10 @@ namespace
 		FSpanJobOutputRef Out = MakeShared<FSpanJobOutput, ESPMode::ThreadSafe>();
 		const int64 JobId = S.NextJobId; // PostLedgerJob takes exactly this one
 
-		auto BuildExecute = [&S, Model, SeqHandle, ChunkBudget, bExact, Draft, LayerBudget, bRead, OverrideStatus, Out](int32 LaneIndex) -> TFunction<void()>
+		auto BuildExecute = [&S, Model, SeqHandle, ChunkBudget, Draft, LayerBudget, bRead, OverrideStatus, Out](int32 LaneIndex) -> TFunction<void()>
 		{
 			const sslm_workspace Workspace = S.Lanes[LaneIndex].Workspace;
-			return [Model, SeqHandle, ChunkBudget, bExact, Draft, LayerBudget, bRead, OverrideStatus, Out, Workspace]()
+			return [Model, SeqHandle, ChunkBudget, Draft, LayerBudget, bRead, OverrideStatus, Out, Workspace]()
 			{
 				TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Span", SuperSLMChannel);
 				TArray<int32> Forced;
@@ -6760,15 +6750,16 @@ namespace
 					Out->Status = sslm_decode_params_init(Model, SSLM_DECODE_MODE_GREEDY, LayerBudget, &Params);
 					if (Out->Status == SSLM_OK)
 					{
-						// Canonical: NULL options (rev 1.2.4's verb). Exact: the learned draft, never NULL
-						// and never empty (rev 1.3.5 cold start: an empty draft sends no span job).
+						// Exact: the learned draft, never NULL and never empty (rev 1.3.5 cold start: an empty draft
+						// sends no span job). Plugin 1.4: engine 1.18 reads NULL options as Exact on the forced chain,
+						// so the options are always passed.
 						sslm_jump_options Opts;
 						FMemory::Memzero(Opts);
 						Opts.struct_size = sizeof(sslm_jump_options);
 						Opts.mode = SSLM_JUMP_EXACT;
 						Opts.draft = Draft.GetData();
 						Opts.draft_count = Draft.Num();
-						Out->Status = sslm_seq_jump_forward(Model, SeqHandle, ChunkBudget, &Params, bExact ? &Opts : nullptr, Workspace,
+						Out->Status = sslm_seq_jump_forward(Model, SeqHandle, ChunkBudget, &Params, &Opts, Workspace,
 							Forced.GetData(), ChunkBudget, &Count);
 					}
 				}
@@ -6842,7 +6833,7 @@ namespace
 	// After Apply: each schema-bound CPU generation that has ended feeds its learned draft (§6 P1-X
 	// "Which generations feed it"): an off or exact one whose walk the plugin knows, with the reads
 	// on, merged on the game thread into a new snapshot swapped in by pointer. The store itself
-	// refuses a canonical stream and one that did not end with the walk accepting.
+	// refuses a stream that did not end with the walk accepting.
 	void FinishJumpGenerations(FSuperSLMSubsystemState& S)
 	{
 		for (FSlot& Slot : S.Slots)
@@ -7059,6 +7050,7 @@ namespace
 					TEXT("sslm_prefill failed after %d of %d prompt tokens (%s)"), Slot.PromptConsumed, Slot.Prompt.Num(), *StatusText(Out->Status)));
 				return;
 			}
+			NoteDecodeDeliveryHold(S, Slot);
 			ApplyJumpForcedRead(S, Slot, JobIdCap, Out->PerSequence[0]); // §6 P1-X: the chain at the prompt's end
 		};
 
@@ -7237,30 +7229,6 @@ namespace
 			}
 			return;
 		}
-#if WITH_DEV_AUTOMATION_TESTS
-		// FSuperSLMSchemaJumpReviewTestAccess::GetCanonicalDecodesPlannedWithOpenChain (review finding 4):
-		// ground truth for the drain rule. Under recording, before this decode job is posted, the
-		// game thread reads each Canonical member's chain itself (cap 0, read-only, §5.3). A due
-		// member has no job in flight (a jump-mode generation takes no continuation), so the read
-		// sees the state the job will start from. Not one of GetForcednessReads()'s.
-		if (S.bRecordSpanJobs)
-		{
-			for (int32 Idx : SlotIndices)
-			{
-				const FSlot& Member = S.Slots[Idx];
-				if (!Member.Jump.bActive || Member.Jump.Mode != SuperSLMCore::ESchemaJumpMode::Canonical || Member.Seq == nullptr)
-				{
-					continue;
-				}
-				int32_t Chain = 0;
-				int32_t Accepting = 0;
-				if (sslm_seq_forced_tokens(S.Model, Member.Seq, nullptr, 0, &Chain, &Accepting) == SSLM_OK && Chain > 0)
-				{
-					++S.CanonicalOpenChainDecodes;
-				}
-			}
-		}
-#endif
 		for (int32 Idx : SlotIndices)
 		{
 			++S.Slots[Idx].OutstandingJobCount;
@@ -7568,6 +7536,7 @@ namespace
 				const int32 Token = Out->DecodeTokens[I];
 				// Schema fast-decode plan rev 1.3.5, §6 P1-X: the walk, the pending token and the
 				// forcedness read, before the token reaches the output.
+				NoteDecodeDeliveryHold(S, Slot);
 				NoteJumpDecodeResult(S, Slot, JobIdCap, Token, Out->PerSequence[I]);
 
 				if (Token >= 0)
@@ -7956,7 +7925,7 @@ namespace
 		}
 
 		// 2b. Schema fast-decode plan rev 1.3.5, §6 P1 and P1-X: a due decoding sequence whose next job
-		// is a span job (SuperSLMCore::NextJob: canonical mode's drain rule, exact mode's span after a
+		// is a span job (SuperSLMCore::NextJob: exact mode's span after a
 		// decode job that left a pending token at a forced state with a non-empty learned draft) gets
 		// it on its own pinned lane, one sequence per job. A sequence that wants one is never offered
 		// to a decode batch below, so mixed batches hold only drained sequences (P1.7, P1X.9).
@@ -9076,10 +9045,30 @@ bool ParseSuperSLMSchemaJumpForwardSwitch(const FString& Text, ESuperSLMSchemaJu
 	SuperSLMCore::ESchemaJumpMode Mode = SuperSLMCore::ESchemaJumpMode::Off;
 	if (!SuperSLMCore::ParseSchemaJumpSwitch(Utf8.Get(), Mode))
 	{
+		if (SuperSLMCore::IsRemovedCanonicalSwitchValue(Utf8.Get()))
+		{
+			// Plugin 1.4 (multi-row ruling 39 Q7): refused, and the mode falls back to Off.
+			InOutMode = ESuperSLMSchemaJumpForward::Off;
+			UE_LOG(LogSuperSLM, Warning, TEXT("Schema jump-forward \"%s\": Canonical was removed in SuperSLM-Unreal 1.4 (SuperSLM 1.18.0 removed it); the mode falls back to Off. Use exact (or 1) for skip-ahead with the same tokens as Off."),
+				*Text);
+		}
 		return false;
 	}
 	InOutMode = ToPublicJumpMode(Mode);
 	return true;
+}
+
+// ---- FSuperSLMExactDraftProvider (multi-row GPU ruling 41, Q13; SuperSLMExactDraftProvider.h) ----
+
+SuperSLMCore::FDraftTableRef FSuperSLMExactDraftProvider::Snapshot(const USuperSLMSubsystem& Cpu, const uint8* ArtifactHash, int32 SchemaIndex)
+{
+	const FSuperSLMSubsystemState* S = Cpu.State;
+	if (S == nullptr || ArtifactHash == nullptr || SchemaIndex < 0 || FMemory::Memcmp(S->ArtifactHash, ArtifactHash, 32) != 0)
+	{
+		return SuperSLMCore::FDraftTableRef();
+	}
+	// The same artifact, so the same SCM1 section: the GPU's schema index is the CPU walk table's.
+	return S->DraftTables.Snapshot(S->DraftKey(SchemaIndex));
 }
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -9483,11 +9472,6 @@ bool FSuperSLMSchemaJumpReviewTestAccess::LoadSchemaWalkTableNow(USuperSLMSubsys
 TArray<FSuperSLMForcednessReadRecord> FSuperSLMSchemaJumpReviewTestAccess::GetForcednessReads(const USuperSLMSubsystem& Subsystem)
 {
 	return Subsystem.State != nullptr ? Subsystem.State->ForcednessReadRecords : TArray<FSuperSLMForcednessReadRecord>();
-}
-
-int32 FSuperSLMSchemaJumpReviewTestAccess::GetCanonicalDecodesPlannedWithOpenChain(const USuperSLMSubsystem& Subsystem)
-{
-	return Subsystem.State != nullptr ? Subsystem.State->CanonicalOpenChainDecodes : -1;
 }
 
 bool FSuperSLMSchemaJumpReviewTestAccess::IsWalkKnown(const USuperSLMSubsystem& Subsystem, const FSuperSLMSequence& Sequence)

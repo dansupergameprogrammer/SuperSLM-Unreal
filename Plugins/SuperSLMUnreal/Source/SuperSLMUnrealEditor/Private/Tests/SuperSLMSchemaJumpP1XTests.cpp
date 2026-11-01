@@ -583,9 +583,9 @@ bool FSuperSLMSchemaJumpP1XConcurrencyTest::RunTest(const FString& Parameters)
 	return bOk;
 }
 
-// P1X.9 Composition. One decode job holds an Exact sequence (between span jobs), a Canonical
-// sequence (drained) and an Off one; each equals its solo run (P1.7's analog). Red: verbs stubbed,
-// seam unbuilt.
+// P1X.9 Composition. One decode job holds two Exact sequences (between span jobs) and an Off one; each equals its
+// solo run (P1.7's analog). Ruling 40 (red-suite-mr6.md): the second member was Canonical (drained), which plugin 1.4
+// removes; it is now an Exact sequence on the population's second prompt. Red: verbs stubbed, seam unbuilt.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMSchemaJumpP1XCompositionTest, "SuperSLM.SchemaJump.P1X.Composition",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMSchemaJumpP1XCompositionTest::RunTest(const FString& Parameters)
@@ -602,22 +602,20 @@ bool FSuperSLMSchemaJumpP1XCompositionTest::RunTest(const FString& Parameters)
 	if (!OffPopulation(*this, Rig, 96, Off, Requests)) { return false; }
 	FSuperSLMSchemaJumpTestAccess::SeedDraftTableFromStreams(*Rig.Cpu, Rig.Schema, Streams(Off));
 	FSuperSLMSchemaJumpTestAccess::StartRecording(*Rig.Cpu);
-	const ESuperSLMSchemaJumpForward Modes[3] = { kExact, ESuperSLMSchemaJumpForward::Canonical, ESuperSLMSchemaJumpForward::Off };
+	const ESuperSLMSchemaJumpForward Modes[3] = { kExact, kExact, ESuperSLMSchemaJumpForward::Off };
 	TArray<FConcurrentRun> Runs;
 	Runs.AddDefaulted(3);
 	for (int32 I = 0; I < 3; ++I) { Runs[I].Request = Requests[I]; Runs[I].Request.SchemaJumpForward = Modes[I]; }
 	if (!RunConcurrently(*this, Rig, Runs, /*bKeep*/ true, /*bGatherAtDecode*/ true)) { return false; }
 	bool bOk = RequireSpanActivity(*this, SpanJobsOf(*Rig.Cpu, Runs[0].Result.Sequence), TEXT("P1X.9 exact"));
-	bOk &= RequireSpanActivity(*this, SpanJobsOf(*Rig.Cpu, Runs[1].Result.Sequence), TEXT("P1X.9 canonical"));
+	bOk &= RequireSpanActivity(*this, SpanJobsOf(*Rig.Cpu, Runs[1].Result.Sequence), TEXT("P1X.9 second exact"));
 	bOk &= TestTrue(TEXT("precondition: one decode job served all three"),
 		SomeDecodeJobServedAll(*Rig.Cpu, { Runs[0].Result.Sequence, Runs[1].Result.Sequence, Runs[2].Result.Sequence }));
 	for (const FConcurrentRun& R : Runs) { Rig.Cpu->ReturnSequence(R.Result.Sequence); }
 	Settle(*Rig.Cpu);
 	bOk &= SameEnding(*this, Runs[0].Result, Off[0], TEXT("P1X.9 exact equals its solo run (off's)"));
 	bOk &= SameEnding(*this, Runs[2].Result, Off[2], TEXT("P1X.9 off equals its solo run"));
-	FRunResult CanonSolo;
-	if (!RunSolo(*this, Rig, Runs[1].Request, CanonSolo)) { return false; }
-	bOk &= SameEnding(*this, Runs[1].Result, CanonSolo, TEXT("P1X.9 canonical equals its solo run"));
+	bOk &= SameEnding(*this, Runs[1].Result, Off[1], TEXT("P1X.9 second exact equals its solo run (off's)"));
 	return bOk;
 }
 

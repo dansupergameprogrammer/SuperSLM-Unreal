@@ -62,7 +62,8 @@ per device rather than promised:
 - In 1.0 the GPU verdict is always withheld: the self-check records it in the report, and every
   public surface shows *Not Yet Run*. A later release shows it.
 - SuperSLM's own GPU certification covers two devices: the NVIDIA RTX 2080 SUPER and the AMD
-  Radeon RX 7900 XTX.
+  Radeon RX 7900 XTX. Its multi-row passes (1.18.0, used by plugin 1.4) are certified on the AMD
+  Radeon RX 7900 XT, and on an NVIDIA RTX 5060 they gave the same tokens as SuperSLM's reference.
 
 The GPU backend is never refused because of the self-check, and a sequence never switches backend
 on its own. The one exception is above the sequence API: a query (`USuperSLMQuery`, and the

@@ -2,13 +2,15 @@
 
 #include "CoreMinimal.h"
 
+class USuperSLMGpuSubsystem;
 class USuperSLMModel;
 class USuperSLMSubsystem;
 class UWorld;
 
 // The packaged prefix-cache check (precache plan step U4: cells 4.5, 8.9, 10.5, 10.6 and 10.7, 5.9's build leg,
-// and the restore's per-MiB calibration). CPU only. Opt-in from the command line, like the packaged check: each run
-// is one leg, writes one JSON report, logs one line per check and exits 0 when every check passed, 1 otherwise.
+// and the restore's per-MiB calibration) on the CPU, and (step U8) cells 10.5 and 10.6 on the GPU. Opt-in from the
+// command line, like the packaged check: each run is one leg, writes one JSON report, logs one line per check and
+// exits 0 when every check passed, 1 otherwise.
 //
 //   -SuperSLMExamplePrefixCacheCheck=<Leg>
 //       Cooked       10.5: a recompute pass (the set not registered), then the set registered and the
@@ -46,6 +48,12 @@ class UWorld;
 //                    between any two build jobs (rev 1.18.10); (d) rev 1.18.11 (section 15.31): the build's own
 //                    chunk jobs, graded once a prefix_prefill pair prices them (the median chunk's worker ms at
 //                    most its K x TickBudgetMs), recorded before; the lane's hitch count recorded beside it.
+//       GpuCooked, GpuBudget, GpuDiskWrite, GpuDiskRead
+//                    Cooked, Budget, DiskWrite and DiskRead on the GameInstance's GPU subsystem (pooled, with its
+//                    prefix cache, ten sequences at a context of 240): the set's GPU build for this adapter serves
+//                    the cooked tier, the disk tier writes the GPU's own files. The same checks, but the game
+//                    thread's time in the GPU subsystem's tick is recorded, not graded (the plugin states no GPU
+//                    game-thread bound). The set needs a GPU build made on this adapter (SuperSLMBuildPrefixes).
 //   -SuperSLMExamplePrefixSet=<object path>   the set (default /Game/SuperSLMExamplePrefixes/U4PrefixSet.U4PrefixSet):
 //                                             10 root entries, built for the CPU and cooked; of equal length for
 //                                             every leg but Residency, which needs Text and Tokens entries
@@ -67,9 +75,10 @@ class FSuperSLMPrefixCacheCheck
 public:
 	// True when the command line asks for a leg; OutLeg is its name as given.
 	static bool IsRequested(FString& OutLeg);
-	// Starts the leg over the loaded model and the GameInstance's CPU subsystem. A leg name that is not one of
-	// the eight, or a build without the prefix cache (SUPERSLM_WITH_PREFIX_CACHE off), fails at once and exits 1.
-	static void Start(USuperSLMModel& Model, USuperSLMSubsystem& Cpu, const FString& Leg, const FString& ModelPath);
+	// Starts the leg over the loaded model and the GameInstance's CPU subsystem, or for a Gpu* leg its GPU subsystem
+	// (null: the leg fails). A leg name that is not one of the twelve, or a build without the prefix cache
+	// (SUPERSLM_WITH_PREFIX_CACHE off), fails at once and exits 1.
+	static void Start(USuperSLMModel& Model, USuperSLMSubsystem& Cpu, USuperSLMGpuSubsystem* Gpu, const FString& Leg, const FString& ModelPath);
 	// The running check, or null.
 	static FSuperSLMPrefixCacheCheck* Active();
 
@@ -81,5 +90,7 @@ public:
 private:
 	FSuperSLMPrefixCacheCheck();
 	struct FState;
+	struct FGpuState;
 	TUniquePtr<FState> State;
+	TUniquePtr<FGpuState> GpuState;
 };

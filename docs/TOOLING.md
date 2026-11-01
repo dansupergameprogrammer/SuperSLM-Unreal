@@ -96,6 +96,29 @@ Double-click a `USuperSLMModel` asset. Two tabs:
   `Saved/SuperSLM/RuntimeSettings.ini` (only the setting that command chose; the other keeps its
   saved value, or its shipped one when none is saved), which later sessions, packaged games
   included, load before their first configuration. Both work in the editor and in packaged builds.
+- **Build Prefixes**, the context-menu action on a `USuperSLMPrefixSet` asset. It builds the set's entries in the
+  background behind a progress notification with a Cancel button: the CPU entries, and the entries of the GPU this
+  editor runs on, stored together. While Play In Editor or the query window has a GPU configured, or when the GPU
+  cannot be configured, the GPU entries are left as they were and the Output Log says why. See
+  [ARCHITECTURE.md](ARCHITECTURE.md#the-prefix-cache).
+- **`-run=SuperSLMBuildPrefixes`**, the same build as a commandlet, for a build machine, saving each set's package:
+
+  ```
+  UnrealEditor-Cmd.exe "<Project>.uproject" -run=SuperSLMBuildPrefixes -Sets=/Game/Sets/Npc.Npc -RequireGpu -unattended
+  ```
+
+  | Flag | Effect |
+  |---|---|
+  | `-Sets=/Game/A.A,/Game/B.B` | The sets to build (object paths, comma-separated). |
+  | `-All` | Every prefix set the asset registry knows. |
+  | `-NoGpu` | Build the CPU entries only; the sets' GPU builds are kept as they were. |
+  | `-RequireGpu` | Exit 1 when a set's GPU entries were not built (no GPU, a GPU that does not configure, a refused GPU build). Its CPU entries are still stored. |
+  | `-ExpectGpuDevice=0x1002:0x744C` | Build GPU entries only when this machine's GPU has that PCI vendor and device (hex); otherwise they are not built. Implies `-RequireGpu`. |
+
+  Every finding is logged as a warning naming its entry and producer (`[CPU]`, or `[GPU 0x1002:0x744c]`). The exit
+  code is 0 when every set built, 1 when a set was refused, could not be saved, or (with `-RequireGpu`) has no GPU
+  build from this run, and 2 for bad arguments. Run it once on each GPU model you ship to; each run replaces only
+  its own GPU's build.
 - **The conversion pre-check** (`SuperSLMConversionPreCheck::Run`, editor module, C++). It reads a
   checkpoint's configuration and tokenizer files and reports, before you spend time converting,
   every blocker it finds, the context length, the KV block size and the predicted reset and adopt

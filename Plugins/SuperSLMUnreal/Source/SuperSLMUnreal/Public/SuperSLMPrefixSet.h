@@ -3,9 +3,10 @@
 // A cooked prefix set (precache plan §5.8): the model it is for, the entries a designer authors
 // (by token ids or by text, rev 1.18), and, per producer (backend, and on the GPU the adapter's vendor and device), the
 // built 'SLUP' wrapper bytes of each entry with the Layer-1 identity they were built under. The
-// editor's Build Prefixes action and the SuperSLMBuildPrefixes commandlet fill Builds; the cook
-// validates them (a warning naming each stale entry); a subsystem registers the set with its cache's
-// cooked tier (USuperSLMSubsystem::RegisterPrefixSet). The rules are host-tested in
+// editor's Build Prefixes action and the SuperSLMBuildPrefixes commandlet fill Builds (the CPU's, and
+// the GPU's of the machine they run on); the cook validates them (a warning naming each stale entry);
+// a subsystem registers the set with its cache's cooked tier (USuperSLMSubsystem::RegisterPrefixSet,
+// and in C++ USuperSLMGpuSubsystem::RegisterPrefixSet, which takes only a build of its own GPU). The rules are host-tested in
 // Private/Core/SuperSLMPrefixSetCore.h; SuperSLMPrefixSetTools.h is the Unreal-side bridge.
 //
 // Entries defined by text (§5.8 *Entries defined by text*; PC-16 (b); cells 2.17, 2.18, 7.20, 9.12): the Input
@@ -28,8 +29,8 @@ enum class ESuperSLMPrefixEntryInput : uint8
 	Text,
 };
 
-// One authored entry. ParentName names another entry of the set (a nested entry): the cache builds
-// none until budget-mode nesting (plan step U6), so the build leaves it empty and says so.
+// One authored entry. ParentName names another entry of the set (a nested entry): a cooked set builds
+// none, so the build leaves it empty and says so (NestedRequiresBudgetMode).
 USTRUCT(BlueprintType)
 struct SUPERSLMUNREAL_API FSuperSLMPrefixSetEntry
 {

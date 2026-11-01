@@ -84,8 +84,7 @@ void ASuperSLMExampleScene::BeginPlay()
 	if (SuperSLMExample::SchemaJumpForwardFromCommandLine(FCommandLine::Get(), Settings.SchemaJumpForward))
 	{
 		UE_LOG(LogSuperSLMExample, Display, TEXT("-SuperSLMExampleJumpForward: the extraction's schema jump-forward mode is %s."),
-			Settings.SchemaJumpForward == ESuperSLMSchemaJumpForward::Exact ? TEXT("exact")
-			: Settings.SchemaJumpForward == ESuperSLMSchemaJumpForward::Canonical ? TEXT("canonical") : TEXT("off"));
+			Settings.SchemaJumpForward == ESuperSLMSchemaJumpForward::Exact ? TEXT("exact") : TEXT("off"));
 	}
 
 	if (FSuperSLMPrefixCacheCheck::Active() != nullptr)
@@ -157,8 +156,9 @@ void ASuperSLMExampleScene::OnModelPackageLoaded(EAsyncLoadingResult::Type Resul
 	FString PrefixLeg;
 	if (FSuperSLMPrefixCacheCheck::IsRequested(PrefixLeg))
 	{
-		// The packaged prefix-cache check configures the CPU subsystem itself; the demo does not start.
-		FSuperSLMPrefixCacheCheck::Start(*Model, *Cpu, PrefixLeg, ModelPath);
+		// The packaged prefix-cache check configures the CPU (or, for a Gpu* leg, the GPU) subsystem itself; the demo
+		// does not start.
+		FSuperSLMPrefixCacheCheck::Start(*Model, *Cpu, Gpu, PrefixLeg, ModelPath);
 		LoadState = ELoadState::Ready;
 		Status = FString::Printf(TEXT("Running the packaged prefix-cache check, leg %s."), *PrefixLeg);
 		return;

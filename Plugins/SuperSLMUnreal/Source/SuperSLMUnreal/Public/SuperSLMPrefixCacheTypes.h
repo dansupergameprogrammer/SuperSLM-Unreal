@@ -175,7 +175,9 @@ struct SUPERSLMUNREAL_API FSuperSLMGpuPrefixCacheSettings
 	int64 BudgetBytes = 0;
 	bool bDiskEnabled = false;
 	FString DiskDirectory;   // empty: <ProjectSaved>/SuperSLM/PrefixCacheGpu
-	int64 DiskMaxBytes = 0;
+	// The directory is trimmed to this, oldest first, at Configure() and after writes; 256 MiB, as the CPU's
+	// PrefixDiskCacheMaxBytes (0 trims every file the tier writes).
+	int64 DiskMaxBytes = 256ll * 1024 * 1024;
 };
 
 #endif // SUPERSLM_WITH_PREFIX_CACHE

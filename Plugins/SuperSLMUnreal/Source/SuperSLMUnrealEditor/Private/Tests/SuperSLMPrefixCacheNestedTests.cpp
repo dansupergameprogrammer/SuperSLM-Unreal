@@ -218,7 +218,6 @@ namespace
 // Cell 1.9 (§5.4 Ghost charges): nested entries in budget mode; parent P (4) evicted while its children
 // D1 and D2 (1 private page each) stay; P is a ghost of its whole charge, and the cache admits new
 // entries up to the budget without the probe exceeding it. C = 9: P 4, D1 1, D2 1, a leased L of 2, 1 free.
-// Red until U6: a nested spec is refused NestedRequiresBudgetMode.
 // Mutant: the ghost charge dropped -> the admissions take P's 4 while D1 and D2 map them -> form 1
 // red (drawn above charged) or engine exhaustion.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMPrefixCacheCpuNestedGhostChargeTest, "SuperSLM.PrefixCache.Cpu.Nested.GhostCharge",

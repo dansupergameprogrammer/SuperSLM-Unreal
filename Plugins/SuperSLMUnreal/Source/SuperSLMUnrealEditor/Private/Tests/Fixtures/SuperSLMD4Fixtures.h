@@ -211,6 +211,21 @@ namespace SuperSLMD4Fixtures
 		return FMath::IsFinite(Out);
 	}
 
+	// A written profile's C = 2..7 pairs (schema fast-decode plan rev 1.3.6, P1.1), added under their
+	// INI keys so the shared oracle prices a 2..7-token chunk as Configure() does; a key that is absent
+	// or not a number is left out, and the oracle uses the chunk-1 member in its place.
+	inline void AddWrittenPerChunk(const FIniSection& S, TMap<FString, double>& Out)
+	{
+		for (int32 C = 2; C <= 7; ++C)
+		{
+			for (const FString& Key : { FString::Printf(TEXT("PromptChunk%dTokenCostMs"), C), FString::Printf(TEXT("PromptChunk%dTokenCostPerPositionMs"), C) })
+			{
+				double V = 0.0;
+				if (const FString* Text = S.Keys.Find(Key); Text && ParseDouble(*Text, V)) { Out.Add(Key, V); }
+			}
+		}
+	}
+
 	// Two printed values of one quantity agree when they differ by no more than half a unit in the
 	// last place of the coarser print.
 	inline bool PrintedValuesAgree(const FString& A, const FString& B)

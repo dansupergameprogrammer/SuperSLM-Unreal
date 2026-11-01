@@ -131,11 +131,12 @@ namespace SuperSLMExample
 	// and the default is kept.
 	bool FrameBudgetLayersFromCommandLine(int32& OutLayers);
 
-	// -SuperSLMExampleJumpForward=0|1|off|exact|canonical in CommandLine: the schema-jump-forward mode
-	// the scene's extraction requests carry (FSuperSLMExampleSettings::SchemaJumpForward), parsed by
-	// the plugin's ParseSuperSLMSchemaJumpForwardSwitch (case-insensitive; 0 is off, 1 canonical).
-	// True when the switch is present and valid. Any other value, empty or padded included, is
-	// refused with a Warning naming the switch, and InOutMode stays as it was (plan P1.9, XD7).
+	// -SuperSLMExampleJumpForward=0|1|off|exact in CommandLine: the schema-jump-forward mode the
+	// scene's extraction requests carry (FSuperSLMExampleSettings::SchemaJumpForward), parsed by the
+	// plugin's ParseSuperSLMSchemaJumpForwardSwitch (case-insensitive; 0 is off, 1 exact). True when
+	// the switch is present and valid. Canonical's old values (canonical, 2) are refused with a
+	// Warning naming the switch and InOutMode set to Off (plugin 1.4); any other value, empty or
+	// padded included, is refused with a Warning naming the switch, and InOutMode stays as it was.
 	bool SchemaJumpForwardFromCommandLine(const TCHAR* CommandLine, ESuperSLMSchemaJumpForward& InOutMode);
 }
 

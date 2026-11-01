@@ -21,8 +21,10 @@
 #include "SuperSLMGpuSubsystem.generated.h"
 
 class USuperSLMModel;
+class USuperSLMPrefixSet;
 struct FSuperSLMGpuSubsystemState;
 struct FSuperSLMGpuConfigureFlight;
+struct FSuperSLMGpuCookedSources;
 
 // L2-S2 (the plan §2.1, §4, §5, §7 item 11, §8, §10.3;
 // Coverage Model §9, cells R-S2a-R-S2g; the red-suite record).
@@ -189,6 +191,12 @@ public:
 	// leaves the walk where it was, so its reading is the last token's. False when unbound, before
 	// the current generation's first token, and for an invalid handle.
 	bool IsSchemaAccepting(const FSuperSLMGpuSequence& Sequence) const;
+
+	// The forced tokens among the current generation's applied tokens, the GPU twin of the CPU's
+	// FSuperSLMSequenceStats::ForcedTokenCount. Plugin 1.4 removes Canonical, the one mode that delivered forced ids
+	// (multi-row rulings 39 Q7 and 40): under Off and Exact it stays 0, as Off's does (Exact's committed drafts are
+	// the model's own tokens). 0 for an invalid handle. Game thread; game-side state only.
+	int64 GetForcedTokenCount(const FSuperSLMGpuSequence& Sequence) const;
 
 	// --- Per-sequence slicing (plan §8 Frame Budget; §10.4 query window) ---
 
@@ -511,19 +519,40 @@ public:
 	ESuperSLMPrefixPhase GetPrefixPhase(const FSuperSLMPrefix& Prefix) const;
 	int32 GetLivePrefixCount() const;
 
-	// --- The prefix cache's GPU instance: declared for plugin 1.4.0, NOT available in 1.3.0. Every call below refuses
-	// NotConfigured in 1.3.0 (RequestPrefix says why; the others read Invalid, false or an unconfigured snapshot), and
-	// ConfigurePrefixCache() has no effect. In 1.3.0 the prefix cache is CPU-only (USuperSLMSubsystem). The calls exist
-	// only in a build with SUPERSLM_WITH_PREFIX_CACHE on (SuperSLMPrefixCacheTypes.h; SuperSLMGpuSubsystemPrefixCache.inl).
-	// In 1.4.0 they are to serve pooled sequences, keyed by the adapter's vendor and device. ---
+	// --- The prefix cache's GPU instance (plugin 1.4.0): the CPU cache's verbs, serving pooled sequences, its disk
+	// files keyed by the adapter's vendor and device. Without a cache (no budget, or a dedicated configuration, refused
+	// PrefixCacheRequiresPooled) RequestPrefix, WarmPrefix and DropPrefix refuse NotConfigured and say why; the queries
+	// read Invalid, false or an unconfigured snapshot. After a terminal device loss they refuse DeviceUnavailable until
+	// the next Configure(). The calls exist only in a build with SUPERSLM_WITH_PREFIX_CACHE on (SuperSLMPrefixCacheTypes.h;
+	// SuperSLMGpuSubsystemPrefixCache.inl). A lease or op from the configuration a TearDown() ended reads by name
+	// afterwards (Cancelled, or its result), until the next TearDown(). ---
 
-	// 1.4.0: applied at the next Configure(); BudgetBytes 0 (the default) configures no cache. 1.3.0: no effect.
+	// Applied at the next Configure(); BudgetBytes 0 (the default) configures no cache.
 	void ConfigurePrefixCache(const FSuperSLMGpuPrefixCacheSettings& Settings);
 	bool RequestPrefix(const FSuperSLMPrefixSpec& Spec, FSuperSLMPrefix& OutPrefix, FString& OutError);
 	bool ReturnPrefix(const FSuperSLMPrefix& Prefix);
 	ESuperSLMPrefixSource GetPrefixSource(const FSuperSLMPrefix& Prefix) const;
 	ESuperSLMPrefixLeaseState GetPrefixLeaseState(const FSuperSLMPrefix& Prefix) const;
 	FSuperSLMPrefixCacheStats GetPrefixCacheStats() const;
+	// Explicit residency control, as USuperSLMSubsystem's (§5.6, PC-16 (a)): WarmPrefix makes an entry resident with no
+	// lease; DropPrefix evicts a resident unpinned entry or marks it to go when it next is (MemoryAndDisk also deletes
+	// its disk file). Neither can end, invalidate or reach through a lease.
+	bool WarmPrefix(const FSuperSLMPrefixSpec& Spec, FSuperSLMPrefixOp& OutOp, FString& OutError);
+	bool DropPrefix(const FSuperSLMPrefixSpec& Spec, ESuperSLMPrefixDropScope Scope, FSuperSLMPrefixOp& OutOp, FString& OutError);
+	// False for an op neither this configuration's cache nor the last ended one issued.
+	bool GetPrefixOpResult(const FSuperSLMPrefixOp& Op, FSuperSLMPrefixOpResult& Out) const;
+	// The cooked tier, as USuperSLMSubsystem's (§5.3 item 2, §5.8; plugin 1.4.0), C++ only: registers a cooked prefix
+	// set's entries built for this GPU, so a request whose key one of them carries restores it instead of recomputing.
+	// A GPU build serves only the adapter vendor and device that built it: a set with no build for this exact device
+	// (another GPU's, or CPU only) registers nothing (one Log line) and its requests recompute; so does an entry its
+	// build left empty, and bytes the engine refuses (another producer) are a miss that recomputes. The subsystem keeps
+	// a copy of each registered set (its entries and builds), so the asset may unload, and registers it with every
+	// configuration's cache: a set registered before the first Configure() is kept and registered, its model checked,
+	// when a Configure() installs a GPU cache. A set whose model is not the configured model is refused by name
+	// (PrefixSetModelMismatch, logged once) and forgotten: register it again after configuring its model. Registering
+	// a set again replaces its copy (after a rebuild). Game thread.
+	void RegisterPrefixSet(USuperSLMPrefixSet* Set);
+	void UnregisterPrefixSet(USuperSLMPrefixSet* Set);
 
 	// Adopts Prefix (sslm_gpu_seq_adopt_prefix) on the submission thread; draws nothing (§3.4
 	// "Adopt"). Dedicated mode: resolves UnsupportedOnGpu with the reason, like the overload above.
@@ -619,6 +648,11 @@ public:
 	// without the example scene rendering.
 	double GetLastGpuBusyMs() const;
 
+	// Erratum E-13 (rulings 48 and 48a): the row cost the multi-row plan uses, in milliseconds -- the game's
+	// GpuRowCostMs when it set one, the price Configure() calibrated on this GPU, or the 6.2 ms default (calibration
+	// off, or fell back). 0 while no backend is configured or the calibration is still running.
+	double GetGpuRowCostMs() const;
+
 	// Game thread: the coherent completed timing published by the most recent Tick(). Repeated
 	// observers between ticks see exactly the same pair even while the worker finishes new work.
 	FSuperSLMGpuTimingSnapshot GetGpuTimingSnapshot() const;
@@ -710,6 +744,8 @@ private:
 	friend struct FSuperSLMSelfCheckAccess;
 	friend struct FSuperSLMGpuTestAccess; // test-only access (SuperSLMGpuTestAccess.h, U1 round 3)
 	friend struct FSuperSLMPagedGpuTestSeam; // paged-KV test seams (SuperSLMPagedGpuTestSeam.h, plan §3.9)
+	friend struct FSuperSLMGpuMultiRowTestAccess; // MR6 multi-row test seam (SuperSLMGpuMultiRowTestSeam.h, multi-row GPU plan §5.2-§5.4)
+	friend struct FSuperSLMGpuPrefixSetAccess; // a cooked prefix set's GPU build (SuperSLMGpuPrefixSetAccess.h, precache U7)
 
 	// Every Layer-1 GPU handle, the submission thread, the slot table and the scheduler
 	// figures (SuperSLMGpuSubsystem.cpp). Held by pointer so this reflected header includes no
@@ -720,7 +756,15 @@ private:
 	FSuperSLMGpuSubsystemState* State = nullptr;
 	// ConfigurePrefixCache()'s settings, read at Configure() (step U6; null until set).
 	TSharedPtr<FSuperSLMGpuPrefixCacheSettings> PendingPrefixCacheSettings;
+	// The last ended configuration's GPU cache, its engine handles all released: kept so that a lease or residency op
+	// from it reads by name (Cancelled, its result) after TearDown(), as the CPU cache's do. Replaced at each TearDown().
+	TSharedPtr<class FSuperSLMGpuPrefixCacheHost> RetiredPrefixCacheHost;
 	friend class FSuperSLMPrefixCacheTestSeam;
+	// RegisterPrefixSet()'s copies (precache U7), kept on the subsystem across configurations (the cache host is one
+	// per configuration); null until the first registration. ReRegisterPrefixSets() registers each with a newly
+	// installed GPU cache, after its Configure(), and forgets a set whose model it refuses.
+	TSharedPtr<FSuperSLMGpuCookedSources> CookedPrefixSets;
+	void ReRegisterPrefixSets();
 
 	// SetFixedTickLatency()'s and SetLayersPerTick()'s shared gate: no sequence vended (a deferred
 	// return included) and no restore queued. What names the constant in OutError. Game thread.
@@ -764,6 +808,14 @@ private:
 	// BeginConfigure(), which spends them. 0 is unarmed. Only the seam writes them. Game thread.
 	int32 NextConfigurePageCountPerturbation = 0;
 	uint32 NextPoolCreateStatusOverride = 0;
+	// Ruling 48 (E-13) test seams (FSuperSLMGpuMultiRowTestAccess::ArmRowCostCalibration(),
+	// ArmRowCostCalibrationTimeout()): they arm the NEXT Configure()'s calibration, which spends them. Game thread.
+	TArray<double> NextRowCostCalibrationArms;
+	// Erratum E-14 (ruling 53): the late position's arms (ArmRowCostCalibrationPositions(); ArmRowCostCalibration() sets
+	// both). Spent by the next Configure().
+	TArray<double> NextRowCostCalibrationLateArms;
+	bool bNextRowCostLateArmsByAttempt = false; // ArmRowCostCalibration(): phase 2 takes the arm of the attempt phase 1 used
+	bool bNextRowCostCalibrationTimeout = false;
 
 	void TearDown();
 };

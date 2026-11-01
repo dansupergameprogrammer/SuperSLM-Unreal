@@ -298,6 +298,7 @@ namespace SuperSLML2S3Fixtures
 		// BlockCount x L covers the composed floor at any GpuLayersPerTick >= 1 and the one-call floor.
 		GpuConfig.K = FMath::Max(BlockCount * AExNumHiddenLayers, BlockCount);
 		GpuConfig.TickBudgetMs = 100000.0;
+		GpuConfig.bCalibrateGpuRowCost = false; // ruling 51 F4: only the R48/R50/R51 cells calibrate
 		const FSuperSLMGpuConfigureReport GpuReport = Out.Gpu->Configure(Out.Model, GpuConfig);
 		if (GpuReport.Result != ESuperSLMGpuConfigureResult::Success)
 		{

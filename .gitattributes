@@ -35,3 +35,6 @@
 # an LFS pointer, because a pointer is a different blob. Its own .gitattributes (vendored with
 # it) governs its line endings.
 Plugins/SuperSLMUnreal/Source/ThirdParty/** -filter -diff -merge
+
+# Vendored SuperSLM files that upstream stores with CRLF bytes: kept byte-identical to the tag's blob (1.4.0, v1.18.0).
+Plugins/SuperSLMUnreal/Source/ThirdParty/SuperSLM/tests/multirow-gpu/p41_wine_baseline_*.txt -text

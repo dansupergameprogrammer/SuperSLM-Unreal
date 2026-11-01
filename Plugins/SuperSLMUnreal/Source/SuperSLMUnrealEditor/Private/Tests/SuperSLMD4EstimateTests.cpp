@@ -125,6 +125,7 @@ namespace SuperSLMD4EstimateTests
 					Written && Reported && *Written == *Reported && ParseDouble(*Written, V));
 				OutProfiles[Mode].Add(F, V);
 			}
+			AddWrittenPerChunk(*S, OutProfiles[Mode]);
 		}
 		bOk &= T.TestTrue(TEXT("both mode profiles were written"), bSeen[0] && bSeen[1]);
 		return bOk;
@@ -437,12 +438,13 @@ namespace SuperSLMD4EstimateTests
 			bOk &= TestTrue(*FString::Printf(TEXT("the cost-domain refusal names LayerCostMs (%s)"), *Report.Message), Report.Message.Contains(TEXT("LayerCostMs")));
 		}
 
-		// Explicit caller costs win over a matching saved estimate, in both modes.
+		// Explicit caller costs win over a matching saved estimate, in both modes. The estimate's C = 2..7
+		// pairs still price a 2..7-token chunk, since the caller set none of them (rev 1.3.6, P1.1).
 		for (int32 Mode = 0; Mode < 2; ++Mode)
 		{
 			FCostProfile Caller;
 			for (const FString& F : CostFields()) { Caller.Add(F, Defaults[Mode].FindRef(F) * 1.5 + (IsPerPositionField(F) ? 0.0005 : 0.125)); }
-			bOk &= PricedBy(*this, *Cpu, *Model, Mode, Caller, Caller, TEXT("caller"), Mode == 0 ? TEXT("mode-0 caller costs over an estimate") : TEXT("mode-1 caller costs over an estimate"));
+			bOk &= PricedBy(*this, *Cpu, *Model, Mode, Caller, WithOverrides(Written[Mode], Caller), TEXT("caller"), Mode == 0 ? TEXT("mode-0 caller costs over an estimate") : TEXT("mode-1 caller costs over an estimate"));
 		}
 		bOk &= TestTrue(TEXT("INI files restored"), Costs.Restore() && Settings.Restore());
 		return bOk;
@@ -496,7 +498,7 @@ namespace SuperSLMD4EstimateTests
 	// and the next Configure() with no caller costs resolves each per-C pair to the written figure.
 	// The pair is NOT one of the report's thirteen "suggested" fields (that contract is D4's and is
 	// unchanged here): the field names and where the report prints them are the implementer's, and
-	// this cell reads only the INI keys the runtime configuration documents. Red until the arms land.
+	// this cell reads only the INI keys the runtime configuration documents.
 	IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMD4EstimatePerChunkArmsTest,
 		"SuperSLM.D4.Estimate.PerChunkArms", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 	bool FSuperSLMD4EstimatePerChunkArmsTest::RunTest(const FString& Parameters)

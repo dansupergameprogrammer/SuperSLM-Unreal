@@ -44,10 +44,10 @@ from pathlib import Path
 PLUGIN_ROOT = Path(__file__).resolve().parents[1].parent  # .../Plugins/SuperSLMUnreal
 THIRDPARTY_ROOT = PLUGIN_ROOT / "Source" / "ThirdParty" / "SuperSLM"
 
-EXPECTED_TAG = "v1.15.0"
-EXPECTED_COMMIT_PREFIX = "165962acaf"
-EXPECTED_BASE_RELEASE_COMMIT = "165962acafe901753dfe37153d7116b132a18b5a"
-EXPECTED_FILE_COUNT = 1575  # release files excluding .github/ and vendoring metadata
+EXPECTED_TAG = "v1.18.1"
+EXPECTED_COMMIT_PREFIX = "c3c14b1669"
+EXPECTED_BASE_RELEASE_COMMIT = "c3c14b16690a0c0c54de781f6f30380d88e62bd1"  # v1.18.0, the last tagged release commit
+EXPECTED_FILE_COUNT = 1718  # files excluding .github/ and vendoring metadata
 
 _RUNTIME_BUILD_CS_NAME = "SuperSLMUnreal.Build.cs"
 
@@ -115,7 +115,8 @@ def test_a_vendored_tree_exists_and_pinned():
     assert re.search(
         rf"(?m)^Base release commit:[ \t]*{EXPECTED_BASE_RELEASE_COMMIT}[ \t]*$", text
     ), "the release must name its tagged commit as its base release commit"
-    assert "Release status: published release v1.15.0" in text
+    # Plugin 1.4: re-vendored at the v1.18.1 tag (the exit-destructor fix).
+    assert "Release status: published release v1.18.1" in text
     vendored_files = [
         path for path in THIRDPARTY_ROOT.rglob("*")
         if path.is_file()

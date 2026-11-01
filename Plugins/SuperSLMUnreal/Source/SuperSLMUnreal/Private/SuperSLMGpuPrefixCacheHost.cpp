@@ -5,6 +5,7 @@
 #if SUPERSLM_WITH_PREFIX_CACHE && SUPERSLMUNREAL_WITH_GPU
 
 #include "RHIGlobals.h"
+#include "HAL/PlatformTime.h"
 #include "SuperSLMLog.h"
 
 using namespace SuperSLMCore;
@@ -41,8 +42,14 @@ FPrefixEngineIdentity FSuperSLMGpuPrefixCacheHost::MakeGpuIdentity(const FPrefix
 	return Identity;
 }
 
-void FSuperSLMGpuPrefixCacheHost::ResolveAdapterIds(uint32& OutVendorId, uint32& OutDeviceId)
+void FSuperSLMGpuPrefixCacheHost::ResolveAdapterIds(bool bLayer1Known, uint32 Layer1VendorId, uint32 Layer1DeviceId, uint32& OutVendorId, uint32& OutDeviceId)
 {
+	if (bLayer1Known)
+	{
+		OutVendorId = Layer1VendorId;
+		OutDeviceId = Layer1DeviceId;
+		return;
+	}
 	OutVendorId = static_cast<uint32>(GRHIVendorId);
 	OutDeviceId = static_cast<uint32>(GRHIDeviceId);
 }
@@ -83,58 +90,142 @@ FSuperSLMPrefixLaneJob FSuperSLMGpuPrefixCacheHost::MakeLaneJob(const FPrefixCom
 	case EPrefixCommandKind::Build:
 	{
 		Job.Kind = ESuperSLMPrefixLaneKind::Build;
-		const TArray<int32> Tokens(Command.Spec.Tokens.data(), static_cast<int32>(Command.Spec.Tokens.size()));
-		const FString Schema = UTF8_TO_TCHAR(Command.Spec.SchemaName.c_str());
-		const int32 Budget = FMath::Max(Command.ContextLength, 1); // nested: the suffix's budget
-		const uint64 Parent = Command.ParentEngineHandle;
-		Job.Run = [this, L1, Note, Tokens, Schema, Budget, Parent](const FSuperSLMPrefixLaneContext& /*Lane*/, FPrefixCompletion* Out)
+		// Precache U6, Q7: the build runs in steps, each one submission-thread job, so no single job nears the row-21
+		// device-loss bound and frame-path jobs run between them. The first step begins (and binds the schema); every step
+		// prefills in MaxPrefillChunk calls until the build's tokens are in or the step's slice is spent; the step that
+		// prefills the last token freezes. Only the finishing step (or an abort) writes the completion.
+		struct FSteps
 		{
-			CheckOffGameThread();
+			TArray<int32> Tokens;
+			FString Schema;
+			int32 Budget = 1;
+			uint64 Parent = 0;
 			SslmGpuPrefixHandle* Prefix = nullptr;
-			// A nested build continues its parent, which the core keeps cached and pinned until this
-			// job's completion is applied; a child binds no schema of its own (it carries its parent's).
-			SslmGpuStatus Status = Parent != 0
-				? sslm_gpu_prefix_begin_from(L1->Ctx, GpuHandleOf(Parent), Budget, &Prefix)
-				: sslm_gpu_prefix_begin(L1->Ctx, L1->Model, L1->Pool, Budget, &Prefix);
-			Note(Status);
-			if (Status == SslmGpuStatus::SSLM_OK && Parent == 0 && !Schema.IsEmpty())
-			{
-				const int32 Index = L1->SchemaIndexOf ? L1->SchemaIndexOf(Schema) : -1;
-				if (Index < 0)
-				{
-					Note(sslm_gpu_prefix_release(L1->Ctx, Prefix));
-					Out->Engine = EPrefixEngineResult::UnknownSchema;
-					Out->EngineStatus = -1; // resolved by name before any engine call that binds
-					return;
-				}
-				Status = sslm_gpu_prefix_set_schema(L1->Ctx, Prefix, Index);
-				Note(Status);
-			}
+			bool bBegun = false;
+			std::atomic<bool> bFinished{false};
 			int32 Done = 0;
 			int32 PrefillCalls = 0;
-			while (Status == SslmGpuStatus::SSLM_OK && Done < Tokens.Num())
+			uint64 EntryId = 0;
+			int32 StepsRun = 0;      // steps that prefilled (the GPU's chunk jobs, cells 1.7 (c), 5.13)
+			bool bHeldCounted = false; // counted in Test.HeldBuilds while the build hold keeps it
+		};
+		TSharedRef<FSteps, ESPMode::ThreadSafe> Steps = MakeShared<FSteps, ESPMode::ThreadSafe>();
+		Steps->Tokens = TArray<int32>(Command.Spec.Tokens.data(), static_cast<int32>(Command.Spec.Tokens.size()));
+		Steps->Schema = UTF8_TO_TCHAR(Command.Spec.SchemaName.c_str());
+		Steps->Budget = FMath::Max(Command.ContextLength, 1); // nested: the suffix's budget
+		Steps->Parent = Command.ParentEngineHandle;
+		Steps->EntryId = Command.EntryId;
+#if WITH_DEV_AUTOMATION_TESTS
+		NoteBuildState(Steps->EntryId, ESuperSLMPrefixBuildState::Queued); // emitted: the core has charged it
+#endif
+		Job.Run = [this, L1, Note, Steps](const FSuperSLMPrefixLaneContext& /*Lane*/, FPrefixCompletion* Out)
+		{
+			CheckOffGameThread();
+			FSteps& St = *Steps;
+			SslmGpuStatus Status = SslmGpuStatus::SSLM_OK;
+			if (!St.bBegun)
 			{
-				const int32 Count = FMath::Min(Tokens.Num() - Done, L1->MaxPrefillChunk);
-				int32_t Consumed = 0;
-				Status = sslm_gpu_prefix_prefill(L1->Ctx, Prefix, Tokens.GetData() + Done, Count, /*prompt*/ 0, L1->DispatchBudget, &Consumed);
-				++PrefillCalls;
+				St.bBegun = true;
+				// A nested build continues its parent, which the core keeps cached and pinned until this build's
+				// completion is applied; a child binds no schema of its own (it carries its parent's).
+#if WITH_DEV_AUTOMATION_TESTS
+				const int32 Forced = Test.GpuNextBuildBeginStatus.exchange(0);
+				if (Forced != 0)
+				{
+					Status = static_cast<SslmGpuStatus>(Forced); // the begin is not called: nothing drawn
+				}
+				else
+#endif
+				Status = St.Parent != 0
+					? sslm_gpu_prefix_begin_from(L1->Ctx, GpuHandleOf(St.Parent), St.Budget, &St.Prefix)
+					: sslm_gpu_prefix_begin(L1->Ctx, L1->Model, L1->Pool, St.Budget, &St.Prefix);
 				Note(Status);
-				Done += Consumed;
+				if (Status == SslmGpuStatus::SSLM_OK && St.Parent == 0 && !St.Schema.IsEmpty())
+				{
+					const int32 Index = L1->SchemaIndexOf ? L1->SchemaIndexOf(St.Schema) : -1;
+					if (Index < 0)
+					{
+						Note(sslm_gpu_prefix_release(L1->Ctx, St.Prefix));
+						St.Prefix = nullptr;
+						Out->Engine = EPrefixEngineResult::UnknownSchema;
+						Out->EngineStatus = -1; // resolved by name before any engine call that binds
+						St.bFinished.store(true, std::memory_order_release);
+						return;
+					}
+					Status = sslm_gpu_prefix_set_schema(L1->Ctx, St.Prefix, Index);
+					Note(Status);
+				}
+#if WITH_DEV_AUTOMATION_TESTS
+				if (Status == SslmGpuStatus::SSLM_OK)
+				{
+					NoteBuildState(St.EntryId, ESuperSLMPrefixBuildState::Begun);
+				}
+#endif
+			}
+#if WITH_DEV_AUTOMATION_TESTS
+			// The build hold (§8; cells 7.21, 1.7) and the chunk hold (cells 1.7 (c), 5.13), the GPU's way: a held step
+			// calls nothing more and returns, and the glue posts it again, so the submission thread never waits inside a
+			// job (a job that waited would near the row-21 device-loss bound). The build hold holds after begin, before
+			// the first prefill; the chunk hold between two prefilling steps.
+			if (Status == SslmGpuStatus::SSLM_OK && St.Done < St.Tokens.Num())
+			{
+				const int32 ChunkAfter = Test.ChunkHoldAfter.load();
+				const bool bHeld = (St.StepsRun == 0 && Test.bBuildHold.load())
+					|| (ChunkAfter >= 0 && St.StepsRun > 0 && St.StepsRun >= ChunkAfter);
+				if (bHeld)
+				{
+					if (!St.bHeldCounted && St.StepsRun == 0 && Test.bBuildHold.load())
+					{
+						St.bHeldCounted = true;
+						Test.HeldBuilds.fetch_add(1);
+					}
+					return;
+				}
+				if (St.bHeldCounted)
+				{
+					St.bHeldCounted = false;
+					Test.HeldBuilds.fetch_sub(1);
+				}
+			}
+#endif
+			const double SliceEnd = FPlatformTime::Seconds() + BuildStepSliceSeconds;
+			int32 CallsThisStep = 0;
+			while (Status == SslmGpuStatus::SSLM_OK && St.Done < St.Tokens.Num() && (CallsThisStep == 0 || FPlatformTime::Seconds() < SliceEnd))
+			{
+				const int32 Count = FMath::Min(St.Tokens.Num() - St.Done, L1->MaxPrefillChunk);
+				int32_t Consumed = 0;
+				Status = sslm_gpu_prefix_prefill(L1->Ctx, St.Prefix, St.Tokens.GetData() + St.Done, Count, /*prompt*/ 0, L1->DispatchBudget, &Consumed);
+				++St.PrefillCalls;
+				++CallsThisStep;
+				Note(Status);
+				St.Done += Consumed;
 				if (Status == SslmGpuStatus::SSLM_OK && Consumed <= 0)
 				{
 					Status = SslmGpuStatus::SSLM_GPU_PREFIX_REJECTED; // no progress: never loop
 				}
 			}
-			NotePrefixPrefills(PrefillCalls); // §15.26
+#if WITH_DEV_AUTOMATION_TESTS
+			if (CallsThisStep > 0)
+			{
+				++St.StepsRun;
+				FScopeLock Lock(&Test.BuildStateGuard);
+				Test.ChunkJobsByEntry.FindOrAdd(St.EntryId) += 1;
+			}
+#endif
+			if (Status == SslmGpuStatus::SSLM_OK && St.Done < St.Tokens.Num())
+			{
+				return; // the slice is spent: the glue posts the next step
+			}
+			NotePrefixPrefills(St.PrefillCalls); // §15.26
 			if (Status == SslmGpuStatus::SSLM_OK)
 			{
-				Status = sslm_gpu_prefix_freeze(L1->Ctx, Prefix);
+				Status = sslm_gpu_prefix_freeze(L1->Ctx, St.Prefix);
 				Note(Status);
 			}
-			if (Status != SslmGpuStatus::SSLM_OK && Prefix != nullptr)
+			if (Status != SslmGpuStatus::SSLM_OK && St.Prefix != nullptr)
 			{
-				Note(sslm_gpu_prefix_release(L1->Ctx, Prefix));
-				Prefix = nullptr;
+				Note(sslm_gpu_prefix_release(L1->Ctx, St.Prefix));
+				St.Prefix = nullptr;
 			}
 			Out->Engine = GpuEngineResultOf(Status);
 			if (Out->Engine == EPrefixEngineResult::Refused)
@@ -142,7 +233,48 @@ FSuperSLMPrefixLaneJob FSuperSLMGpuPrefixCacheHost::MakeLaneJob(const FPrefixCom
 				Out->Engine = EPrefixEngineResult::Failed; // a build's refusal is not a miss
 			}
 			Out->EngineStatus = static_cast<int32_t>(Status);
-			Out->EngineHandle = GpuHandleBits(Prefix);
+			Out->EngineHandle = GpuHandleBits(St.Prefix);
+#if WITH_DEV_AUTOMATION_TESTS
+			if (Status == SslmGpuStatus::SSLM_OK)
+			{
+				NoteBuildState(St.EntryId, ESuperSLMPrefixBuildState::Frozen);
+			}
+			else
+			{
+				ForgetBuildState(St.EntryId);
+			}
+#endif
+			St.bFinished.store(true, std::memory_order_release);
+		};
+		Job.MoreSteps = [Steps]() { return !Steps->bFinished.load(std::memory_order_acquire); };
+		Job.AbortSteps = [this, L1, Note, Steps](FPrefixCompletion* Out)
+		{
+			FSteps& St = *Steps;
+			if (St.bFinished.load(std::memory_order_acquire))
+			{
+				return;
+			}
+#if WITH_DEV_AUTOMATION_TESTS
+			if (St.bHeldCounted)
+			{
+				St.bHeldCounted = false;
+				Test.HeldBuilds.fetch_sub(1);
+			}
+			ForgetBuildState(St.EntryId);
+			if (St.Prefix != nullptr)
+			{
+				++Test.UnfrozenBuildReleases; // cell 1.7: a begun, unfrozen build the teardown released (once)
+			}
+#endif
+			if (St.Prefix != nullptr)
+			{
+				Note(sslm_gpu_prefix_release(L1->Ctx, St.Prefix));
+				St.Prefix = nullptr;
+			}
+			Out->Engine = EPrefixEngineResult::Failed;
+			Out->EngineStatus = -1;
+			Out->EngineHandle = 0;
+			St.bFinished.store(true, std::memory_order_release);
 		};
 		break;
 	}
@@ -158,9 +290,56 @@ FSuperSLMPrefixLaneJob FSuperSLMGpuPrefixCacheHost::MakeLaneJob(const FPrefixCom
 			Hint = 0; // cell 8.12's GPU twin: the hint fails
 		}
 #endif
-		Job.Run = [this, L1, Note, Ref, Hint](const FSuperSLMPrefixLaneContext& /*Lane*/, FPrefixCompletion* Out)
+#if WITH_DEV_AUTOMATION_TESTS
+		// The restore hold (cell 1.7): a held restore calls nothing and is posted again, as a held build step is.
+		struct FRestoreHold
+		{
+			std::atomic<bool> bRan{false};
+			bool bCounted = false;
+		};
+		TSharedRef<FRestoreHold, ESPMode::ThreadSafe> RestoreHold = MakeShared<FRestoreHold, ESPMode::ThreadSafe>();
+		Job.MoreSteps = [RestoreHold]() { return !RestoreHold->bRan.load(std::memory_order_acquire); };
+		Job.AbortSteps = [this, RestoreHold, Ref](FPrefixCompletion* Out)
+		{
+			if (RestoreHold->bRan.load(std::memory_order_acquire))
+			{
+				return;
+			}
+			if (RestoreHold->bCounted)
+			{
+				RestoreHold->bCounted = false;
+				Test.HeldRestores.fetch_sub(1);
+			}
+			DropPayload(Ref);
+			Out->Engine = EPrefixEngineResult::Failed;
+			Out->EngineStatus = -1;
+			RestoreHold->bRan.store(true, std::memory_order_release);
+		};
+#endif
+		Job.Run = [this, L1, Note, Ref, Hint
+#if WITH_DEV_AUTOMATION_TESTS
+			, RestoreHold
+#endif
+		](const FSuperSLMPrefixLaneContext& /*Lane*/, FPrefixCompletion* Out)
 		{
 			CheckOffGameThread();
+#if WITH_DEV_AUTOMATION_TESTS
+			if (Test.bGpuRestoreHold.load())
+			{
+				if (!RestoreHold->bCounted)
+				{
+					RestoreHold->bCounted = true;
+					Test.HeldRestores.fetch_add(1);
+				}
+				return;
+			}
+			if (RestoreHold->bCounted)
+			{
+				RestoreHold->bCounted = false;
+				Test.HeldRestores.fetch_sub(1);
+			}
+			ON_SCOPE_EXIT { RestoreHold->bRan.store(true, std::memory_order_release); };
+#endif
 			TArray<uint8> Bytes;
 			const bool bHave = TakePayloadCopy(Ref, Bytes);
 			DropPayload(Ref); // the Restore owns the bytes
@@ -192,9 +371,58 @@ FSuperSLMPrefixLaneJob FSuperSLMGpuPrefixCacheHost::MakeLaneJob(const FPrefixCom
 	{
 		Job.Kind = ESuperSLMPrefixLaneKind::Save;
 		const uint64 Engine = Command.EngineHandle;
-		Job.Run = [this, L1, Note, Engine](const FSuperSLMPrefixLaneContext& /*Lane*/, FPrefixCompletion* Out)
+#if WITH_DEV_AUTOMATION_TESTS
+		// The save hold (cell 3.10 (v); the U2 review's delete-behind-save, GPU twins): a held save calls nothing and is
+		// posted again, as a held restore is, so its write-back's file write is never issued while it holds. A held save the
+		// teardown ends (the glue's abort) completes Skipped: it never ran, so nothing failed and nothing is logged, and a
+		// drop's delete waiting on it runs in the teardown's drain (§5.4 rev 1.18.5), as the CPU host's step 1a has it.
+		struct FSaveHold
+		{
+			std::atomic<bool> bRan{false};
+			bool bCounted = false;
+		};
+		TSharedRef<FSaveHold, ESPMode::ThreadSafe> SaveHold = MakeShared<FSaveHold, ESPMode::ThreadSafe>();
+		Job.MoreSteps = [SaveHold]() { return !SaveHold->bRan.load(std::memory_order_acquire); };
+		Job.AbortSteps = [this, SaveHold](FPrefixCompletion* Out)
+		{
+			if (SaveHold->bRan.load(std::memory_order_acquire))
+			{
+				return;
+			}
+			if (SaveHold->bCounted)
+			{
+				SaveHold->bCounted = false;
+				Test.HeldSaves.fetch_sub(1);
+			}
+			Out->Engine = EPrefixEngineResult::Skipped;
+			Out->EngineStatus = -1;
+			SaveHold->bRan.store(true, std::memory_order_release);
+		};
+#endif
+		Job.Run = [this, L1, Note, Engine
+#if WITH_DEV_AUTOMATION_TESTS
+			, SaveHold
+#endif
+		](const FSuperSLMPrefixLaneContext& /*Lane*/, FPrefixCompletion* Out)
 		{
 			CheckOffGameThread();
+#if WITH_DEV_AUTOMATION_TESTS
+			if (Test.bGpuSaveHold.load())
+			{
+				if (!SaveHold->bCounted)
+				{
+					SaveHold->bCounted = true;
+					Test.HeldSaves.fetch_add(1);
+				}
+				return;
+			}
+			if (SaveHold->bCounted)
+			{
+				SaveHold->bCounted = false;
+				Test.HeldSaves.fetch_sub(1);
+			}
+			ON_SCOPE_EXIT { SaveHold->bRan.store(true, std::memory_order_release); };
+#endif
 #if SUPERSLM_WITH_GPU_PREFIX_SAVE
 			size_t Size = 0;
 			SslmGpuStatus Status = sslm_gpu_prefix_save(L1->Ctx, GpuHandleOf(Engine), nullptr, &Size);
@@ -230,7 +458,20 @@ FSuperSLMPrefixLaneJob FSuperSLMGpuPrefixCacheHost::MakeLaneJob(const FPrefixCom
 		Job.Run = [this, L1, Note, Engine](const FSuperSLMPrefixLaneContext& /*Lane*/, FPrefixCompletion* Out)
 		{
 			CheckOffGameThread();
+#if WITH_DEV_AUTOMATION_TESTS
+			// The GPU busy-release substitution (§8, cell 5.15's GPU legs): SSLM_BUSY returned in place of a release
+			// that is never called, so the handle stays live and the core issues the release again.
+			int32 Busy = Test.GpuBusyReleases.load();
+			while (Busy > 0 && !Test.GpuBusyReleases.compare_exchange_weak(Busy, Busy - 1)) {}
+			SslmGpuStatus Status = Busy > 0 ? SslmGpuStatus::SSLM_BUSY : sslm_gpu_prefix_release(L1->Ctx, GpuHandleOf(Engine));
+			const int32 Substitute = Test.GpuSubstitutedReleaseStatus.load();
+			if (Busy <= 0 && Substitute != 0)
+			{
+				Status = static_cast<SslmGpuStatus>(Substitute); // the real release ran and consumed the handle
+			}
+#else
 			const SslmGpuStatus Status = sslm_gpu_prefix_release(L1->Ctx, GpuHandleOf(Engine));
+#endif
 			Note(Status);
 			// §5.4 *What a release's status means* (rev 1.18.1): SSLM_BUSY alone leaves the handle untouched (Busy: the
 			// core issues it again); every other status consumed the handle, so the release has applied.

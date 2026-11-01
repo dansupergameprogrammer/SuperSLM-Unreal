@@ -109,6 +109,61 @@ struct SUPERSLMUNREAL_API FSuperSLMGpuRuntimeConfig
 	// Pooled with a GPU cache: region A, in blocks of P_blk. No GPU cache exists in the paging
 	// release, so it is accepted and ignored there.
 	int32 CacheGhostBlocks = 1;
+
+	// --- The GPU frame budget and multi-row scheduling (multi-row GPU plan rev 1.3.2, §5.1-§5.4, slice MR6; rulings 37
+	// and 39). Appended, so every earlier field keeps its place. The chooser (Private/Core/SuperSLMGpuRowsChooser.h)
+	// reads these once, at Configure(), and never a measured time, so the tokens and each action's rows never depend on
+	// device timing. ---
+
+	// The GPU work one action may put in one frame, in milliseconds. 0 (the default) means one row: GpuRowCostMs +
+	// SceneGpuShareMs. Otherwise it is clamped to NominalTickMs. An action that runs l layers of an M-row chunk is priced
+	// at C(M) x (1 + margin) x l / L + SceneGpuShareMs, with C(M) the vendored engine's measured cost table
+	// (gpu_rows_cost_table.h) scaled by GpuRowCostMs. A budget below one row is not refused: one layer per action is
+	// always admitted, and Configure() logs a warning (ruling 39 Q2).
+	double SchemaJumpGpuFrameBudgetMs = 0.0;
+	// One row's GPU time, in milliseconds: the cost table's M = 1 entry, C(1), one row through every layer including
+	// the logits finish. 0 (the default) is unset: Configure() measures it on this GPU once per model and adapter
+	// (bCalibrateGpuRowCost), or uses 6.2 ms, measured on the reference box, when calibration is off. A value above 0
+	// is the game's own price: it wins and no calibration runs (erratum E-13, rulings 48 and 48a). Negative or not
+	// finite is refused (InvalidSchemaJumpBudget).
+	double GpuRowCostMs = 0.0;
+	// The scene's share of the frame's GPU time, in milliseconds (default 0: unknown; a game that knows it sets it).
+	// It comes out of every slice's budget (ruling 39 Q1).
+	double SceneGpuShareMs = 0.0;
+	// The nominal tick period, in milliseconds (default 16.7, 60 fps): the frame budget's maximum.
+	double NominalTickMs = 16.7;
+	// The margin added to every multi-row price, in per-mille of the table's cost (default 150, §5.1's m; MR-D15).
+	// Valid 0-1000000; anything else is refused at Configure() (InvalidSchemaJumpBudget).
+	int32 GpuRowsMarginPerMille = 150;
+	// Multi-row scheduling (§5.2-§5.4; MR-D16): prompts are read up to 8 rows per pass, and Exact verifies its drafts
+	// as rows on the OneCall path. False restores 1.17's one-row scheduling exactly (P4.4). Tokens are identical
+	// either way.
+	bool bGpuMultiRow = true;
+	// Erratum E-13 (rulings 48, 48a, 50 and 51): with GpuRowCostMs unset (0), Configure() measures C(1) on this GPU -- a
+	// throwaway sequence, 3 warm-up and 3 timed one-row tokens including the logits finish, priced at the max rounded
+	// up to 0.1 ms -- once per model artifact, GPU adapter and logits-head placement in the process. With no frame
+	// budget it runs inside Configure() on the submission thread; with SchemaJumpGpuFrameBudgetMs set it runs one slice
+	// per tick -- 1 layer first, then as many layers as fit the budget at the largest per-layer cost measured so far
+	// with the plan's margin, the logits finish alone when it does not fit -- and nothing is admitted or planned until
+	// it settles. A failure, a timeout (per attempt: 2 s without a frame budget, 10 s with one) or a price outside
+	// [1.24 ms, 124 ms] after one retry falls back to 6.2 ms with a warning, once per process; the model is never
+	// refused for it (a lost device is DeviceUnavailable, as at any other Configure() step). False: 6.2 ms, no
+	// calibration.
+	// Erratum E-14 (rulings 53, 53a and 54): the measured price, C_a at the early position pos_a, is a line in position,
+	// C(1, pos) = C_a + slope x (pos - pos_a), and every slice is priced at the position it ends at. The slope starts at
+	// the default, 0.0015 x C_a per position. With a frame budget set, a second phase reads the throwaway sequence to
+	// P2 = min(256, ContextCap - 8) and times 1 warm-up and 3 tokens there, only in the room each tick's generations
+	// leave (no wall-clock cap); the measured slope, max(0, C_b - C_a) / (P2 - pos_a), replaces the default and is
+	// cached. A failure, or a line that prices C(1, ContextCap) above 124 ms, keeps the default with one warning, and
+	// is not measured again in the process. A cached measured line is re-checked under each ContextCap (ruling 55). The
+	// game's value, the 6.2 ms default and the fallback are flat lines.
+	// Ruling 56: the calibration also keeps F, the largest of its timed logits finishes (for the game's value, the default
+	// and the fallback, ceil(g(1) x C(1) / 1000) from the cost table); with a frame budget a one-row slice that ends a
+	// token is priced l x (C(1, pos) - F) / L + F with the margin. After its warm-up tokens each attempt also runs one
+	// layer of each widened row kernel (2, 4 or 8 rows) the plan can pick, untimed and never over the budget (one that
+	// does not fit is skipped with a log line).
+	// USuperSLMGpuSubsystem::GetGpuRowCostMs() reads the row cost in use.
+	bool bCalibrateGpuRowCost = true;
 };
 
 enum class ESuperSLMGpuConfigureResult : uint8
@@ -129,6 +184,7 @@ enum class ESuperSLMGpuConfigureResult : uint8
 	KAboveMaximum,           // K above kMaxJobTicks (2^20), plan §5 (D-SLM7803); appended last so earlier values keep their numbers
 	InvalidSequenceBudget,   // plugin paging plan §3.1: SequenceBudget < 0 or > ContextCap; appended
 	KvPoolRefused,           // plugin paging plan §3.1, §3.4: the pool create returned KV_POOL_TOO_LARGE or ALLOCATION_FAILED, or its stats disagree with the computed geometry; the message names the pages, the bytes and the status
+	InvalidSchemaJumpBudget, // multi-row GPU plan §5.1 (MR6): a frame-budget field is negative or not finite, GpuRowCostMs or NominalTickMs is not positive, or GpuRowsMarginPerMille is outside 0-1000000; appended
 };
 
 struct SUPERSLMUNREAL_API FSuperSLMGpuConfigureReport

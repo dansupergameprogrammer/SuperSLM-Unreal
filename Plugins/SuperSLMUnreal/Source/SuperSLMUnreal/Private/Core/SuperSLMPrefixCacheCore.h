@@ -421,6 +421,9 @@ namespace SuperSLMCore
 		// afterwards too, as a warm op does (§5.6 *Generations and teardown*), until kPrefixOpRing later such leases
 		// drop it. Every other verb treats it as a handle of no configuration (cell 2.10).
 		EPrefixLeaseState GetLeaseState(int64_t Handle) const;
+		// True when the lease resolved Cancelled while Pending (§5.11 (a)), not a Ready lease whose handle a teardown
+		// released: a retired GPU host, its leases kept, answers as the CPU core does after Configure().
+		bool IsCancelledWhilePending(int64_t Handle) const;
 		// The key of the entry a Ready lease holds (a nested spec's parent key, as the host's disk-file
 		// seam needs it). False for any other handle.
 		bool GetLeaseKey(int64_t Handle, FPrefixKey& OutKey) const;
@@ -458,6 +461,10 @@ namespace SuperSLMCore
 		// lifetime; a resolved op keeps its result across a re-Configure until it leaves the ring, then reads
 		// Expired; a Pending op never expires.
 		bool GetOpResult(uint64_t OpId, FPrefixOpResult& Out) const;
+		// The next op id this core would issue, and a floor for it: a host that replaces another core (the GPU's, one
+		// core per configuration) carries the ids on, so op ids never repeat within the subsystem's lifetime.
+		uint64_t PeekNextOpId() const;
+		void CarryOpIdsFrom(uint64_t NextOpId);
 		// The end of Tick()'s apply pass, after every completion of the pass has been applied (step 1): steps 2
 		// and 3 of §5.6 *When a mark is applied* (mark applications queued after every op issued before this
 		// pass, then the issue-ordered queue drained while its head's hash has completed).

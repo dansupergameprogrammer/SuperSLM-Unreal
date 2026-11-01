@@ -151,6 +151,9 @@ public class SuperSLMUnreal : ModuleRules
 		if (Target.Platform == UnrealTargetPlatform.Win64)
 		{
 			PublicDefinitions.Add("SUPERSLMUNREAL_WITH_GPU=1");
+			// Precache step U6 (plugin 1.4.0): the GPU prefix save and restore verbs, released by SuperSLM 1.16.0 and vendored at
+			// v1.18.1. Public, so the editor's GPU cache cells compile their save and restore legs too.
+			PublicDefinitions.Add("SUPERSLM_WITH_GPU_PREFIX_SAVE=1");
 			// d3d12_harness.h and the GPU sources' own relative includes live here.
 			PrivateIncludePaths.Add(Path.Combine(ThirdPartyRoot(), "src", "gpu"));
 			PublicSystemLibraries.AddRange(new string[] { "d3d12.lib", "dxgi.lib", "dxguid.lib" });
@@ -194,6 +197,21 @@ public class SuperSLMUnreal : ModuleRules
 	// which an installed engine's editor does not let a project plugin write. The files are staged
 	// NonUFS: Layer 1 opens them with Win32 file calls, so they stay loose files outside any pak.
 	// The shader count follows the vendored tree (35 at 1.7.0); no list is restated here.
+	// Engine 1.18 (multi-row GPU plan §3.1/§3.2, plugin 1.4): the row-widened site variants are compiled
+	// beside them, H in {2, 4, 8}, exactly as the vendored CMakeLists.txt and build.bat do: each
+	// src/gpu/shaders_wide/<site>_wide.hlsl as <site>_wide_h<H>.cso with -D SSLM_WIDE_H=<H>, and the one
+	// GEMM source once per GEMM site as <gemm>_gemm_wide_h<H>.cso with -D SSLM_GEMM_SITE=<1..6>, both with
+	// -I src/gpu/shaders. sslm_gpu_seq_embed_rows chunks of two or more rows load them.
+	private static readonly string[] WideGemmSites = { "q_proj", "kv_proj", "o_proj", "gate_proj", "up_proj", "down_proj" };
+	private static readonly int[] WideRows = { 2, 4, 8 };
+
+	private struct ShaderJob
+	{
+		public string Name;
+		public string Hlsl;
+		public string Defines;
+	}
+
 	private void CompileAndStageGpuShaders()
 	{
 		string ShaderSourceDir = Path.Combine(ThirdPartyRoot(), "src", "gpu", "shaders");
@@ -203,6 +221,31 @@ public class SuperSLMUnreal : ModuleRules
 		if (HlslFiles.Length == 0)
 		{
 			throw new BuildException("SuperSLMUnreal: no .hlsl found under " + ShaderSourceDir);
+		}
+		List<ShaderJob> Jobs = new List<ShaderJob>();
+		foreach (string Hlsl in HlslFiles)
+		{
+			Jobs.Add(new ShaderJob { Name = Path.GetFileNameWithoutExtension(Hlsl), Hlsl = Hlsl, Defines = "" });
+		}
+		string WideDir = Path.Combine(ThirdPartyRoot(), "src", "gpu", "shaders_wide");
+		string[] WideSites = Directory.GetFiles(WideDir, "*_site_wide.hlsl");
+		Array.Sort(WideSites, StringComparer.Ordinal);
+		string WideGemm = Path.Combine(WideDir, "proj_gemm_wide.hlsl");
+		if (WideSites.Length == 0 || !File.Exists(WideGemm))
+		{
+			throw new BuildException("SuperSLMUnreal: the row-widened shaders are missing under " + WideDir);
+		}
+		string WideInclude = " -I \"" + ShaderSourceDir + "\"";
+		foreach (int H in WideRows)
+		{
+			foreach (string Site in WideSites)
+			{
+				Jobs.Add(new ShaderJob { Name = Path.GetFileNameWithoutExtension(Site) + "_h" + H, Hlsl = Site, Defines = " -D SSLM_WIDE_H=" + H + WideInclude });
+			}
+			for (int G = 0; G < WideGemmSites.Length; ++G)
+			{
+				Jobs.Add(new ShaderJob { Name = WideGemmSites[G] + "_gemm_wide_h" + H, Hlsl = WideGemm, Defines = " -D SSLM_WIDE_H=" + H + " -D SSLM_GEMM_SITE=" + (G + 1) + WideInclude });
+			}
 		}
 
 		// A .cso is current when it is newer than its own .hlsl and every shared .hlsli, the same
@@ -241,7 +284,7 @@ public class SuperSLMUnreal : ModuleRules
 			}
 			try
 			{
-				CompileShadersLocked(HlslFiles, NewestHeader, OutputDir);
+				CompileShadersLocked(Jobs, NewestHeader, OutputDir);
 			}
 			finally
 			{
@@ -250,13 +293,14 @@ public class SuperSLMUnreal : ModuleRules
 		}
 	}
 
-	private void CompileShadersLocked(string[] HlslFiles, DateTime NewestHeader, string OutputDir)
+	private void CompileShadersLocked(List<ShaderJob> Jobs, DateTime NewestHeader, string OutputDir)
 	{
 		string Dxc = null;
 		List<string> ShaderNames = new List<string>();
-		foreach (string Hlsl in HlslFiles)
+		foreach (ShaderJob Job in Jobs)
 		{
-			string Name = Path.GetFileNameWithoutExtension(Hlsl);
+			string Name = Job.Name;
+			string Hlsl = Job.Hlsl;
 			ShaderNames.Add(Name);
 			string Cso = Path.Combine(OutputDir, Name + ".cso");
 			bool bCurrent = File.Exists(Cso)
@@ -268,7 +312,7 @@ public class SuperSLMUnreal : ModuleRules
 				{
 					Dxc = FindDxc();
 				}
-				CompileShader(Dxc, Hlsl, Cso);
+				CompileShader(Dxc, Hlsl, Job.Defines, Cso);
 			}
 			RuntimeDependencies.Add("$(PluginDir)/Binaries/Win64/shaders/" + Name + ".cso", Cso, StagedFileType.NonUFS);
 		}
@@ -322,12 +366,12 @@ public class SuperSLMUnreal : ModuleRules
 
 	// dxc writes a temporary file beside the .cso, which is moved into place only when dxc
 	// succeeds, so an interrupted compile never leaves a partial .cso that reads as current.
-	private static void CompileShader(string Dxc, string Hlsl, string Final)
+	private static void CompileShader(string Dxc, string Hlsl, string Defines, string Final)
 	{
 		string Cso = Final + "." + Process.GetCurrentProcess().Id + ".tmp";
 		ProcessStartInfo Info = new ProcessStartInfo(Dxc)
 		{
-			Arguments = "-T cs_6_2 -E main -Fo \"" + Cso + "\" \"" + Hlsl + "\" -O3 -HV 2018 -WX",
+			Arguments = "-T cs_6_2 -E main -Fo \"" + Cso + "\" \"" + Hlsl + "\" -O3 -HV 2018 -WX" + Defines,
 			UseShellExecute = false,
 			RedirectStandardOutput = true,
 			RedirectStandardError = true,
@@ -348,6 +392,6 @@ public class SuperSLMUnreal : ModuleRules
 			}
 		}
 		File.Move(Cso, Final, true);
-		Console.WriteLine("SuperSLMUnreal: dxc " + Path.GetFileName(Hlsl) + " -> " + Final);
+		Console.WriteLine("SuperSLMUnreal: dxc " + Path.GetFileName(Hlsl) + Defines + " -> " + Final);
 	}
 }

@@ -21,6 +21,7 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+#include "SuperSLMGpuSubsystem.h"
 #include "SuperSLMModel.h"
 #include "SuperSLMSubsystem.h"
 
@@ -146,10 +147,14 @@ struct FSuperSLMPrefixCacheCheck::FState
 {
 };
 
+struct FSuperSLMPrefixCacheCheck::FGpuState
+{
+};
+
 FSuperSLMPrefixCacheCheck::FSuperSLMPrefixCacheCheck() = default;
 FSuperSLMPrefixCacheCheck::~FSuperSLMPrefixCacheCheck() = default;
 
-void FSuperSLMPrefixCacheCheck::Start(USuperSLMModel&, USuperSLMSubsystem&, const FString& Leg, const FString&)
+void FSuperSLMPrefixCacheCheck::Start(USuperSLMModel&, USuperSLMSubsystem&, USuperSLMGpuSubsystem*, const FString& Leg, const FString&)
 {
 	using namespace SuperSLMPrefixCacheCheck;
 	TArray<FCheckLine> Checks;
@@ -2552,18 +2557,762 @@ struct FSuperSLMPrefixCacheCheck::FState
 	}
 };
 
+// The GPU legs (precache plan step U8: cells 10.5 and 10.6 on the GPU): the CPU legs' Cooked, Budget, DiskWrite and
+// DiskRead over the GameInstance's GPU subsystem, pooled, with its prefix cache. The set's GPU build for this adapter
+// serves the cooked tier; the disk tier writes the GPU's own files (keyed by the adapter). The game thread's time in
+// the GPU subsystem's tick is recorded for every tick, not graded: the plugin states no GPU game-thread bound, and GPU
+// timing is reported, never a gate.
+struct FSuperSLMPrefixCacheCheck::FGpuState
+{
+	using FCheckLine = SuperSLMPrefixCacheCheck::FCheckLine;
+
+	enum class ELeg : uint8 { Cooked, Budget, DiskWrite, DiskRead };
+	enum class EStep : uint8 { Start, Reference, Cooked, BudgetEntry, Travel, BudgetReentry, DiskWrite, DiskFlush, DiskRead, Done };
+
+	struct FLane
+	{
+		int32 Entry = 0;
+		enum class EState : uint8 { Requested, Adopting, Starting, Generating, Done } State = EState::Requested;
+		FSuperSLMPrefix Lease;
+		FSuperSLMGpuSequence Sequence;
+		FSuperSLMLifecycleOpHandle Op;
+		ESuperSLMPrefixSource Source = ESuperSLMPrefixSource::Pending;
+		TArray<int32> Tokens;
+	};
+
+	struct FPass
+	{
+		TArray<int32> Order;
+		int32 Concurrency = 1;
+		int32 Next = 0;
+		TArray<FLane> Lanes;
+		FSuperSLMPrefixCacheStats Before;
+		double MaxTickMs = 0.0;
+		double SumTickMs = 0.0;
+		int32 Ticks = 0;
+		bool IsDone() const
+		{
+			if (Next < Order.Num()) { return false; }
+			for (const FLane& L : Lanes) { if (L.State != FLane::EState::Done) { return false; } }
+			return true;
+		}
+	};
+
+	// The GPU configuration: ten pooled sequences (the level's ten adopters at once) at a context of 240, room for an
+	// entry of 128, its suffix and its reply. Region C is sized in whole blocks of ceil(ContextCap / B) pages, so the
+	// small context is what lets the Budget leg's five entries be a budget at all (at the model's cap one block would
+	// hold every entry). At B = 16 a block is 15 pages and an entry 8: the Budget leg's 5.5 entries (44 pages) round up
+	// to three blocks, 45 pages, which hold five entries and not a sixth.
+	static constexpr int32 GpuBlocks = SuperSLMPrefixCacheCheck::Entries;
+	static constexpr int64 GpuContextCap = 240;
+	static constexpr int64 GpuDiskMaxBytes = 256ll * 1024 * 1024; // the CPU's PrefixDiskCacheMaxBytes default
+
+	TStrongObjectPtr<USuperSLMModel> Model;
+	TStrongObjectPtr<USuperSLMPrefixSet> Set;
+	USuperSLMGpuSubsystem& Gpu;
+	ELeg Leg = ELeg::Cooked;
+	FString LegName;
+	FString ModelPath;
+	FString SetPath;
+	FString DiskDir;
+	FString ComparePath;
+	EStep Step = EStep::Start;
+	TArray<FSuperSLMPrefixSpec> Specs;
+	TArray<FName> EntryNames;
+	TArray<TArray<int32>> Suffixes;
+	TArray<TArray<int32>> Reference;
+	FPass Pass;
+	TArray<FCheckLine> Checks;
+	TSharedRef<FJsonObject> Report = MakeShared<FJsonObject>();
+	double LegStarted = FPlatformTime::Seconds();
+	double PhaseStarted = FPlatformTime::Seconds();
+	int64 EntryBytes = 0;
+	int64 BudgetBytes = 0;
+	TWeakObjectPtr<UWorld> TravelFrom;
+	TFunction<void()> AfterTravel;
+	FString TravelCheck;
+
+	FGpuState(USuperSLMModel& InModel, USuperSLMGpuSubsystem& InGpu, const FString& InLeg, const FString& InModelPath)
+		: Model(&InModel), Gpu(InGpu), LegName(InLeg), ModelPath(InModelPath)
+	{
+		if (!FParse::Value(FCommandLine::Get(), TEXT("SuperSLMExamplePrefixSet="), SetPath) || SetPath.IsEmpty())
+		{
+			SetPath = SuperSLMPrefixCacheCheck::kDefaultSet;
+		}
+		FParse::Value(FCommandLine::Get(), TEXT("SuperSLMExamplePrefixDiskDir="), DiskDir);
+		FParse::Value(FCommandLine::Get(), TEXT("SuperSLMExamplePrefixCompare="), ComparePath);
+		Report->SetNumberField(TEXT("schema"), 1);
+		Report->SetStringField(TEXT("backend"), TEXT("GPU"));
+		Report->SetStringField(TEXT("gpu_brand"), FPlatformMisc::GetPrimaryGPUBrand());
+		Report->SetStringField(TEXT("model_path"), ModelPath);
+		Report->SetStringField(TEXT("prefix_set"), SetPath);
+		Report->SetNumberField(TEXT("model_bytes"), static_cast<double>(InModel.GetMappedArtifactSize()));
+		SuperSLMPrefixCacheCheck::AddPlatform(Checks, Report);
+	}
+
+	void Add(const FString& Name, bool bPass, const FString& Detail) { Checks.Add({ Name, bPass, Detail }); }
+
+	void Fail(const FString& Name, const FString& Detail)
+	{
+		Add(Name, false, Detail);
+		End();
+	}
+
+	void End()
+	{
+		if (Step == EStep::Done)
+		{
+			return;
+		}
+		Step = EStep::Done;
+		Report->SetNumberField(TEXT("elapsed_s"), FPlatformTime::Seconds() - LegStarted);
+		Report->SetObjectField(TEXT("stats_at_end"), SuperSLMPrefixCacheCheck::JsonStats(Gpu.GetPrefixCacheStats()));
+		SuperSLMPrefixCacheCheck::Finish(LegName, Checks, Report);
+	}
+
+	void EnterPhase(EStep Next)
+	{
+		Step = Next;
+		PhaseStarted = FPlatformTime::Seconds();
+	}
+
+	bool ParseLeg()
+	{
+		static const TCHAR* const Names[] = { TEXT("GpuCooked"), TEXT("GpuBudget"), TEXT("GpuDiskWrite"), TEXT("GpuDiskRead") };
+		static const ELeg Values[] = { ELeg::Cooked, ELeg::Budget, ELeg::DiskWrite, ELeg::DiskRead };
+		for (int32 I = 0; I < 4; ++I)
+		{
+			if (LegName.Equals(Names[I], ESearchCase::IgnoreCase))
+			{
+				Leg = Values[I];
+				LegName = Names[I];
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// The set as the CPU legs read it (10 roots of equal length against the loaded model), with a GPU build whose
+	// every entry has bytes. Which adapter's build serves is the cache's choice; the report names every GPU build.
+	bool LoadSet()
+	{
+		USuperSLMPrefixSet* Loaded = LoadObject<USuperSLMPrefixSet>(nullptr, *SetPath);
+		if (Loaded == nullptr)
+		{
+			Fail(TEXT("pre.prefix_set_loaded"), FString::Printf(TEXT("no prefix set at %s (is its folder in DirectoriesToAlwaysCook?)"), *SetPath));
+			return false;
+		}
+		Set.Reset(Loaded);
+		TArray<FString> GpuBuilds;
+		int32 FullGpuBuilds = 0;
+		for (const FSuperSLMPrefixSetBuild& B : Loaded->Builds)
+		{
+			if (B.Backend != 1)
+			{
+				continue;
+			}
+			int32 Built = 0;
+			for (const FSuperSLMPrefixSetBuiltEntry& E : B.Entries) { Built += E.Wrapper.Num() > 0 ? 1 : 0; }
+			FullGpuBuilds += Built == SuperSLMPrefixCacheCheck::Entries ? 1 : 0;
+			GpuBuilds.Add(FString::Printf(TEXT("[GPU 0x%04x:0x%04x] %d entries with bytes (Layer 1 %s %s)"),
+				static_cast<uint32>(B.AdapterVendorId) & 0xFFFFu, static_cast<uint32>(B.AdapterDeviceId) & 0xFFFFu, Built, *B.Layer1Tag, *B.Layer1Commit));
+		}
+		bool bRoots = Loaded->Entries.Num() == SuperSLMPrefixCacheCheck::Entries;
+		const int32 Length = Loaded->Entries.Num() > 0 ? Loaded->Entries[0].Tokens.Num() : 0;
+		for (const FSuperSLMPrefixSetEntry& E : Loaded->Entries)
+		{
+			bRoots &= E.ParentName.IsNone() && E.SchemaName.IsNone() && E.Tokens.Num() == Length && Length > 0;
+		}
+		const FString Detail = FString::Printf(TEXT("%d entries of %d tokens; GPU builds: %s; set model %s"), Loaded->Entries.Num(), Length,
+			GpuBuilds.Num() > 0 ? *FString::Join(GpuBuilds, TEXT(", ")) : TEXT("none"), Loaded->Model ? *Loaded->Model->GetPathName() : TEXT("none"));
+		Report->SetStringField(TEXT("prefix_set_detail"), Detail);
+		if (!bRoots || FullGpuBuilds == 0 || Loaded->Model != Model.Get())
+		{
+			Fail(TEXT("pre.prefix_set_built_for_gpu"), Detail + TEXT("; expected 10 root entries of equal length, a GPU build with every entry, against the loaded model"));
+			return false;
+		}
+		Add(TEXT("pre.prefix_set_built_for_gpu"), true, Detail);
+		for (int32 I = 0; I < Loaded->Entries.Num(); ++I)
+		{
+			FSuperSLMPrefixSpec Spec;
+			Spec.Tokens = Loaded->Entries[I].Tokens;
+			Specs.Add(MoveTemp(Spec));
+			EntryNames.Add(Loaded->Entries[I].Name);
+			TArray<int32> Suffix;
+			for (int32 J = 0; J < SuperSLMPrefixCacheCheck::SuffixLength; ++J) { Suffix.Add(1100 + 10 * I + J); }
+			Suffixes.Add(MoveTemp(Suffix));
+		}
+		return true;
+	}
+
+	bool Configure(int64 CacheBudgetBytes, bool bDisk, const TCHAR* What)
+	{
+		FSuperSLMGpuPrefixCacheSettings Settings;
+		Settings.BudgetBytes = CacheBudgetBytes;
+		Settings.bDiskEnabled = bDisk;
+		Settings.DiskDirectory = bDisk ? DiskDir : FString();
+		// The GPU settings' DiskMaxBytes defaults to 0, a limit of 0 bytes: every file written would be trimmed away.
+		Settings.DiskMaxBytes = bDisk ? GpuDiskMaxBytes : 0;
+		Gpu.ConfigurePrefixCache(Settings);
+		FSuperSLMGpuRuntimeConfig Config;
+		Config.ContextCap = GpuContextCap;
+		Config.BlockCount = GpuBlocks;
+		Config.SequenceBudget = static_cast<int32>(GpuContextCap);
+		Config.PrefixBlockCount = 0;
+		Config.RestoreHeadroomBlocks = 1;
+		// Region A: each cache entry with a live adopter pre-charges floor(L / B) pages there, and its blocks are
+		// ceil(ContextCap / B) pages, so one block per adopter holds the ten adopted at once.
+		Config.CacheGhostBlocks = GpuBlocks;
+		Config.DispatchBudget = 25 * SuperSLMExample::NumHiddenLayers; // a whole token per tick
+		Config.K = GpuBlocks + 1;
+		Config.TickBudgetMs = 1000.0;
+		Config.FinishParallelTasks = 4;
+		Config.MaxQueuedOperationsPerSequence = 4;
+		Config.bCalibrateGpuRowCost = false;
+		const FSuperSLMGpuConfigureReport R = Gpu.Configure(Model.Get(), Config);
+		if (R.Result != ESuperSLMGpuConfigureResult::Success)
+		{
+			Fail(FString::Printf(TEXT("pre.configure.%s"), What), FString::Printf(TEXT("GPU Configure() refused (%d): %s"), static_cast<int32>(R.Result), *R.Message));
+			return false;
+		}
+		if (!Gpu.GetPrefixCacheStats().bConfigured)
+		{
+			Fail(FString::Printf(TEXT("pre.configure.%s"), What), TEXT("GPU Configure() succeeded but the GPU prefix cache is not configured"));
+			return false;
+		}
+		return true;
+	}
+
+	void BeginPass(const TArray<int32>& Order, int32 Concurrency, EStep Next)
+	{
+		Pass = FPass();
+		Pass.Order = Order;
+		Pass.Concurrency = Concurrency;
+		Pass.Before = Gpu.GetPrefixCacheStats();
+		EnterPhase(Next);
+	}
+
+	static TArray<int32> Ascending()
+	{
+		TArray<int32> Out;
+		for (int32 I = 0; I < SuperSLMPrefixCacheCheck::Entries; ++I) { Out.Add(I); }
+		return Out;
+	}
+
+	bool AdvancePass()
+	{
+		while (Pass.Next < Pass.Order.Num())
+		{
+			int32 InFlight = 0;
+			for (const FLane& L : Pass.Lanes) { InFlight += L.State != FLane::EState::Done ? 1 : 0; }
+			if (InFlight >= Pass.Concurrency)
+			{
+				break;
+			}
+			FLane Lane;
+			Lane.Entry = Pass.Order[Pass.Next++];
+			FString Error;
+			if (!Gpu.RequestPrefix(Specs[Lane.Entry], Lane.Lease, Error))
+			{
+				Fail(TEXT("run.request"), FString::Printf(TEXT("RequestPrefix(%s) refused: %s"), *EntryNames[Lane.Entry].ToString(), *Error));
+				return false;
+			}
+			Pass.Lanes.Add(MoveTemp(Lane));
+		}
+		for (FLane& L : Pass.Lanes)
+		{
+			const FString Name = EntryNames[L.Entry].ToString();
+			switch (L.State)
+			{
+			case FLane::EState::Requested:
+			{
+				const ESuperSLMPrefixLeaseState LeaseState = Gpu.GetPrefixLeaseState(L.Lease);
+				if (LeaseState == ESuperSLMPrefixLeaseState::Pending)
+				{
+					break;
+				}
+				if (LeaseState != ESuperSLMPrefixLeaseState::Ready)
+				{
+					Fail(TEXT("run.lease"), FString::Printf(TEXT("%s's lease resolved %s"), *Name, SuperSLMPrefixCacheCheck::LeaseStateName(LeaseState)));
+					return false;
+				}
+				L.Source = Gpu.GetPrefixSource(L.Lease);
+				if (Gpu.VendSequence(L.Sequence, ESuperSLMGpuDecodePath::OneCall) != ESuperSLMGpuVendResult::Success)
+				{
+					Fail(TEXT("run.vend"), FString::Printf(TEXT("no GPU sequence for %s's adopter"), *Name));
+					return false;
+				}
+				L.Op = Gpu.RequestAdoptPrefix(L.Sequence, L.Lease);
+				if (!L.Op.IsValid())
+				{
+					Fail(TEXT("run.adopt"), FString::Printf(TEXT("RequestAdoptPrefix(%s) refused: %s"), *Name, *Gpu.GetLastLifecycleRequestError()));
+					return false;
+				}
+				L.State = FLane::EState::Adopting;
+				break;
+			}
+			case FLane::EState::Adopting:
+			case FLane::EState::Starting:
+			{
+				const ESuperSLMRestoreResult Result = Gpu.GetLifecycleOpResult(L.Op);
+				if (Result == ESuperSLMRestoreResult::Pending)
+				{
+					break;
+				}
+				Gpu.ReleaseLifecycleOpHandle(L.Op);
+				L.Op = {};
+				const bool bAdopt = L.State == FLane::EState::Adopting;
+				if (Result != ESuperSLMRestoreResult::Success)
+				{
+					Fail(bAdopt ? TEXT("run.adopt") : TEXT("run.generate"), FString::Printf(TEXT("%s's %s resolved %d (%s)"), *Name,
+						bAdopt ? TEXT("adopt") : TEXT("generation start"), static_cast<int32>(Result), *Gpu.GetLastLifecycleRequestError()));
+					return false;
+				}
+				if (!bAdopt)
+				{
+					L.State = FLane::EState::Generating;
+					break;
+				}
+				FSuperSLMGenerationRequest Request;
+				Request.PromptTokens = Suffixes[L.Entry];
+				Request.MaxNewTokens = SuperSLMPrefixCacheCheck::MaxNewTokens;
+				L.Op = Gpu.RequestBeginGeneration(L.Sequence, Request);
+				if (!L.Op.IsValid())
+				{
+					Fail(TEXT("run.generate"), FString::Printf(TEXT("RequestBeginGeneration for %s refused: %s"), *Name, *Gpu.GetLastLifecycleRequestError()));
+					return false;
+				}
+				L.State = FLane::EState::Starting;
+				break;
+			}
+			case FLane::EState::Generating:
+			{
+				const ESuperSLMSequencePhase Phase = Gpu.GetPhase(L.Sequence);
+				if (Phase == ESuperSLMSequencePhase::Faulted)
+				{
+					Fail(TEXT("run.generate"), FString::Printf(TEXT("%s's adopter faulted (reason %d)"), *Name, static_cast<int32>(Gpu.GetLastFaultReason(L.Sequence))));
+					return false;
+				}
+				if (Phase != ESuperSLMSequencePhase::Complete || Gpu.GetPendingLifecycleOperationCount(L.Sequence) > 0)
+				{
+					break;
+				}
+				L.Tokens = Gpu.GetGeneratedTokens(L.Sequence);
+				Gpu.ReturnSequence(L.Sequence);
+				L.Sequence = {};
+				Gpu.ReturnPrefix(L.Lease);
+				L.State = FLane::EState::Done;
+				break;
+			}
+			default:
+				break;
+			}
+		}
+		return true;
+	}
+
+	TSharedRef<FJsonObject> RecordPass(const TCHAR* Key)
+	{
+		const FSuperSLMPrefixCacheStats After = Gpu.GetPrefixCacheStats();
+		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> Rows;
+		for (const FLane& L : Pass.Lanes)
+		{
+			TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
+			Row->SetNumberField(TEXT("index"), L.Entry);
+			Row->SetStringField(TEXT("entry"), EntryNames[L.Entry].ToString());
+			Row->SetStringField(TEXT("source"), SuperSLMPrefixCacheCheck::SourceName(L.Source));
+			Row->SetArrayField(TEXT("tokens"), SuperSLMPrefixCacheCheck::JsonInts(L.Tokens));
+			Rows.Add(MakeShared<FJsonValueObject>(Row));
+		}
+		O->SetArrayField(TEXT("entries"), Rows);
+		O->SetObjectField(TEXT("stats_before"), SuperSLMPrefixCacheCheck::JsonStats(Pass.Before));
+		O->SetObjectField(TEXT("stats_after"), SuperSLMPrefixCacheCheck::JsonStats(After));
+		O->SetNumberField(TEXT("prefix_prefill_calls"), static_cast<double>(After.PrefixPrefillCalls - Pass.Before.PrefixPrefillCalls));
+		O->SetNumberField(TEXT("prefix_prefill_builds"), static_cast<double>(After.PrefixPrefillBuilds - Pass.Before.PrefixPrefillBuilds));
+		O->SetNumberField(TEXT("ticks"), Pass.Ticks);
+		O->SetNumberField(TEXT("max_game_thread_tick_ms"), Pass.MaxTickMs);
+		O->SetNumberField(TEXT("mean_game_thread_tick_ms"), Pass.Ticks > 0 ? Pass.SumTickMs / Pass.Ticks : 0.0);
+		O->SetNumberField(TEXT("elapsed_s"), FPlatformTime::Seconds() - PhaseStarted);
+		Report->SetObjectField(Key, O);
+		return O;
+	}
+
+	int32 CountSource(ESuperSLMPrefixSource Source) const
+	{
+		int32 N = 0;
+		for (const FLane& L : Pass.Lanes) { N += L.Source == Source ? 1 : 0; }
+		return N;
+	}
+
+	FString SourcesText() const
+	{
+		TArray<FString> Parts;
+		for (const FLane& L : Pass.Lanes) { Parts.Add(FString::Printf(TEXT("%s %s"), *EntryNames[L.Entry].ToString(), SuperSLMPrefixCacheCheck::SourceName(L.Source))); }
+		return FString::Join(Parts, TEXT(", "));
+	}
+
+	void CheckTokens(const FString& Name, const TCHAR* Against)
+	{
+		TArray<FString> Differ;
+		for (const FLane& L : Pass.Lanes)
+		{
+			if (!Reference.IsValidIndex(L.Entry) || Reference[L.Entry] != L.Tokens || L.Tokens.Num() == 0)
+			{
+				Differ.Add(EntryNames[L.Entry].ToString());
+			}
+		}
+		Add(Name, Differ.Num() == 0 && Pass.Lanes.Num() == SuperSLMPrefixCacheCheck::Entries,
+			Differ.Num() == 0 ? FString::Printf(TEXT("%d adopters' tokens equal %s"), Pass.Lanes.Num(), Against)
+				: FString::Printf(TEXT("differ from %s: %s"), Against, *FString::Join(Differ, TEXT(", "))));
+	}
+
+	void CheckNoPrefill(const FString& Name)
+	{
+		const FSuperSLMPrefixCacheStats After = Gpu.GetPrefixCacheStats();
+		const int64 Calls = After.PrefixPrefillCalls - Pass.Before.PrefixPrefillCalls;
+		const int64 Builds = After.PrefixPrefillBuilds - Pass.Before.PrefixPrefillBuilds;
+		Add(Name, Calls == 0 && Builds == 0, FString::Printf(TEXT("%lld prefix prefill calls, %lld builds (the plugin's own count, FSuperSLMPrefixCacheStats::PrefixPrefillCalls)"), Calls, Builds));
+	}
+
+	// Recorded, not graded: the game thread's time in USuperSLMGpuSubsystem::TickOncePerFrame over the pass.
+	void RecordTick(const FString& Name)
+	{
+		Add(Name, Pass.Ticks > 0, FString::Printf(TEXT("recorded, not graded: max %.4f ms, mean %.4f ms over %d ticks (the CPU backend's bound is %.1f ms; the plugin states no GPU bound)"),
+			Pass.MaxTickMs, Pass.Ticks > 0 ? Pass.SumTickMs / Pass.Ticks : 0.0, Pass.Ticks, SuperSLMExample::CpuGameThreadTickBoundMs));
+	}
+
+	void KeepReference()
+	{
+		Reference.SetNum(SuperSLMPrefixCacheCheck::Entries);
+		for (const FLane& L : Pass.Lanes) { Reference[L.Entry] = L.Tokens; }
+	}
+
+	TArray<FString> DiskFiles(const TCHAR* Pattern) const
+	{
+		TArray<FString> Files;
+		IFileManager::Get().FindFiles(Files, *(DiskDir / Pattern), true, false);
+		return Files;
+	}
+
+	bool LoadCompare()
+	{
+		FString Text;
+		TSharedPtr<FJsonObject> Root;
+		const TSharedPtr<FJsonObject>* Pass1 = nullptr;
+		const TArray<TSharedPtr<FJsonValue>>* Rows = nullptr;
+		if (ComparePath.IsEmpty() || !FFileHelper::LoadFileToString(Text, *ComparePath)
+			|| !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Text), Root) || !Root.IsValid()
+			|| !Root->TryGetObjectField(TEXT("disk_write"), Pass1) || !(*Pass1)->TryGetArrayField(TEXT("entries"), Rows))
+		{
+			Fail(TEXT("pre.run1_report"), FString::Printf(TEXT("run 1's report could not be read from '%s' (-SuperSLMExamplePrefixCompare=)"), *ComparePath));
+			return false;
+		}
+		bool bRun1Passed = false;
+		Root->TryGetBoolField(TEXT("pass"), bRun1Passed);
+		Add(TEXT("pre.run1_passed"), bRun1Passed, ComparePath);
+		Reference.SetNum(SuperSLMPrefixCacheCheck::Entries);
+		for (const TSharedPtr<FJsonValue>& Value : *Rows)
+		{
+			const TSharedPtr<FJsonObject> Row = Value->AsObject();
+			int32 Index = -1;
+			const TArray<TSharedPtr<FJsonValue>>* Tokens = nullptr;
+			if (Row.IsValid() && Row->TryGetNumberField(TEXT("index"), Index) && Reference.IsValidIndex(Index) && Row->TryGetArrayField(TEXT("tokens"), Tokens))
+			{
+				for (const TSharedPtr<FJsonValue>& T : *Tokens) { Reference[Index].Add(static_cast<int32>(T->AsNumber())); }
+			}
+		}
+		return true;
+	}
+
+	void TravelThen(UWorld* World, const FString& CheckName, TFunction<void()> Then)
+	{
+		TravelFrom = World;
+		TravelCheck = CheckName;
+		AfterTravel = MoveTemp(Then);
+		EnterPhase(EStep::Travel);
+		UE_LOG(LogSuperSLMPrefixCacheCheck, Display, TEXT("%s: leaving the level and entering it again"), SuperSLMPrefixCacheCheck::kLine);
+		UGameplayStatics::OpenLevel(World, FName(*World->GetPackage()->GetName()));
+	}
+
+	void StartLeg()
+	{
+		if (!ParseLeg())
+		{
+			Fail(TEXT("pre.leg"), FString::Printf(TEXT("'%s' is not a GPU leg (GpuCooked, GpuBudget, GpuDiskWrite, GpuDiskRead)"), *LegName));
+			return;
+		}
+		UE_LOG(LogSuperSLMPrefixCacheCheck, Display, TEXT("%s: %s started"), SuperSLMPrefixCacheCheck::kLine, *LegName);
+		if (!LoadSet())
+		{
+			return;
+		}
+		if (Leg == ELeg::Cooked || Leg == ELeg::Budget)
+		{
+			Gpu.UnregisterPrefixSet(Set.Get());
+			if (Configure(SuperSLMPrefixCacheCheck::LargeBudgetBytes, false, TEXT("reference")))
+			{
+				BeginPass(Ascending(), SuperSLMPrefixCacheCheck::Entries, EStep::Reference);
+			}
+			return;
+		}
+		if (DiskDir.IsEmpty())
+		{
+			Fail(TEXT("pre.disk_directory"), TEXT("-SuperSLMExamplePrefixDiskDir= is required"));
+			return;
+		}
+		DiskDir = FPaths::ConvertRelativePathToFull(DiskDir);
+		if (Leg == ELeg::DiskWrite)
+		{
+			IFileManager::Get().DeleteDirectory(*DiskDir, false, true);
+			IFileManager::Get().MakeDirectory(*DiskDir, true);
+		}
+		else if (!LoadCompare())
+		{
+			return;
+		}
+		Report->SetStringField(TEXT("disk_directory"), DiskDir);
+		Report->SetNumberField(TEXT("disk_files_at_start"), DiskFiles(TEXT("*.slup")).Num());
+		Gpu.UnregisterPrefixSet(Set.Get()); // the disk tier alone: no cooked entry may serve these
+		if (Configure(SuperSLMPrefixCacheCheck::LargeBudgetBytes, true, TEXT("disk")))
+		{
+			BeginPass(Ascending(), SuperSLMPrefixCacheCheck::Entries, Leg == ELeg::DiskWrite ? EStep::DiskWrite : EStep::DiskRead);
+		}
+	}
+
+	void Tick(UWorld* World, float DeltaSeconds)
+	{
+		using namespace SuperSLMPrefixCacheCheck;
+		if (Step == EStep::Done)
+		{
+			return;
+		}
+		if (Step == EStep::Start)
+		{
+			StartLeg();
+			return;
+		}
+		const double Now = FPlatformTime::Seconds();
+		if (Now - LegStarted > LegSeconds || Now - PhaseStarted > PhaseSeconds)
+		{
+			Fail(TEXT("run.timeout"), FString::Printf(TEXT("step %d passed its time limit (%.0f s in the phase, %.0f s in the leg)"), static_cast<int32>(Step), Now - PhaseStarted, Now - LegStarted));
+			return;
+		}
+		if (Step != EStep::Travel)
+		{
+			const double T0 = FPlatformTime::Seconds();
+			Gpu.TickOncePerFrame(DeltaSeconds);
+			const double Ms = (FPlatformTime::Seconds() - T0) * 1000.0;
+			Pass.MaxTickMs = FMath::Max(Pass.MaxTickMs, Ms);
+			Pass.SumTickMs += Ms;
+			++Pass.Ticks;
+		}
+
+		switch (Step)
+		{
+		case EStep::Reference:
+			if (!AdvancePass() || !Pass.IsDone())
+			{
+				return;
+			}
+			RecordPass(TEXT("reference"));
+			Add(TEXT("pre.reference_recomputed"), CountSource(ESuperSLMPrefixSource::Recomputed) == Entries, SourcesText());
+			{
+				const FSuperSLMPrefixCacheStats S = Gpu.GetPrefixCacheStats();
+				const int64 Builds = S.PrefixPrefillBuilds - Pass.Before.PrefixPrefillBuilds;
+				const int64 Calls = S.PrefixPrefillCalls - Pass.Before.PrefixPrefillCalls;
+				Add(TEXT("pre.prefill_counter_counts_recomputes"), Builds == Entries && Calls >= Entries,
+					FString::Printf(TEXT("%lld builds, %lld prefill calls for %d recomputed prefixes"), Builds, Calls, Entries));
+				EntryBytes = S.ResidentEntries > 0 ? S.ResidentBytes / S.ResidentEntries : 0;
+				Report->SetNumberField(TEXT("entry_bytes"), static_cast<double>(EntryBytes));
+				if (S.ResidentEntries != Entries || EntryBytes <= 0)
+				{
+					Fail(TEXT("pre.all_resident"), FString::Printf(TEXT("%d entries resident after the reference pass, %lld bytes"), S.ResidentEntries, S.ResidentBytes));
+					return;
+				}
+			}
+			KeepReference();
+			if (Leg == ELeg::Cooked)
+			{
+				// A new configuration is a new GPU cache (one per configuration): nothing resident. The set is then
+				// registered and the level loads.
+				if (!Configure(LargeBudgetBytes, false, TEXT("cooked")))
+				{
+					return;
+				}
+				Gpu.RegisterPrefixSet(Set.Get());
+				BeginPass(Ascending(), Entries, EStep::Cooked);
+			}
+			else
+			{
+				// The budget set to 5 entries: five fit, a sixth does not (region C rounds up to whole blocks).
+				BudgetBytes = 5 * EntryBytes + EntryBytes / 2;
+				Report->SetNumberField(TEXT("budget_bytes"), static_cast<double>(BudgetBytes));
+				if (!Configure(BudgetBytes, false, TEXT("budget_5")))
+				{
+					return;
+				}
+				Gpu.RegisterPrefixSet(Set.Get());
+				BeginPass(Ascending(), 1, EStep::BudgetEntry);
+			}
+			return;
+
+		case EStep::Cooked:
+			if (!AdvancePass() || !Pass.IsDone())
+			{
+				return;
+			}
+			RecordPass(TEXT("cooked"));
+			{
+				const FSuperSLMPrefixCacheStats S = Gpu.GetPrefixCacheStats();
+				Add(TEXT("10.5.gpu.set_registered"), S.CookedEntriesRegistered == Entries,
+					FString::Printf(TEXT("%d cooked entries registered for this adapter (%s)"), S.CookedEntriesRegistered, *FPlatformMisc::GetPrimaryGPUBrand()));
+				Add(TEXT("10.5.gpu.every_request_cooked"), CountSource(ESuperSLMPrefixSource::Cooked) == Entries
+					&& Served(S, ESuperSLMPrefixSource::Cooked) - Served(Pass.Before, ESuperSLMPrefixSource::Cooked) == Entries, SourcesText());
+			}
+			CheckNoPrefill(TEXT("10.5.gpu.no_prefix_prefill"));
+			CheckTokens(TEXT("10.5.gpu.tokens_equal_recompute"), TEXT("the recompute pass's"));
+			RecordTick(TEXT("10.5.gpu.tick_recorded"));
+			End();
+			return;
+
+		case EStep::BudgetEntry:
+			if (!AdvancePass() || !Pass.IsDone())
+			{
+				return;
+			}
+			RecordPass(TEXT("budget_entry"));
+			{
+				const FSuperSLMPrefixCacheStats S = Gpu.GetPrefixCacheStats();
+				Add(TEXT("10.5.gpu.budget.entry_cooked"), CountSource(ESuperSLMPrefixSource::Cooked) == Entries, SourcesText());
+				Add(TEXT("10.5.gpu.budget.evicted_to_five"), S.Evictions - Pass.Before.Evictions >= Entries - 5 && S.ResidentEntries <= 5,
+					FString::Printf(TEXT("%lld evictions; %d entries resident (%lld bytes; budget %lld bytes, region C in whole blocks)"),
+						S.Evictions - Pass.Before.Evictions, S.ResidentEntries, S.ResidentBytes, BudgetBytes));
+			}
+			CheckNoPrefill(TEXT("10.5.gpu.budget.entry_no_prefix_prefill"));
+			CheckTokens(TEXT("10.5.gpu.budget.entry_tokens_equal_recompute"), TEXT("the recompute pass's"));
+			RecordTick(TEXT("10.5.gpu.budget.entry_tick_recorded"));
+			TravelThen(World, TEXT("10.5.gpu.budget.level_reentered"), [this]()
+			{
+				TArray<int32> Backward = Ascending();
+				Algo::Reverse(Backward);
+				BeginPass(Backward, 1, EStep::BudgetReentry);
+			});
+			return;
+
+		case EStep::Travel:
+			if (World == nullptr || TravelFrom.Get() == World)
+			{
+				return;
+			}
+			Add(TravelCheck, true, FString::Printf(TEXT("%s, after %.2f s"), *World->GetPackage()->GetName(), Now - PhaseStarted));
+			{
+				TFunction<void()> Then = MoveTemp(AfterTravel);
+				AfterTravel = nullptr;
+				Then();
+			}
+			return;
+
+		case EStep::BudgetReentry:
+			if (!AdvancePass() || !Pass.IsDone())
+			{
+				return;
+			}
+			RecordPass(TEXT("budget_reentry"));
+			{
+				const int32 Cooked = CountSource(ESuperSLMPrefixSource::Cooked);
+				const int32 Memory = CountSource(ESuperSLMPrefixSource::Memory);
+				Add(TEXT("10.5.gpu.budget.evicted_return_cooked"), Memory == 5 && Cooked == Entries - 5,
+					FString::Printf(TEXT("%d Cooked, %d Memory: %s"), Cooked, Memory, *SourcesText()));
+			}
+			CheckNoPrefill(TEXT("10.5.gpu.budget.reentry_no_prefix_prefill"));
+			CheckTokens(TEXT("10.5.gpu.budget.reentry_tokens_unchanged"), TEXT("the recompute pass's"));
+			RecordTick(TEXT("10.5.gpu.budget.reentry_tick_recorded"));
+			End();
+			return;
+
+		case EStep::DiskWrite:
+			if (!AdvancePass() || !Pass.IsDone())
+			{
+				return;
+			}
+			EnterPhase(EStep::DiskFlush);
+			return;
+
+		case EStep::DiskFlush:
+		{
+			const FSuperSLMPrefixCacheStats S = Gpu.GetPrefixCacheStats();
+			const int32 Files = DiskFiles(TEXT("*.slup")).Num();
+			const int32 Temporaries = DiskFiles(TEXT("*.tmp")).Num();
+			if (S.DiskWritesIssued - Pass.Before.DiskWritesIssued < Entries || Files < Entries || Temporaries > 0)
+			{
+				return;
+			}
+			const TSharedRef<FJsonObject> O = RecordPass(TEXT("disk_write"));
+			O->SetNumberField(TEXT("files"), Files);
+			Add(TEXT("10.6.gpu.run1_recomputed"), CountSource(ESuperSLMPrefixSource::Recomputed) == Entries, SourcesText());
+			{
+				const int64 Builds = S.PrefixPrefillBuilds - Pass.Before.PrefixPrefillBuilds;
+				const int64 Calls = S.PrefixPrefillCalls - Pass.Before.PrefixPrefillCalls;
+				Add(TEXT("10.6.gpu.run1_prefill_counter_counts_recomputes"), Builds == Entries && Calls >= Entries,
+					FString::Printf(TEXT("%lld builds, %lld prefill calls for %d recomputed prefixes"), Builds, Calls, Entries));
+			}
+			Add(TEXT("10.6.gpu.run1_written_back"), Files == Entries && S.DiskWritesIssued - Pass.Before.DiskWritesIssued == Entries,
+				FString::Printf(TEXT("%d files in %s; %lld writes issued"), Files, *DiskDir, S.DiskWritesIssued - Pass.Before.DiskWritesIssued));
+			End();
+			return;
+		}
+
+		case EStep::DiskRead:
+			if (!AdvancePass() || !Pass.IsDone())
+			{
+				return;
+			}
+			RecordPass(TEXT("disk_read"));
+			{
+				const FSuperSLMPrefixCacheStats S = Gpu.GetPrefixCacheStats();
+				Add(TEXT("10.6.gpu.run2_all_disk"), CountSource(ESuperSLMPrefixSource::Disk) == Entries
+					&& Served(S, ESuperSLMPrefixSource::Disk) - Served(Pass.Before, ESuperSLMPrefixSource::Disk) == Entries, SourcesText());
+			}
+			CheckNoPrefill(TEXT("10.6.gpu.run2_no_prefix_prefill"));
+			CheckTokens(TEXT("10.6.gpu.run2_tokens_equal_run1"), TEXT("run 1's"));
+			End();
+			return;
+
+		default:
+			return;
+		}
+	}
+};
+
 FSuperSLMPrefixCacheCheck::FSuperSLMPrefixCacheCheck() = default;
 FSuperSLMPrefixCacheCheck::~FSuperSLMPrefixCacheCheck() = default;
 
-void FSuperSLMPrefixCacheCheck::Start(USuperSLMModel& Model, USuperSLMSubsystem& Cpu, const FString& Leg, const FString& ModelPath)
+void FSuperSLMPrefixCacheCheck::Start(USuperSLMModel& Model, USuperSLMSubsystem& Cpu, USuperSLMGpuSubsystem* Gpu, const FString& Leg, const FString& ModelPath)
 {
 	using namespace SuperSLMPrefixCacheCheck;
 	if (GActive.IsValid())
 	{
 		return;
 	}
+	if (Leg.StartsWith(TEXT("Gpu"), ESearchCase::IgnoreCase) && Gpu == nullptr)
+	{
+		TArray<FCheckLine> Checks;
+		TSharedRef<FJsonObject> Report = MakeShared<FJsonObject>();
+		AddPlatform(Checks, Report);
+		Checks.Add({ TEXT("pre.gpu_subsystem"), false, TEXT("the SuperSLM GPU subsystem is missing") });
+		Finish(Leg, Checks, Report);
+		return;
+	}
 	GActive.Reset(new FSuperSLMPrefixCacheCheck());
-	GActive->State = MakeUnique<FState>(Model, Cpu, Leg, ModelPath);
+	if (Leg.StartsWith(TEXT("Gpu"), ESearchCase::IgnoreCase))
+	{
+		GActive->GpuState = MakeUnique<FGpuState>(Model, *Gpu, Leg, ModelPath);
+	}
+	else
+	{
+		GActive->State = MakeUnique<FState>(Model, Cpu, Leg, ModelPath);
+	}
 	if (!GPreExit.IsValid())
 	{
 		// The check holds the model and the set; let them go before the engine tears down.
@@ -2573,6 +3322,11 @@ void FSuperSLMPrefixCacheCheck::Start(USuperSLMModel& Model, USuperSLMSubsystem&
 
 void FSuperSLMPrefixCacheCheck::Tick(UWorld* World, float DeltaSeconds)
 {
+	if (GpuState.IsValid())
+	{
+		GpuState->Tick(World, DeltaSeconds);
+		return;
+	}
 	State->Tick(World, DeltaSeconds);
 }
 

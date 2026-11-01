@@ -125,6 +125,8 @@ nested key, a set with no CPU build validated silently.
 | 2.15, cooked tier (host twin) | `prefix_set_schema_bound_entry_is_a_cooked_hit` |
 | 9.7 (host twin) | `prefix_set_rebuild_after_pin_change_serves_hits_again` |
 | §5.8 rules | `prefix_set_manifest_rules`, `prefix_set_keys_chain_parents`, `prefix_set_assemble_wraps_each_payload_under_its_key`, `prefix_set_fresh_build_validates_clean`, `prefix_set_cook_reports_unbuilt_orphaned_and_invalid_bytes`, `prefix_set_producer_without_an_entry_recomputes`, `prefix_set_replace_keeps_other_producers`, `prefix_set_finding_names_are_distinct` |
+| 2.9, 9.7 for one GPU device (U7; host twins) | `prefix_set_gpu_stale_entries_warn_at_cook_and_recompute_at_runtime`, `prefix_set_gpu_rebuild_after_pin_change_serves_hits_again` |
+| §5.8 per device (U7) | `prefix_set_cook_validates_each_gpu_build_for_its_own_device`, `prefix_set_read_spx1_producer` (the SPX1 producer reading a GPU build is checked with before it is stored) |
 
 ## Green run, plan rev 1.17 (2026-10-17)
 

@@ -259,10 +259,22 @@ namespace SuperSLMExample
 		{
 			return false; // absent: the mode stays as it was, and nothing is logged
 		}
+		// Canonical's old values (plugin 1.4 removed the mode): `canonical` in any case, or `2`, exactly as the plugin's
+		// parser recognises them, whatever the mode was before.
+		const bool bRemovedValue = Text.Equals(TEXT("canonical"), ESearchCase::IgnoreCase) || Text.Equals(TEXT("2"));
 		if (!ParseSuperSLMSchemaJumpForwardSwitch(Text, InOutMode))
 		{
-			UE_LOG(LogSuperSLMExampleDemo, Warning, TEXT("-SuperSLMExampleJumpForward=\"%s\" is not one of 0, 1, off, exact or canonical, so the schema jump-forward mode is unchanged."),
-				*Text);
+			if (bRemovedValue)
+			{
+				// Plugin 1.4: canonical (or 2) names the removed Canonical mode; the parser set Off.
+				UE_LOG(LogSuperSLMExampleDemo, Warning, TEXT("-SuperSLMExampleJumpForward=\"%s\" names Canonical, which was removed in SuperSLM-Unreal 1.4, so the schema jump-forward mode is off."),
+					*Text);
+			}
+			else
+			{
+				UE_LOG(LogSuperSLMExampleDemo, Warning, TEXT("-SuperSLMExampleJumpForward=\"%s\" is not one of 0, 1, off or exact, so the schema jump-forward mode is unchanged."),
+					*Text);
+			}
 			return false;
 		}
 		return true;

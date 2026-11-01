@@ -244,6 +244,7 @@ namespace SuperSLMPagingGpuFixtures
 		C.PrefixBlockCount = PrefixBlocks;
 		C.RestoreHeadroomBlocks = HeadroomBlocks;
 		C.CacheGhostBlocks = 1;
+		C.bCalibrateGpuRowCost = false; // ruling 51 F4: only the R48/R50/R51 cells calibrate
 		return C;
 	}
 
@@ -312,9 +313,22 @@ namespace SuperSLMPagingGpuFixtures
 		bOk &= T.TestEqual(TEXT("region S = BlockCount x R(SequenceBudget), R at the model's cap"), V.CapacityOf(ESuperSLMPagedRegion::S), Want.S);
 		bOk &= T.TestEqual(TEXT("region P = PrefixBlockCount x P_blk"), V.CapacityOf(ESuperSLMPagedRegion::P), Want.P);
 		bOk &= T.TestEqual(TEXT("region H = RestoreHeadroomBlocks x H_blk"), V.CapacityOf(ESuperSLMPagedRegion::H), Want.H);
-		bOk &= T.TestEqual(TEXT("region A is 0 (no cache in the paging release)"), V.CapacityOf(ESuperSLMPagedRegion::A), int64(0));
-		bOk &= T.TestEqual(TEXT("region C is 0 (no cache in the paging release)"), V.CapacityOf(ESuperSLMPagedRegion::C), int64(0));
-		bOk &= T.TestEqual(TEXT("the pool is S + P + H"), V.PoolPages, Want.Pool());
+		// Plugin 1.4.0 (precache U6): with no GPU prefix cache configured, regions A and C stay 0 and the pool is S + P + H, as in the
+		// paging release; with one (ConfigurePrefixCache() before this Configure()), region C holds the cache and the pool is
+		// S + P + H + A + C.
+		const int64 A = V.CapacityOf(ESuperSLMPagedRegion::A);
+		const int64 Cpages = V.CapacityOf(ESuperSLMPagedRegion::C);
+		if (!Rig.Gpu->GetPrefixCacheStats().bConfigured)
+		{
+			bOk &= T.TestEqual(TEXT("no GPU prefix cache: region A is 0"), A, int64(0));
+			bOk &= T.TestEqual(TEXT("no GPU prefix cache: region C is 0"), Cpages, int64(0));
+			bOk &= T.TestEqual(TEXT("no GPU prefix cache: the pool is S + P + H"), V.PoolPages, Want.Pool());
+		}
+		else
+		{
+			bOk &= T.TestTrue(*FString::Printf(TEXT("a GPU prefix cache: region C holds it (%lld pages)"), Cpages), Cpages > 0);
+			bOk &= T.TestEqual(TEXT("a GPU prefix cache: the pool is S + P + H + A + C"), V.PoolPages, Want.Pool() + A + Cpages);
+		}
 		bOk &= T.TestEqual(TEXT("S is fully charged at Configure (the warm reservations)"), V.ChargedOf(ESuperSLMPagedRegion::S), Want.S);
 		return bOk;
 	}
@@ -876,9 +890,26 @@ namespace SuperSLMPagingGpuFixtures
 			"though she knew every tunnel beneath the cliffs and the tide that filled each one. ");
 		TArray<int32> Base;
 		FString Error;
-		if (!T.TestTrue(*FString::Printf(TEXT("the persona text tokenizes (%s)"), *Error), SuperSLM::TokenizeText(Model, Text, Base, Error) && Base.Num() > 16))
+		if (!SuperSLM::TokenizeText(Model, Text, Base, Error) || Base.Num() <= 16)
 		{
-			return false;
+			// Ruling 53 (triage run 3, finding 5): an artifact with no tokenizer section (the box's 1.5B cost-bench
+			// artifact) tokenizes with A-EX, the 0.5B: Qwen2.5 0.5B and 1.5B share one tokenizer. Said in the log.
+			static USuperSLMModel* Fallback = nullptr; // rooted once, kept for the session
+			FString Path, Reason, FallbackError;
+			if (Fallback == nullptr && ResolveArtifact(EGpuArtifact::AEx05B, Path, Reason))
+			{
+				FSuperSLMImportDiagnostic Diag;
+				Fallback = FSuperSLMModelImport::ImportFromFile(Path, Diag);
+				if (Fallback != nullptr) { Fallback->AddToRoot(); }
+			}
+			Base.Reset();
+			const bool bFallback = Fallback != nullptr && SuperSLM::TokenizeText(*Fallback, Text, Base, FallbackError) && Base.Num() > 16;
+			if (!T.TestTrue(*FString::Printf(TEXT("the persona text tokenizes (%s), or with A-EX's tokenizer when the model has none (%s%s)"), *Error, *Reason, *FallbackError), bFallback))
+			{
+				return false;
+			}
+			UE_LOG(LogTemp, Display, TEXT("MakeTokens: %s carries no usable tokenizer (%s); tokenized with A-EX (0.5B, the same Qwen2.5 tokenizer), ruling 53."), *Model.GetName(), *Error);
+			T.AddInfo(FString::Printf(TEXT("%s carries no tokenizer: tokenized with A-EX (0.5B, the same Qwen2.5 tokenizer; ruling 53)"), *Model.GetName()));
 		}
 		Out.Reset(Count);
 		const int32 Start = (Salt * 37) % Base.Num();

@@ -22,13 +22,14 @@
 extern "C" {
 #endif
 
-/* --- Copied from SuperSLM f03a5358, include/superslm/sslm_abi.h --- */
-typedef enum sslm_jump_mode { SSLM_JUMP_CANONICAL = 0, SSLM_JUMP_EXACT = 1 } sslm_jump_mode;
+/* --- As SuperSLM 1.18.0's include/superslm/sslm_abi.h names it (1.18.0 removed canonical mode; 0 is the default,
+ * Exact) --- */
+typedef enum sslm_jump_mode { SSLM_JUMP_DEFAULT = 0, SSLM_JUMP_EXACT = 1 } sslm_jump_mode;
 
 typedef struct sslm_jump_options {
     uint32_t       struct_size;  /* sizeof(sslm_jump_options) */
     int32_t        mode;         /* sslm_jump_mode */
-    const int32_t* draft;        /* EXACT only. NULL: the canonical chain from the state after the pending token */
+    const int32_t* draft;        /* EXACT only. NULL: the forced chain from the state after the pending token */
     int32_t        draft_count;  /* EXACT only. >= 0; at most chunk_budget - 1 tokens are used */
 } sslm_jump_options;
 

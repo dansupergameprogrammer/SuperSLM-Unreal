@@ -27,8 +27,10 @@
 //
 // Producers: a CPU build serves every CPU (the CPU backend is deterministic across machines, and the
 // SPX1 producer check is the engine's). A GPU build serves only the adapter vendor and device that
-// built it (PC-5); GPU entries are built per device at U7, so until then a set has no GPU build and a
-// GPU subsystem recomputes every entry.
+// built it (PC-5): the editor's build makes one for the GPU it runs on, and a GPU with no build of its
+// own exact vendor and device registers nothing and recomputes every entry. Before a GPU build is
+// stored, every payload's SPX1 header must name that device (ReadSpx1Producer,
+// PrefixSetPayloadsFromProducer).
 
 #include "SuperSLMPrefixCacheKey.h"
 #include "SuperSLMPrefixCacheWrapper.h"
@@ -99,7 +101,7 @@ namespace SuperSLMCore
 		LongerThanContextCap,
 		UnknownParent,
 		ParentCycle,
-		NestedRequiresBudgetMode, // a nested entry: the cache builds none until U6, so the build leaves it empty
+		NestedRequiresBudgetMode, // a nested entry: a cooked set builds none, so the build leaves it empty
 		// Cook validation (stored bytes the runtime will refuse or never find; it recomputes them).
 		NotBuilt,                 // no bytes for this entry in this build
 		StaleLayer1Tag,           // built under another Layer-1 tag
@@ -236,6 +238,22 @@ namespace SuperSLMCore
 	// RegisterPrefixSet registers nothing for it; FindEntrySpec returns no spec.
 	bool PrefixSetModelMatches(const std::array<uint8_t, 32>& SetModelArtifactHash,
 		const std::array<uint8_t, 32>& ConfiguredModelArtifactHash);
+
+	// ---- GPU builds, per device (§5.8, PC-5; step U7) ----
+
+	// The SPX1 header's size (Layer 1's src/spx1_format.h).
+	constexpr size_t kSpx1HeaderBytes = 184;
+
+	// The producer an SPX1 payload's header names: the backend at offset 4 (0 CPU, 1 GPU) and the adapter's PCI
+	// vendor and device at offsets 20 and 24, little-endian. False, with the outputs 0, for fewer bytes than the
+	// header or no 'SPX1' magic. It only reads: the digest and every other check are the engine's.
+	bool ReadSpx1Producer(const uint8_t* Data, size_t Size, uint32_t& OutBackend, uint32_t& OutVendorId, uint32_t& OutDeviceId);
+
+	// A build's check before it is stored: every non-empty payload's header names Producer (its backend, adapter
+	// vendor and device). False at the first payload that does not, or does not read: OutIndex is its index and
+	// OutBackend, OutVendorId, OutDeviceId what it names (0 when it does not read). Empty payloads are skipped.
+	bool PrefixSetPayloadsFromProducer(const std::vector<std::vector<uint8_t>>& Payloads, const FPrefixEngineIdentity& Producer,
+		size_t& OutIndex, uint32_t& OutBackend, uint32_t& OutVendorId, uint32_t& OutDeviceId);
 
 	enum class EPrefixSetSpecResult : uint8_t
 	{

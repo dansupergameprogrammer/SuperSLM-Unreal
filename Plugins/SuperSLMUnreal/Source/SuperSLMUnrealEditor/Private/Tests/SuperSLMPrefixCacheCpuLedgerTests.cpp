@@ -151,7 +151,6 @@ namespace
 
 // Cell 8.14, region C (§5.11 (b)): the pool's C equals ceil(PrefixCacheBudgetBytes / block bytes) x
 // P_blk, computed in the test, at a budget that is not a multiple of the block bytes.
-// Red until U2: C is 0 (the CPU subsystem sizes LedgerConfig.CacheRegionPages = 0).
 // Mutant: floor for ceil -> C = 0 -> red.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMPrefixCacheCpuRegionCTest, "SuperSLM.PrefixCache.Cpu.Ledger.RegionC",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
@@ -176,7 +175,6 @@ bool FSuperSLMPrefixCacheCpuRegionCTest::RunTest(const FString& Parameters)
 // all unleased, settling with one page free (see the header: the filler is C - 5, not C - 4). A build
 // charged 4 (L = 3B) takes the free page and fits only with E's refund of 3. E's release is held at the
 // batch gate; the required reading is taken between the eviction decision and the release's apply.
-// Red until U2: no cache, no region C, no deferred refund.
 // Mutants: C refunded at the decision (the build draws while E's private page is held: physical
 // exceeds the charges by k - f = 1 under zero slack -> engine exhaustion, LedgerFaults or form 1
 // red); AdoptPrefix bypassing the one adopt entry point (A never pre-charged -> the same); the loop
@@ -291,7 +289,7 @@ bool FSuperSLMPrefixCacheCpuEvictionWindowTest::RunTest(const FString& Parameter
 // Cell 8.14, refused: every entry leased and no eviction pending -> BudgetExhausted, nothing drawn. A 3 and
 // B C - 4 (B's build peaks at C - 3, which fits beside A; the box's C - 3 peaked one page over and was itself
 // refused), one page free, W charged 3.
-// Red until U2. Mutant: admission over budget (a draw without a charge) -> drawn changes.
+// Mutant: admission over budget (a draw without a charge) -> drawn changes.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMPrefixCacheCpuRefusedTest, "SuperSLM.PrefixCache.Cpu.Ledger.Refused",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMPrefixCacheCpuRefusedTest::RunTest(const FString& Parameters)
@@ -585,7 +583,7 @@ bool FSuperSLMPrefixCacheCpuStaleReleaseTest::RunTest(const FString& Parameters)
 // E 3, the rest 4, one page free (the header), W needs 4. Box 2026-10-21: the probe's initial reading was
 // bounded by LedgerOf().PoolPages, which is 0 in legacy mode, so it read 2 (F_min -6); InitialFree now
 // bounds it by ProbeCeiling().
-// Red until U2. Mutant: refund at the decision -> the build draws early -> F_min refused.
+// Mutant: refund at the decision -> the build draws early -> F_min refused.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMPrefixCacheCpuLegacyLedgerTest, "SuperSLM.PrefixCache.Cpu.Ledger.Legacy",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FSuperSLMPrefixCacheCpuLegacyLedgerTest::RunTest(const FString& Parameters)

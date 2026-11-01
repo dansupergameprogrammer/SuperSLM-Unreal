@@ -435,9 +435,24 @@ ESuperSLMPrefixSource FSuperSLMPrefixCacheHost::GetSource(const FSuperSLMPrefix&
 	return SourceOf(Core().GetSource(Lease.Id));
 }
 
+bool FSuperSLMPrefixCacheHost::IsCancelledWhilePending(const FSuperSLMPrefix& Lease) const
+{
+	return Lease.IsValid() && Core().IsCancelledWhilePending(Lease.Id);
+}
+
 ESuperSLMPrefixLeaseState FSuperSLMPrefixCacheHost::GetLeaseState(const FSuperSLMPrefix& Lease) const
 {
 	return LeaseStateOf(Core().GetLeaseState(Lease.Id));
+}
+
+uint64 FSuperSLMPrefixCacheHost::PeekNextOpId() const
+{
+	return static_cast<uint64>(Core().PeekNextOpId());
+}
+
+void FSuperSLMPrefixCacheHost::CarryOpIdsFrom(uint64 NextOpId)
+{
+	Core().CarryOpIdsFrom(static_cast<uint64_t>(NextOpId));
 }
 
 FSuperSLMPrefixCacheStats FSuperSLMPrefixCacheHost::GetStats() const
@@ -824,6 +839,11 @@ void FSuperSLMPrefixCacheHost::LaunchPoolThread(const FPrefixCommand& Command)
 		{
 #if WITH_DEV_AUTOMATION_TESTS
 			EnterDiskExclusion();
+			if (Command.OpId != 0)
+			{
+				PassDropDeleteHold(); // §8 (cell 3.10 (ii), (iii)): a drop's delete held running, before it touches the file
+				Test.DropDeletesRun.fetch_add(1);
+			}
 #endif
 			// The delete's outcome (a drop's disk part reads it, §5.6; a wrapper miss's removal ignores it):
 			// Ok = deleted, NotFound = no file, Error = the file API refused (the file stays), with the file API's
@@ -875,6 +895,7 @@ void FSuperSLMPrefixCacheHost::LaunchPoolThread(const FPrefixCommand& Command)
 		{
 #if WITH_DEV_AUTOMATION_TESTS
 			EnterDiskExclusion();
+			PassTrimHold(); // §8 (cell 3.10's trim race): the trim held running, before it lists the directory
 #endif
 			FPrefixFileOps Files(*this);
 			// A crash between a write and its rename leaves its temporary; one an hour old is no write in progress
@@ -981,50 +1002,75 @@ void FSuperSLMPrefixCacheHost::RunCheckCooked(const FPrefixCommand& Command, FPr
 
 // ---- The cooked tier ----
 
+namespace
+{
+	// "CPU", or "GPU 0x1002:0x744c": the producer as the cook's finding lines name it.
+	FString CookedProducerLabel(const FPrefixEngineIdentity& Identity)
+	{
+		return Identity.Backend == 0 ? FString(TEXT("CPU"))
+			: FString::Printf(TEXT("GPU 0x%04x:0x%04x"), Identity.AdapterVendorId & 0xFFFFu, Identity.AdapterDeviceId & 0xFFFFu);
+	}
+}
+
+FSuperSLMCookedSetSource FSuperSLMPrefixCacheHost::MakeCookedSetSource(const USuperSLMPrefixSet& Set)
+{
+	FSuperSLMCookedSetSource Source;
+	Source.Path = Set.GetPathName();
+	SuperSLMPrefixSetBridge::SetModelHash(Set, Source.ModelHash); // zeros for no model or an unreadable header
+	Source.Entries = SuperSLMPrefixSetBridge::CoreEntries(Set);
+	Source.Builds = SuperSLMPrefixSetBridge::CoreBuilds(Set);
+	return Source;
+}
+
 int32 FSuperSLMPrefixCacheHost::RegisterCookedSet(const USuperSLMPrefixSet& Set)
 {
-	UnregisterCookedSet(Set);
+	ECookedRegistration Outcome = ECookedRegistration::Registered;
+	return RegisterCookedSource(MakeCookedSetSource(Set), Outcome);
+}
+
+int32 FSuperSLMPrefixCacheHost::RegisterCookedSource(const FSuperSLMCookedSetSource& Source, ECookedRegistration& OutOutcome)
+{
+	UnregisterCookedPath(Source.Path);
 	// The set's model against the configured model (§5.8, rev 1.18.2; §5.9 rev 1.18.4): a set's ids belong to its
 	// model's tokenizer, so a mismatched set is refused by name (PrefixSetModelMismatch, once) and nothing registers.
 	// An unreadable model reads as zeros, and is refused the same way. Before the first Configure() there is no
 	// model to check against: the set registers, and Configure() checks it (rev 1.18.5).
-	std::array<uint8_t, 32> SetHash{};
-	const std::string SetName = TCHAR_TO_UTF8(*Set.GetPathName());
+	const std::array<uint8_t, 32>& SetHash = Source.ModelHash;
+	const std::string SetName = TCHAR_TO_UTF8(*Source.Path);
 	{
-		uint8 Hash[32];
-		if (Set.Model != nullptr && SuperSLMRuntime::ReadArtifactHash(*Set.Model, Hash))
-		{
-			FMemory::Memcpy(SetHash.data(), Hash, 32);
-		}
 		const bool bMatches = Core().CheckPrefixSetModel(SetName, SetHash);
 		FlushLog();
 		if (!bMatches)
 		{
+			OutOutcome = ECookedRegistration::ModelMismatch;
 			return 0;
 		}
 	}
-	const std::vector<FPrefixSetBuild> Builds = SuperSLMPrefixSetBridge::CoreBuilds(Set);
-	FPrefixEngineIdentity Runtime;
-	Runtime.Backend = 0; // this host serves the CPU subsystem; the GPU twin selects by its device (U7)
-	const int32_t Index = SelectPrefixSetBuild(Builds, Runtime);
+	// The build that serves this cache's own producer (§5.8, PC-5; step U7): its configured identity, so the CPU
+	// host takes any CPU build and the GPU host only a build of its own adapter's exact vendor and device.
+	const std::vector<FPrefixSetBuild>& Builds = Source.Builds;
+	const int32_t Index = SelectPrefixSetBuild(Builds, Config.Identity);
 	if (Index < 0)
 	{
-		UE_LOG(LogSuperSLM, Log, TEXT("PrefixCache: %s has no CPU build; its entries recompute"), *Set.GetPathName());
+		UE_LOG(LogSuperSLM, Log, TEXT("PrefixCache: %s has no build for this producer [%s]; its entries recompute"), *Source.Path,
+			*CookedProducerLabel(Config.Identity));
+		OutOutcome = ECookedRegistration::NoBuild;
 		return 0;
 	}
+	OutOutcome = ECookedRegistration::Registered;
 	const FPrefixSetBuild& Build = Builds[static_cast<size_t>(Index)];
-	FCookedSet& Registered = CookedBySet.FindOrAdd(Set.GetPathName());
+	FCookedSet& Registered = CookedBySet.FindOrAdd(Source.Path);
 	Registered.ModelHash = SetHash;
 	Registered.Name = SetName;
 	TArray<uint64>& Ids = Registered.Ids;
 	// A Text entry whose ids are not its text's under the set's model (TextChanged, §5.8 *Staleness*) is skipped:
 	// it has no spec and is not served. A cooked set carries such an entry with no bytes; an uncooked one may still
 	// carry the bytes of its old ids, and they never register.
-	const std::vector<FPrefixSetEntry> Entries = SuperSLMPrefixSetBridge::CoreEntries(Set);
+	const std::vector<FPrefixSetEntry>& Entries = Source.Entries;
 	for (const size_t Stale : PrefixSetStaleTextEntries(Entries, SetHash))
 	{
 		UE_LOG(LogSuperSLM, Log, TEXT("PrefixCache: %s: entry '%s' is TextChanged (its ids are not its text's under the set's model); not registered"),
-			*Set.GetPathName(), UTF8_TO_TCHAR(Entries[Stale].Name.c_str()));
+			*Source.Path, UTF8_TO_TCHAR(Entries[Stale].Name.c_str()));
 	}
 	for (const FPrefixSetRegistration& R : PrefixSetRegistrations(Build, Entries, SetHash))
 	{
@@ -1042,8 +1088,13 @@ int32 FSuperSLMPrefixCacheHost::RegisterCookedSet(const USuperSLMPrefixSet& Set)
 
 void FSuperSLMPrefixCacheHost::UnregisterCookedSet(const USuperSLMPrefixSet& Set)
 {
+	UnregisterCookedPath(Set.GetPathName());
+}
+
+void FSuperSLMPrefixCacheHost::UnregisterCookedPath(const FString& SetPath)
+{
 	FCookedSet Gone;
-	if (CookedBySet.RemoveAndCopyValue(Set.GetPathName(), Gone))
+	if (CookedBySet.RemoveAndCopyValue(SetPath, Gone))
 	{
 		UnregisterCookedIds(Gone.Ids);
 	}
@@ -1064,6 +1115,21 @@ int32 FSuperSLMPrefixCacheHost::CookedEntriesRegistered() const
 	FScopeLock Lock(&CookedGuard);
 	return CookedBlobs.Num();
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+int32 FSuperSLMPrefixCacheHost::StaleCookedEntries() const
+{
+	int32 Stale = 0;
+	for (const TPair<FString, FCookedSet>& Pair : CookedBySet)
+	{
+		for (const uint64 Id : Pair.Value.Ids)
+		{
+			Stale += Core().IsCookedStale(Id) ? 1 : 0;
+		}
+	}
+	return Stale;
+}
+#endif
 
 void FSuperSLMPrefixCacheHost::RunWriteDisk(const FPrefixCommand& Command, FPrefixCompletion& Out)
 {
@@ -1428,6 +1494,7 @@ void FSuperSLMPrefixCacheHost::DeliverLaneJob(const FSuperSLMPrefixLaneJob& Job)
 #if WITH_DEV_AUTOMATION_TESTS
 		if (Job.bBuildChunk)
 		{
+			FScopeLock Lock(&Test.BuildStateGuard);
 			Test.ChunkJobsByEntry.FindOrAdd(Run->EntryId) += 1;
 		}
 #endif
@@ -1858,6 +1925,7 @@ ESuperSLMPrefixBuildState FSuperSLMPrefixCacheHost::BuildStateOf(const FSuperSLM
 int32 FSuperSLMPrefixCacheHost::ChunkJobsOf(const FSuperSLMPrefix& Lease) const
 {
 	const uint64 EntryId = static_cast<uint64>(Core().GetLeaseEntryId(Lease.Id));
+	FScopeLock Lock(&Test.BuildStateGuard);
 	return EntryId != 0 ? Test.ChunkJobsByEntry.FindRef(EntryId) : 0;
 }
 
@@ -1879,6 +1947,9 @@ void FSuperSLMPrefixCacheHost::ReleaseTestHolds()
 	Test.bBuildHold.store(false);
 	Test.bHoldWriteBacks.store(false);
 	Test.bHoldDiskReads.store(false); // the hash-completion hold does not yield (§8)
+	Test.bHoldDropDeletes.store(false);
+	Test.bHoldTrims.store(false);
+	Test.bGpuSaveHold.store(false);
 }
 
 void FSuperSLMPrefixCacheHost::PassDiskReadHold()
@@ -1893,6 +1964,34 @@ void FSuperSLMPrefixCacheHost::PassDiskReadHold()
 		FPlatformProcess::Sleep(0.0005f);
 	}
 	Test.HeldDiskReads.fetch_sub(1);
+}
+
+void FSuperSLMPrefixCacheHost::PassDropDeleteHold()
+{
+	if (!Test.bHoldDropDeletes.load())
+	{
+		return;
+	}
+	Test.HeldDropDeletes.fetch_add(1);
+	while (Test.bHoldDropDeletes.load())
+	{
+		FPlatformProcess::Sleep(0.0005f);
+	}
+	Test.HeldDropDeletes.fetch_sub(1);
+}
+
+void FSuperSLMPrefixCacheHost::PassTrimHold()
+{
+	if (!Test.bHoldTrims.load())
+	{
+		return;
+	}
+	Test.HeldTrims.fetch_add(1);
+	while (Test.bHoldTrims.load())
+	{
+		FPlatformProcess::Sleep(0.0005f);
+	}
+	Test.HeldTrims.fetch_sub(1);
 }
 
 void FSuperSLMPrefixCacheHost::EnterKeyDisk(const FPrefixKey& Key)

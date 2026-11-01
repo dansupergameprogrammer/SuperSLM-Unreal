@@ -23,8 +23,7 @@
 // Fixtures. NoTokenizer uses PC-12's three-schema artifact (SUPERSLM_PRECACHE_PC12_ARTIFACTS, three_schema.sslm:
 // the engine's synthetic fixture, which has no tokenizer section), as the cooked cells do. ModelMismatch uses the
 // shipped 1.5B artifact as model B, as the U2 review cells do. Persistence's old-asset leg needs a prefix set saved
-// by the U3 class (before the text fields): SUPERSLM_PRECACHE_U3_SET_ASSET names its .uasset file (the U4 box run
-// keeps one, README "The Text cells"); the leg fails by name when it is missing.
+// by the U3 class (before the text fields): Tests/Fixtures/PrefixSet/U3SetBeforeText.uasset (its PROVENANCE.md).
 //
 // The cook legs run what a cook runs: the pre-save hook's function (SuperSLMPrefixSetEditor::ValidateAtCook) and
 // the cooked package's copy (SuperSLMPrefixSetTools::CookedImage, which USuperSLMPrefixSet::Serialize writes when
@@ -50,6 +49,7 @@
 #include "Fixtures/SuperSLMPrefixCacheFixtures.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformMisc.h"
+#include "Interfaces/IPluginManager.h"
 #include "Misc/FileHelper.h"
 #include "Interfaces/ITargetPlatformManagerModule.h"
 #include "Misc/PackageName.h"
@@ -731,8 +731,9 @@ bool FSuperSLMPrefixSetTextPersistenceTest::RunTest(const FString& Parameters)
 	bool bOk = true;
 
 	// The old asset: copied into this project under a fixture path and loaded.
-	FString OldFile;
-	if (ResolveEnvFile(*this, TEXT("SUPERSLM_PRECACHE_U3_SET_ASSET"), nullptr, OldFile))
+	const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("SuperSLMUnreal"));
+	const FString OldFile = FPaths::Combine(Plugin.IsValid() ? Plugin->GetBaseDir() : FString(), TEXT("Source/SuperSLMUnrealEditor/Private/Tests/Fixtures/PrefixSet/U3SetBeforeText.uasset"));
+	if (TestTrue(*FString::Printf(TEXT("%s exists"), *OldFile), FPaths::FileExists(OldFile)))
 	{
 		const FString OldPackage = TEXT("/Game/SuperSLMTestFixtures/U3SetBeforeText");
 		const FString OldTarget = FPackageName::LongPackageNameToFilename(OldPackage, FPackageName::GetAssetPackageExtension());

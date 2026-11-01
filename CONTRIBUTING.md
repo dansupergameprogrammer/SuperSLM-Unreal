@@ -77,8 +77,8 @@ the example test to the run above:
   default whole-token setting and
   its CPU game-thread `Tick()` under 1 ms, and GPU tests that compare the GPU backend's tokens with a
   recorded SuperSLM run (`SuperSLM.L2S2.SliceInvariance.AgainstSslmGenerateAnchor`). GPU
-  determinism is per device, and SuperSLM certifies only the RTX 2080 SUPER and the AMD Radeon RX
-  7900 XTX. On other hardware these tests can fail without a defect in your change.
+  determinism is per device, and SuperSLM certifies the RTX 2080 SUPER and the AMD Radeon RX 7900
+  XTX, and its multi-row passes on the AMD Radeon RX 7900 XT. On other hardware these tests can fail without a defect in your change.
 - The decode-threading tests (`SuperSLM.D4`) are not in the filter: each estimate test runs
   `SuperSLM.EstimateCosts` for several minutes, the settings tests write and restore
   `Saved/SuperSLM/RuntimeSettings.ini`, and the `Restart` pairs need two editor sessions in order

@@ -6,10 +6,11 @@
 // passed prompts the engine then refused.
 //
 //   SuperSLM.PrefixCache.Cpu.Nested.AdoptFullLength   budget mode: a root lease and a nested child, the child
-//                                                     adopted and generated Off, Exact and Canonical: the context
-//                                                     after the adopt is parent + suffix, no run faults but at its
-//                                                     schema's end, Exact equals Off, and Off over the child equals
-//                                                     Off from the whole prompt
+//                                                     adopted and generated Off and Exact: the context after the
+//                                                     adopt is parent + suffix, no run faults but at its schema's
+//                                                     end, Exact equals Off, and Off over the child equals Off from
+//                                                     the whole prompt (ruling 40: the Canonical leg is retired
+//                                                     with Canonical; Exact's leg covers the skip-ahead pass)
 //   SuperSLM.PrefixCache.Cpu.Nested.AdoptCapFullLength the context-cap check after a nested adopt counts the whole
 //                                                     length: a prompt that fits after the suffix alone but not
 //                                                     after parent + suffix is refused by name at its activation
@@ -150,8 +151,8 @@ bool FSuperSLMPrefixCacheCpuNestedAdoptFullLengthTest::RunTest(const FString& Pa
 	if (!MakeNestedLeases(*this, Rig, Whole.PromptTokens, Root, Child, RootLength, SuffixLength)) { return false; }
 	const int64 WholeLength = RootLength + SuffixLength;
 
-	FRunResult Off, Exact, Canon;
-	int64 OffContext = -1, ExactContext = -1, CanonContext = -1;
+	FRunResult Off, Exact;
+	int64 OffContext = -1, ExactContext = -1;
 	if (!RunOverLease(*this, Rig, Child, ESuperSLMSchemaJumpForward::Off, kMaxNew, Off, OffContext)) { return false; }
 	bool bOk = TestEqual(TEXT("after the nested adopt the context is parent + suffix"), OffContext, WholeLength);
 	bOk &= EndedCleanly(*this, Off, TEXT("Off over the nested lease"));
@@ -165,12 +166,6 @@ bool FSuperSLMPrefixCacheCpuNestedAdoptFullLengthTest::RunTest(const FString& Pa
 	bOk &= RequireSpanActivity(*this, SpanJobsOf(*Rig.Cpu, Exact.Sequence), TEXT("Exact over the nested lease"));
 	bOk &= EndedCleanly(*this, Exact, TEXT("Exact over the nested lease"));
 	bOk &= SameEnding(*this, Exact, Off, TEXT("Exact over the nested lease equals Off over it"));
-
-	FSuperSLMSchemaJumpTestAccess::StartRecording(*Rig.Cpu);
-	if (!RunOverLease(*this, Rig, Child, ESuperSLMSchemaJumpForward::Canonical, kMaxNew, Canon, CanonContext)) { return false; }
-	bOk &= TestEqual(TEXT("Canonical: after the nested adopt the context is parent + suffix"), CanonContext, WholeLength);
-	bOk &= RequireSpanActivity(*this, SpanJobsOf(*Rig.Cpu, Canon.Sequence), TEXT("Canonical over the nested lease"));
-	bOk &= EndedCleanly(*this, Canon, TEXT("Canonical over the nested lease"));
 
 	Rig.Cpu->ReturnPrefix(Child);
 	Rig.Cpu->ReturnPrefix(Root);

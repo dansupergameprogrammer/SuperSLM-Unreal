@@ -98,9 +98,18 @@ struct SUPERSLMUNREAL_API FSuperSLMGenerationRequest
 
 	// Schema fast-decode plan rev 1.3.5, §6 P1 and P1-X (SuperSLMSchemaJumpTypes.h): jump-forward for
 	// this generation, default Off. The CPU subsystem reads it at the generation's activation, and
-	// only when a schema is bound; the GPU subsystem ignores it. Forced tokens count toward
-	// MaxNewTokens (§16 Q12). With SUPERSLM_WITH_SCHEMA_JUMP_FORWARD 0 (an older vendored engine) the
-	// verbs are the plugin's stubs, so every setting runs Off's loop.
+	// only when a schema is bound. Forced tokens count toward MaxNewTokens (§16 Q12). With
+	// SUPERSLM_WITH_SCHEMA_JUMP_FORWARD 0 (an older vendored engine) the verbs are the plugin's stubs,
+	// so every setting runs Off's loop.
+	// The GPU subsystem (plugin 1.4, multi-row GPU plan MR6) runs Exact on the OneCall path with
+	// bGpuMultiRow on and a bound schema, when its Configure-time plan admits it: verified draft rows
+	// (sslm_gpu_seq_embed_rows EXACT_DRAFT), drafted by the same provider as the CPU's (the forced chain,
+	// then the CPU subsystem's learned table; ruling 41). Its tokens, saves and ForcedTokenCount are Off's.
+	// Otherwise (Composed, multi-row off, no plan) Exact runs Off's loop. SuperSLM's GPU certification
+	// covers the NVIDIA RTX 2080 SUPER and the AMD Radeon RX 7900 XTX, and its multi-row passes, which this
+	// uses, are certified on the AMD Radeon RX 7900 XT. SuperSLM 1.17.0 fixed the RTX 50-series results: on an
+	// NVIDIA RTX 5060 the multi-row passes gave the same tokens as SuperSLM's reference, but its timing is not
+	// certified. GPU determinism is per device and is not claimed.
 	ESuperSLMSchemaJumpForward SchemaJumpForward = ESuperSLMSchemaJumpForward::Off;
 };
 

@@ -14,6 +14,7 @@ neither:
 | The span-after-decode loop: which job a sequence takes next, and whether it may join a decode batch | same |
 | P1.1's per-C prompt pricing and the bound; the C = 2..7 calibration arm's fit (`FitSmallChunkArm`, rev 1.3.6 price source) | `Source/SuperSLMUnreal/Private/SuperSLMPrefillPlanning.h` |
 | The red engine-verb stubs compile beside the vendored engine header | `Source/SuperSLMUnreal/Private/SuperSLMSchemaJumpAbi.h`, `SuperSLMSchemaJumpAbiStubs.cpp` (built, never linked) |
+| What plugin 1.4 keeps of P2's GPU core (plan rev 1.4.4, §6.1; cell P2H.4): delivery (`ApplyResult`), the carry of pending results through a save (`CarryPending`, `ClampCarriedDelay`, `RequeueCarried`), and the wrapper extension's codec, version 1 only. Ruling 40 retired the rest with Canonical on the GPU (the planner, `Rest`, the status map, the sliced path, wrapper v2, the fake engine and the GPU stubs); its shared checks are re-pointed at the multi-row Exact path as automation cells (red-suite-mr6.md) | `Source/SuperSLMUnreal/Private/Core/SuperSLMGpuSchemaJumpCore.h/.cpp`; `test_gpu_delivery.cpp`; `run_gpu_mutants.py` (XG27, XG27c) |
 
 **This is a red suite.** The core's `.cpp` and the `...WithTable` functions are the suite's
 stubs, so every test fails on the stub's value. The implementation replaces them. The interface in

@@ -8,3 +8,4 @@
 #include "SuperSLMPrefixCacheCore.cpp"
 #include "SuperSLMPageLedgerCore.cpp"
 #include "SuperSLMSchemaJumpCore.cpp"
+#include "SuperSLMGpuSchemaJumpCore.cpp"

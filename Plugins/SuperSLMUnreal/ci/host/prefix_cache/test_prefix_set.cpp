@@ -1,7 +1,8 @@
-// Cooked prefix sets (precache plan §5.8; step U3): the manifest, the build's assembly, cook
+// Cooked prefix sets (precache plan §5.8; steps U3, U7): the manifest, the build's assembly, cook
 // validation, runtime selection per producer, and the host twins of cells 2.9, 2.15 (cooked tier)
-// and 9.7. The Unreal cells (SuperSLMPrefixCacheCookedTests.cpp) run the same rules through the
-// asset, the editor build and a cook.
+// and 9.7, on the CPU and (U7) for one GPU device; the SPX1 producer reading a GPU build is checked
+// with before it is stored. The Unreal cells (SuperSLMPrefixCacheCookedTests.cpp,
+// SuperSLMPrefixCacheGpuCookedTests.cpp) run the same rules through the asset, the editor build and a cook.
 
 #include "cache_fixture.h"
 
@@ -137,7 +138,7 @@ HOST_TEST(prefix_set_finding_names_are_distinct, "§5.8 (findings by name)")
 	EXPECT_EQ(std::string(PrefixSetFindingName(EPrefixSetFinding::SpecEdited)), std::string("SpecEdited"));
 }
 
-HOST_TEST(prefix_set_manifest_rules, "§5.8 (entries), §5.6 (malformed spec), §5.9 (nested before U6)")
+HOST_TEST(prefix_set_manifest_rules, "§5.8 (entries), §5.6 (malformed spec), §5.9 (a cooked set builds no nested entry)")
 {
 	std::vector<FPrefixSetEntry> E;
 	E.push_back(Entry("greeting", 1));                       // 0 ok
@@ -412,8 +413,8 @@ HOST_TEST(prefix_set_schema_bound_entry_is_a_cooked_hit, "2.15 (cooked tier, hos
 	EXPECT_TRUE(ServedFrom(C, Other, EPrefixSource::Recomputed));
 }
 
-// "A player's device without an entry recomputes" (U7's rule, CPU now): a producer with no build, or
-// an entry its build left empty, registers nothing, and the request recomputes.
+// "A player's device without an entry recomputes" (§5.8, U7): a producer with no build, or an entry
+// its build left empty, registers nothing, and the request recomputes. The GPU twins are below.
 HOST_TEST(prefix_set_producer_without_an_entry_recomputes, "§5.8 (per-producer entries), §5.9")
 {
 	std::vector<FPrefixSetEntry> E;
@@ -489,4 +490,226 @@ HOST_TEST(prefix_set_replace_keeps_other_producers, "§5.8 (one build per produc
 	}
 	EXPECT_EQ(CpuBuilds, static_cast<size_t>(1));
 	EXPECT_NE(SelectPrefixSetBuild(Builds, GpuProducer(0x1002, 0x744C)), -1);
+}
+
+// ---- GPU builds, per device (§5.8, PC-5; step U7) ----
+
+namespace
+{
+	// A minimal SPX1 header for the producer reading: the magic, the backend at 4, the adapter vendor at 20 and
+	// device at 24 (little-endian), the rest zero. Not a blob the engine would restore: only its producer is read here.
+	std::vector<uint8_t> Spx1Header(uint32_t Backend, uint32_t Vendor, uint32_t Device, size_t Size = kSpx1HeaderBytes)
+	{
+		std::vector<uint8_t> B(Size, 0);
+		auto Put = [&B](size_t At, uint32_t V)
+		{
+			if (At + 4 > B.size())
+			{
+				return;
+			}
+			B[At] = static_cast<uint8_t>(V & 0xFFu);
+			B[At + 1] = static_cast<uint8_t>((V >> 8u) & 0xFFu);
+			B[At + 2] = static_cast<uint8_t>((V >> 16u) & 0xFFu);
+			B[At + 3] = static_cast<uint8_t>((V >> 24u) & 0xFFu);
+		};
+		if (B.size() >= 4)
+		{
+			B[0] = 'S';
+			B[1] = 'P';
+			B[2] = 'X';
+			B[3] = '1';
+		}
+		Put(4, Backend);
+		Put(20, Vendor);
+		Put(24, Device);
+		return B;
+	}
+
+	size_t CountOnProducer(const std::vector<FPrefixSetFindingLine>& Lines, EPrefixSetFinding Finding, const std::string& Entry, const FPrefixEngineIdentity& Producer)
+	{
+		size_t N = 0;
+		for (const FPrefixSetFindingLine& L : Lines)
+		{
+			const bool bProducer = L.bHasProducer && L.Backend == Producer.Backend
+				&& (Producer.Backend == 0 || (L.AdapterVendorId == Producer.AdapterVendorId && L.AdapterDeviceId == Producer.AdapterDeviceId));
+			if (L.Finding == Finding && L.EntryName == Entry && bProducer)
+			{
+				++N;
+			}
+		}
+		return N;
+	}
+}
+
+HOST_TEST(prefix_set_read_spx1_producer, "§5.8 (a GPU build's payloads name its device), PC-5")
+{
+	uint32_t Backend = 7;
+	uint32_t Vendor = 7;
+	uint32_t Device = 7;
+	const std::vector<uint8_t> Gpu = Spx1Header(1u, 0x1002u, 0x744Cu);
+	EXPECT_TRUE(ReadSpx1Producer(Gpu.data(), Gpu.size(), Backend, Vendor, Device));
+	EXPECT_EQ(Backend, 1u);
+	EXPECT_EQ(Vendor, 0x1002u);
+	EXPECT_EQ(Device, 0x744Cu);
+	// The byte order is little-endian: a device whose high byte is set reads back whole.
+	const std::vector<uint8_t> High = Spx1Header(1u, 0x10DEu, 0xA1B2C3D4u);
+	EXPECT_TRUE(ReadSpx1Producer(High.data(), High.size(), Backend, Vendor, Device));
+	EXPECT_EQ(Device, 0xA1B2C3D4u);
+
+	// One byte short of the header, another magic, no bytes: not read, and every output 0.
+	const std::vector<uint8_t> Short = Spx1Header(1u, 0x1002u, 0x744Cu, kSpx1HeaderBytes - 1);
+	EXPECT_TRUE(!ReadSpx1Producer(Short.data(), Short.size(), Backend, Vendor, Device));
+	EXPECT_EQ(Backend, 0u);
+	EXPECT_EQ(Vendor, 0u);
+	EXPECT_EQ(Device, 0u);
+	std::vector<uint8_t> Other = Gpu;
+	Other[3] = '2';
+	EXPECT_TRUE(!ReadSpx1Producer(Other.data(), Other.size(), Backend, Vendor, Device));
+	EXPECT_TRUE(!ReadSpx1Producer(nullptr, 0, Backend, Vendor, Device));
+	const std::vector<uint8_t> Fake = MakeFakePayload("", {1, 2, 3});
+	EXPECT_TRUE(!ReadSpx1Producer(Fake.data(), Fake.size(), Backend, Vendor, Device));
+
+	// The build's check: every non-empty payload names the producer; the first that does not is named.
+	const FPrefixEngineIdentity Radeon = GpuProducer(0x1002, 0x744C);
+	size_t Index = 99;
+	EXPECT_TRUE(PrefixSetPayloadsFromProducer({Gpu, {}, Gpu}, Radeon, Index, Backend, Vendor, Device));
+	EXPECT_TRUE(!PrefixSetPayloadsFromProducer({Gpu, Spx1Header(1u, 0x1002u, 0x744Du)}, Radeon, Index, Backend, Vendor, Device));
+	EXPECT_EQ(Index, static_cast<size_t>(1));
+	EXPECT_EQ(Device, 0x744Du);
+	EXPECT_TRUE(!PrefixSetPayloadsFromProducer({Spx1Header(0u, 0x1002u, 0x744Cu)}, Radeon, Index, Backend, Vendor, Device)); // a CPU blob
+	EXPECT_EQ(Index, static_cast<size_t>(0));
+	EXPECT_EQ(Backend, 0u);
+	EXPECT_TRUE(!PrefixSetPayloadsFromProducer({Gpu, Fake}, Radeon, Index, Backend, Vendor, Device)); // not SPX1 at all
+	EXPECT_EQ(Index, static_cast<size_t>(1));
+	EXPECT_EQ(Vendor, 0u);
+	// The CPU producer's own blobs (backend 0, no adapter) pass its check.
+	EXPECT_TRUE(PrefixSetPayloadsFromProducer({Spx1Header(0u, 0u, 0u)}, FixtureIdentity(), Index, Backend, Vendor, Device));
+}
+
+// Cell 2.9's host twin for one GPU device: this device's build with a stale tag, a stale artifact hash and a spec
+// edited after the build; the cook names each against [GPU 0x1002:0x744c] (and, with no CPU build, every entry NotBuilt
+// for the CPU); a cache keyed by that device serves each by recompute and the fresh entry as a cooked hit.
+HOST_TEST(prefix_set_gpu_stale_entries_warn_at_cook_and_recompute_at_runtime, "2.9 (host twin, one GPU device), U7")
+{
+	const FPrefixEngineIdentity Radeon = GpuProducer(0x1002, 0x744C);
+	std::vector<FPrefixSetEntry> E;
+	E.push_back(Entry("fresh", 1));
+	E.push_back(Entry("old_tag", 2));
+	E.push_back(Entry("old_model", 3));
+	E.push_back(Entry("edited", 4));
+	FPrefixSetBuild Build = BuildUnder(E, Radeon);
+	REQUIRE_EQ(Build.Entries.size(), E.size());
+	FPrefixEngineIdentity OldPin = Radeon;
+	OldPin.Layer1Tag = "v1.13.0";
+	Build.Entries[1] = BuiltAlone(E[1], OldPin);
+	FPrefixEngineIdentity OldModel = Radeon;
+	OldModel.ArtifactHash[5] ^= 0x5A;
+	Build.Entries[2] = BuiltAlone(E[2], OldModel);
+	E[3].Tokens[7] += 1;
+
+	const std::vector<FPrefixSetBuild> Builds = {Build};
+	const std::vector<FPrefixSetFindingLine> F = ValidatePrefixSetForCook(E, Builds, FixtureIdentity(), FixtureShape());
+	EXPECT_EQ(CountOnProducer(F, EPrefixSetFinding::StaleLayer1Tag, "old_tag", Radeon), static_cast<size_t>(1));
+	EXPECT_EQ(CountOnProducer(F, EPrefixSetFinding::StaleArtifact, "old_model", Radeon), static_cast<size_t>(1));
+	EXPECT_EQ(CountOnProducer(F, EPrefixSetFinding::SpecEdited, "edited", Radeon), static_cast<size_t>(1));
+	EXPECT_EQ(CountOnProducer(F, EPrefixSetFinding::NotBuilt, "fresh", FixtureIdentity()), static_cast<size_t>(1)); // no CPU build
+	EXPECT_EQ(F.size(), static_cast<size_t>(7));
+	for (const FPrefixSetFindingLine& L : F)
+	{
+		if (L.Backend == 1)
+		{
+			EXPECT_TRUE(Contains(FormatPrefixSetFinding("/Game/Sets/Npc", L), "[GPU 0x1002:0x744c]"));
+		}
+	}
+
+	FCacheFixture C(8, false, 8, &Radeon);
+	REQUIRE_TRUE(C.bConfigured);
+	EXPECT_EQ(RegisterSet(C, Builds), static_cast<size_t>(4));
+	EXPECT_TRUE(ServedFrom(C, E[0], EPrefixSource::Cooked));
+	EXPECT_TRUE(ServedFrom(C, E[1], EPrefixSource::Recomputed));
+	EXPECT_TRUE(ServedFrom(C, E[2], EPrefixSource::Recomputed));
+	EXPECT_TRUE(ServedFrom(C, E[3], EPrefixSource::Recomputed));
+	EXPECT_EQ(C.Diag().ServedBySource[static_cast<int>(EPrefixSource::Cooked)], 1u);
+	EXPECT_EQ(C.Sim->Violations.size(), static_cast<size_t>(0));
+
+	// The same build on another device: not selected, nothing registers, every request recomputes.
+	const FPrefixEngineIdentity Other = GpuProducer(0x1002, 0x744D);
+	FCacheFixture O(8, false, 8, &Other);
+	REQUIRE_TRUE(O.bConfigured);
+	EXPECT_EQ(RegisterSet(O, Builds), static_cast<size_t>(0));
+	EXPECT_TRUE(ServedFrom(O, E[0], EPrefixSource::Recomputed));
+	EXPECT_EQ(O.Sim->CountHistory(EPrefixCommandKind::CheckCooked), static_cast<size_t>(0));
+}
+
+// Cell 9.7's host twin for one GPU device: its build under the previous pin is all recompute and warns at cook; the
+// rebuild replaces that device's build only (another device's is kept), validates clean for it, and serves cooked hits
+// with no prefix prefill.
+HOST_TEST(prefix_set_gpu_rebuild_after_pin_change_serves_hits_again, "9.7 (host twin, one GPU device), U7")
+{
+	const FPrefixEngineIdentity Radeon = GpuProducer(0x1002, 0x744C);
+	const FPrefixEngineIdentity Nvidia = GpuProducer(0x10DE, 0x1E84);
+	std::vector<FPrefixSetEntry> E;
+	E.push_back(Entry("a", 1));
+	E.push_back(Entry("b", 2, "schema_two"));
+	FPrefixEngineIdentity OldRadeon = Radeon;
+	OldRadeon.Layer1Tag = "v1.13.0";
+	OldRadeon.Layer1Commit = "002094a6da8ba33450e6fabc08503b22e35d1610";
+	std::vector<FPrefixSetBuild> Builds = {BuildUnder(E, OldRadeon), BuildUnder(E, Nvidia)};
+
+	const std::vector<FPrefixSetFindingLine> Before = ValidatePrefixSetForCook(E, Builds, FixtureIdentity(), FixtureShape());
+	EXPECT_EQ(CountOnProducer(Before, EPrefixSetFinding::StaleLayer1Tag, "a", Radeon), static_cast<size_t>(1));
+	EXPECT_EQ(CountOnProducer(Before, EPrefixSetFinding::StaleLayer1Tag, "b", Radeon), static_cast<size_t>(1));
+	EXPECT_EQ(CountOnProducer(Before, EPrefixSetFinding::StaleLayer1Tag, "a", Nvidia), static_cast<size_t>(0)); // the other device's is current
+	{
+		FCacheFixture C(8, false, 8, &Radeon);
+		REQUIRE_TRUE(C.bConfigured);
+		RegisterSet(C, Builds);
+		EXPECT_TRUE(ServedFrom(C, E[0], EPrefixSource::Recomputed));
+		EXPECT_TRUE(ServedFrom(C, E[1], EPrefixSource::Recomputed));
+	}
+
+	ReplacePrefixSetBuild(Builds, BuildUnder(E, Radeon));
+	REQUIRE_EQ(Builds.size(), static_cast<size_t>(2)); // replaced, not appended; the other device's kept
+	EXPECT_EQ(SelectPrefixSetBuild(Builds, Radeon), 1);
+	EXPECT_EQ(SelectPrefixSetBuild(Builds, Nvidia), 0);
+	EXPECT_EQ(Builds[0].Producer.AdapterVendorId, 0x10DEu);
+	const std::vector<FPrefixSetFindingLine> After = ValidatePrefixSetForCook(E, Builds, FixtureIdentity(), FixtureShape());
+	for (const FPrefixSetFindingLine& L : After)
+	{
+		EXPECT_EQ(L.Backend == 1 && L.AdapterVendorId == 0x1002u, false); // nothing left against the rebuilt device
+	}
+	{
+		FCacheFixture C(8, false, 8, &Radeon);
+		REQUIRE_TRUE(C.bConfigured);
+		EXPECT_EQ(RegisterSet(C, Builds), static_cast<size_t>(2));
+		EXPECT_TRUE(ServedFrom(C, E[0], EPrefixSource::Cooked));
+		EXPECT_TRUE(ServedFrom(C, E[1], EPrefixSource::Cooked));
+		EXPECT_EQ(C.Diag().BuildsIssued, 0u);
+	}
+}
+
+// Cook validation checks each GPU build for its own device: a CPU build and two devices' builds, all current, are a
+// clean set; one device's entry carrying the other device's bytes is one finding, against that device only.
+HOST_TEST(prefix_set_cook_validates_each_gpu_build_for_its_own_device, "§5.8 (cook validation per producer), U7")
+{
+	const FPrefixEngineIdentity Radeon = GpuProducer(0x1002, 0x744C);
+	const FPrefixEngineIdentity Nvidia = GpuProducer(0x10DE, 0x1E84);
+	std::vector<FPrefixSetEntry> E;
+	E.push_back(Entry("a", 1));
+	E.push_back(Entry("b", 2));
+	std::vector<FPrefixSetBuild> Builds = {BuildUnder(E, FixtureIdentity()), BuildUnder(E, Radeon), BuildUnder(E, Nvidia)};
+	EXPECT_EQ(ValidatePrefixSetForCook(E, Builds, FixtureIdentity(), FixtureShape()).size(), static_cast<size_t>(0));
+
+	// Radeon's "b" holds Nvidia's bytes for "b": its key is another device's.
+	REQUIRE_EQ(Builds[1].Entries.size(), static_cast<size_t>(2));
+	REQUIRE_EQ(Builds[2].Entries.size(), static_cast<size_t>(2));
+	Builds[1].Entries[1].Wrapper = Builds[2].Entries[1].Wrapper;
+	const std::vector<FPrefixSetFindingLine> F = ValidatePrefixSetForCook(E, Builds, FixtureIdentity(), FixtureShape());
+	REQUIRE_EQ(F.size(), static_cast<size_t>(1));
+	EXPECT_EQ(F[0].EntryName, std::string("b"));
+	EXPECT_EQ(F[0].Backend, static_cast<uint8_t>(1));
+	EXPECT_EQ(F[0].AdapterVendorId, 0x1002u);
+	EXPECT_EQ(F[0].AdapterDeviceId, 0x744Cu);
+	EXPECT_EQ(F[0].Finding, EPrefixSetFinding::SpecEdited);
+	EXPECT_TRUE(Contains(FormatPrefixSetFinding("/Game/Sets/Npc", F[0]), "entry 'b' [GPU 0x1002:0x744c]"));
 }

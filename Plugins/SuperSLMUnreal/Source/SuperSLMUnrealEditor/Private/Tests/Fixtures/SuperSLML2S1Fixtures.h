@@ -492,9 +492,17 @@ namespace SuperSLML2S1Fixtures
 				// selects -- the batched pair at 8 tokens or more (the engine's tiled-GEMM threshold),
 				// the chunk-1 pair below it. Written out here rather than read from the production
 				// header, so the oracle stays independent of the code it checks.
+				// A chunk of 2..7 tokens (schema fast-decode plan rev 1.3.6, P1.1) reads its own
+				// pair when the profile carries it -- a saved estimate's PromptChunk<C> keys -- each
+				// member on its own, else the chunk-1 pair.
 				const bool bBatched = Job.PromptTokens >= 8;
-				const double TokenMs = bBatched ? Cost(TEXT("BatchedPromptTokenCostMs")) : Cost(TEXT("PromptTokenCostMs"));
-				const double PerPositionMs = bBatched ? Cost(TEXT("BatchedPromptTokenCostPerPositionMs")) : Cost(TEXT("PromptTokenCostPerPositionMs"));
+				double TokenMs = bBatched ? Cost(TEXT("BatchedPromptTokenCostMs")) : Cost(TEXT("PromptTokenCostMs"));
+				double PerPositionMs = bBatched ? Cost(TEXT("BatchedPromptTokenCostPerPositionMs")) : Cost(TEXT("PromptTokenCostPerPositionMs"));
+				if (Job.PromptTokens >= 2 && Job.PromptTokens <= 7)
+				{
+					if (const double* V = Costs.Find(FString::Printf(TEXT("PromptChunk%dTokenCostMs"), Job.PromptTokens))) { TokenMs = *V; }
+					if (const double* V = Costs.Find(FString::Printf(TEXT("PromptChunk%dTokenCostPerPositionMs"), Job.PromptTokens))) { PerPositionMs = *V; }
+				}
 				return Job.DecodeLayers * Cost(TEXT("LayerCostMs"))
 					+ Job.DecodeLayerDepthSum * Cost(TEXT("LayerCostPerPositionMs"))
 					+ Job.PromptTokens * TokenMs

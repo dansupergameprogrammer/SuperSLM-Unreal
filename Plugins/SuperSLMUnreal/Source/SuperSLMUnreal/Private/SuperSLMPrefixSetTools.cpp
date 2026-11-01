@@ -7,6 +7,9 @@
 #include "Core/SuperSLMPrefixSetCore.h"
 #include "SuperSLMPrefixSetBridge.h"
 #include "SuperSLMDetokenizer.h"
+#include "SuperSLMGpuPrefixSetAccess.h"
+#include "SuperSLMGpuRuntimeConfig.h"
+#include "SuperSLMGpuSubsystem.h"
 #include "SuperSLMLog.h"
 #include "SuperSLMModel.h"
 #include "SuperSLMPrefixSet.h"
@@ -117,25 +120,50 @@ namespace
 		F.Entry = L.EntryName.empty() ? NAME_None : FName(UTF8_TO_TCHAR(L.EntryName.c_str()));
 		F.bHasProducer = L.bHasProducer;
 		F.Backend = L.Backend;
+		F.AdapterVendorId = L.AdapterVendorId;
+		F.AdapterDeviceId = L.AdapterDeviceId;
 		F.Line = UTF8_TO_TCHAR(FormatPrefixSetFinding(std::string(TCHAR_TO_UTF8(*SetPath)), L).c_str());
 		return F;
 	}
 
-	[[maybe_unused]] FSuperSLMPrefixSetFinding OwnFinding(const FString& SetPath, const TCHAR* Finding, FName Entry, const FString& Detail)
+	// "CPU", "GPU 0x1002:0x744c", or "GPU" for a GPU producer whose device is not known: the producer as the core's
+	// finding lines name it (FormatPrefixSetFinding).
+	[[maybe_unused]] FString ProducerLabel(const FPrefixEngineIdentity& Producer)
+	{
+		if (Producer.Backend == 0)
+		{
+			return TEXT("CPU");
+		}
+		if (Producer.AdapterVendorId == 0 && Producer.AdapterDeviceId == 0)
+		{
+			return TEXT("GPU");
+		}
+		return FString::Printf(TEXT("GPU 0x%04x:0x%04x"), Producer.AdapterVendorId & 0xFFFFu, Producer.AdapterDeviceId & 0xFFFFu);
+	}
+
+	// A build's own finding (BuildFailed, UnknownSchema, GpuNotBuilt, AdapterIdMismatch), against Producer. With no
+	// entry, a finding about the whole set: "<set>: [<producer>]: <Finding> (<detail>)".
+	[[maybe_unused]] FSuperSLMPrefixSetFinding OwnFinding(const FString& SetPath, const TCHAR* Finding, FName Entry, const FString& Detail,
+		const FPrefixEngineIdentity& Producer)
 	{
 		FSuperSLMPrefixSetFinding F;
 		F.Finding = FName(Finding);
 		F.Entry = Entry;
 		F.bHasProducer = true;
-		F.Backend = 0;
+		F.Backend = Producer.Backend;
+		F.AdapterVendorId = Producer.Backend != 0 ? Producer.AdapterVendorId : 0u;
+		F.AdapterDeviceId = Producer.Backend != 0 ? Producer.AdapterDeviceId : 0u;
+		const FString Label = ProducerLabel(Producer);
 		F.Line = Entry.IsNone()
-			? FString::Printf(TEXT("%s: %s (%s)"), *SetPath, Finding, *Detail)
-			: FString::Printf(TEXT("%s: entry '%s' [CPU]: %s (%s)"), *SetPath, *Entry.ToString(), Finding, *Detail);
+			? FString::Printf(TEXT("%s: [%s]: %s (%s)"), *SetPath, *Label, Finding, *Detail)
+			: FString::Printf(TEXT("%s: entry '%s' [%s]: %s (%s)"), *SetPath, *Entry.ToString(), *Label, Finding, *Detail);
 		return F;
 	}
 
-	// The identity the cook ships with, and the model's shape.
-	bool CurrentIdentity(const USuperSLMPrefixSet& Set, FPrefixEngineIdentity& OutIdentity, FPrefixSetModelShape& OutShape, FString& OutError)
+	// The identity the cook ships with (or a build is made under), and the model's shape: this build's Layer-1 tag
+	// and commit and the set's model's artifact hash, with Producer's backend and adapter ids (the CPU's: all 0).
+	bool CurrentIdentity(const USuperSLMPrefixSet& Set, const FPrefixEngineIdentity& Producer, FPrefixEngineIdentity& OutIdentity,
+		FPrefixSetModelShape& OutShape, FString& OutError)
 	{
 		if (Set.Model == nullptr)
 		{
@@ -158,7 +186,9 @@ namespace
 		FMemory::Memcpy(OutIdentity.ArtifactHash.data(), Hash, 32);
 		OutIdentity.Layer1Tag = TCHAR_TO_UTF8(*SuperSLMSaveBlob::CompiledLayer1Tag());
 		OutIdentity.Layer1Commit = TCHAR_TO_UTF8(*SuperSLMSaveBlob::CompiledLayer1Commit());
-		OutIdentity.Backend = 0;
+		OutIdentity.Backend = Producer.Backend;
+		OutIdentity.AdapterVendorId = Producer.Backend != 0 ? Producer.AdapterVendorId : 0u;
+		OutIdentity.AdapterDeviceId = Producer.Backend != 0 ? Producer.AdapterDeviceId : 0u;
 		OutShape.ContextCap = Shape.ContextCap;
 		OutShape.VocabSize = Shape.VocabSize;
 		return true;
@@ -170,6 +200,8 @@ namespace
 		FString Tag;
 		FString Commit;
 		bool bFlipHash = false;
+		uint32 AdapterVendorId = 0; // non-zero: a GPU build is stamped as this vendor's
+		uint32 AdapterDeviceId = 0; // non-zero: ... and this device's
 	};
 	TOptional<FBuildOverride> GBuildOverride;
 	std::atomic<int64> GGameThreadBuildCalls{0};
@@ -216,7 +248,7 @@ bool SuperSLMPrefixSetTools::ValidateForCook(const USuperSLMPrefixSet& Set, TArr
 	OutFindings.Reset();
 	FPrefixEngineIdentity Current;
 	FPrefixSetModelShape Shape;
-	if (!CurrentIdentity(Set, Current, Shape, OutError))
+	if (!CurrentIdentity(Set, FPrefixEngineIdentity(), Current, Shape, OutError)) // each build is checked for its own producer
 	{
 		return false;
 	}
@@ -476,17 +508,19 @@ namespace
 	}
 }
 
-// One CPU build in three phases (§5.8 *The build runs in the background*, PC-15 Q9; cell 3.11): Begin on the game
-// thread (identity, the tokenize pass, the manifest, the model's mapping, the pool and workspace), the entries on
-// any one thread (prefill, freeze and save per entry; cancellable between entries), and Finish on the game thread
-// (one replacement of the set's CPU build, or nothing on a cancel).
+// One build in three phases (§5.8 *The build runs in the background*, PC-15 Q9; cell 3.11). The CPU's: Begin on the game
+// thread (identity, the tokenize pass, the manifest, the model's mapping, the pool and workspace), the entries on any
+// one thread (prefill, freeze and save per entry; cancellable between entries), and Finish on the game thread (one
+// replacement of the set's CPU build, or nothing on a cancel). The GPU's (step U7): Begin on the game thread (the GPU
+// cache's identity, the tokenize pass, the manifest), the entries one at a time through the GPU subsystem's own cache
+// (PumpBuildGpu, game thread; every GPU call on the submission thread), and the same Finish for this device's build.
 struct SuperSLMPrefixSetTools::FPrefixSetBuildJob
 {
 #if defined(SSLM_HAS_PREFIX_SAVE_ABI)
 	TUniquePtr<FBuildContext> Context; // created and released on the game thread; used by the entries' thread between
 #endif
 	FString Path;
-	FPrefixEngineIdentity Producer;
+	FPrefixEngineIdentity Producer;            // the real producer: the payloads' SPX1 headers are checked against it
 	FPrefixSetTokenizePass Tokenized;
 	std::vector<bool> Buildable;
 	std::vector<bool> Kept;                    // the entries' thread sets its own failures; read at Finish
@@ -503,7 +537,72 @@ struct SuperSLMPrefixSetTools::FPrefixSetBuildJob
 	std::atomic<bool> bResume{false};
 	int32 PauseAfterEntries = -1;              // test seam (cell 3.11's cancel leg); -1 = none
 	bool bFinished = false;
+	// The GPU build's state (game thread only): the subsystem it runs through, the next entry to request, and the
+	// entry in flight (its lease of the GPU cache).
+	bool bGpu = false;
+	TWeakObjectPtr<USuperSLMGpuSubsystem> Gpu;
+	size_t NextEntry = 0;
+	bool bLeased = false;
+	size_t LeaseIndex = 0;
+	FSuperSLMPrefix Lease;
 };
+
+namespace
+{
+	// Both builds' first phase after the identity, on the game thread: the tokenize pass (§5.8 *Tokenized at build*; the
+	// registry is game-thread API), before any prefill, then the manifest. Each Text entry's own text, nothing prepended
+	// (a nested entry's suffix alone), against the set's model. A failing entry keeps its previous ids and bytes and is
+	// reported by name; the others build. Kept[i]: entry i failed at the tokenize pass (and keeps its bytes).
+	void PrepareBuildEntries(USuperSLMPrefixSet& Set, const FPrefixSetModelShape& Shape, SuperSLMPrefixSetTools::FPrefixSetBuildJob& Job)
+	{
+		const FString& Path = Job.Path;
+		Job.Tokenized = TokenizePrefixSetText(CoreEntries(Set), Shape, Job.Producer.ArtifactHash,
+			[&Set](const std::string& Text, std::vector<int32_t>& OutIds, std::string& OutTokenizeError)
+			{
+				TArray<int32> Ids;
+				FString Error;
+				const bool bOk = SuperSLM::TokenizeText(*Set.Model, FString(UTF8_TO_TCHAR(Text.c_str())), Ids, Error);
+				OutIds.assign(Ids.GetData(), Ids.GetData() + Ids.Num());
+				OutTokenizeError = TCHAR_TO_UTF8(*Error);
+				return bOk;
+			});
+		const FPrefixSetTokenizePass& Tokenized = Job.Tokenized;
+		for (const FPrefixSetFindingLine& L : Tokenized.Lines)
+		{
+			Job.BeginFindings.Add(UnrealFinding(Path, L));
+		}
+		const std::vector<FPrefixSetEntry>& Entries = Tokenized.Entries;
+		std::vector<bool>& Buildable = Job.Buildable;
+		for (const FPrefixSetFindingLine& L : CheckPrefixSetManifest(Entries, Shape, &Buildable))
+		{
+			bool bFailedEntry = false; // reported once, by the tokenize pass
+			for (size_t I = 0; I < Entries.size(); ++I)
+			{
+				bFailedEntry |= Tokenized.Failed[I] && Entries[I].Name == L.EntryName;
+			}
+			if (!bFailedEntry)
+			{
+				Job.BeginFindings.Add(UnrealFinding(Path, L));
+			}
+		}
+		// Kept[i]: entry i failed (at the tokenize pass, or later in its build or save) and keeps its bytes.
+		Job.Kept = Tokenized.Failed;
+		for (size_t I = 0; I < Entries.size(); ++I)
+		{
+			Buildable[I] = Buildable[I] && !Job.Kept[I];
+		}
+		Job.Payloads.assign(Entries.size(), std::vector<uint8_t>());
+		for (const FSuperSLMPrefixSetEntry& E : Set.Entries)
+		{
+			Job.EntryNames.Add(E.Name);
+		}
+		for (size_t I = 0; I < Entries.size(); ++I)
+		{
+			Job.EntriesTotal += Buildable[I] ? 1 : 0;
+		}
+		Job.Fingerprint = EntriesFingerprint(Set);
+	}
+}
 
 TSharedPtr<SuperSLMPrefixSetTools::FPrefixSetBuildJob, ESPMode::ThreadSafe> SuperSLMPrefixSetTools::BeginBuildCpu(USuperSLMPrefixSet& Set, FString& OutError)
 {
@@ -512,9 +611,8 @@ TSharedPtr<SuperSLMPrefixSetTools::FPrefixSetBuildJob, ESPMode::ThreadSafe> Supe
 	FPrefixSetBuildJob& Job = *JobPtr;
 	Job.Path = Set.GetPathName();
 	const FString& Path = Job.Path;
-	FPrefixEngineIdentity& Producer = Job.Producer;
 	FPrefixSetModelShape Shape;
-	if (!CurrentIdentity(Set, Producer, Shape, OutError))
+	if (!CurrentIdentity(Set, FPrefixEngineIdentity(), Job.Producer, Shape, OutError))
 	{
 		return nullptr;
 	}
@@ -522,46 +620,11 @@ TSharedPtr<SuperSLMPrefixSetTools::FPrefixSetBuildJob, ESPMode::ThreadSafe> Supe
 	OutError = FString::Printf(TEXT("%s: this build's Layer 1 (%s) has no prefix save; cooked prefix sets need 1.14.0"), *Path, *SuperSLMSaveBlob::CompiledLayer1Tag());
 	return nullptr;
 #else
-	// The tokenize pass (§5.8 *Tokenized at build*): here, on the game thread (the registry is game-thread API),
-	// before the model is mapped for the build and before any prefill. Each Text entry's own text, nothing
-	// prepended (a nested entry's suffix alone), against the set's model. A failing entry keeps its previous ids
-	// and bytes and is reported by name; the others build.
-	Job.Tokenized = TokenizePrefixSetText(CoreEntries(Set), Shape, Producer.ArtifactHash,
-		[&Set](const std::string& Text, std::vector<int32_t>& OutIds, std::string& OutTokenizeError)
-		{
-			TArray<int32> Ids;
-			FString Error;
-			const bool bOk = SuperSLM::TokenizeText(*Set.Model, FString(UTF8_TO_TCHAR(Text.c_str())), Ids, Error);
-			OutIds.assign(Ids.GetData(), Ids.GetData() + Ids.Num());
-			OutTokenizeError = TCHAR_TO_UTF8(*Error);
-			return bOk;
-		});
-	const FPrefixSetTokenizePass& Tokenized = Job.Tokenized;
-	for (const FPrefixSetFindingLine& L : Tokenized.Lines)
-	{
-		Job.BeginFindings.Add(UnrealFinding(Path, L));
-	}
-	const std::vector<FPrefixSetEntry>& Entries = Tokenized.Entries;
-	std::vector<bool>& Buildable = Job.Buildable;
-	for (const FPrefixSetFindingLine& L : CheckPrefixSetManifest(Entries, Shape, &Buildable))
-	{
-		bool bFailedEntry = false; // reported once, by the tokenize pass
-		for (size_t I = 0; I < Entries.size(); ++I)
-		{
-			bFailedEntry |= Tokenized.Failed[I] && Entries[I].Name == L.EntryName;
-		}
-		if (!bFailedEntry)
-		{
-			Job.BeginFindings.Add(UnrealFinding(Path, L));
-		}
-	}
-	// Kept[i]: entry i failed (at the tokenize pass, or below in its prefill, freeze or save) and keeps its bytes.
-	Job.Kept = Tokenized.Failed;
-	std::vector<bool>& Kept = Job.Kept;
-	for (size_t I = 0; I < Entries.size(); ++I)
-	{
-		Buildable[I] = Buildable[I] && !Kept[I];
-	}
+	// The tokenize pass and the manifest, here on the game thread, before the model is mapped for the build and
+	// before any prefill.
+	PrepareBuildEntries(Set, Shape, Job);
+	const std::vector<FPrefixSetEntry>& Entries = Job.Tokenized.Entries;
+	const std::vector<bool>& Buildable = Job.Buildable;
 
 	// The model is mapped here; a model the engine refuses at map (PC-12's two-name artifact, cell
 	// 2.15) refuses the whole build by name, and the set is left as it was.
@@ -621,17 +684,6 @@ TSharedPtr<SuperSLMPrefixSetTools::FPrefixSetBuildJob, ESPMode::ThreadSafe> Supe
 			return nullptr;
 		}
 	}
-
-	Job.Payloads.assign(Entries.size(), std::vector<uint8_t>());
-	for (const FSuperSLMPrefixSetEntry& E : Set.Entries)
-	{
-		Job.EntryNames.Add(E.Name);
-	}
-	for (size_t I = 0; I < Entries.size(); ++I)
-	{
-		Job.EntriesTotal += Buildable[I] ? 1 : 0;
-	}
-	Job.Fingerprint = EntriesFingerprint(Set);
 	return JobPtr;
 #endif
 }
@@ -666,7 +718,7 @@ void SuperSLMPrefixSetTools::RunBuildEntries(FPrefixSetBuildJob& Job)
 		const TArray<uint8> Payload = BuildOneEntry(*Job.Context, Entries[I], Finding, Detail);
 		if (Payload.Num() == 0)
 		{
-			Job.EntryFindings.Add(OwnFinding(Job.Path, Finding, Job.EntryNames[static_cast<int32>(I)], Detail + TEXT("; it keeps its previous bytes")));
+			Job.EntryFindings.Add(OwnFinding(Job.Path, Finding, Job.EntryNames[static_cast<int32>(I)], Detail + TEXT("; it keeps its previous bytes"), Job.Producer));
 			Job.Kept[I] = true;
 		}
 		else
@@ -695,88 +747,200 @@ SuperSLMPrefixSetTools::FBuildProgress SuperSLMPrefixSetTools::GetBuildProgress(
 	return P;
 }
 
+namespace
+{
+	// The producer a job's build is stored under: the real one, with the test seam's stamp applied (a previous pin,
+	// another model, or, for a GPU build, another device).
+	FPrefixEngineIdentity StampedProducer(const SuperSLMPrefixSetTools::FPrefixSetBuildJob& Job)
+	{
+		FPrefixEngineIdentity Producer = Job.Producer;
+#if WITH_DEV_AUTOMATION_TESTS
+		if (GBuildOverride.IsSet())
+		{
+			if (!GBuildOverride->Tag.IsEmpty())
+			{
+				Producer.Layer1Tag = TCHAR_TO_UTF8(*GBuildOverride->Tag);
+			}
+			if (!GBuildOverride->Commit.IsEmpty())
+			{
+				Producer.Layer1Commit = TCHAR_TO_UTF8(*GBuildOverride->Commit);
+			}
+			if (GBuildOverride->bFlipHash)
+			{
+				Producer.ArtifactHash[0] ^= 0xFF;
+			}
+			if (Producer.Backend != 0 && GBuildOverride->AdapterVendorId != 0)
+			{
+				Producer.AdapterVendorId = GBuildOverride->AdapterVendorId;
+			}
+			if (Producer.Backend != 0 && GBuildOverride->AdapterDeviceId != 0)
+			{
+				Producer.AdapterDeviceId = GBuildOverride->AdapterDeviceId;
+			}
+		}
+#endif
+		return Producer;
+	}
+
+	// The common head of every finish, on the game thread: the job's own findings (its first phase's unless
+	// bBeginFindings is false, then its entries'), the build's mapping released, and the outcomes that store
+	// nothing: not done or finished twice, cancelled, or the set edited while it ran. True when the job may be
+	// stored; otherwise OutResult and OutError say why.
+	bool BeginFinish(USuperSLMPrefixSet& Set, SuperSLMPrefixSetTools::FPrefixSetBuildJob& Job, bool bBeginFindings,
+		TArray<FSuperSLMPrefixSetFinding>& OutFindings, FString& OutError, SuperSLMPrefixSetTools::EBuildFinish& OutResult)
+	{
+		using SuperSLMPrefixSetTools::EBuildFinish;
+		if (bBeginFindings)
+		{
+			OutFindings.Append(Job.BeginFindings);
+		}
+		if (!Job.bWorkDone.load() || Job.bFinished)
+		{
+			OutError = FString::Printf(TEXT("%s: the build's entries have not finished (or it was already finished)"), *Job.Path);
+			OutResult = EBuildFinish::Refused;
+			return false;
+		}
+		Job.bFinished = true;
+		OutFindings.Append(Job.EntryFindings);
+#if defined(SSLM_HAS_PREFIX_SAVE_ABI)
+		Job.Context.Reset(); // the model's mapping is registry state: released here, on the game thread
+#endif
+		if (Job.bCancel.load())
+		{
+			OutError = FString::Printf(TEXT("%s: the build was cancelled after %d of %d entries; the set keeps its previous build"), *Job.Path,
+				Job.EntriesDone.load(), Job.EntriesTotal);
+			OutResult = EBuildFinish::Cancelled;
+			return false;
+		}
+		if (EntriesFingerprint(Set) != Job.Fingerprint || Set.GetPathName() != Job.Path)
+		{
+			OutError = FString::Printf(TEXT("%s: the set or its model was edited while the build ran; nothing was stored (build it again)"), *Job.Path);
+			OutResult = EBuildFinish::Refused;
+			return false;
+		}
+		return true;
+	}
+
+	// A GPU build's check before it is stored (§5.8, PC-5): every payload's SPX1 header names the producer the build
+	// ran as (backend 1, its adapter's vendor and device). False, with an AdapterIdMismatch finding, otherwise.
+	bool GpuPayloadsFromProducer(const SuperSLMPrefixSetTools::FPrefixSetBuildJob& Job, TArray<FSuperSLMPrefixSetFinding>& OutFindings, FString& OutError)
+	{
+		size_t Index = 0;
+		uint32_t Backend = 0;
+		uint32_t Vendor = 0;
+		uint32_t Device = 0;
+		if (PrefixSetPayloadsFromProducer(Job.Payloads, Job.Producer, Index, Backend, Vendor, Device))
+		{
+			return true;
+		}
+		const FName Entry = Job.EntryNames.IsValidIndex(static_cast<int32>(Index)) ? Job.EntryNames[static_cast<int32>(Index)] : NAME_None;
+		const FString Detail = FString::Printf(TEXT("its SPX1 payload names backend %u, adapter 0x%04x:0x%04x, not this build's GPU; the GPU part is not stored"),
+			Backend, Vendor & 0xFFFFu, Device & 0xFFFFu);
+		OutFindings.Add(OwnFinding(Job.Path, TEXT("AdapterIdMismatch"), Entry, Detail, Job.Producer));
+		OutError = FString::Printf(TEXT("%s: entry '%s': %s"), *Job.Path, *Entry.ToString(), *Detail);
+		return false;
+	}
+
+	// What a finish stores, staged on copies of the set's builds and entries and written in one Modify().
+	struct FStagedSet
+	{
+		TArray<FSuperSLMPrefixSetBuild> Builds;
+		TArray<FSuperSLMPrefixSetEntry> Entries;
+		bool bEntriesTokenized = false;
+	};
+
+	// One job's build into Staged: its producer's earlier builds go (ReplacePrefixSetBuild's rule, host-tested), the
+	// others stay with their own BuiltAt, and the new build goes last, every entry with Kept[i] set keeping the bytes
+	// that producer's previous build stored under its name (KeepPreviousPrefixSetBytes; one replacement at the end).
+	// The first job staged also writes each tokenized Text entry's new ids and hashes beside its text; an entry kept
+	// keeps its own, so its kept bytes stay keyed by its kept ids.
+	void StageBuild(const USuperSLMPrefixSet& Set, const SuperSLMPrefixSetTools::FPrefixSetBuildJob& Job, const std::vector<bool>& Kept, FStagedSet& Staged)
+	{
+		const std::vector<FPrefixSetEntry>& Entries = Job.Tokenized.Entries;
+		FPrefixSetBuild Built = AssemblePrefixSetBuild(Entries, StampedProducer(Job), Job.Payloads);
+		KeepPreviousPrefixSetBytes(Built, CoreBuilds(Set), Kept);
+		TArray<FSuperSLMPrefixSetBuild> Out;
+		for (const FSuperSLMPrefixSetBuild& Old : Staged.Builds)
+		{
+			if (!PrefixSetBuildServes(CoreBuild(Old).Producer, Built.Producer))
+			{
+				Out.Add(Old);
+			}
+		}
+		Out.Add(UnrealBuild(Built, FDateTime::UtcNow()));
+		Staged.Builds = MoveTemp(Out);
+		if (Staged.bEntriesTokenized)
+		{
+			return;
+		}
+		Staged.bEntriesTokenized = true;
+		for (int32 I = 0; I < Staged.Entries.Num() && static_cast<size_t>(I) < Entries.size(); ++I)
+		{
+			FSuperSLMPrefixSetEntry& E = Staged.Entries[I];
+			const FPrefixSetEntry& T = Entries[static_cast<size_t>(I)];
+			if (E.Input == ESuperSLMPrefixEntryInput::Text && !Kept[static_cast<size_t>(I)])
+			{
+				E.Tokens = TArray<int32>(T.Tokens.data(), static_cast<int32>(T.Tokens.size()));
+				E.TextHash = HashHex(T.TextHash);
+				E.TokenizedModelHash = HashHex(T.TokenizedModelHash);
+			}
+		}
+	}
+
+	void StoreStaged(USuperSLMPrefixSet& Set, FStagedSet& Staged)
+	{
+		Set.Modify();
+		Set.Builds = MoveTemp(Staged.Builds);
+		Set.Entries = MoveTemp(Staged.Entries);
+		Set.MarkPackageDirty();
+	}
+
+	FPrefixEngineIdentity AnyGpuProducer()
+	{
+		FPrefixEngineIdentity Gpu;
+		Gpu.Backend = 1; // its device unknown: the finding reads [GPU]
+		return Gpu;
+	}
+
+	const TCHAR* LeaseStateName(ESuperSLMPrefixLeaseState State)
+	{
+		switch (State)
+		{
+		case ESuperSLMPrefixLeaseState::Invalid: return TEXT("Invalid");
+		case ESuperSLMPrefixLeaseState::Pending: return TEXT("Pending");
+		case ESuperSLMPrefixLeaseState::Ready: return TEXT("Ready");
+		case ESuperSLMPrefixLeaseState::BudgetExhausted: return TEXT("BudgetExhausted");
+		case ESuperSLMPrefixLeaseState::PoolExhausted: return TEXT("PoolExhausted");
+		case ESuperSLMPrefixLeaseState::UnknownSchema: return TEXT("UnknownSchema");
+		case ESuperSLMPrefixLeaseState::Cancelled: return TEXT("Cancelled");
+		case ESuperSLMPrefixLeaseState::Failed: return TEXT("Failed");
+		case ESuperSLMPrefixLeaseState::Ended: return TEXT("Ended");
+		}
+		return TEXT("Unknown");
+	}
+}
+
 SuperSLMPrefixSetTools::EBuildFinish SuperSLMPrefixSetTools::FinishBuildCpu(USuperSLMPrefixSet& Set, FPrefixSetBuildJob& Job,
 	TArray<FSuperSLMPrefixSetFinding>& OutFindings, FString& OutError)
 {
 	check(IsInGameThread());
-	OutFindings = Job.BeginFindings;
-	if (!Job.bWorkDone.load() || Job.bFinished)
+	OutFindings.Reset();
+	EBuildFinish Result = EBuildFinish::Refused;
+	if (!BeginFinish(Set, Job, /*bBeginFindings*/ true, OutFindings, OutError, Result))
 	{
-		OutError = FString::Printf(TEXT("%s: the build's entries have not finished (or it was already finished)"), *Job.Path);
-		return EBuildFinish::Refused;
+		return Result;
 	}
-	Job.bFinished = true;
-	OutFindings.Append(Job.EntryFindings);
-#if defined(SSLM_HAS_PREFIX_SAVE_ABI)
-	Job.Context.Reset(); // the model's mapping is registry state: released here, on the game thread
-#endif
-	const FString& Path = Job.Path;
-	if (Job.bCancel.load())
-	{
-		OutError = FString::Printf(TEXT("%s: the build was cancelled after %d of %d entries; the set keeps its previous build"), *Path, Job.EntriesDone.load(), Job.EntriesTotal);
-		return EBuildFinish::Cancelled;
-	}
-	if (EntriesFingerprint(Set) != Job.Fingerprint || Set.GetPathName() != Path)
-	{
-		OutError = FString::Printf(TEXT("%s: the set or its model was edited while the build ran; nothing was stored (build it again)"), *Path);
-		return EBuildFinish::Refused;
-	}
-	const std::vector<FPrefixSetEntry>& Entries = Job.Tokenized.Entries;
-	const std::vector<bool>& Kept = Job.Kept;
-	FPrefixEngineIdentity Producer = Job.Producer;
-#if WITH_DEV_AUTOMATION_TESTS
-	if (GBuildOverride.IsSet())
-	{
-		if (!GBuildOverride->Tag.IsEmpty())
-		{
-			Producer.Layer1Tag = TCHAR_TO_UTF8(*GBuildOverride->Tag);
-		}
-		if (!GBuildOverride->Commit.IsEmpty())
-		{
-			Producer.Layer1Commit = TCHAR_TO_UTF8(*GBuildOverride->Commit);
-		}
-		if (GBuildOverride->bFlipHash)
-		{
-			Producer.ArtifactHash[0] ^= 0xFF;
-		}
-	}
-#endif
-	// ReplacePrefixSetBuild's rule (host-tested): this producer's earlier builds go, the others stay
-	// with their own BuiltAt, and the new build goes last.
-	FPrefixSetBuild Built = AssemblePrefixSetBuild(Entries, Producer, Job.Payloads);
-	KeepPreviousPrefixSetBytes(Built, CoreBuilds(Set), Kept); // per-entry failure: one replacement at the end
-	TArray<FSuperSLMPrefixSetBuild> Out;
-	for (const FSuperSLMPrefixSetBuild& Old : Set.Builds)
-	{
-		if (!PrefixSetBuildServes(CoreBuild(Old).Producer, Built.Producer))
-		{
-			Out.Add(Old);
-		}
-	}
-	Out.Add(UnrealBuild(Built, FDateTime::UtcNow()));
-	Set.Modify();
-	Set.Builds = MoveTemp(Out);
-	// Each tokenized Text entry's new ids and hashes, beside its text. A failing entry (at the tokenize pass, or in
-	// its prefill, freeze or save) keeps its own, so its kept bytes stay keyed by its kept ids.
-	for (int32 I = 0; I < Set.Entries.Num(); ++I)
-	{
-		FSuperSLMPrefixSetEntry& E = Set.Entries[I];
-		const FPrefixSetEntry& T = Entries[static_cast<size_t>(I)];
-		if (E.Input == ESuperSLMPrefixEntryInput::Text && !Kept[static_cast<size_t>(I)])
-		{
-			E.Tokens = TArray<int32>(T.Tokens.data(), static_cast<int32>(T.Tokens.size()));
-			E.TextHash = HashHex(T.TextHash);
-			E.TokenizedModelHash = HashHex(T.TokenizedModelHash);
-		}
-	}
-	Set.MarkPackageDirty();
-
-	// GPU entries: built per certified device at plan step U7 (the GPU save verb is 1.15.0's). Reported not built,
-	// never as a failure, and the set's GPU builds are kept as they were (rev 1.18.1, cell 3.11).
+	FStagedSet Staged{Set.Builds, Set.Entries};
+	StageBuild(Set, Job, Job.Kept, Staged);
+	StoreStaged(Set, Staged);
+	// A CPU build alone makes no GPU entries: the set's GPU builds are kept as they were, and reported not built,
+	// never as a failure (rev 1.18.1, cell 3.11). The Build Prefixes action and the commandlet build this machine's
+	// GPU's entries beside it (FinishBuildCpuAndGpu).
 	if (Set.Entries.Num() > 0)
 	{
-		OutFindings.Add(OwnFinding(Path, TEXT("GpuNotBuilt"), NAME_None,
-			TEXT("GPU entries are built per device from plan step U7; a GPU subsystem recomputes every entry until then")));
+		OutFindings.Add(OwnFinding(Job.Path, TEXT("GpuNotBuilt"), NAME_None,
+			TEXT("this build made the CPU entries only; the Build Prefixes action and the SuperSLMBuildPrefixes commandlet build the GPU entries of the GPU they run on, and a GPU with no build of its own recomputes every entry"),
+			AnyGpuProducer()));
 	}
 	return EBuildFinish::Stored;
 }
@@ -793,6 +957,307 @@ bool SuperSLMPrefixSetTools::BuildCpu(USuperSLMPrefixSet& Set, TArray<FSuperSLMP
 	}
 	RunBuildEntries(*Job);
 	return FinishBuildCpu(Set, *Job, OutFindings, OutError) == EBuildFinish::Stored; // the caller logs the findings
+}
+
+// ---- The GPU build, per device (§5.8, PC-5; step U7) ----
+
+TSharedPtr<SuperSLMPrefixSetTools::FPrefixSetBuildJob, ESPMode::ThreadSafe> SuperSLMPrefixSetTools::BeginBuildGpu(USuperSLMPrefixSet& Set,
+	USuperSLMGpuSubsystem& Gpu, FString& OutError)
+{
+	check(IsInGameThread());
+	TSharedPtr<FPrefixSetBuildJob, ESPMode::ThreadSafe> JobPtr = MakeShared<FPrefixSetBuildJob, ESPMode::ThreadSafe>();
+	FPrefixSetBuildJob& Job = *JobPtr;
+	Job.Path = Set.GetPathName();
+	Job.bGpu = true;
+	const FString& Path = Job.Path;
+	// The GPU cache the entries are built through: its identity is the producer (backend 1, the vendor and device of
+	// the adapter Layer 1 runs on). Cold for this build: no disk tier and no cooked set, so every entry is built on
+	// this device here (a Memory hit is an entry this configuration already built on it).
+	FPrefixEngineIdentity CacheIdentity;
+	bool bDisk = false;
+	int32 Cooked = 0;
+	FString Why;
+	if (!FSuperSLMGpuPrefixSetAccess::ReadBuildCache(Gpu, CacheIdentity, bDisk, Cooked, Why))
+	{
+		OutError = FString::Printf(TEXT("%s: the GPU entries need a GPU subsystem configured pooled with a prefix cache (%s)"), *Path, *Why);
+		return nullptr;
+	}
+	if (bDisk)
+	{
+		OutError = FString::Printf(TEXT("%s: the GPU subsystem's prefix cache has its disk tier on; the GPU build needs it off, so every entry is built rather than read back"), *Path);
+		return nullptr;
+	}
+	if (Cooked > 0)
+	{
+		OutError = FString::Printf(TEXT("%s: the GPU subsystem's prefix cache has %d cooked entr%s registered; the GPU build needs none, so every entry is built rather than restored"),
+			*Path, Cooked, Cooked == 1 ? TEXT("y") : TEXT("ies"));
+		return nullptr;
+	}
+	FPrefixSetModelShape Shape;
+	if (!CurrentIdentity(Set, CacheIdentity, Job.Producer, Shape, OutError))
+	{
+		return nullptr;
+	}
+	if (Job.Producer.ArtifactHash != CacheIdentity.ArtifactHash || Gpu.GetConfiguredModel() == nullptr)
+	{
+		OutError = FString::Printf(TEXT("%s: the GPU subsystem is configured with %s, not the set's model %s (PrefixSetModelMismatch); nothing was built"), *Path,
+			Gpu.GetConfiguredModel() != nullptr ? *Gpu.GetConfiguredModel()->GetPathName() : TEXT("no model"), *Set.Model->GetPathName());
+		return nullptr;
+	}
+	Job.Producer = CacheIdentity; // the key the GPU cache computes for each entry is the one the build stores
+	PrepareBuildEntries(Set, Shape, Job);
+	Job.Gpu = &Gpu;
+	return JobPtr;
+}
+
+bool SuperSLMPrefixSetTools::PumpBuildGpu(FPrefixSetBuildJob& Job, USuperSLMGpuSubsystem& Gpu, float DeltaSeconds)
+{
+	check(IsInGameThread());
+	if (!Job.bGpu || Job.bWorkDone.load())
+	{
+		return false;
+	}
+	const std::vector<FPrefixSetEntry>& Entries = Job.Tokenized.Entries;
+	if (Job.Gpu.Get() != &Gpu)
+	{
+		// Not the subsystem the build began on: every entry left keeps its previous bytes.
+		Job.EntryFindings.Add(OwnFinding(Job.Path, TEXT("BuildFailed"), NAME_None,
+			TEXT("PumpBuildGpu was given another GPU subsystem than BeginBuildGpu's; the entries left keep their previous bytes"), Job.Producer));
+		for (size_t I = Job.NextEntry; I < Entries.size(); ++I)
+		{
+			Job.Kept[I] = Job.Kept[I] || Job.Buildable[I];
+		}
+		Job.bWorkDone.store(true);
+		return false;
+	}
+	Gpu.Tick(DeltaSeconds); // the request's key hash, its build steps and their deliveries all move on ticks
+
+	if (Job.bLeased)
+	{
+		const ESuperSLMPrefixLeaseState LeaseState = Gpu.GetPrefixLeaseState(Job.Lease);
+		if (LeaseState == ESuperSLMPrefixLeaseState::Pending)
+		{
+			return true;
+		}
+		const size_t I = Job.LeaseIndex;
+		TArray<uint8> Payload;
+		FString Why;
+		const TCHAR* Finding = TEXT("BuildFailed");
+		if (LeaseState == ESuperSLMPrefixLeaseState::Ready)
+		{
+			bool bOnGameThread = false;
+			if (!FSuperSLMGpuPrefixSetAccess::SaveLease(Gpu, Job.Lease, Payload, bOnGameThread, Why))
+			{
+				Payload.Reset();
+			}
+#if WITH_DEV_AUTOMATION_TESTS
+			if (bOnGameThread)
+			{
+				GGameThreadBuildCalls.fetch_add(1); // cell 3.11's counter: a GPU save on the game thread (never expected)
+			}
+#endif
+		}
+		else
+		{
+			Finding = LeaseState == ESuperSLMPrefixLeaseState::UnknownSchema ? TEXT("UnknownSchema") : TEXT("BuildFailed");
+			Why = FString::Printf(TEXT("the GPU cache's lease resolved %s"), LeaseStateName(LeaseState));
+		}
+		Gpu.ReturnPrefix(Job.Lease);
+		Job.Lease = FSuperSLMPrefix();
+		Job.bLeased = false;
+		if (Payload.Num() == 0)
+		{
+			Job.EntryFindings.Add(OwnFinding(Job.Path, Finding, Job.EntryNames[static_cast<int32>(I)], Why + TEXT("; it keeps its previous bytes"), Job.Producer));
+			Job.Kept[I] = true;
+		}
+		else
+		{
+			Job.Payloads[I].assign(Payload.GetData(), Payload.GetData() + Payload.Num());
+		}
+		Job.EntriesDone.fetch_add(1);
+		Job.NextEntry = I + 1;
+	}
+
+	// Between entries: a cancel ends the build here (the entry in hand has finished); the test pause holds here.
+	if (Job.bCancel.load())
+	{
+		Job.bPaused.store(false);
+		Job.bWorkDone.store(true);
+		return false;
+	}
+	size_t Next = Job.NextEntry;
+	while (Next < Entries.size() && !Job.Buildable[Next])
+	{
+		++Next;
+	}
+	Job.NextEntry = Next;
+	if (Next >= Entries.size())
+	{
+		Job.bWorkDone.store(true);
+		return false;
+	}
+	if (Job.PauseAfterEntries >= 0 && Job.EntriesDone.load() == Job.PauseAfterEntries && !Job.bResume.load())
+	{
+		Job.bPaused.store(true);
+		return true;
+	}
+	Job.bPaused.store(false);
+	const FPrefixSetEntry& E = Entries[Next];
+	FSuperSLMPrefixSpec Spec;
+	Spec.Tokens = TArray<int32>(E.Tokens.data(), static_cast<int32>(E.Tokens.size()));
+	Spec.SchemaName = E.SchemaName.empty() ? NAME_None : FName(UTF8_TO_TCHAR(E.SchemaName.c_str()));
+	FString RequestError;
+	if (!Gpu.RequestPrefix(Spec, Job.Lease, RequestError))
+	{
+		Job.Lease = FSuperSLMPrefix();
+		Job.EntryFindings.Add(OwnFinding(Job.Path, TEXT("BuildFailed"), Job.EntryNames[static_cast<int32>(Next)],
+			FString::Printf(TEXT("the GPU cache refused its request (%s); it keeps its previous bytes"), *RequestError), Job.Producer));
+		Job.Kept[Next] = true;
+		Job.EntriesDone.fetch_add(1);
+		Job.NextEntry = Next + 1;
+		return true;
+	}
+	Job.bLeased = true;
+	Job.LeaseIndex = Next;
+	return true;
+}
+
+SuperSLMPrefixSetTools::EBuildFinish SuperSLMPrefixSetTools::FinishBuildGpu(USuperSLMPrefixSet& Set, FPrefixSetBuildJob& Job,
+	TArray<FSuperSLMPrefixSetFinding>& OutFindings, FString& OutError)
+{
+	check(IsInGameThread());
+	OutFindings.Reset();
+	EBuildFinish Result = EBuildFinish::Refused;
+	if (!Job.bGpu)
+	{
+		OutError = FString::Printf(TEXT("%s: FinishBuildGpu was given a CPU build"), *Job.Path);
+		return EBuildFinish::Refused;
+	}
+	if (!BeginFinish(Set, Job, /*bBeginFindings*/ true, OutFindings, OutError, Result))
+	{
+		return Result;
+	}
+	if (!GpuPayloadsFromProducer(Job, OutFindings, OutError))
+	{
+		return EBuildFinish::Refused;
+	}
+	FStagedSet Staged{Set.Builds, Set.Entries};
+	StageBuild(Set, Job, Job.Kept, Staged);
+	StoreStaged(Set, Staged);
+	return EBuildFinish::Stored;
+}
+
+SuperSLMPrefixSetTools::EBuildFinish SuperSLMPrefixSetTools::FinishBuildCpuAndGpu(USuperSLMPrefixSet& Set, FPrefixSetBuildJob& CpuJob, FPrefixSetBuildJob* GpuJob,
+	const FString& GpuNotBuiltReason, TArray<FSuperSLMPrefixSetFinding>& OutFindings, FString& OutError, bool& bOutGpuStored)
+{
+	check(IsInGameThread());
+	OutFindings.Reset();
+	bOutGpuStored = false;
+	EBuildFinish CpuResult = EBuildFinish::Refused;
+	const bool bCpu = BeginFinish(Set, CpuJob, /*bBeginFindings*/ true, OutFindings, OutError, CpuResult);
+	// The GPU job is finished whatever the CPU's outcome. Its first phase's findings are the CPU's (the same tokenize
+	// pass and manifest), so only its entries' are reported.
+	TArray<FSuperSLMPrefixSetFinding> GpuFindings;
+	FString GpuError;
+	EBuildFinish GpuResult = EBuildFinish::Refused;
+	const bool bGpu = GpuJob != nullptr && GpuJob->bGpu && BeginFinish(Set, *GpuJob, /*bBeginFindings*/ false, GpuFindings, GpuError, GpuResult);
+	if (!bCpu)
+	{
+		OutFindings.Append(GpuFindings);
+		return CpuResult;
+	}
+	if (GpuJob != nullptr && !bGpu && GpuResult == EBuildFinish::Cancelled)
+	{
+		// One build, one cancel: nothing is stored.
+		OutFindings.Append(GpuFindings);
+		OutError = GpuError;
+		return EBuildFinish::Cancelled;
+	}
+	// A Text entry's ids are written once, for both builds, so its bytes in each stay keyed by the ids it keeps: an
+	// entry either build failed keeps its previous ids and its previous bytes in both.
+	std::vector<bool> CpuKept = CpuJob.Kept;
+	std::vector<bool> GpuKept = bGpu ? GpuJob->Kept : std::vector<bool>();
+	if (bGpu)
+	{
+		for (int32 I = 0; I < Set.Entries.Num() && static_cast<size_t>(I) < CpuKept.size() && static_cast<size_t>(I) < GpuKept.size(); ++I)
+		{
+			if (Set.Entries[I].Input == ESuperSLMPrefixEntryInput::Text)
+			{
+				const bool bKept = CpuKept[static_cast<size_t>(I)] || GpuKept[static_cast<size_t>(I)];
+				CpuKept[static_cast<size_t>(I)] = bKept;
+				GpuKept[static_cast<size_t>(I)] = bKept;
+			}
+		}
+	}
+	FStagedSet Staged{Set.Builds, Set.Entries};
+	StageBuild(Set, CpuJob, CpuKept, Staged);
+	if (bGpu)
+	{
+		if (GpuPayloadsFromProducer(*GpuJob, GpuFindings, GpuError))
+		{
+			StageBuild(Set, *GpuJob, GpuKept, Staged);
+			bOutGpuStored = true;
+		}
+	}
+	else
+	{
+		const FString Reason = GpuJob != nullptr ? GpuError : GpuNotBuiltReason;
+		GpuFindings.Add(OwnFinding(CpuJob.Path, TEXT("GpuNotBuilt"), NAME_None,
+			FString::Printf(TEXT("%s; the set's GPU builds are kept as they were"), Reason.IsEmpty() ? TEXT("the GPU part did not run") : *Reason), AnyGpuProducer()));
+	}
+	OutFindings.Append(GpuFindings);
+	StoreStaged(Set, Staged);
+	return EBuildFinish::Stored;
+}
+
+void SuperSLMPrefixSetTools::GetBuildProducer(const FPrefixSetBuildJob& Job, uint8& OutBackend, uint32& OutVendorId, uint32& OutDeviceId)
+{
+	OutBackend = Job.Producer.Backend;
+	OutVendorId = Job.Producer.AdapterVendorId;
+	OutDeviceId = Job.Producer.AdapterDeviceId;
+}
+
+bool SuperSLMPrefixSetTools::MakeGpuBuildConfig(const USuperSLMPrefixSet& Set, FSuperSLMGpuRuntimeConfig& OutConfig,
+	FSuperSLMGpuPrefixCacheSettings& OutCacheSettings, FString& OutError)
+{
+	OutConfig = FSuperSLMGpuRuntimeConfig();
+	OutCacheSettings = FSuperSLMGpuPrefixCacheSettings();
+	if (Set.Model == nullptr)
+	{
+		OutError = FString::Printf(TEXT("%s: the prefix set names no model"), *Set.GetPathName());
+		return false;
+	}
+	SuperSLMRuntime::FModelShape Shape;
+	FString ShapeError;
+	if (!SuperSLMRuntime::ReadModelShape(*Set.Model, Shape, ShapeError) || Shape.ContextCap <= 0 || Shape.NumHiddenLayers <= 0)
+	{
+		OutError = FString::Printf(TEXT("%s: the model %s's shape is unreadable (%s)"), *Set.GetPathName(), *Set.Model->GetPathName(), *ShapeError);
+		return false;
+	}
+	// superslm_gpu::kQkNormDispatchesPerLayer (gpu_port.h), the larger of Layer 1's two per-layer dispatch counts: a
+	// budget of this x the depth is a whole token per tick on either (SuperSLMEditorRuntimeHost's load-time value).
+	constexpr uint32 kMaxDispatchesPerLayer = 25;
+	OutConfig.ContextCap = Shape.ContextCap; // the manifest admits entries up to the model's cap
+	OutConfig.BlockCount = 1;
+	OutConfig.DispatchBudget = kMaxDispatchesPerLayer * static_cast<uint32>(Shape.NumHiddenLayers);
+	OutConfig.K = 2; // above the one-sequence floor; a KBelowMinimum names the floor and the caller configures again at it
+	OutConfig.TickBudgetMs = 1000.0;
+	OutConfig.SequenceBudget = static_cast<int32>(FMath::Min<int64>(Shape.ContextCap, 64)); // pooled: GPU prefixes exist only there
+	OutConfig.PrefixBlockCount = 0;
+	OutConfig.RestoreHeadroomBlocks = 1;
+	OutConfig.CacheGhostBlocks = 1;
+	OutConfig.bCalibrateGpuRowCost = false;
+	// Any budget above 0 sizes region C in whole blocks of ceil(ContextCap / B) pages (RegionCPagesFor), so one byte
+	// is one block: it holds the largest entry the manifest admits (at most the model's cap) at its peak charge.
+	OutCacheSettings.BudgetBytes = 1;
+	OutCacheSettings.bDiskEnabled = false;
+	OutCacheSettings.DiskMaxBytes = 0;
+	return true;
+}
+
+bool SuperSLMPrefixSetTools::AnyGpuSubsystemConfigured()
+{
+	return FSuperSLMGpuPrefixSetAccess::ConfiguredSubsystemCount() > 0;
 }
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -820,9 +1285,10 @@ void SuperSLMPrefixSetTools::ResetGameThreadBuildCalls()
 #endif // WITH_EDITOR
 
 #if WITH_DEV_AUTOMATION_TESTS
-SuperSLMPrefixSetTools::FScopedBuildIdentityOverride::FScopedBuildIdentityOverride(const FString& Layer1Tag, const FString& Layer1Commit, bool bFlipArtifactHash)
+SuperSLMPrefixSetTools::FScopedBuildIdentityOverride::FScopedBuildIdentityOverride(const FString& Layer1Tag, const FString& Layer1Commit, bool bFlipArtifactHash,
+	uint32 AdapterVendorId, uint32 AdapterDeviceId)
 {
-	GBuildOverride = FBuildOverride{Layer1Tag, Layer1Commit, bFlipArtifactHash};
+	GBuildOverride = FBuildOverride{Layer1Tag, Layer1Commit, bFlipArtifactHash, AdapterVendorId, AdapterDeviceId};
 }
 
 SuperSLMPrefixSetTools::FScopedBuildIdentityOverride::~FScopedBuildIdentityOverride()

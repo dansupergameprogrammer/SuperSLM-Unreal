@@ -77,12 +77,6 @@ struct SUPERSLMUNREAL_API FSuperSLMSchemaJumpReviewTestAccess
 	// they were made (P1.11 (b), (e), (f)).
 	static TArray<FSuperSLMForcednessReadRecord> GetForcednessReads(const USuperSLMSubsystem& Subsystem);
 
-	// Ground truth for the drain rule (P1.2, P1.11 (c); review finding 4): under recording, before
-	// each decode job is planned for a Canonical schema-bound sequence, the seam itself reads
-	// sslm_seq_forced_tokens (cap 0) and counts the decode jobs planned while it reported a chain
-	// (out_count > 0). The seam's own read is not one of GetForcednessReads()'s.
-	static int32 GetCanonicalDecodesPlannedWithOpenChain(const USuperSLMSubsystem& Subsystem);
-
 	// Whether the walk is known for Sequence's current generation (§6 P1 "When the walk is known").
 	static bool IsWalkKnown(const USuperSLMSubsystem& Subsystem, const FSuperSLMSequence& Sequence);
 

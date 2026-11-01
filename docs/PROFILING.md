@@ -55,7 +55,8 @@ Insights counters, set once per job, slice or tick (never per layer):
   `DeliveredJobs`, `HostFinishMs`, `PrefillMsPerToken`, `TokensPerSecond`, `PoolOccupied`,
   `PoolFree`, `RetainedResultBytes`.
 - **GPU** (`SuperSLM/GPU/...`): `GpuBusyMsPerSlice`, `HostFinishMs`, `LayersPerSlice`, `HitchCount`,
-  `DeliveredTokens`, `K`, `DueTokens`, `RetainedResultBytes`.
+  `DeliveredTokens`, `K`, `DueTokens`, `RetainedResultBytes`, and, from 1.4, `RowsPerChunk`, `RowsSliceMs`,
+  `HostFinishUs`, `ExactFellBackToOff`, `ExactStepFellBack` and `CalibratedGpuRowCostUs`.
 
 `HostFinishMs` on the GPU is the wall time of the finish call, which includes the device-resident
 head's dispatch when the head is on. `GpuBusyMsPerSlice` does not include that dispatch.

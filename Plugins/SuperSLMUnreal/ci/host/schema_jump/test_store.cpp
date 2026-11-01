@@ -87,25 +87,6 @@ HOST_TEST(store_snapshot_held_across_many_merges_never_changes, "P1X.8 host half
 	EXPECT_TRUE(BuildDraft(Held.get(), A, S0, Wide()) == DraftBefore);
 }
 
-HOST_TEST(store_learns_nothing_from_a_canonical_generation, "P1X.12 (b); §6 P1-X: the table learns only from the model; mutant XD3 (canonical feeding)")
-{
-	FDraftTableStore Store;
-	const FFakeAutomaton A = OrderAutomaton();
-	Finish(Store, KeyA, ESchemaJumpMode::Canonical, A, OrderStreamA());
-	EXPECT_TRUE(Store.Snapshot(KeyA) == nullptr);
-
-	Finish(Store, KeyA, ESchemaJumpMode::Exact, A, OrderStreamA());
-	const FDraftTableRef Exact = Store.Snapshot(KeyA);
-	REQUIRE_TRUE(Exact != nullptr);
-	EXPECT_EQ(Exact->CountOf(S0, 100), 1u);
-
-	Finish(Store, KeyA, ESchemaJumpMode::Canonical, A, OrderStreamB());
-	const FDraftTableRef After = Store.Snapshot(KeyA);
-	REQUIRE_TRUE(After != nullptr);
-	EXPECT_EQ(After->CountOf(S0, 101), 0u);
-	EXPECT_EQ(After->CountOf(S0, 100), 1u);
-}
-
 HOST_TEST(store_keys_tables_by_model_and_schema, "§6 P1-X: a per-(model, schema) table")
 {
 	FDraftTableStore Store;
@@ -265,7 +246,7 @@ HOST_TEST(p1x12b_off_and_exact_generations_that_end_accepting_feed, "P1X.12 (b):
 HOST_TEST(p1x12b_a_generation_that_did_not_end_accepting_feeds_nothing, "P1X.12 (b): cut by MaxNewTokens, a fault, a cancel or a release; mutant XD3 (an unfinished stream feeding)")
 {
 	const FFakeAutomaton A = OrderAutomaton();
-	const ESchemaJumpMode Modes[] = {ESchemaJumpMode::Off, ESchemaJumpMode::Exact, ESchemaJumpMode::Canonical};
+	const ESchemaJumpMode Modes[] = {ESchemaJumpMode::Off, ESchemaJumpMode::Exact};
 	for (ESchemaJumpMode M : Modes)
 	{
 		FDraftTableStore Store;

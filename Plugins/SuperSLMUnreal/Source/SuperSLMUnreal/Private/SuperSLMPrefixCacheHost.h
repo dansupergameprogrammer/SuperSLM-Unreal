@@ -28,6 +28,7 @@
 #include "Containers/Queue.h"
 #include "Core/SuperSLMBuildSlicing.h"
 #include "Core/SuperSLMPrefixCacheCore.h"
+#include "Core/SuperSLMPrefixSetCore.h"
 #include "HAL/CriticalSection.h"
 #include "superslm/sslm_abi.h"
 #include "SuperSLMSequenceTypes.h"
@@ -115,9 +116,34 @@ struct FSuperSLMPrefixLaneJob
 	// and on a GPU build. bBuildChunk: this job is one of its chunk jobs.
 	TSharedPtr<FSuperSLMCpuBuildRun, ESPMode::ThreadSafe> BuildRun;
 	bool bBuildChunk = false;
+
+	// A GPU build (precache U6, Q7): the build runs in steps, each its own submission-thread job under the row-21 bound,
+	// so frame-path jobs run between them. MoreSteps (read on the game thread after a step's delivery) says another step
+	// is owed: the glue posts Run again instead of delivering. AbortSteps (on the submission thread) ends the build where it
+	// is, releasing what it began, and writes a failed completion. Both null on every other job.
+	TFunction<bool()> MoreSteps;
+	TFunction<void(SuperSLMCore::FPrefixCompletion* Out)> AbortSteps;
 };
 
 class USuperSLMPrefixSet;
+
+// A cooked prefix set as the cooked tier registers it (§5.8): the set's path name, its model's artifact hash (zeros
+// when there is none or its header does not read), and its entries and builds as the core's types. A copy, so the
+// asset may unload or be collected after it is made.
+struct FSuperSLMCookedSetSource
+{
+	FString Path;
+	std::array<uint8_t, 32> ModelHash{};
+	std::vector<SuperSLMCore::FPrefixSetEntry> Entries;
+	std::vector<SuperSLMCore::FPrefixSetBuild> Builds;
+};
+
+// USuperSLMGpuSubsystem::RegisterPrefixSet()'s copies, by path name. The GPU cache host belongs to one configuration,
+// so the subsystem keeps these and registers each with every configuration's host (step U7).
+struct FSuperSLMGpuCookedSources
+{
+	TMap<FString, FSuperSLMCookedSetSource> ByPath;
+};
 
 class FSuperSLMPrefixCacheHost
 {
@@ -136,11 +162,15 @@ public:
 	bool Return(const FSuperSLMPrefix& Lease);
 	ESuperSLMPrefixSource GetSource(const FSuperSLMPrefix& Lease) const;
 	ESuperSLMPrefixLeaseState GetLeaseState(const FSuperSLMPrefix& Lease) const;
+	bool IsCancelledWhilePending(const FSuperSLMPrefix& Lease) const;
 	FSuperSLMPrefixCacheStats GetStats() const;
 	// Explicit residency control (§5.6, rev 1.18). The op table is the core's, which outlives configurations.
 	bool Warm(const FSuperSLMPrefixSpec& Spec, FSuperSLMPrefixOp& OutOp, FString& OutError);
 	bool Drop(const FSuperSLMPrefixSpec& Spec, ESuperSLMPrefixDropScope Scope, FSuperSLMPrefixOp& OutOp, FString& OutError);
 	bool GetOpResult(const FSuperSLMPrefixOp& Op, FSuperSLMPrefixOpResult& Out) const;
+	// The core's op-id carry (the GPU host is one per configuration; see FSuperSLMPrefixCacheCore::CarryOpIdsFrom).
+	uint64 PeekNextOpId() const;
+	void CarryOpIdsFrom(uint64 NextOpId);
 
 	// ReleasePrefix's refusal: true (refuse) for any handle this cache minted.
 	bool RefuseRelease(const FSuperSLMPrefix& Prefix, FString& OutError);
@@ -153,19 +183,36 @@ public:
 	EAdoptLookup BeginAdopt(const FSuperSLMPrefix& Prefix, sslm_prefix& OutHandle, uint64& OutToken, uint64& OutEntryId, FString& OutError);
 	void EndAdopt(uint64 Token);
 
-	// ---- The cooked tier (§5.3 item 2, §5.8; step U3), game thread ----
-	// Registers Set's entries with the core's cooked tier: the build that serves this CPU subsystem
-	// and each of its entries with readable bytes (SelectPrefixSetBuild, PrefixSetRegistrations). A
-	// set with no CPU build, and an entry the build left empty, register nothing: those requests
-	// recompute. The bytes are copied, so the asset may unload. Registering a set again replaces its
-	// earlier registration (a rebuilt set). Registrations outlive Configure(), as the core's do, but each
-	// Configure() checks every registered set's model against the model it names (§5.8, rev 1.18.5): a set
-	// registered before the first Configure(), and a set a re-Configure() to another model no longer
-	// matches, is unregistered with PrefixSetModelMismatch, once. Returns how many entries registered.
+	// ---- The cooked tier (§5.3 item 2, §5.8; steps U3, U7), game thread ----
+	// Registers a set's entries with the core's cooked tier: the build that serves this cache's own producer, its
+	// configured identity (SelectPrefixSetBuild: any CPU build on the CPU; on the GPU only a build of this adapter's
+	// exact vendor and device), and each of its entries with readable bytes (PrefixSetRegistrations). A set with no
+	// build for this producer (one Log line), and an entry the build left empty, register nothing: those requests
+	// recompute. The bytes are copied, so the asset may unload. Registering a set again replaces its earlier
+	// registration (a rebuilt set). Registrations outlive Configure(), as the core's do, but each Configure() checks
+	// every registered set's model against the model it names (§5.8, rev 1.18.5): a set registered before the first
+	// Configure(), and a set a re-Configure() to another model no longer matches, is unregistered with
+	// PrefixSetModelMismatch, once. Before the first Configure() the identity is the default (the CPU's): only the
+	// CPU host, which outlives its configurations, registers then; the GPU subsystem keeps its sets' sources and
+	// registers them once its host is configured. Returns how many entries registered.
+	enum class ECookedRegistration : uint8
+	{
+		Registered,    // the set's model matches (or nothing is configured yet) and this producer has a build
+		ModelMismatch, // refused by name, PrefixSetModelMismatch (logged once, by the core)
+		NoBuild,       // no build serves this producer (logged once, here)
+	};
+	// The copy RegisterCookedSource() registers: the set's path, model hash, entries and builds.
+	static FSuperSLMCookedSetSource MakeCookedSetSource(const USuperSLMPrefixSet& Set);
 	int32 RegisterCookedSet(const USuperSLMPrefixSet& Set);
+	int32 RegisterCookedSource(const FSuperSLMCookedSetSource& Source, ECookedRegistration& OutOutcome);
 	void UnregisterCookedSet(const USuperSLMPrefixSet& Set);
+	void UnregisterCookedPath(const FString& SetPath);
 	int32 CookedEntriesRegistered() const;
 	bool IsCoreConfigured() const { return Core().IsConfigured(); }
+	// The engine identity this cache keys by (backend, adapter ids, Layer-1 pin, the model's artifact hash), and
+	// whether its disk tier is on: the configured values (defaults before the first Configure()).
+	const SuperSLMCore::FPrefixEngineIdentity& GetIdentity() const { return Config.Identity; }
+	bool IsDiskEnabled() const { return Config.bDiskEnabled; }
 
 	// ---- The executor, game thread ----
 	// Applies every completion that has arrived, then takes the core's commands and starts them.
@@ -300,7 +347,35 @@ public:
 		// re-Configure(): chunk jobs issued at a delivery under a teardown (must stay 0), and unfrozen builds the
 		// teardown released (each exactly once).
 		std::atomic<int32> ChunkHoldAfter{-1};
-		TMap<uint64, int32> ChunkJobsByEntry;
+		TMap<uint64, int32> ChunkJobsByEntry; // guarded by BuildStateGuard (the GPU host counts on the submission thread)
+		// The GPU busy-release substitution (cell 5.15's GPU legs): the next this-many releases return SSLM_BUSY and call
+		// nothing.
+		std::atomic<int32> GpuBusyReleases{0};
+		// The GPU release-status substitution (cell 5.15's non-busy leg): the real release runs, then this GPU status is
+		// returned in place of its own; 0 (SSLM_OK) when off.
+		std::atomic<int32> GpuSubstitutedReleaseStatus{0};
+		// The GPU cache build's begin-status substitution (cells 3.5, 5.5): one-shot; the next build's begin is not
+		// called and this GPU status is its result (0: off).
+		std::atomic<int32> GpuNextBuildBeginStatus{0};
+		// The GPU cache restore hold (cell 1.7's restore legs): while set, a restore job calls nothing and is posted
+		// again; HeldRestores counts the restores stopped at it now.
+		std::atomic<bool> bGpuRestoreHold{false};
+		std::atomic<int32> HeldRestores{0};
+		// The pool-thread holds on a drop's delete and on the trim (§8; cell 3.10 (ii), (iii) and the trim race; read
+		// through the GPU seams): a drop's delete (a RemoveDiskFile carrying an op) stops after it is taken, inside the
+		// delete/trim exclusion and the per-key overlap counter, before it touches the file; a trim stops after it is
+		// taken, inside the exclusion, before it lists the directory. Both yield to teardown (ReleaseTestHolds).
+		// DropDeletesRun: drop deletes that went past the hold to the file API. Never reset.
+		std::atomic<bool> bHoldDropDeletes{false};
+		std::atomic<int32> HeldDropDeletes{0};
+		std::atomic<bool> bHoldTrims{false};
+		std::atomic<int32> HeldTrims{0};
+		std::atomic<int64> DropDeletesRun{0};
+		// The GPU save hold (cell 3.10 (v); the U2 review's delete-behind-save on the GPU): while set, a cache save job
+		// calls nothing and is posted again; HeldSaves counts the saves stopped at it now. A held save the teardown
+		// finds is delivered Skipped (no engine call).
+		std::atomic<bool> bGpuSaveHold{false};
+		std::atomic<int32> HeldSaves{0};
 		int64 ChunkJobsIssuedInTeardown = 0;
 		int64 UnfrozenBuildReleases = 0;
 	};
@@ -314,6 +389,8 @@ public:
 	// The same, keyed as an instance on another adapter would key it (the GPU instance's AdapterKey cell).
 	FString DiskFileOfWithAdapter(const FSuperSLMPrefixSpec& Spec, uint32 VendorId, uint32 DeviceId) const;
 	const SuperSLMCore::FPrefixCacheConfig& ConfigForTest() const { return Config; }
+	// Registered cooked entries whose bytes the engine refused (marked stale by the core: never tried again).
+	int32 StaleCookedEntries() const;
 	uint64 EngineHandleOf(const FSuperSLMPrefix& Lease);
 	bool OffGameThreadAssertTrips();
 	bool GameThreadAccessorTrips();
@@ -448,6 +525,8 @@ public:
 	void EnterDiskExclusion();
 	void LeaveDiskExclusion() { Test.DiskExclusion.fetch_sub(1); }
 	void PassDiskReadHold();
+	void PassDropDeleteHold();
+	void PassTrimHold();
 	void EnterKeyDisk(const SuperSLMCore::FPrefixKey& Key);
 	void LeaveKeyDisk(const SuperSLMCore::FPrefixKey& Key);
 	bool ParkHeldHash(const SuperSLMCore::FPrefixCommand& Command, const SuperSLMCore::FPrefixCompletion& Out);

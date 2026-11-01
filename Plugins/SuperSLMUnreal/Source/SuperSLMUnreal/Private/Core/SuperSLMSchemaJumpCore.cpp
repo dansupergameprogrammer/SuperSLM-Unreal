@@ -267,7 +267,7 @@ namespace SuperSLMCore
 		}
 		if (Text[0] == '1' && Text[1] == '\0')
 		{
-			OutMode = ESchemaJumpMode::Canonical;
+			OutMode = ESchemaJumpMode::Exact; // plugin 1.4 (multi-row ruling 39 Q7): 1 is Exact, the new numbering
 			return true;
 		}
 		if (EqualsIgnoringCase(Text, "off"))
@@ -280,12 +280,19 @@ namespace SuperSLMCore
 			OutMode = ESchemaJumpMode::Exact;
 			return true;
 		}
-		if (EqualsIgnoringCase(Text, "canonical"))
+		if (IsRemovedCanonicalSwitchValue(Text))
 		{
-			OutMode = ESchemaJumpMode::Canonical;
-			return true;
+			// Plugin 1.4 (errata E-11 (e); multi-row ruling 39 Q7): Canonical was removed. Refused, and the mode
+			// falls back to Off; the caller logs that Canonical was removed in 1.4.
+			OutMode = ESchemaJumpMode::Off;
+			return false;
 		}
 		return false;
+	}
+
+	bool IsRemovedCanonicalSwitchValue(const char* Text)
+	{
+		return Text != nullptr && (EqualsIgnoringCase(Text, "canonical") || (Text[0] == '2' && Text[1] == '\0'));
 	}
 
 	bool IsThreadedDecodeEffective(bool bParallelDecodeRequested, int32_t FinishParallelTasks)
@@ -640,7 +647,8 @@ namespace SuperSLMCore
 	void FDraftTableStore::OnGenerationFinished(const FDraftTableKey& Key, ESchemaJumpMode Mode, bool bEndedAccepting,
 		const ISchemaAutomaton& Automaton, const int32_t* Tokens, size_t TokenCount)
 	{
-		if (Mode == ESchemaJumpMode::Canonical || !bEndedAccepting)
+		(void)Mode; // Off and Exact both learn (plugin 1.4: Canonical, which never did, is removed)
+		if (!bEndedAccepting)
 		{
 			return;
 		}
@@ -684,15 +692,6 @@ namespace SuperSLMCore
 		{
 			return EJumpNextJob::Decode;
 		}
-		if (Facts.Mode == ESchemaJumpMode::Canonical)
-		{
-			// The drain rule (§5.6): span until the chain reports 0 or a call returns non-OK.
-			if (Facts.bLastJobWasSpan && Facts.bLastSpanFailed)
-			{
-				return EJumpNextJob::Decode;
-			}
-			return Facts.ForcedChainLength > 0 ? EJumpNextJob::Span : EJumpNextJob::Decode;
-		}
 		// Exact (§6 P1-X loop): one span job after a decode job that left a pending token at a forced
 		// state, when the learned draft is non-empty; never two in a row.
 		if (Facts.bLastJobWasSpan)
@@ -706,14 +705,6 @@ namespace SuperSLMCore
 	bool MayJoinDecodeBatch(const FJumpSequenceFacts& Facts)
 	{
 		return NextJob(Facts) == EJumpNextJob::Decode;
-	}
-
-	int32_t CanonicalSpanChunkBudget(const FJumpSequenceFacts& Facts, int32_t MaxPrefillChunkBudget)
-	{
-		const int32_t Pending = Facts.bPendingToken ? 1 : 0;
-		const int32_t Forced = std::max(0, std::min(Facts.ForcedChainLength, Facts.RemainingAllowance));
-		const int32_t Budget = std::min(Pending + Forced, MaxPrefillChunkBudget);
-		return Budget - Pending > 0 ? Budget : 0;
 	}
 
 	// --- A span's result on the tracked walk (rev 1.3.6, §6 P1-X "The walk"; P1X.12 (f); XD10) ---

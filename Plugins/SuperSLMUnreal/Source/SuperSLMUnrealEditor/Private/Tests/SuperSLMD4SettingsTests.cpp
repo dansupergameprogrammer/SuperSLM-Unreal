@@ -652,6 +652,7 @@ namespace SuperSLMD4SettingsTests
 						bWritten &= ParseDouble(S->Keys.FindRef(Field), V);
 						Saved.Add(Field, V);
 					}
+					AddWrittenPerChunk(*S, Saved);
 				}
 			}
 		}

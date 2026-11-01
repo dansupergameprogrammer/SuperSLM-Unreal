@@ -4,6 +4,129 @@ All notable changes to SuperSLM-Unreal are recorded here. Versions follow the `V
 `Plugins/SuperSLMUnreal/SuperSLMUnreal.uplugin`. The plugin versions independently of SuperSLM; each entry
 names the SuperSLM release it vendors.
 
+## 1.4.0 - 2026-11-01
+
+**Vendored SuperSLM:** `v1.18.1` (`c3c14b16690a0c0c54de781f6f30380d88e62bd1`), up from `v1.15.0`.
+
+**Saves:** a save made by 1.3.0 is refused by 1.4.0 with `Layer1Mismatch`, and the reverse, because the vendored
+SuperSLM release changed. A cached prefix written by 1.3.0 counts as a miss and is rebuilt by prefill. Rebuild your
+prefix sets.
+
+### Added
+
+- **Multi-row GPU decoding** (`FSuperSLMGpuRuntimeConfig::bGpuMultiRow`, on by default). The GPU backend reads up to
+  eight prompt tokens per pass through SuperSLM 1.18.0's multi-row verbs, on both paths (one-call and composed). Each
+  pass is sliced by layers so the plan keeps each frame within the GPU frame budget (`SchemaJumpGpuFrameBudgetMs`; by
+  default, one token's GPU cost). The plan comes from the configuration, the vendored cost table and the cost measured
+  when the model loads; it never times the generations themselves. The tokens are the same as one token at a time. `bGpuMultiRow = false`
+  restores 1.3.0's GPU scheduling.
+  - `FSuperSLMGpuRuntimeConfig` gains `SchemaJumpGpuFrameBudgetMs` (0, the default: one token's GPU cost per frame),
+    `GpuRowCostMs`, `SceneGpuShareMs`, `NominalTickMs`, `GpuRowsMarginPerMille` (default 150) and `bGpuMultiRow`; a
+    bad value is refused with `InvalidSchemaJumpBudget`. A budget too small for one token is accepted and warned.
+  - Trace counters `SuperSLM/GPU/RowsPerChunk`, `RowsSliceMs`, `HostFinishUs`, `ExactFellBackToOff` and
+    `ExactStepFellBack`.
+  - With the budget below one token's cost, one-token passes are sliced by layers on both paths, so the plan keeps
+    each frame within it.
+- **`Exact` on the GPU backend.** On the one-call path with multi-row on, a schema-bound `Exact` generation checks
+  its guesses in one multi-row pass: the schema's forced text, then the guesses the CPU backend learns. A step with
+  no guess, or whose check cannot start, runs as `Off`'s step. Its tokens and saves equal `Off`'s. On the composed
+  path or with multi-row off, `Exact` runs as `Off`. It also runs as `Off`, logged once per session, when the model
+  is mapped without its device-resident logits head, or when no pass of 2 to 8 tokens fits the budget with the
+  logits stage (counted in `ExactFellBackToOff`). The learned guesses are the CPU backend's: they exist only when the
+  CPU backend is configured with the same model and has finished generations of that schema. GPU generations do not
+  add to them, so without them GPU `Exact` proposes only the schema's forced text.
+- **Saves:** a save taken while a multi-row pass is open abandons it, so the blob holds the sequence as it stood
+  before that pass, and feeds its tokens again after the save. GPU saves stay version 1.
+- **After a schema dead end** the GPU sequence can begin a new generation with an empty prompt, as on the CPU, and a
+  restore in dedicated mode reads that state from the saved sequence.
+- **The GPU cost of a token is measured when a model loads** (`FSuperSLMGpuRuntimeConfig::GpuRowCostMs`, now 0 by
+  default, meaning "measure it"; a value above 0 is your own price and wins). `Configure()` times a few tokens on a
+  throwaway sequence on the player's GPU, once per model, GPU and logits-head placement in the process. It drops a
+  timing far slower than the others and re-takes it. With a frame budget set, the measurement runs a slice per frame
+  within the budget, and the first generation waits for it. Without one, it runs inside `Configure()`. A failure, a
+  timeout or an implausible result falls back to 6.2 ms with one warning, and never refuses the model. A lost device
+  makes `Configure()` return `DeviceUnavailable`. `bCalibrateGpuRowCost = false` skips it (6.2 ms).
+  `USuperSLMGpuSubsystem::GetGpuRowCostMs()` reads the cost in use, and the trace counter
+  `SuperSLM/GPU/CalibratedGpuRowCostUs` records it.
+- **Later tokens are priced higher.** A token's GPU time grows with its position. With a frame budget set, the plugin
+  times a second, later position in the frame time the generations leave free, and prices each slice at its position,
+  so the price keeps up as a reply grows. Until then it assumes a small default growth.
+- **The end of a token is priced on its own.** The slice that finishes a token also computes its output scores. That
+  cost is measured and priced separately, so the plan can keep that slice within the budget.
+- **The widened GPU kernels are warmed at load,** within the budget, so their first-use cost is paid there rather than
+  in a frame of play. A kernel that does not fit the budget is skipped, with a log line.
+- **Stall diagnosis:** a sequence that has work but gets none done for 600 frames logs one warning with its planner
+  state.
+- **Warnings:** a forced-token or multi-row embed failure that falls back now logs a warning naming the GPU status, and
+  the below-one-token warning says that one-token passes are sliced, and how many layers per frame.
+- **The prefix cache on the GPU backend** (Windows x64, pooled sequences). `USuperSLMGpuSubsystem`'s cache calls
+  (`ConfigurePrefixCache`, `RequestPrefix`, `ReturnPrefix`, `GetPrefixSource`, `GetPrefixLeaseState`,
+  `GetPrefixCacheStats`) are now connected to its scheduler, and it gains the CPU cache's residency calls
+  (`WarmPrefix`, `DropPrefix`, `GetPrefixOpResult`). Call `ConfigurePrefixCache` with `BudgetBytes` above 0
+  before `Configure()` with `SequenceBudget` above 0, then adopt a Ready lease with
+  `RequestAdoptPrefix(Sequence, Prefix)`. The cache serves a prefix from memory, then from disk (with `bDiskEnabled`),
+  and builds it by prefill only when neither has it. It is keyed by the vendor and device of the GPU SuperSLM runs
+  on (read from that adapter, not from the engine's renderer, so `-nullrhi` and two-GPU machines key correctly), so a
+  disk entry written on another GPU is a miss. It can hold a nested prefix on its parent's pages. The cache's memory is its own
+  region of the GPU page pool, sized from `BudgetBytes`, so the pool grows by that much. A build runs as a series of
+  short jobs on the GPU submission thread, so frames keep running while it builds. `ReleasePrefix` refuses a cache
+  lease: end it with `ReturnPrefix`. A Ready lease is also a sharing hint for `RequestRestoreSequence`. A budget with a dedicated configuration (`SequenceBudget` 0) installs no cache,
+  and `RequestPrefix` then refuses `NotConfigured: PrefixCacheRequiresPooled`. After the GPU device is lost the cache
+  serves nothing more, and requests refuse `DeviceUnavailable` until the next `Configure()`.
+- **Cooked prefix sets on the GPU, per device.** A GPU entry serves only the GPU vendor and device that built it.
+  Entries are matched by GPU vendor and device id; cards that share a device id (for example the RX 7900 XT and
+  XTX) share entries. Determinism on the GPU is per device, so a card that shares an id with the one that built the
+  entry is served it, but is not certified to match its own prefill byte for byte.
+  - `USuperSLMGpuSubsystem::RegisterPrefixSet` and `UnregisterPrefixSet` (C++ only; there are no Blueprint nodes for
+    them) register a set with the GPU cache's cooked tier. The subsystem keeps a copy of each registered set, so the
+    asset may unload, and registers it again with every `Configure()` that installs a GPU cache; a set registered
+    before the first `Configure()` is kept until then. A set built for another model is refused by name, once, and
+    forgotten: register it again after configuring its model.
+  - The editor's **Build Prefixes** action now builds this editor's GPU's entries beside the CPU entries and stores
+    both together. It configures a GPU of its own for the build, so it leaves the GPU entries unbuilt, and says why,
+    while Play In Editor or the query window has a GPU configured; the CPU entries are still built. Each GPU entry is
+    checked to name the device it is stored under before it is stored.
+  - A GPU with no build of its own exact vendor and device registers nothing from the set (one log line) and builds
+    every entry by prefill, as does an entry whose bytes SuperSLM refuses.
+  - The `SuperSLMBuildPrefixes` commandlet builds the GPU entries too, and takes `-NoGpu` (CPU entries only),
+    `-RequireGpu` (exit 1 when the GPU entries were not built) and `-ExpectGpuDevice=0x1002:0x744C` (build GPU entries
+    only on that vendor and device; implies `-RequireGpu`).
+  - Certified on the AMD Radeon RX 7900 XT. Build a set's GPU entries on each GPU model you ship to: a player's GPU
+    with no entry of its own builds the prefixes by prefill.
+
+### Removed
+
+- **`Canonical`** (`ESuperSLMSchemaJumpForward::Canonical`, value 2), removed from SuperSLM 1.18.0. C++ that names
+  `ESuperSLMSchemaJumpForward::Canonical` no longer compiles: use `Exact`, which keeps `Off`'s tokens, or `Off`. A
+  value of 2 reaching the plugin runs as `Off`. The example's `-SuperSLMExampleJumpForward=canonical` (or `2`) runs
+  `Off`, with a warning that says Canonical was removed.
+
+### Certified hardware
+
+- **AMD Radeon RX 7900 XT:** every build passed, and the automated suite passed apart from one timing check on the 1.5B
+  model and ten cells that need an idle machine, recorded reference outputs, model checkpoints or a rendering run.
+  26 of 28 frame-timing lines held the budget at the 99th percentile (the two misses are the known issue below).
+- **The GPU prefix cache in a packaged game** (Windows x64 Development build of the example, RX 7900 XT, 0.5B model):
+  10 cooked 128-token prefixes all served from the cooked set with no prefill and the same tokens as building them;
+  at a budget of five, the five evicted came back from the cooked set when the level was entered again; with the
+  disk tier on, a second run served all 10 from disk with the same tokens. The game thread's time in the GPU
+  backend's tick was at most 0.18 ms per frame.
+- **NVIDIA RTX 5060:** the multi-row kernels gave the same tokens as SuperSLM's reference on every check (SuperSLM
+  1.17.0 fixed the RTX 50-series results). Its timing is not certified.
+- GPU frame timing is measured and reported, not certified to the frame.
+
+### Known issues
+
+- **The GPU cache's calls are C++ only.** `USuperSLMGpuSubsystem` has no Blueprint cache or prefix set nodes.
+- **On a card that slows down under sustained load, a 2 ms budget can run over for a stretch of frames.** In
+  certification two 2 ms setups ran consecutive frames at 2.0 to 2.6 ms while the card ran slow (99th-percentile
+  frames 2.05 and 2.38 ms) and delivered 12 to 12.5 tokens per second against 18 to 21 normally. Larger budgets were
+  not affected.
+- **`Exact` on the GPU can be slower than `Off`.** With mixed one-call and composed agents at the default budget (0.5B
+  model, AMD Radeon RX 7900 XT, four agents, 84 tokens), `Exact` delivered 20.1 tokens per second against `Off`'s
+  24.0. Its tokens are always `Off`'s; measure it in your
+  game.
+
 ## 1.3.0 - 2026-10-24
 
 **Vendored SuperSLM:** `v1.15.0` (`165962acafe901753dfe37153d7116b132a18b5a`), up from `v1.13.1`.

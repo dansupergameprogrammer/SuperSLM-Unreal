@@ -4,21 +4,21 @@
 // §5.6, §5.10.5, §5.10.6, §5.10.8; §17.11): the policy that needs no engine.
 //
 // What it owns:
-//   - the three-way setting, Off | Exact | Canonical, default Off (the ruling of
-//     2026-10-20 16:23Z: both modes are plain options), and the example's scratch switch values;
+//   - the setting, Off | Exact, default Off (the ruling of 2026-10-20 16:23Z: a plain option; plugin 1.4 removes
+//     Canonical, errata E-11 (e), multi-row ruling 39 Q7 and Q10), and the example's scratch switch values;
 //   - the effective threaded-decode predicate and the exact-mode draft cap it implies (§5.10.6,
 //     P1X.7; threaded decode is an opt-in, 16:24Z);
 //   - the learned draft, D2-online (§5.10.5, §6 P1-X): a per-(model, schema) count table, walk
 //     state -> token -> count, filled from finished generations that ended accepting (Off and
-//     Exact; never Canonical), learning only at states observed forced, at most 4 tokens per state
+//     Exact), learning only at states observed forced, at most 4 tokens per state
 //     with every token counted in the state's total, read as an immutable snapshot, replaced by
 //     pointer on the game thread, dropped at model unmap; and the draft it yields, gated at a share
 //     product of 0.5, the lowest token id on a tie, stopped at the first state the table does not
 //     hold, clipped to the span budget;
 //   - forcedness as the plugin observes it (rev 1.3.5): sslm_seq_forced_tokens (cap 0) read before
 //     the first decode job and after every decode and span job, recorded per walk state;
-//   - the span-after-decode loop's decisions (§6 P1 drain rule, P1-X loop): which job a sequence
-//     takes next, whether it may join a decode batch, and the canonical span's chunk budget.
+//   - the span-after-decode loop's decisions (§6 P1-X loop): which job a sequence
+//     takes next and whether it may join a decode batch.
 //
 // It never calls Layer 1. The automaton it walks is supplied by the caller (ISchemaAutomaton): the
 // transitions are SCM1's, which the subsystem reads itself (the ABI has no walk-state query), and
@@ -41,19 +41,24 @@ namespace SuperSLMCore
 {
 	// --- The setting (§6 P1-X) ---
 
-	// SchemaJumpForward. Value-initialised, it is Off.
+	// SchemaJumpForward. Value-initialised, it is Off. Plugin 1.4 removes Canonical (errata E-11 (e)); Off and Exact
+	// keep their numbers, so an old project's Canonical (2) is no enumerator and falls back to Off (ruling 39 Q10).
 	enum class ESchemaJumpMode : uint8_t
 	{
 		Off = 0,
 		Exact = 1,
-		Canonical = 2,
 	};
 
-	// The example's scratch switch value (§6 P1, P1-X; cell P1.9): -SuperSLMExampleJumpForward=0|1
-	// from P1 (0 Off, 1 Canonical) and off|exact|canonical from P1-X, the names in any case.
-	// Returns true and sets OutMode for one of those. Returns false and leaves OutMode unchanged for
-	// anything else: empty or padded text, another number, a null Text. The caller logs the refusal.
+	// The example's scratch switch value (§6 P1, P1-X; cell P1.9; plugin 1.4, multi-row ruling 39 Q7):
+	// -SuperSLMExampleJumpForward=0|1 (0 Off, 1 Exact) or off|exact, the names in any case. Returns true and sets
+	// OutMode for one of those. `canonical` in any case, and `2`, are refused: false, with OutMode set to Off
+	// (Canonical was removed in 1.4; the caller logs that). Anything else (empty or padded text, another number, a
+	// null Text) returns false and leaves OutMode unchanged; the caller logs the refusal.
 	bool ParseSchemaJumpSwitch(const char* Text, ESchemaJumpMode& OutMode);
+
+	// True for a switch value that named Canonical before plugin 1.4: `canonical` in any case, or `2` (the refusal
+	// above that sets Off). A null Text is false.
+	bool IsRemovedCanonicalSwitchValue(const char* Text);
 
 	// --- Threaded decode (G24, §5.10.6) ---
 
@@ -280,9 +285,8 @@ namespace SuperSLMCore
 
 		// A CPU generation under Key's schema has ended: merge its stream into a new table and swap it
 		// in by pointer. Only the model's own, finished output is learned (rev 1.3.5): an Off or Exact
-		// generation that ended with the walk accepting feeds the table; a Canonical one never does
-		// (its forced tokens are not the model's), nor does one that did not end accepting (cut by
-		// MaxNewTokens, a fault, a cancel or a release). The GPU never calls this.
+		// generation that ended with the walk accepting feeds the table; one that did not end accepting
+		// (cut by MaxNewTokens, a fault, a cancel or a release) never does. The GPU never calls this.
 		void OnGenerationFinished(const FDraftTableKey& Key, ESchemaJumpMode Mode, bool bEndedAccepting,
 			const ISchemaAutomaton& Automaton, const int32_t* Tokens, size_t TokenCount);
 
@@ -333,9 +337,4 @@ namespace SuperSLMCore
 
 	// True exactly when NextJob(Facts) is Decode.
 	bool MayJoinDecodeBatch(const FJumpSequenceFacts& Facts);
-
-	// A canonical span job's chunk_budget: the pending token (if any) plus forced tokens, clipped
-	// to MaxPrefillChunkBudget and to the allowance (forced tokens count toward MaxNewTokens, §16
-	// Q12). 0 when no forced token fits.
-	int32_t CanonicalSpanChunkBudget(const FJumpSequenceFacts& Facts, int32_t MaxPrefillChunkBudget);
 }
