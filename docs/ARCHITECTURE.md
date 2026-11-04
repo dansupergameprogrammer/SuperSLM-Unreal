@@ -1,6 +1,6 @@
 # Architecture
 
-> **Status:** the implemented Windows x64 architecture as of 1.4.0. See [PAGING.md](PAGING.md) for
+> **Status:** the implemented Windows x64 architecture as of 1.5.1. See [PAGING.md](PAGING.md) for
 > the paging API, and [BLUEPRINT_API.md](BLUEPRINT_API.md) and [TOOLING.md](TOOLING.md).
 
 ---
@@ -54,7 +54,7 @@ The plugin compiles SuperSLM's sources with the engine's toolchain. It never lin
 SuperSLM library.
 
 - The library sources of one exact SuperSLM commit are vendored under
-  `Plugins/SuperSLMUnreal/Source/ThirdParty/SuperSLM/`; 1.5.0 vendors SuperSLM v1.19.0
+  `Plugins/SuperSLMUnreal/Source/ThirdParty/SuperSLM/`; 1.5.1 vendors SuperSLM v1.19.0
   (92ab95b760fdb6f24a27474c2a0e0f5f6be85568). `VENDORED_VERSION.txt` names the tag and its commit,
   and `VENDORED_MANIFEST.sha256` records each file's hash. Five route-P witness tool files carry
   a tracked hook-API adaptation described in `VENDORED_VERSION.txt`. The build reads the tag and commit from
@@ -377,7 +377,7 @@ the directory is trimmed to `PrefixDiskCacheMaxBytes` (256 MiB by default), olde
 that a crash left behind is removed at the next trim once it is an hour old. A re-`Configure()` empties the memory
 tier, and disk files stay. Registered prefix sets stay while the model stays the same: a `Configure()` of another model
 unregisters the sets built for a different one (logged `PrefixSetModelMismatch`), so register them again after
-configuring their model. In 1.4.0 the budget is set in C++: the **Load SuperSLM Model** node has no input for it.
+configuring their model. The budget is set in C++ (since 1.4.0): the **Load SuperSLM Model** node has no input for it.
 
 **Using it.** `RequestPrefix(Spec, OutPrefix, OutError)` takes a spec: the prefix's tokens, its schema name
 (`NAME_None` for none) and, for a nested prefix, its parent. It returns a lease at once. When `GetPrefixPhase` reads
@@ -452,7 +452,7 @@ defined by its token ids or by text, with an optional schema and an optional par
   another model or another SuperSLM build, or edited since its build. The game builds such an entry by prefill when
   it is requested. A text entry whose text or model changed ships with no ids and no bytes.
 - **Rebuild your sets whenever the plugin's vendored SuperSLM changes.**
-- In 1.4.0 a nested entry is not built; the build says so, and its requests are built by prefill.
+- A nested entry is not built (as in 1.4.0); the build says so, and its requests are built by prefill.
 - `RegisterPrefixSet(Set)` adds a set's entries to the cooked tier, and registering the set again after a rebuild
   replaces them. Only the build for the subsystem's own producer is used: any CPU build on the CPU, and on the GPU a
   build of that exact vendor and device. A set with no such build registers nothing (one log line), and its requests
@@ -483,7 +483,7 @@ defined by its token ids or by text, with an optional schema and an optional par
 Worker time is not frame time: the plugin spreads a long job over frames, and the game thread only hands jobs out and
 collects their results.
 
-**On the GPU (1.4.0, Windows x64).** `USuperSLMGpuSubsystem` has its own cache, for pooled sequences only. Call
+**On the GPU (from 1.4.0, Windows x64).** `USuperSLMGpuSubsystem` has its own cache, for pooled sequences only. Call
 `ConfigurePrefixCache(Settings)` with `Settings.BudgetBytes` above 0, then `Configure()` with `SequenceBudget` above 0.
 The cache's memory is its own region of the GPU page pool, sized from the budget, and the pool grows by that much. A
 budget with a dedicated configuration (`SequenceBudget` 0) installs no cache, and `RequestPrefix` refuses

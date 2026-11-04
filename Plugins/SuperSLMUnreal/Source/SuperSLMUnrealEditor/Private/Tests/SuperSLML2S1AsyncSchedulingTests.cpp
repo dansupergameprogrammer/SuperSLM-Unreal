@@ -5,7 +5,8 @@
 // R-S1g -- "The game thread's own Tick() cost -- Plan plus Apply, no Layer-1 call -- stays within
 //   a bound independent of this fold's own readings" (D-SLM7407/D-SLM7410). A-EX, R-S1b's own
 //   8-sequence shape, SuperSLM.Tick.Plan/.Apply scope durations read from the game thread only.
-//   Asserted: the summed Plan+Apply duration stays under 1 ms PER TICK -- the 1 ms bound's own
+//   Asserted: the p99 of the summed Plan+Apply duration stays under 1 ms (1.5.1: timing is graded on
+//   the p99; the worst tick and the count at or over 1 ms are reported, not graded) -- the 1 ms bound's own
 //   provenance is independent of this cell's own reading (a bound must not come from the reading it grades): T-2815 §12.1's
 //   diagnosis of the round-3/4 overrun cause measured the synchronous build's non-Layer-1-call
 //   tick overhead at "microseconds" on this box, in an investigation run for a different defect,
@@ -1236,20 +1237,44 @@ bool FSuperSLML2S1GameThreadTickCostBoundedTest::RunTest(const FString& Paramete
 	// "microseconds" on this same box, in an investigation run to find a different defect, not to
 	// justify this bound. 1 ms is roughly three orders of magnitude above that reading.
 	constexpr double kMaxTickCostMs = 1.0;
+	// 1.5.1 (project timing policy): the bound grades the p99 of Plan+Apply, nearest rank. An isolated spike -- a tester
+	// saw one tick of 14.7 ms on a busy laptop and one of 1.55 ms on a quiet one, in about 1,900 ticks, once in Plan and
+	// once in Apply: the OS preempting the game thread -- is reported, not failed.
+	constexpr double kTickCostPercentile = 0.99;
 	bool bOk = true;
 	double WorstDurationMs = 0.0;
+	int32 WorstTickIndex = INDEX_NONE;
+	double WorstPlanMs = 0.0;
+	double WorstApplyMs = 0.0;
+	int32 TicksAtOrOverBound = 0;
+	TArray<double> DurationsMs;
+	DurationsMs.Reserve(History.Num());
 	for (const FSuperSLMTickReport& Tick : History)
 	{
 		bOk &= TestTrue(*FString::Printf(TEXT("tick %d: DurationMs must equal PlanMs + ApplyMs (Plan %.6f ms, Apply %.6f ms, Duration %.6f ms)"),
 				Tick.TickIndex, Tick.PlanMs, Tick.ApplyMs, Tick.DurationMs),
 			FMath::IsNearlyEqual(Tick.DurationMs, Tick.PlanMs + Tick.ApplyMs, 1e-6));
-		bOk &= TestTrue(*FString::Printf(TEXT("tick %d: Plan+Apply must stay under %.3f ms (got %.6f ms: Plan %.6f ms, Apply %.6f ms) -- never a Layer-1 call cost"),
-				Tick.TickIndex, kMaxTickCostMs, Tick.DurationMs, Tick.PlanMs, Tick.ApplyMs),
-			Tick.DurationMs < kMaxTickCostMs);
-		WorstDurationMs = FMath::Max(WorstDurationMs, Tick.DurationMs);
+		DurationsMs.Add(Tick.DurationMs);
+		if (Tick.DurationMs >= kMaxTickCostMs)
+		{
+			++TicksAtOrOverBound;
+		}
+		if (WorstTickIndex == INDEX_NONE || Tick.DurationMs > WorstDurationMs)
+		{
+			WorstDurationMs = Tick.DurationMs;
+			WorstTickIndex = Tick.TickIndex;
+			WorstPlanMs = Tick.PlanMs;
+			WorstApplyMs = Tick.ApplyMs;
+		}
 	}
-	AddInfo(FString::Printf(TEXT("R-S1g: %d ticks, worst Plan+Apply duration %.6f ms (bound %.3f ms)"),
-		History.Num(), WorstDurationMs, kMaxTickCostMs));
+	DurationsMs.Sort();
+	const int32 P99Index = FMath::Clamp(FMath::CeilToInt(kTickCostPercentile * DurationsMs.Num()) - 1, 0, DurationsMs.Num() - 1);
+	const double P99DurationMs = DurationsMs[P99Index];
+	AddInfo(FString::Printf(TEXT("R-S1g: %d ticks, worst Plan+Apply duration %.6f ms (tick %d: Plan %.6f ms, Apply %.6f ms); %d tick(s) at or over %.3f ms (reported, not graded); p99 %.6f ms (bound %.3f ms)"),
+		History.Num(), WorstDurationMs, WorstTickIndex, WorstPlanMs, WorstApplyMs, TicksAtOrOverBound, kMaxTickCostMs, P99DurationMs, kMaxTickCostMs));
+	bOk &= TestTrue(*FString::Printf(TEXT("the p99 of Plan+Apply over %d ticks must stay under %.3f ms (got %.6f ms) -- never a Layer-1 call cost"),
+			History.Num(), kMaxTickCostMs, P99DurationMs),
+		P99DurationMs < kMaxTickCostMs);
 
 	return bOk;
 }

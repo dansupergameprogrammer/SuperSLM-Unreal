@@ -231,6 +231,20 @@ struct SUPERSLMUNREAL_API FSuperSLMGpuTestAccess
 	// Releases the held tick job; a no-op when nothing is held.
 	static void ReleaseHeldTickJob(USuperSLMGpuSubsystem& Gpu);
 
+	// --- 1.5.1: the row-21 bounds of the calls Configure() makes before it reports the backend
+	// configured (the first use of every decode-path pipeline). Game thread.
+
+	// The frame-path bound (kFramePathBoundSeconds) and the first-use bound's floor
+	// (kFirstUseBoundFloorSeconds), as the product declares them. Pure: needs no device.
+	static double GetFramePathBoundSeconds();
+	static double GetFirstUseBoundFloorSeconds();
+
+	// The bounds the configured state's Configure() gave its pool-and-warm-up job and its
+	// whole-token row-cost calibration jobs (0 when no calibration ran in Configure(): a game
+	// price, the default, a calibration reused from earlier in the process, or a sliced one).
+	// False, both 0, when Gpu is not configured.
+	static bool GetConfigureFirstUseBounds(const USuperSLMGpuSubsystem& Gpu, double& OutWarmUpBoundSeconds, double& OutCalibrationBoundSeconds);
+
 	// The result a GPU restore resolves when its Layer-1 step failed with Status
 	// (SuperSLMGpuStatusMapping::ToRestoreFailureResult(), the one function the restore itself
 	// calls). bSchemaCrossCheckFailed is the plugin's own schema cross-check after the restore.

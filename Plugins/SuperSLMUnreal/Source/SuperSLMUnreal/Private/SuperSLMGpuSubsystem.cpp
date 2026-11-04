@@ -310,6 +310,23 @@ namespace
 		return FMath::Max(kFramePathBoundSeconds, Derived);
 	}
 
+	// 1.5.1 (a tester's first launch after a fresh packaged build): the GPU calls Configure() makes
+	// before it reports the backend configured and that run the decode path for the first time --
+	// the pool-and-warm-up job (step 3 of PrepareGpuState()) and the whole-token row-cost
+	// calibration -- are where the engine builds its pipeline state objects. Layer 1 creates them
+	// lazily, on first dispatch (harness::GetOrBuildComposedPipeline() from the dispatch recording),
+	// and on a cold driver shader cache the driver compiles each one then: that report's warm-up
+	// took 21.5 s, over the 10 s frame-path bound, and Configure() was refused on a healthy device;
+	// the next six launches, cache warm, were fine. These calls take the load-time bound for the
+	// model's bytes, never below kFirstUseBoundFloorSeconds. Steady-state frame-path calls keep
+	// kFramePathBoundSeconds: by then every pipeline the decode path uses is built.
+	constexpr double kFirstUseBoundFloorSeconds = 60.0;
+
+	double FirstUseBoundSeconds(int64 Bytes)
+	{
+		return FMath::Max(kFirstUseBoundFloorSeconds, LoadTimeBoundSeconds(Bytes));
+	}
+
 	// Row 21 (D-SLM7762): the process-wide lock records its holder -- which subsystem state, which
 	// job, what kind of call, when it began and its bound -- so a game thread waiting on a job that
 	// cannot start because another subsystem's call holds the lock takes the device-loss path once
@@ -1776,6 +1793,8 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	bool bTickShortBatched = false;     // ruling 59.1: this tick's batch already holds its one short member
 	bool bColdHeldWork = false;         // ruling 59c point 7: the cold rule held work back this tick (what may empty a tick)
 	uint32 ConfigureWidenedMask = 0;    // run 5 (59c point 3): the widths (bit M) Configure()'s warm-up ran
+	double ConfigureWarmUpBoundSeconds = 0.0;      // 1.5.1: the bound Configure()'s pool-and-warm-up job ran under
+	double ConfigureCalibrationBoundSeconds = 0.0; // 1.5.1: the bound its whole-token calibration ran under (0: none ran)
 #if WITH_DEV_AUTOMATION_TESTS
 	TArray<TPair<int64, FIntVector4>> TestExactApplySamples; // 59d point 6: (sequence, (generated, next pos, bound, chunk open))
 #endif
@@ -11140,6 +11159,9 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 	//    Dedicated mode is unchanged: its warm sequences, then the warm-up.
 	if (bJobsFinished && Outcome->Result == ESuperSLMGpuConfigureResult::Success)
 	{
+		// 1.5.1: the first dispatch of every decode-path pipeline is here, so this job takes the first-use bound
+		// (FirstUseBoundSeconds()), not the frame-path one: on a cold driver shader cache the driver compiles them in it.
+		S->ConfigureWarmUpBoundSeconds = FirstUseBoundSeconds(S->DeclaredModelBytes);
 		bJobsFinished = S->RunSync([S, Outcome, KvBytesPerSequence, PageCountPerturbation, PoolCreateStatusOverride, WarmLimit]()
 		{
 			// Warm-up: one token embedded and driven to full depth on a scratch sequence builds
@@ -11376,7 +11398,7 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 					S->bAdapterIdsKnown = true;
 				}
 			}
-		});
+		}, TEXT("first-use call (pool and warm-up)"), S->ConfigureWarmUpBoundSeconds); // 1.5.1, row 21 (no LoadBytes: not a map rate)
 	}
 
 	if (bJobsFinished)
@@ -11508,7 +11530,10 @@ static FSuperSLMGpuConfigureReport PrepareGpuState(const SuperSLMRuntime::FModel
 					}
 					TSharedPtr<FJob> Job = MakeShared<FJob>();
 					Job->bTickJob = true; // so the per-tick GPU seam records it (test builds)
-					Job->CallKind = TEXT("load-time call (row-cost calibration)");
+					Job->CallKind = TEXT("first-use call (row-cost calibration)");
+					// 1.5.1: before Configure() reports the backend configured, so the first-use bound (FirstUseBoundSeconds()).
+					S->ConfigureCalibrationBoundSeconds = FirstUseBoundSeconds(S->DeclaredModelBytes);
+					Job->BoundSeconds = S->ConfigureCalibrationBoundSeconds;
 #if WITH_DEV_AUTOMATION_TESTS
 					Job->TestTick = S->TickIndex;
 #endif
@@ -13579,6 +13604,22 @@ FSuperSLMLayer1LayerLayout FSuperSLMGpuTestAccess::ComputeLayer1LayerLayout(uint
 	return Out;
 }
 
+// 1.5.1 (row 21): the bounds of Configure()'s first-use calls. Game thread.
+double FSuperSLMGpuTestAccess::GetFramePathBoundSeconds() { return kFramePathBoundSeconds; }
+double FSuperSLMGpuTestAccess::GetFirstUseBoundFloorSeconds() { return kFirstUseBoundFloorSeconds; }
+bool FSuperSLMGpuTestAccess::GetConfigureFirstUseBounds(const USuperSLMGpuSubsystem& Gpu, double& OutWarmUpBoundSeconds, double& OutCalibrationBoundSeconds)
+{
+	OutWarmUpBoundSeconds = 0.0;
+	OutCalibrationBoundSeconds = 0.0;
+	if (Gpu.State == nullptr)
+	{
+		return false;
+	}
+	OutWarmUpBoundSeconds = Gpu.State->ConfigureWarmUpBoundSeconds;
+	OutCalibrationBoundSeconds = Gpu.State->ConfigureCalibrationBoundSeconds;
+	return true;
+}
+
 // Ruling 2026-09-26 (plan §2.5 row 21, implementation items 12 and 13): the slowed device, the
 // event and plan logs, the outstanding-job counts, the hitch counters, the pending-event count and
 // the paced tick. Game thread.
@@ -15101,6 +15142,14 @@ bool FSuperSLMGpuTestAccess::LoadLayer1ModelFacts(const void*, int64, FSuperSLML
 }
 FSuperSLMLayer1LayerLayout FSuperSLMGpuTestAccess::ComputeLayer1LayerLayout(uint32, uint32, uint32, uint32, uint32, uint32) { return FSuperSLMLayer1LayerLayout(); }
 void FSuperSLMGpuTestAccess::SetSubmissionDelaySeconds(USuperSLMGpuSubsystem&, double) {}
+double FSuperSLMGpuTestAccess::GetFramePathBoundSeconds() { return 10.0; }
+double FSuperSLMGpuTestAccess::GetFirstUseBoundFloorSeconds() { return 60.0; }
+bool FSuperSLMGpuTestAccess::GetConfigureFirstUseBounds(const USuperSLMGpuSubsystem&, double& OutWarmUpBoundSeconds, double& OutCalibrationBoundSeconds)
+{
+	OutWarmUpBoundSeconds = 0.0;
+	OutCalibrationBoundSeconds = 0.0;
+	return false;
+}
 bool FSuperSLMGpuTestAccess::SetEventLogEnabled(USuperSLMGpuSubsystem&, bool) { return false; }
 TArray<FSuperSLMGpuEventLogEntry> FSuperSLMGpuTestAccess::GetEventLog(const USuperSLMGpuSubsystem&) { return TArray<FSuperSLMGpuEventLogEntry>(); }
 TArray<FSuperSLMGpuPlanLogEntry> FSuperSLMGpuTestAccess::GetPlanLog(const USuperSLMGpuSubsystem&) { return TArray<FSuperSLMGpuPlanLogEntry>(); }

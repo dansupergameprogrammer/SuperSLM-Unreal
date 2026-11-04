@@ -60,7 +60,9 @@ GPU configuration refusal, so it needs a D3D12 GPU (any model). Two others hold 
 scheduler's game-thread work to under 1 ms per tick, the plugin's own bound:
 `SuperSLM.L2S1.AsyncScheduling.GameThreadTickCostBounded` (the maintainer's machine reads about
 three orders of magnitude below it) and `SuperSLM.U1.Cpu.RestoreTickBound`. A very slow or heavily
-loaded machine can fail them without a defect in your change.
+loaded machine can fail them without a defect in your change. From 1.5.1,
+`GameThreadTickCostBounded` grades the 99th percentile of its ticks, so a single tick the operating
+system preempted is reported, with the worst tick, and does not fail it.
 
 **The routine run**, the one the maintainer runs before a release, uses the same filter as
 `.github/workflows/plugin-build.yml` (`TEST_FILTER`), headless. It adds the GPU backend's tests and

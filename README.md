@@ -8,10 +8,13 @@ the game thread, and gives the same answer to the same prompt every time.
 It needs no server, API key or internet connection. The model ships with your game as an Unreal
 asset, and the plugin schedules its work around your frame.
 
-> **Status: 1.4.** Released; built and tested on Windows x64. 1.4 reads prompts on the GPU several tokens
-> per pass and brings `Exact` skip-ahead to the GPU backend
-> ([Multi-row GPU passes](docs/ARCHITECTURE.md#multi-row-gpu-passes)), brings the prefix cache to the GPU
-> backend, and measures the GPU's cost per token when a model loads. `Canonical` skip-ahead is removed. 1.3 added a prefix cache with cooked prefix sets
+> **Status: 1.5.1.** Released; built and tested on Windows x64. 1.5.1 gives the GPU backend's first launch after
+> an install the time it needs to build its shaders. 1.5 moved to SuperSLM 1.19, added JSON arrays
+> to schemas, and made a schema-bound generation that finishes its JSON document end cleanly: it completes, and
+> `GetLastDecodeOutcome` reads `ESuperSLMDecodeOutcome::SchemaComplete`. 1.4 added reading prompts on the GPU several tokens
+> per pass and brought `Exact` skip-ahead to the GPU backend
+> ([Multi-row GPU passes](docs/ARCHITECTURE.md#multi-row-gpu-passes)), brought the prefix cache to the GPU
+> backend, measured the GPU's cost per token when a model loads, and removed `Canonical` skip-ahead. 1.3 added a prefix cache with cooked prefix sets
 > ([The prefix cache](docs/ARCHITECTURE.md#the-prefix-cache)) and skip-ahead for schema-bound generations
 > on the CPU backend ([Skip-ahead](docs/ARCHITECTURE.md#skip-ahead-for-schema-bound-generations)). 1.2 added an optional shared page pool for sequence memory
 > ([Paging](docs/PAGING.md)). Performance tuning is the
@@ -235,7 +238,7 @@ Measured with 1.2 in a packaged Development build of the example on one machine 
 three runs. The query reads 123 prompt tokens (41 for the order, 82 for the reply, which includes
 the order) and generates 35 (a 28-token JSON order, then a 7-token reply).
 
-This table is 1.2's. 1.3 and 1.4 have not been timed in this scene yet; what it changes is measured by
+This table is 1.2's. 1.3, 1.4 and 1.5 have not been timed in this scene yet; what it changes is measured by
 SuperSLM on the same CPU and model: schema-bound generation of the example order took 1,257 ms at
 1.2's engine and 921 ms at 1.3's, with the same tokens, timed in one session; a later session
 timed 1.3 at 897 ms with skip-ahead off and 604 ms with Exact (see

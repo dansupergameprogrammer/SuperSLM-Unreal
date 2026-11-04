@@ -165,7 +165,7 @@ Rules the surface keeps:
   the two enums keep the same numbering; no Blueprint node returns them (see the C++ results
   below).
 - **The decoding mode is not exposed**; the plugin uses greedy decoding.
-- **The prefix cache's budget and skip-ahead are C++ settings in 1.4.0.** The **Load SuperSLM Model** node has no
+- **The prefix cache's budget and skip-ahead are C++ settings** (since 1.4.0). The **Load SuperSLM Model** node has no
   cache input, so the cache nodes work once C++ has configured the cache; no Blueprint request carries
   `SchemaJumpForward`.
 - **No Blueprint text states GPU determinism.** In 1.0 the GPU verdict is always withheld: it
