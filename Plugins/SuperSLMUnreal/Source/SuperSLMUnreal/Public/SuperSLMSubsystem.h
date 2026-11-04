@@ -201,7 +201,8 @@ public:
 	// The outcome of Sequence's own most recent decode step (§5, §6) -- never a bare sentinel
 	// int outside this module. On a Faulted sequence it names only SchemaDeadEnd or
 	// SequenceNoLongerValid and reads Generating for every other fault; the fault's reason is
-	// logged (LogSuperSLM Warning "Sequence N faulted: <reason>"), not returned.
+	// logged (LogSuperSLM Warning "Sequence N faulted: <reason>"), not returned. A generation that
+	// ended at its schema's complete document is Complete and reads SchemaComplete.
 	ESuperSLMDecodeOutcome GetLastDecodeOutcome(const FSuperSLMSequence& Sequence) const;
 
 	// The copy delivered with this sequence's most recent job that changed it (reset, adopt,

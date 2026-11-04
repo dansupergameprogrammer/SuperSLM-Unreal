@@ -152,7 +152,7 @@ public class SuperSLMUnreal : ModuleRules
 		{
 			PublicDefinitions.Add("SUPERSLMUNREAL_WITH_GPU=1");
 			// Precache step U6 (plugin 1.4.0): the GPU prefix save and restore verbs, released by SuperSLM 1.16.0 and vendored at
-			// v1.18.1. Public, so the editor's GPU cache cells compile their save and restore legs too.
+			// v1.19.0. Public, so the editor's GPU cache cells compile their save and restore legs too.
 			PublicDefinitions.Add("SUPERSLM_WITH_GPU_PREFIX_SAVE=1");
 			// d3d12_harness.h and the GPU sources' own relative includes live here.
 			PrivateIncludePaths.Add(Path.Combine(ThirdPartyRoot(), "src", "gpu"));

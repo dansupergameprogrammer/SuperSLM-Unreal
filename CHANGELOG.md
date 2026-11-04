@@ -4,6 +4,53 @@ All notable changes to SuperSLM-Unreal are recorded here. Versions follow the `V
 `Plugins/SuperSLMUnreal/SuperSLMUnreal.uplugin`. The plugin versions independently of SuperSLM; each entry
 names the SuperSLM release it vendors.
 
+## 1.5.0 - 2026-11-03
+
+**Vendored SuperSLM:** `v1.19.0` (`92ab95b760fdb6f24a27474c2a0e0f5f6be85568`), up from `v1.18.1`.
+
+**Saves:** a save made by 1.4.0 is refused by 1.5.0 with `Layer1Mismatch`, and the reverse, because the vendored
+SuperSLM release changed. A cached prefix written by 1.4.0 counts as a miss and is rebuilt by prefill. Rebuild your
+prefix sets.
+
+### Added
+
+- **JSON arrays in schemas.** SuperSLM 1.19.0's schema compiler accepts a `"type": "array"` node with one `items`
+  schema: `minItems` required items (at most 8; `0` allows `[]`), then `]` or another item, with no leading, trailing
+  or doubled comma; arrays can nest. `maxItems` is refused by name. A model whose schemas have no array needs no
+  reconversion. Schemas are still compiled offline by SuperSLM's tools; the plugin looks up and binds an array schema by
+  name as it does any other.
+
+### Fixed
+
+- **A schema-bound generation that finishes its JSON document with tokens still left now completes.** Through 1.4.0,
+  when the schema's walk reached its accepting state and had no continuation before `MaxNewTokens`, the plugin ended
+  the generation `Faulted` with `SchemaDeadEnd`, on both backends and every GPU path (one-row, multi-row, and `Exact`'s
+  multi-row close). SuperSLM reports that end as a retryable `-2` with the walk kept, not as an error; the fault was the
+  plugin's. The plugin now reads the walk's accepting state at the `-2`: accepting ends the generation `Complete`, and
+  `GetLastDecodeOutcome` reads the new **`SchemaComplete`**; not accepting (the schema allowed no next token before
+  its document was complete) still ends it `Faulted` with `SchemaDeadEnd`.
+  - `ESuperSLMDecodeOutcome::SchemaComplete` (5) and its Blueprint mirror `ESuperSLMDecodeOutcomeBP::SchemaComplete` are
+    appended, so every existing value keeps its number. A `switch` over the enum with no `default` needs the new case.
+  - A GPU sequence that completed at its schema's end can be saved, as any completed sequence can; through 1.4.0 it
+    was faulted and the save was refused. A save taken after that end, or while it was still in flight, restores to
+    the same `Complete`, with `IsSchemaAccepting` true, so the restored sequence's stop reason is `Completed` on the GPU
+    as on the CPU.
+  - The example project now fails its extraction stage on `SchemaDeadEnd`. It used to pass that outcome on as a
+    finished extraction, which was how a complete document arrived through 1.4.0; a complete document now arrives as
+    `Complete`.
+  - As with any completed generation, the next generation on the sequence needs a reset first, on both backends.
+  - The query window's stop reason was already `Completed` for an accepting walk, and is unchanged; a dead end stays
+    `SchemaRejected`. The schema dry run's "-2 (dead end)" line reads yes for either kind of `-2`.
+- **The MCP toolset's `lastDecodeOutcome` names `KvBudgetExceeded`.** A sequence faulted by its paged-KV budget was
+  reported as `SequenceNoLongerValid`, the name for a released sequence. It now reads `KvBudgetExceeded`.
+
+### Known issues
+
+- **Running the whole `SuperSLM.PrefixCache` automation group in one editor process can freeze the editor.** The
+  freeze moves between cells (seen in `Cpu.Coalescing` and in several `Gpu.Nested` cells), every cell passes when run
+  on its own, and 1.4.0 freezes the same way. Run the group in smaller batches until it is fixed. It is under
+  investigation; whether a game can reach it outside the tests is not yet known.
+
 ## 1.4.0 - 2026-11-01
 
 **Vendored SuperSLM:** `v1.18.1` (`c3c14b16690a0c0c54de781f6f30380d88e62bd1`), up from `v1.15.0`.

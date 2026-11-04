@@ -87,7 +87,7 @@ cl /nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Itests /Isrc\gpu /Ite
 	src\forward\checked_chain_funnel.cpp src\forward\forward_sites.cpp src\forward\parallel_split.cpp src\decode_digest.cpp ^
 	src\kv_pages.cpp src\spx1_format.cpp src\sslm_abi.cpp src\damped_greedy_antilm.cpp src\damped_greedy_topk.cpp src\damped_greedy_phaseD.cpp src\damped_greedy_phaseD_loop.cpp ^
 	src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp ^
-	tests\test_main.cpp tests\test_slm18x_saturation_census.cpp tests\test_slm19x_schema_damped_greedy.cpp tests\test_tiled_gemm.cpp tests\test_attn_rowsites.cpp tests\test_decode_threading.cpp tests\test_decode_threading_d1.cpp ^
+	tests\test_main.cpp tests\test_slm18x_saturation_census.cpp tests\test_slm19x_schema_damped_greedy.cpp tests\test_tiled_gemm.cpp tests\test_attn_rowsites.cpp tests\test_decode_threading.cpp tests\test_decode_threading_d1.cpp tests\test_batched_threading.cpp ^
 	tests\test_schema_fast_decode.cpp tests\schema_fast_decode\sfd_red_stubs_tf.cpp tests\schema_fast_decode\sfd_red_stubs_x.cpp ^
 	src\gpu\gpu_inflight_registry.cpp tests\gpu-g3-core\g3_superslm_tests_adapter.cpp tests\gpu-g3-core\g3_cells_ledger.cpp /Fo:out\ /Fe:out\superslm_tests.exe ^
 	/link d3d12.lib dxgi.lib dxguid.lib
@@ -2305,6 +2305,46 @@ if not defined SUPERSLM_SCHEMA_FAST_DECODE_FIXTURE_DIR (
 		echo python is absent -- the schema fast-decode fixture was not generated, the M1/J1 cells below will fail for the missing fixture
 	)
 )
+rem Engine 1.19, the clean stop at the schema's end: the GPU cells G1-G10 (tests\schema-fast-decode-gpu\
+rem sfdg_cleanstop.h, sfdg_cell_cs_g*.cpp; the CPU cells E1-E8 run inside superslm_tests.exe, below). Placed after
+rem the F-SFD provisioning above because the cells read that fixture. The compile-and-link gate always runs: the
+rem schema fast-decode GPU suite's own flags, sources and seam definitions (build_sfd_gpu.bat), every cell linked
+rem against the current engine; a cell that does not compile or link fails this build. The runtime step runs every
+rem cell when SUPERSLM_SCHEMA_FAST_DECODE_FIXTURE_DIR is set (provisioned above by default), with the shaders this
+rem build compiled, and a failing cell fails this build. The cells need a hardware D3D12 device, as
+rem superslm_tests.exe's own GPU cells do.
+if exist out\sfdg-cs rmdir /s /q out\sfdg-cs
+mkdir out\sfdg-cs\engine out\sfdg-cs\cells out\sfdg-cs\shaders
+set SFDGCS_FLAGS=/nologo /std:c++20 /O2 /W4 /fp:precise /EHsc /Iinclude /Isrc /Isrc\gpu /Itests /Itests\paged-kv /Itests\paged-kv-gpu /Itests\t2791-gpu-prefill-read-red-suite /Itests\schema-fast-decode-gpu /DSUPERSLM_GPU_TEST_SEAMS /DSUPERSLM_GPU_ALLOC_FAULT_INJECTION /DSUPERSLM_ENABLE_BAD_ALLOC_INJECTION /DSUPERSLM_GPU_G5_FINISH_ROW_FAULT_INJECTION
+cl /c %SFDGCS_FLAGS% /Fo:out\sfdg-cs\engine\ src\artifact.cpp src\sha256.cpp src\tokenizer.cpp src\model.cpp src\intmath.cpp src\silu_lut.cpp src\matmul.cpp src\proof_manifest.cpp src\trace_hook.cpp src\forward\checked_chain_funnel.cpp src\forward\forward_sites.cpp src\forward\parallel_split.cpp src\gpu\gpu_inflight_registry.cpp src\decode_digest.cpp src\kv_pages.cpp src\spx1_format.cpp src\sslm_abi.cpp src\damped_greedy_antilm.cpp src\damped_greedy_topk.cpp src\damped_greedy_phaseD.cpp src\damped_greedy_phaseD_loop.cpp src\gpu\superslm_gpu.cpp src\gpu\gpu_1p0.cpp > out\sfdg-cs\engine.log 2>&1
+if errorlevel 1 (
+	type out\sfdg-cs\engine.log
+	echo clean-stop GPU cells: the seam engine build FAILED
+	goto :hard_fail
+)
+for %%f in (1 2 3 4 5 6 7 8 9 10) do (
+	cl %SFDGCS_FLAGS% tests\schema-fast-decode-gpu\sfdg_cell_cs_g%%f.cpp out\sfdg-cs\engine\*.obj /Fo:out\sfdg-cs\cells\ /Fe:out\sfdg-cs\sfdg_cell_cs_g%%f.exe /link d3d12.lib dxgi.lib dxguid.lib shlwapi.lib psapi.lib > out\sfdg-cs\cell_g%%f.log 2>&1 || (type out\sfdg-cs\cell_g%%f.log & echo clean-stop GPU cell sfdg_cell_cs_g%%f did not compile or link & goto :hard_fail)
+)
+echo clean-stop GPU cells: G1-G10 compiled and linked against the current engine.
+rem The schema fast-decode GPU tools (tools\schema_fast_decode_gpu_p2_ref.cpp, schema_fast_decode_gpu_jf_bench.cpp,
+rem schema_fast_decode_gx3_bench.cpp): compiled and linked here against the same seam engine, so each has a build
+rem recipe in this file (tools\ci\check_tools_have_build_recipe.py). Not run: P2.16's reference, GB2/GB3's jump-forward
+rem bench and GX.3's per-submit bench take a model and a D3D12 device, and the box driver
+rem (tools\schema_fast_decode_box\run_gpu_box_step.ps1) runs them. A tool that does not compile or link fails this build.
+mkdir out\sfdg-cs\tools
+cl %SFDGCS_FLAGS% tools\schema_fast_decode_gpu_p2_ref.cpp out\sfdg-cs\engine\*.obj /Fo:out\sfdg-cs\tools\ /Fe:out\sfdg-cs\tools\schema_fast_decode_gpu_p2_ref.exe /link d3d12.lib dxgi.lib dxguid.lib shlwapi.lib psapi.lib > out\sfdg-cs\tool_p2_ref.log 2>&1 || (type out\sfdg-cs\tool_p2_ref.log & echo schema fast-decode GPU tool schema_fast_decode_gpu_p2_ref did not compile or link & goto :hard_fail)
+cl %SFDGCS_FLAGS% tools\schema_fast_decode_gpu_jf_bench.cpp out\sfdg-cs\engine\*.obj /Fo:out\sfdg-cs\tools\ /Fe:out\sfdg-cs\tools\sslm_schema_fast_decode_gpu_jf_bench.exe /link d3d12.lib dxgi.lib dxguid.lib shlwapi.lib psapi.lib > out\sfdg-cs\tool_jf_bench.log 2>&1 || (type out\sfdg-cs\tool_jf_bench.log & echo schema fast-decode GPU tool schema_fast_decode_gpu_jf_bench did not compile or link & goto :hard_fail)
+cl %SFDGCS_FLAGS% tools\schema_fast_decode_gx3_bench.cpp out\sfdg-cs\engine\*.obj /Fo:out\sfdg-cs\tools\ /Fe:out\sfdg-cs\tools\sslm_schema_fast_decode_gx3_bench.exe /link d3d12.lib dxgi.lib dxguid.lib shlwapi.lib psapi.lib > out\sfdg-cs\tool_gx3_bench.log 2>&1 || (type out\sfdg-cs\tool_gx3_bench.log & echo schema fast-decode GPU tool schema_fast_decode_gx3_bench did not compile or link & goto :hard_fail)
+echo schema fast-decode GPU tools: P2.16 reference, jump-forward bench and GX.3 bench compiled and linked.
+if not defined SUPERSLM_SCHEMA_FAST_DECODE_FIXTURE_DIR goto :sfdgcs_runtime_skipped
+xcopy /Y /Q out\shaders\*.cso out\sfdg-cs\shaders\ >nul
+for %%f in (1 2 3 4 5 6 7 8 9 10) do (
+	out\sfdg-cs\sfdg_cell_cs_g%%f.exe "--fixture-dir=%SUPERSLM_SCHEMA_FAST_DECODE_FIXTURE_DIR%" || (echo clean-stop GPU cell sfdg_cell_cs_g%%f FAILED & goto :hard_fail)
+)
+goto :sfdgcs_runtime_done
+:sfdgcs_runtime_skipped
+echo clean-stop GPU cells SKIPPED at runtime: set SUPERSLM_SCHEMA_FAST_DECODE_FIXTURE_DIR ^(python tools\gen_schema_fast_decode_fixture.py DIR^) to run them.
+:sfdgcs_runtime_done
 out\superslm_tests.exe
 set ec=%errorlevel%
 if not %b1_ec%==0 set ec=%b1_ec%

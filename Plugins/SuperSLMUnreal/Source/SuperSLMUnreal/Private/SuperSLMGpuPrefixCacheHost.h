@@ -3,7 +3,7 @@
 // Preprocessed out unless SUPERSLM_WITH_PREFIX_CACHE is on. Its save and restore calls are preprocessed out
 // unless SUPERSLM_WITH_GPU_PREFIX_SAVE is on as well. It defaults to 0 here: Layer 1 1.15.0 exported the GPU prefix
 // save and restore verbs without releasing them (1.16.0 released them) and defines no feature macro for them, so
-// SuperSLMUnreal.Build.cs sets it on Win64, where the vendored engine is v1.18.1 (plugin 1.4.0). Installed by the
+// SuperSLMUnreal.Build.cs sets it on Win64, where the vendored engine is v1.19.0 (plugin 1.5.0). Installed by the
 // GPU subsystem's Configure(): see SuperSLMGpuSubsystemPrefixCache.h.
 //
 // The GPU subsystem's prefix cache instance (precache plan §5.3-§5.7, §5.11; step U6). It is the CPU

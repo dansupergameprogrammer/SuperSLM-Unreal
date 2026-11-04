@@ -292,7 +292,7 @@ namespace
 				OutTokens = Cpu.GetGeneratedTokens(Run.Seq);
 				if (Cpu.GetLastDecodeOutcome(Run.Seq) == ESuperSLMDecodeOutcome::SchemaDeadEnd)
 				{
-					return ERunStep::Finished; // the schema is complete: the workload ends here on every backend
+					return ERunStep::Finished; // the schema allows no next token: the workload ends here on every backend
 				}
 				OutError = TEXT("the CPU self-check sequence faulted");
 				return ERunStep::Failed;

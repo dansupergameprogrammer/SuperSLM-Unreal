@@ -296,8 +296,11 @@ bool FSuperSLML2S1SchemaBindOnNonFreshRoutedToResetThenBindTest::RunTest(const F
 	return TestTrue(TEXT("SetSchema on the now-fresh (Idle) sequence must succeed"), Subsystem->SetSchema(Seq, NoneSchema, RebindError));
 }
 
-// The "-2 surfaced as Schema Dead End" clause, realized against A-EX's real compiled schema
-// (`potion_shop_order`) -- on the maintainer's ruling on T-2805 §6 Q4.
+// The "-2 surfaced by name" clause, realized against A-EX's real compiled schema
+// (`potion_shop_order`) -- on the maintainer's ruling on T-2805 §6 Q4. Plugin 1.5.0: the -2 this
+// construction reaches is at the schema's ACCEPTING state, so it is the document's end, and the
+// generation ends Complete with SchemaComplete (not Faulted / SchemaDeadEnd) with tokens still left in
+// MaxNewTokens. The non-accepting dead end that stays a fault is SuperSLM.SchemaCleanStop.P5.
 //
 // Verified at source before writing this test (`v1.5.0`, `src/sslm_abi.cpp`, the G5-2 masked-
 // argmax/CSR-transition block, cited there as "S2/D-SLM3476"): at a bound schema's OWN accepting
@@ -314,11 +317,11 @@ bool FSuperSLML2S1SchemaBindOnNonFreshRoutedToResetThenBindTest::RunTest(const F
 // at source that -2 cannot arise this way, stop and report it") does not apply. Needs the
 // tokenizer-bearing A-EX rebuild (D-SLM7339) for its own prompt text.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FSuperSLML2S1SchemaDeadEndSurfacedByNameTest,
-	"SuperSLM.L2S1.Misuse.SchemaDeadEndSurfacedByName",
+	FSuperSLML2S1SchemaCompleteSurfacedByNameTest,
+	"SuperSLM.L2S1.Misuse.SchemaCompleteSurfacedByName",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
-bool FSuperSLML2S1SchemaDeadEndSurfacedByNameTest::RunTest(const FString& Parameters)
+bool FSuperSLML2S1SchemaCompleteSurfacedByNameTest::RunTest(const FString& Parameters)
 {
 	FTestWorldWrapper TestWorldWrapper;
 	if (!TestWorldWrapper.CreateTestWorld(EWorldType::Game))
@@ -327,7 +330,7 @@ bool FSuperSLML2S1SchemaDeadEndSurfacedByNameTest::RunTest(const FString& Parame
 	}
 
 	USuperSLMModel* Model = nullptr;
-	switch (ImportAEx(*this, TEXT("R-S1f SchemaDeadEndSurfacedByName"), Model))
+	switch (ImportAEx(*this, TEXT("R-S1f SchemaCompleteSurfacedByName"), Model))
 	{
 		case EAExAvailability::Absent: return false;
 		case EAExAvailability::ImportFailed: return false;
@@ -390,21 +393,23 @@ bool FSuperSLML2S1SchemaDeadEndSurfacedByNameTest::RunTest(const FString& Parame
 	FString RunError;
 	const bool bCompleted = RunGenerationToCompletion(*Subsystem, Seq, Request, Generated, /*MaxWallClockSeconds*/ 60.0, RunError);
 	const ESuperSLMDecodeOutcome LastOutcome = Subsystem->GetLastDecodeOutcome(Seq);
+	const ESuperSLMSequencePhase Phase = Subsystem->GetPhase(Seq);
+	const bool bAccepting = Subsystem->GetStats(Seq).bSchemaAccepting;
 	Subsystem->ReturnSequence(Seq);
 
+	// Plugin 1.5.0: the schema's end is a clean stop. The sequence completes, and its outcome names the
+	// schema's end, never a fault.
+	bool bOk = TestTrue(*FString::Printf(TEXT("generation must end Complete at the schema's end (phase %d; %s)"), (int32)Phase, *RunError), bCompleted);
 	// A decode path that keeps advancing dfa_walk_state on -2 instead of freezing it (the
 	// pre-D-SLM3476 defect the source comment itself names: "the walk froze in place, emitting
-	// token 0 forever at SSLM_OK") would run to MaxNewTokens=100 and report Complete, never
-	// Faulted -- failing this first assertion.
-	if (!TestFalse(TEXT("generation must dead-end before MaxNewTokens=100, never reach Complete"), bCompleted))
-	{
-		return false;
-	}
+	// token 0 forever at SSLM_OK") would run to MaxNewTokens=100 -- failing this assertion.
+	bOk &= TestTrue(*FString::Printf(TEXT("the schema ends before MaxNewTokens=100 (%d tokens)"), Generated.Num()), Generated.Num() < Request.MaxNewTokens);
+	bOk &= TestTrue(TEXT("the walk is accepting at the end"), bAccepting);
 	// FEAT oracle: the sequence's own recorded last decode outcome must be the named enum value,
-	// never a bare -2 leaking through, and never a different fault (e.g. a mid-generation call
-	// rejection) standing in for the schema-specific one this cell names.
-	return TestEqual(TEXT("the sequence's last decode outcome must be SchemaDeadEnd (-2)"),
-		(uint8)LastOutcome, (uint8)ESuperSLMDecodeOutcome::SchemaDeadEnd);
+	// never a bare -2 leaking through, and never a fault standing in for the schema's end.
+	bOk &= TestEqual(TEXT("the sequence's last decode outcome must be SchemaComplete (-2, accepting)"),
+		(uint8)LastOutcome, (uint8)ESuperSLMDecodeOutcome::SchemaComplete);
+	return bOk;
 }
 
 // A-AD's base carries no tokenizer either (D-SLM7339 names it for retokenization too, but no

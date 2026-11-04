@@ -79,9 +79,10 @@ the `.sslm` file. The plugin looks a schema up by name in a model (`FSuperSLMSch
 `FSuperSLMGpuSchemaLookup` for the GPU backend); a name the model does not carry fails at lookup.
 A schema is bound to a sequence when the sequence starts, and changing it requires a reset.
 
-What the schema compiler accepts is SuperSLM's to define: at the current pin, objects with known,
-required keys in a fixed order, enums, booleans, and unbounded free-text strings. See SuperSLM's
-documentation for the exact subset.
+What the schema compiler accepts is SuperSLM's to define: at the current pin (v1.19.0), objects with known,
+required keys in a fixed order, enums, booleans, unbounded free-text strings, and arrays of one item
+schema with a `minItems` count (from 1.19.0; `maxItems` is refused). See SuperSLM's documentation for
+the exact subset.
 
 ## Adapters
 

@@ -70,10 +70,10 @@ bool FSuperSLMU1CpuHeldSchemaContentTest::RunTest(const FString& Parameters)
         !TestTrue(TEXT("reference inline bind"), Cpu->SetSchema(ReferenceSeq, Schema, Error))) { return false; }
     TArray<int32> Reference;
     if (!Run(ReferenceSeq, Reference) ||
-        !TestEqual(TEXT("inline schema-content reference reaches the defined dead end"), (uint8)Cpu->GetPhase(ReferenceSeq),
-            (uint8)ESuperSLMSequencePhase::Faulted) ||
-        !TestEqual(TEXT("inline schema-content reference reports SchemaDeadEnd"), (uint8)Cpu->GetLastDecodeOutcome(ReferenceSeq),
-            (uint8)ESuperSLMDecodeOutcome::SchemaDeadEnd)) { return false; }
+        !TestEqual(TEXT("inline schema-content reference reaches the schema's end, a clean stop"), (uint8)Cpu->GetPhase(ReferenceSeq),
+            (uint8)ESuperSLMSequencePhase::Complete) ||
+        !TestEqual(TEXT("inline schema-content reference reports SchemaComplete"), (uint8)Cpu->GetLastDecodeOutcome(ReferenceSeq),
+            (uint8)ESuperSLMDecodeOutcome::SchemaComplete)) { return false; }
     Cpu->ReturnSequence(ReferenceSeq);
     for (int32 I = 0; I < 40; ++I) { Cpu->Tick(1.0f / 60.0f); FPlatformProcess::Sleep(0.005f); }
 
@@ -107,10 +107,10 @@ bool FSuperSLMU1CpuHeldSchemaContentTest::RunTest(const FString& Parameters)
         }
         else
         {
-            bOk &= TestEqual(TEXT("held schema span reaches the same defined dead end"), (uint8)Cpu->GetPhase(S),
-                (uint8)ESuperSLMSequencePhase::Faulted);
-            bOk &= TestEqual(TEXT("held schema span reports SchemaDeadEnd"), (uint8)Cpu->GetLastDecodeOutcome(S),
-                (uint8)ESuperSLMDecodeOutcome::SchemaDeadEnd);
+            bOk &= TestEqual(TEXT("held schema span reaches the same schema end, a clean stop"), (uint8)Cpu->GetPhase(S),
+                (uint8)ESuperSLMSequencePhase::Complete);
+            bOk &= TestEqual(TEXT("held schema span reports SchemaComplete"), (uint8)Cpu->GetLastDecodeOutcome(S),
+                (uint8)ESuperSLMDecodeOutcome::SchemaComplete);
             bOk &= TestEqual(TEXT("held bind matches the inline-bind reference"), Tokens, Reference);
         }
         Cpu->ReturnSequence(S);

@@ -1,5 +1,5 @@
 // Slice MR6 (multi-row GPU plan rev 1.3.2, §5.2-§5.4; red-suite-mr6.md; rulings 37, 39, 40, 42, 42a, 43, 45, 48, 50, 51 and 53): the plugin's multi-row
-// scheduling, against the engine MR6 vendors (SuperSLM v1.18.1).
+// scheduling, against the engine MR6 vendors (SuperSLM v1.19.0).
 //   P4.4  bGpuMultiRow = false is 1.17's scheduling: one-row actions only, the same action trace for Exact as for Off,
 //         one prompt token per OneCall action; tokens equal the CPU's Off run.
 //   7.12  An adapter swap requested while a chunk is open waits for the close; the output equals the twin (the swap
@@ -609,25 +609,26 @@ namespace
 			FSuperSLMSchemaJumpTestAccess::SeedDraftTableFromStreams(*Rig.Cpu.Cpu, Rig.Cpu.Schema, { Off.Tokens }));
 	}
 
-	// Ruling 53 (triage run 3, findings 5 and 6a): a dead end at a finished schema stays a FAULT on both backends, and a
-	// Faulted sequence can be neither saved nor begun again without a reset. A cell that saves, or begins again, after
-	// its run therefore uses a MaxNew that ends inside its schema: the request is made at kMaxNew, and when the CPU's Off
-	// run of it meets the dead end after N tokens, MaxNew becomes N - 1 (the run then ends on MaxNewTokens on a produced
-	// token). The CPU's Off run of the result must end Complete. Exact's tokens are Off's (C17), so one probe serves both.
+	// Ruling 53 (triage run 3, findings 5 and 6a) made a cell that saves, or begins again, after its run use a MaxNew that
+	// ends inside its schema. Plugin 1.5.0 ends a finished schema cleanly (Complete / SchemaComplete), but these cells
+	// grade a run that stops on MaxNewTokens on a produced token, so the trim stays: the request is made at kMaxNew, and
+	// when the CPU's Off run of it reaches the schema's end after N tokens, MaxNew becomes N - 1. The CPU's Off run of the
+	// result must end Complete on MaxNewTokens. Exact's tokens are Off's (C17), so one probe serves both.
 	bool MakeInSchemaRequest(FAutomationTestBase& T, const FGpuRig& Rig, ESuperSLMSchemaJumpForward Mode, FSuperSLMGenerationRequest& Out,
 		const FString& Prompt = SuperSLML2S2Fixtures::PinnedSelfCheckPrompt(), int32 MaxNew = kMaxNew)
 	{
 		FRunResult Cpu;
 		if (!MakeRequest(T, Rig, Mode, MaxNew, Out, Prompt) || !RunCpu(T, Rig, Out, kOff, Cpu)) { return false; }
-		if (Cpu.Phase == ESuperSLMSequencePhase::Faulted)
+		if (Cpu.Outcome == ESuperSLMDecodeOutcome::SchemaComplete)
 		{
-			if (!T.TestTrue(*FString::Printf(TEXT("precondition: the request meets its schema's dead end after two tokens or more (%d; outcome %d)"), Cpu.Tokens.Num(), (int32)Cpu.Outcome),
-				Cpu.Outcome == ESuperSLMDecodeOutcome::SchemaDeadEnd && Cpu.Tokens.Num() >= 2)) { return false; }
+			if (!T.TestTrue(*FString::Printf(TEXT("precondition: the request reaches its schema's end after two tokens or more (%d; phase %d)"), Cpu.Tokens.Num(), (int32)Cpu.Phase),
+				Cpu.Phase == ESuperSLMSequencePhase::Complete && Cpu.Tokens.Num() >= 2)) { return false; }
 			Out.MaxNewTokens = Cpu.Tokens.Num() - 1;
 			if (!RunCpu(T, Rig, Out, kOff, Cpu)) { return false; }
 		}
 		return T.TestEqual(*FString::Printf(TEXT("precondition: MaxNewTokens %d ends inside the schema (the CPU's Off run completes; ruling 53)"), Out.MaxNewTokens),
-			(uint8)Cpu.Phase, (uint8)ESuperSLMSequencePhase::Complete);
+			(uint8)Cpu.Phase, (uint8)ESuperSLMSequencePhase::Complete) &&
+			T.TestEqual(TEXT("precondition: ... on MaxNewTokens, a produced token"), (uint8)Cpu.Outcome, (uint8)ESuperSLMDecodeOutcome::TokenProduced);
 	}
 
 	// The v1 wrapper's carried-event count: the u32 at +20 from its magic (magic, version, path, primed, stopped, 0,
@@ -867,9 +868,10 @@ bool FSuperSLMGpuMultiRowR40CarryTest::RunTest(const FString& Parameters)
 // R40.3 Re-arm after a dead end (re-points P2H.3's gpu_rest_second_generation, the dead-end legs of
 // gpu_rest_transitions_advance and gpu_rest_no_chain_finishes, XG20/XG32; P2.12; the shared halves of P2.7 and
 // P2.17). Pooled (the armed flag is readable), both paths, Exact with the switch on against the one-row twin: the
-// generation ends SchemaDeadEnd with the walk accepting, and on OneCall the dead end is met in an Exact close (§4.7
-// step 5); the sequence is armed after it. Ruling 53: the dead end stays a fault (the sequence is Faulted, as the
-// CPU's), so every later begin follows a reset (D-SLM7946), and the reset clears the armed flag (K7): an empty-prompt
+// generation ends at its schema's end with the walk accepting, and on OneCall the end (the -2) is met in an Exact close
+// (§4.7 step 5); the sequence is armed after it. Plugin 1.5.0: that end is a clean stop (Complete / SchemaComplete, as
+// the CPU's), and a completed sequence still needs a reset before its next begin (D-SLM7946); the reset clears the armed
+// flag (K7): an empty-prompt
 // begin after it faults by name as unarmed, as the twin's does; a second generation with a prompt (ending inside its
 // schema) equals the twin's; the armed flag and the final save equal the twin's. Then Exact over an adopted
 // prompt-only prefix (armed at the adopt), with no prompt, equals the twin's: the armed empty-prompt begin.
@@ -897,7 +899,7 @@ bool FSuperSLMGpuMultiRowR40RearmTest::RunTest(const FString& Parameters)
 			FArm& A = Arms[Multi];
 			TArray<FAct> Acts;
 			if (!C.Reconfigure(*this, Path, Multi != 0, 512) || !RunMr(*this, C.Rig, Path, Req, A.First, Acts, true)) { return false; }
-			bOk &= TestEqual(*(Arm + TEXT(": the generation ends SchemaDeadEnd")), (uint8)A.First.Outcome, (uint8)ESuperSLMDecodeOutcome::SchemaDeadEnd);
+			bOk &= TestEqual(*(Arm + TEXT(": the generation ends SchemaComplete")), (uint8)A.First.Outcome, (uint8)ESuperSLMDecodeOutcome::SchemaComplete);
 			bOk &= TestTrue(*(Arm + TEXT(": with the walk accepting")), A.First.bAccepting);
 			if (Multi && Path == EPath::WholeToken)
 			{
@@ -909,8 +911,8 @@ bool FSuperSLMGpuMultiRowR40RearmTest::RunTest(const FString& Parameters)
 			}
 			A.ArmedAfterFirst = FSuperSLMPagedGpuTestSeam::SequenceArmed(*C.Rig.Gpu, A.First.Sequence);
 			bOk &= TestEqual(*(Arm + TEXT(": armed after the dead end (the close sets ready_for_logits)")), A.ArmedAfterFirst, 1);
-			// Ruling 53: the dead end left the sequence Faulted, as the CPU's; a begin needs a reset first.
-			bOk &= TestEqual(*(Arm + TEXT(": the dead end is a fault (ruling 53)")), (uint8)A.First.Phase, (uint8)ESuperSLMSequencePhase::Faulted);
+			// Plugin 1.5.0: the schema's end left the sequence Complete, as the CPU's; a begin still needs a reset first.
+			bOk &= TestEqual(*(Arm + TEXT(": the schema's end is a clean stop")), (uint8)A.First.Phase, (uint8)ESuperSLMSequencePhase::Complete);
 			const ESuperSLMGpuDecodePath DPath = DecodePathOf(Path);
 			if (!SuperSLMPagingGpuFixtures::ResetAndWait(*this, *C.Rig.Gpu, A.First.Sequence, DPath)) { ReturnAndSettle(C.Rig, A.First.Sequence); return false; }
 			A.ArmedAfterReset = FSuperSLMPagedGpuTestSeam::SequenceArmed(*C.Rig.Gpu, A.First.Sequence);
@@ -966,9 +968,11 @@ bool FSuperSLMGpuMultiRowR40RearmTest::RunTest(const FString& Parameters)
 
 // R40.4 The restore's armed flag (re-points P2H.3's gpu_rest_on_restore and the dedicated restore's "TS.bArmed from the
 // getter", and gpu_rest_begin's armed start). OneCall, Exact with the switch on. Two saved states: not armed, MaxNewTokens
-// on a produced token (dedicated and pooled); and armed (pooled, where the flag is readable). Ruling 53 keeps a dead end
-// a fault, and a Faulted sequence cannot be saved, so the armed state is no longer the dead end: it is a sequence that
-// adopted a prompt-only prefix (armed at the adopt, K7) and has not begun. The save is version 1; a restore saved again
+// on a produced token (dedicated and pooled); and armed (pooled, where the flag is readable). Under ruling 53 a dead end
+// was a fault and could not be saved, so the armed state here is a sequence that adopted a prompt-only prefix (armed at
+// the adopt, K7) and has not begun. A save at a schema's clean end (plugin 1.5.0) is saved and restored by
+// SuperSLM.SchemaCleanStop.P9 (and P2-P4's restore), which check the restored ending and stop reason on a dedicated
+// slot, not the armed flag; no cell restores the armed flag from such a save. The save is version 1; a restore saved again
 // gives the same bytes (the armed word survives); on the pooled slot the restored flag equals the saved sequence's (1
 // and 0); and a second generation from the restored sequence equals one from the saved sequence, tokens and final save.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMGpuMultiRowR40RestoreArmedTest, "SuperSLM.MultiRow.MR6.R40_4.ExactRestoreKeepsTheArmedFlag",
@@ -991,10 +995,10 @@ bool FSuperSLMGpuMultiRowR40RestoreArmedTest::RunTest(const FString& Parameters)
 		Joined.MaxNewTokens = kMaxNew;
 		FRunResult Probe;
 		if (!RunCpu(*this, C.Rig, Joined, kOff, Probe)) { return false; }
-		if (Probe.Phase == ESuperSLMSequencePhase::Faulted)
+		if (Probe.Outcome == ESuperSLMDecodeOutcome::SchemaComplete)
 		{
-			if (!TestTrue(*FString::Printf(TEXT("precondition: over the prefix, Second meets its schema's dead end after two tokens or more (%d)"), Probe.Tokens.Num()),
-				Probe.Outcome == ESuperSLMDecodeOutcome::SchemaDeadEnd && Probe.Tokens.Num() >= 2)) { return false; }
+			if (!TestTrue(*FString::Printf(TEXT("precondition: over the prefix, Second reaches its schema's end after two tokens or more (%d)"), Probe.Tokens.Num()),
+				Probe.Phase == ESuperSLMSequencePhase::Complete && Probe.Tokens.Num() >= 2)) { return false; }
 			Joined.MaxNewTokens = Probe.Tokens.Num() - 1;
 			if (!RunCpu(*this, C.Rig, Joined, kOff, Probe)) { return false; }
 		}

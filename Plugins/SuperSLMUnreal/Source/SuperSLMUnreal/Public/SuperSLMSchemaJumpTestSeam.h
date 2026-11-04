@@ -151,6 +151,15 @@ struct SUPERSLMUNREAL_API FSuperSLMSchemaJumpTestAccess
 	static void SetJobHold(USuperSLMSubsystem& Subsystem, const FSuperSLMSequence& Sequence, ESuperSLMJobHoldPoint Point);
 	static bool IsJobHeld(const USuperSLMSubsystem& Subsystem, const FSuperSLMSequence& Sequence);
 	static void ReleaseJobHold(USuperSLMSubsystem& Subsystem, const FSuperSLMSequence& Sequence);
+
+	// --- Plugin 1.5.0, the clean stop (cell P5): a -2 whose walk is NOT accepting ---
+	// Arms SuperSLM's single-shot degenerate-row seam, compiled into development builds by the vendored wrappers: the
+	// next finish in the process (any sequence, bound or not; on the CPU, a schema-bound greedy finish) sees every logit
+	// at INT32_MIN, so a schema-bound finish's masked argmax has no transition and returns -2 at whatever walk state the
+	// sequence is in. Process-wide: arm it right before the one finish the cell drives, with nothing else running. The
+	// GPU arm returns false in a build without the GPU backend.
+	static void ArmCpuDegenerateFinishRow();
+	static bool ArmGpuDegenerateFinishRow();
 };
 
 #endif // WITH_DEV_AUTOMATION_TESTS

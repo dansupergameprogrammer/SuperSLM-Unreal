@@ -92,12 +92,13 @@ bool FSuperSLMSchemaDryRun::Tick(float DeltaSeconds, bool& bOutSucceeded, FSuper
 	const FSuperSLMSequenceStats Stats = Subsystem.GetStats(Sequence);
 	OutReport.bSchemaAccepting = Stats.bSchemaAccepting;
 	OutReport.ForcedTokenCount = Stats.ForcedTokenCount;
-	OutReport.bDeadEnd = Subsystem.GetLastDecodeOutcome(Sequence) == ESuperSLMDecodeOutcome::SchemaDeadEnd;
+	const ESuperSLMDecodeOutcome LastOutcome = Subsystem.GetLastDecodeOutcome(Sequence);
+	OutReport.bDeadEnd = LastOutcome == ESuperSLMDecodeOutcome::SchemaDeadEnd || LastOutcome == ESuperSLMDecodeOutcome::SchemaComplete;
 	OutReport.Frames = Frames;
 
 	SuperSLMPromptResult::FStopFacts Facts;
 	Facts.Phase = Phase;
-	Facts.LastOutcome = Subsystem.GetLastDecodeOutcome(Sequence);
+	Facts.LastOutcome = LastOutcome;
 	Facts.bSchemaAccepting = Stats.bSchemaAccepting;
 	FSuperSLMModelShapeFacts Shape;
 	Facts.bContextCapReached = SuperSLMModelInspector::ReadShape(Model, Shape) &&

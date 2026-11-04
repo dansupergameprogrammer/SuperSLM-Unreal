@@ -44,10 +44,10 @@ from pathlib import Path
 PLUGIN_ROOT = Path(__file__).resolve().parents[1].parent  # .../Plugins/SuperSLMUnreal
 THIRDPARTY_ROOT = PLUGIN_ROOT / "Source" / "ThirdParty" / "SuperSLM"
 
-EXPECTED_TAG = "v1.18.1"
-EXPECTED_COMMIT_PREFIX = "c3c14b1669"
-EXPECTED_BASE_RELEASE_COMMIT = "c3c14b16690a0c0c54de781f6f30380d88e62bd1"  # v1.18.0, the last tagged release commit
-EXPECTED_FILE_COUNT = 1718  # files excluding .github/ and vendoring metadata
+EXPECTED_TAG = "v1.19.0"
+EXPECTED_COMMIT_PREFIX = "92ab95b760"
+EXPECTED_BASE_RELEASE_COMMIT = "92ab95b760fdb6f24a27474c2a0e0f5f6be85568"  # v1.19.0, the last tagged release commit
+EXPECTED_FILE_COUNT = 2063  # files excluding .github/ and vendoring metadata
 
 _RUNTIME_BUILD_CS_NAME = "SuperSLMUnreal.Build.cs"
 
@@ -115,8 +115,8 @@ def test_a_vendored_tree_exists_and_pinned():
     assert re.search(
         rf"(?m)^Base release commit:[ \t]*{EXPECTED_BASE_RELEASE_COMMIT}[ \t]*$", text
     ), "the release must name its tagged commit as its base release commit"
-    # Plugin 1.4: re-vendored at the v1.18.1 tag (the exit-destructor fix).
-    assert "Release status: published release v1.18.1" in text
+    # Plugin 1.5: re-vendored at the v1.19.0 tag (JSON arrays in schemas, the -2 clean stop).
+    assert "Release status: published release v1.19.0" in text
     vendored_files = [
         path for path in THIRDPARTY_ROOT.rglob("*")
         if path.is_file()

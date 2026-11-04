@@ -54,8 +54,8 @@ The plugin compiles SuperSLM's sources with the engine's toolchain. It never lin
 SuperSLM library.
 
 - The library sources of one exact SuperSLM commit are vendored under
-  `Plugins/SuperSLMUnreal/Source/ThirdParty/SuperSLM/`; 1.4.0 vendors SuperSLM v1.18.1
-  (c3c14b16690a0c0c54de781f6f30380d88e62bd1). `VENDORED_VERSION.txt` names the tag and its commit,
+  `Plugins/SuperSLMUnreal/Source/ThirdParty/SuperSLM/`; 1.5.0 vendors SuperSLM v1.19.0
+  (92ab95b760fdb6f24a27474c2a0e0f5f6be85568). `VENDORED_VERSION.txt` names the tag and its commit,
   and `VENDORED_MANIFEST.sha256` records each file's hash. Five route-P witness tool files carry
   a tracked hook-API adaptation described in `VENDORED_VERSION.txt`. The build reads the tag and commit from
   `VENDORED_VERSION.txt` and compiles them into the plugin, so every report and save blob can name

@@ -32,8 +32,9 @@ namespace SuperSLMPromptResult
 	// T-2853 design §5's composition, in this order:
 	//   accepting                                      -> Completed (whatever ended it: under
 	//     `prompt_result` the accepting state's mask page is empty, so a completed walk's next
-	//     step is a -2 and the sequence ends Faulted/SchemaDeadEnd with the walk accepting);
-	//   Faulted / SchemaDeadEnd                        -> SchemaRejected;
+	//     step is a -2 and the sequence ends Complete/SchemaComplete with the walk accepting, or
+	//     it ends Complete on MaxNewTokens at the token that closed the document);
+	//   Faulted / SchemaDeadEnd (a -2 with the walk not accepting) -> SchemaRejected;
 	//   Complete (MaxNewTokens; a schema excludes every special id, so no stop id can end it)
 	//     or Faulted / Generating at context_cap       -> BudgetExhausted.
 	// False -- nothing composed -- while the sequence is still Idle/Prefilling/Decoding, and for a

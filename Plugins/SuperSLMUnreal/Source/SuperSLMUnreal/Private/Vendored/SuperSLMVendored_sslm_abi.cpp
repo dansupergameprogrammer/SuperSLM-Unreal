@@ -6,4 +6,10 @@
 // those anonymous-namespace definitions as a hard redefinition error. One #include per file
 // here preserves the same one-.cpp-one-TU shape UBT's automatic module-source discovery
 // already gives every other file in this module.
+// Plugin 1.5.0 (the clean stop's cell P5): development builds compile SuperSLM's single-shot CPU degenerate-row seam
+// (ArmCpuFinishDegenerateLogitRowInjection), so a test can reach a -2 whose walk is not accepting. It does nothing
+// until armed (FSuperSLMSchemaJumpTestAccess::ArmCpuDegenerateFinishRow); a shipping build does not compile it.
+#if WITH_DEV_AUTOMATION_TESTS && !defined(SUPERSLM_CPU_G5_FINISH_ROW_FAULT_INJECTION)
+#define SUPERSLM_CPU_G5_FINISH_ROW_FAULT_INJECTION 1
+#endif
 #include "../../../ThirdParty/SuperSLM/src/sslm_abi.cpp"

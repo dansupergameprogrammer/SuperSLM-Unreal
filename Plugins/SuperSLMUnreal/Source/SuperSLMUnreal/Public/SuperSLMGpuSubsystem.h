@@ -188,8 +188,10 @@ public:
 	// thread right after that token's finish (the bridge reports pre-finish membership until then)
 	// and carried back with the token's result, so this never blocks. It reads the reading of the
 	// last result APPLIED (T+K), the same one GetGeneratedTokens() reflects; a schema dead end
-	// leaves the walk where it was, so its reading is the last token's. False when unbound, before
-	// the current generation's first token, and for an invalid handle.
+	// leaves the walk where it was, so its reading is the last token's. After a restore it is the
+	// restore job's reading of the restored walk until the next result applies (plugin 1.5.0: a
+	// sequence saved after its clean stop restores accepting). False when unbound, before the
+	// current generation's first token, and for an invalid handle.
 	bool IsSchemaAccepting(const FSuperSLMGpuSequence& Sequence) const;
 
 	// The forced tokens among the current generation's applied tokens, the GPU twin of the CPU's
@@ -287,8 +289,9 @@ public:
 
 	ESuperSLMSequencePhase GetPhase(const FSuperSLMGpuSequence& Sequence) const;
 	const TArray<int32>& GetGeneratedTokens(const FSuperSLMGpuSequence& Sequence) const;
-	// On a Faulted sequence: SchemaDeadEnd for a schema dead end, Generating for every other
-	// fault. The fault's reason is logged (LogSuperSLM Warning "GPU sequence N faulted: <reason>"),
+	// On a Faulted sequence: SchemaDeadEnd for a schema dead end (a -2 with the walk not accepting),
+	// Generating for every other fault. A generation that reached its schema's complete document (a -2
+	// with the walk accepting) is Complete, and reads SchemaComplete. The fault's reason is logged (LogSuperSLM Warning "GPU sequence N faulted: <reason>"),
 	// and GetLastFaultReason() below gives its category.
 	ESuperSLMDecodeOutcome GetLastDecodeOutcome(const FSuperSLMGpuSequence& Sequence) const;
 
@@ -444,7 +447,9 @@ public:
 	// Idle. Requiring a reset after every fault is the plugin's own rule: Layer 1 requires one only
 	// after an allocation failure (gpu_1p0.h:233-237). A generation that ended in SchemaDeadEnd is
 	// Faulted too -- also the plugin's rule, since Layer 1 lets a dead end be retried
-	// (gpu_1p0.h:564-579). A restore never clears a faulted sequence: it gives a new one.
+	// (gpu_1p0.h:564-579). One that ended at its schema's complete document is Complete
+	// (SchemaComplete) and, like any completed one, needs a reset before the next generation. A
+	// restore never clears a faulted sequence: it gives a new one.
 	FSuperSLMLifecycleOpHandle RequestBeginGeneration(const FSuperSLMGpuSequence& Sequence, const FSuperSLMGenerationRequest& Request);
 
 	// D-SLM7457 ruling (1): Layer 1's GPU ABI has no prefix-adopt verb of any kind (v1.5.0, and

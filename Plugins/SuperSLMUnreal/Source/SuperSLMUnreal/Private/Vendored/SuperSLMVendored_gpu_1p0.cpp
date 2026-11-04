@@ -10,6 +10,11 @@
 #include "Windows/AllowWindowsPlatformAtomics.h"
 #pragma warning(push)
 #pragma warning(disable : 4996) // Layer 1's d3d12_harness.h uses fopen; a vendored header this plugin does not edit
+// Plugin 1.5.0 (the clean stop's cell P5): development builds compile SuperSLM's single-shot GPU degenerate-row seam
+// (ArmGpuFinishDegenerateLogitRowInjection), as the CPU wrapper does its twin. Inert until armed; not in shipping.
+#if WITH_DEV_AUTOMATION_TESTS && !defined(SUPERSLM_GPU_G5_FINISH_ROW_FAULT_INJECTION)
+#define SUPERSLM_GPU_G5_FINISH_ROW_FAULT_INJECTION 1
+#endif
 #include "../../../ThirdParty/SuperSLM/src/gpu/gpu_1p0.cpp"
 #pragma warning(pop)
 #include "Windows/HideWindowsPlatformAtomics.h"

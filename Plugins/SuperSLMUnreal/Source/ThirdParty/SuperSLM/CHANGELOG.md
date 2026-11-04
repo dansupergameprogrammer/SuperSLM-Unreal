@@ -2,6 +2,83 @@
 
 All notable changes to SuperSLM (Layer 1) are recorded here.
 
+## [1.19.0] - 2026-11-03
+
+JSON arrays in schema-constrained generation, and a clean stop at the schema's end. `docs/releases/1.19.0.md` is the
+release note. No ABI, struct layout, status or save format (`SSB5`, `SSB6`, `SLM5`, `SLM6`, `SPX1`) changes.
+
+### Added
+
+- **JSON arrays in schema-constrained generation.** The schema converter (`tools/sslm_convert_schema.py`) compiles a
+  `"type": "array"` node to a cyclic item automaton: `[`, the `minItems` required items separated by `,`, then `]` or
+  another item. `minItems: 0` admits `[]`. A leading, trailing or doubled comma is never accepted. `items` must be one
+  schema object, and arrays nest. `maxItems` is refused by name. A schema with a reachable state that can never finish
+  a document is refused by name, with no artifact.
+- **Release limits for array schemas.** Seven per-schema limits, each with its own named diagnostic: `minItems` 8 per
+  array, nesting depth 8, 4,096 NFA states, 4,096 token-DFA states, 8,388,608 token transitions, 134,217,728 serialized
+  mask bytes and 536,870,912 tracked compiler bytes. A count equal to its limit is admitted. They bind only a schema
+  that contains an array, so an array-free schema compiles to the same table and SCM1 bytes as before.
+- **`tools/sslm_attach_schema.py`**, the offline attachment command. It compiles one or more named schemas against the
+  exact tokenizer checkpoint of a finished `.sslm`, appends one SCM1 section with every other section and header flag
+  unchanged, and runs `sslm_verify` on the base before compiling and on the result before reporting success. It
+  refuses, with no file written: a base that is not intact, already has an SCM1 section, or has no TOKENIZER section;
+  a checkpoint whose tokenizer differs from the base's; a bad schema name; and anything the compiler refuses.
+  `--limits-json` replaces named limits.
+- **Array proof on a real artifact, rerun on the 1.19 engine.** `tests/array-s2/box_run.py` passed all 81 steps on
+  workhorse (RX 7900 XT, 2026-11-03) on the merged engine, with the 0.5B model and IntentDoc v2
+  (`tests/array-s2/RESULTS.md`). Walks 6/6 and rejections 4/4 on CPU and GPU; generation 10/10 valid, CPU = GPU on
+  10/10 prompts (767 tokens), and all 40 streams equal to the 1.16-based run's; save/restore 54/54 generated and 21/21
+  teacher-forced points on each backend; both SCM1 mutants and the state-zero mutant killed. The new GPU Exact
+  jump-forward arm and GPU multi-row arm (prompt and `SSLM_GPU_ROWS_EXACT_DRAFT` chunks) each give the plain GPU
+  document on 10/10 prompts, with 452 drafts kept over 167 draft calls, at ~40 ms/token against plain GPU's 232 at the
+  default slice setting. The canonical arm is dropped, since 1.18.0 runs it as Exact. Known since 1.17.0, measured in the same
+  run: under a bound schema, a model with a tied head finishes each token on the host's legal rows (1.17.0's GPU masked
+  finish), so `SSLM_GPU_RESIDENCY_HEAD_ON_DEVICE` does not change a schema-bound decode. Where most of the vocabulary is
+  legal, as inside a string, that costs about what the full host head does: one-slice GPU decode measured 26.8-28.5
+  ms/token either way, against 18.0 with the device head on a 1.16 base. Tokens are unaffected (RESULTS.md, Finding 6).
+- **The clean stop at the schema's end** (closes 1.18.0's known issue). A `-2` at `SSLM_OK` now has a stated meaning
+  that callers read, not infer. Read the accepting bit right after it: on the CPU `sslm_stats().schema_accepting`
+  or `sslm_seq_forced_tokens`' `out_accepting`; on the GPU `SslmGpuSeqSchemaAcceptingForG5Bridge` or
+  `sslm_gpu_seq_forced_tokens`' `out_accepting`. 1 is a **clean stop**: the document is complete, and decoding should
+  stop with the output final. 0 is a **dead end**, which stays an error. The engine's behaviour is unchanged: the walk
+  and layer index are kept, a retry reproduces the same `-2`, and the sequence can be saved, restored, reset or have
+  its adapter changed. An `SSLM_GPU_ROWS_EXACT_DRAFT` chunk whose draft runs through the schema's last token closes
+  as a clean stop; draft tokens past it are not admitted.
+- **Tests:** clean-stop cells `CS.E1`-`CS.E8` in `superslm_tests` (`tests/schema_fast_decode/sfd_cells_cleanstop.inc`:
+  greedy, damped, sliced, batched, jump-forward, a jump-forward draft that runs past the closing token, save/restore
+  and lifecycle, and the dead-end seam), and GPU cells `sfdg_cell_cs_g1`-`g10` (`tests/schema-fast-decode-gpu/`:
+  whole and sliced tokens, multi-row closes, jump-forward, a jump-forward draft past the closing token,
+  `SLM5`/`SLM6` save/restore, the dead-end seam, and CPU/GPU agreement), built by `build.bat`.
+
+### Fixed
+
+- **sslm_verify checks the SchemaMasks section.** It refuses an SCM1 section the runtime loaders refuse; before, an
+  attach could report "verified" for an artifact that would not map.
+- **A tied checkpoint that also carries `lm_head.weight` converts** (Qwen3-0.6B ships one). When `config.json` sets
+  `tie_word_embeddings` and the checkpoint's `lm_head.weight` has the same dtype, shape and stored bytes as
+  `embed_tokens.weight`, the converter ignores it and the result is byte-identical to converting without it. Any
+  other `lm_head.weight` on a tied config is refused with `TiedLmHeadMismatch`, which names both tensors and what
+  differs (dtype, shape or stored bytes; the comparison is on stored bytes, so `-0.0` against `+0.0` or a BF16
+  embedding re-stored as F32 is refused). Single-file and sharded checkpoints, and both tensor namespaces, take the
+  same rule, and so does `tools/sslm_convert_adapter.py --fallback=merge`, which reads the adapter's base checkpoint
+  directly. Before, every tied checkpoint carrying `lm_head.weight` was refused as an unmapped tensor, and the merge
+  path replaced a differing head with the embedding without a word. Untied checkpoints are unchanged.
+- **The QK-norm conversion flow resolves `--capture` and `--verifier` against the working directory**
+  (`tools/t2700_fused_k_calibration.py flow`), before any use. `--capture ./name` ran a same-named program from
+  `PATH` instead, because the leading `./` was dropped. A bare name is the file in the working directory when one
+  exists there, and is otherwise left to the `PATH` lookup. `docs/quickstart.md` also now states that Qwen3-0.6B,
+  like Qwen3-Embedding-0.6B, needs `--channel-scale-headroom 1.25` (about 27.8 clipped per million at the default).
+
+### Build
+
+- **`build.bat` test and checker fixes.** It links `tests\test_batched_threading.cpp` into
+  `superslm_tests`, as CMake does (before, the link failed with `LNK2019` on `RunBatchedThreadingCells`). The T-2807
+  X2 export-slot check's consumer calls all 55 C verbs, including the 1.14.0 and 1.15.0 prefix save/restore and
+  jump-forward verbs it had missed. The schema fast-decode GPU tools (P2.16 reference, jump-forward bench, GX.3
+  bench) are compiled and linked by `build.bat`. `tests\t3094-multicommand-s0`, a red suite by design for work not
+  yet built, is allowlisted with its reason rather than run on every build, so both build-recipe checks pass.
+  `requirements.txt` now declares `capstone`, which the FP-free scan imports.
+
 ## [1.18.1] - 2026-10-31
 
 A GPU fix release. No token, save format, status, verb or shader changes. `SPX1` prefix blobs are bound to the engine

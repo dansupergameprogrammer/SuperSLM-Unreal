@@ -54,7 +54,8 @@ namespace
 }
 
 // P1.3 Stop (ruling 40: re-pointed from Canonical at Exact over a seeded table). An Exact extraction ends
-// SchemaDeadEnd with the walk accepting, and ComposeStopReason gives Completed (§6 "Stop reporting": the final finish returns -2 with no layer
+// Complete / SchemaComplete with the walk accepting (plugin 1.5.0: the schema's end is a clean stop), and
+// ComposeStopReason gives Completed (§6 "Stop reporting": the final finish returns -2 with no layer
 // pass). The example project's IsSequenceTerminal is outside the plugin; it reads the same two
 // facts, which this cell pins (rev 1.3.5 adopts this reading). Red: verbs stubbed, seam unbuilt.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSuperSLMSchemaJumpP1StopTest, "SuperSLM.SchemaJump.P1.Stop",
@@ -72,8 +73,9 @@ bool FSuperSLMSchemaJumpP1StopTest::RunTest(const FString& Parameters)
 	FRunResult Run;
 	if (!MakeRequest(*this, Rig, PopulationPrompts()[0], kExact, 512, Req) || !RunSolo(*this, Rig, Req, Run)) { return false; }
 	if (!RequireSpanActivity(*this, SpanJobsOf(*Rig.Cpu, Run.Sequence), TEXT("P1.3"))) { return false; }
-	bool bOk = TestEqual(TEXT("the extraction ends Faulted"), (uint8)Run.Phase, (uint8)ESuperSLMSequencePhase::Faulted);
-	bOk &= TestEqual(TEXT("with SchemaDeadEnd"), (uint8)Run.Outcome, (uint8)ESuperSLMDecodeOutcome::SchemaDeadEnd);
+	bool bOk = TestEqual(TEXT("the extraction ends Complete"), (uint8)Run.Phase, (uint8)ESuperSLMSequencePhase::Complete);
+	bOk &= TestEqual(TEXT("with SchemaComplete"), (uint8)Run.Outcome, (uint8)ESuperSLMDecodeOutcome::SchemaComplete);
+	bOk &= TestTrue(*FString::Printf(TEXT("before MaxNewTokens (%d of %d tokens)"), Run.Tokens.Num(), Req.MaxNewTokens), Run.Tokens.Num() < Req.MaxNewTokens);
 	bOk &= TestTrue(TEXT("with the walk accepting"), Run.Stats.bSchemaAccepting);
 	SuperSLMPromptResult::FStopFacts Facts;
 	Facts.Phase = Run.Phase;
@@ -197,7 +199,8 @@ bool FSuperSLMSchemaJumpP1SettingPerGenerationTest::RunTest(const FString& Param
 	Runs.AddDefaulted(2);
 	if (!MakeRequest(*this, Rig, PopulationPrompts()[0], kExact, 96, Runs[0].Request) ||
 		!MakeRequest(*this, Rig, PopulationPrompts()[0], ESuperSLMSchemaJumpForward::Off, 96, Runs[1].Request)) { return false; }
-	if (!RunConcurrently(*this, Rig, Runs, /*bKeep*/ true)) { return false; }
+	// Gathered at decode, as P1.7: without the hold, whether the two land in one decode job is tick timing.
+	if (!RunConcurrently(*this, Rig, Runs, /*bKeep*/ true, /*bGatherAtDecode*/ true)) { return false; }
 	bOk &= TestTrue(TEXT("precondition: one decode job served both"),
 		SomeDecodeJobServedAll(*Rig.Cpu, { Runs[0].Result.Sequence, Runs[1].Result.Sequence }));
 	bOk &= RequireSpanActivity(*this, SpanJobsOf(*Rig.Cpu, Runs[0].Result.Sequence), TEXT("P1.9 Exact generation"));

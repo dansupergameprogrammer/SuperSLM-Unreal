@@ -6,7 +6,7 @@
 //   SuperSLM.PrefixCache.Gpu.SaveCompat.Recorded1p13p1  9.11, the paging release's own GPU saves         [U6]
 //   SuperSLM.PrefixCache.Gpu.SaveCompat.Crafted         9.11, every boundary case, 'SLM5' and 'SLM6'     [U6]
 //
-// On the shipped engine. This build vendors engine v1.18.1 (ThirdParty/SuperSLM/VENDORED_VERSION.txt). The table's one
+// On the shipped engine. This build vendors engine v1.19.0 (ThirdParty/SuperSLM/VENDORED_VERSION.txt). The table's one
 // row (SuperSLMSaveCompatCore.cpp: compiled v1.14.0 accepts v1.13.1 @ d697927 around 'SSB5', 'SSB6', 'SLM5', 'SLM6')
 // does not apply, so every save from another engine release is refused Layer1Mismatch with nothing drawn, as in the CPU
 // file. The row's v1.14.0 acceptance is the host twin's (ci/host/prefix_cache/test_save_compat.cpp).
@@ -366,7 +366,7 @@ bool FSuperSLMPrefixCacheGpuSaveCompatRecordedTest::RunTest(const FString& Param
 		{
 			Expected.Add(FCString::Atoi(*P));
 		}
-		// On the shipped engine (v1.18.1) no row accepts a 1.13.1 save: refused by name, nothing drawn. The continuation
+		// On the shipped engine (v1.19.0) no row accepts a 1.13.1 save: refused by name, nothing drawn. The continuation
 		// file stays the record of what the paging release generated after it.
 		bOk &= TestTrue(*FString::Printf(TEXT("%s: the continuation file is nonempty"), C.Name), Expected.Num() > 0);
 		bOk &= PayloadMagicIs(*this, Blob, C.Magic, C.Name);

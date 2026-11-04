@@ -23,7 +23,7 @@ struct SUPERSLMUNREALEDITOR_API FSuperSLMSchemaDryRunReport
 	FString Text;                 // GeneratedTokens detokenized
 	bool bSchemaAccepting = false; // GetStats().bSchemaAccepting at the stop
 	int64 ForcedTokenCount = 0;    // GetStats().ForcedTokenCount at the stop
-	bool bDeadEnd = false;         // the walk returned -2 (ESuperSLMDecodeOutcome::SchemaDeadEnd)
+	bool bDeadEnd = false;         // the walk returned -2: SchemaDeadEnd (not accepting) or SchemaComplete (accepting)
 	TOptional<ESuperSLMQueryStopReason> StopReason; // SuperSLMPromptResult::ComposeStopReason()
 	int32 Frames = 0;
 };

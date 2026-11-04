@@ -84,6 +84,7 @@ namespace
 		case ESuperSLMDecodeOutcome::Generating: return TEXT("Generating");
 		case ESuperSLMDecodeOutcome::SchemaDeadEnd: return TEXT("Schema Dead End");
 		case ESuperSLMDecodeOutcome::SequenceNoLongerValid: return TEXT("Sequence No Longer Valid");
+		case ESuperSLMDecodeOutcome::SchemaComplete: return TEXT("Schema Complete");
 		}
 		return TEXT("Unknown");
 	}
@@ -858,9 +859,8 @@ const TArray<int32>& FSuperSLMExampleDemo::GeneratedTokens(const FQuery& Query) 
 		: Gpu->GetGeneratedTokens(Query.GpuSequence);
 }
 
-bool FSuperSLMExampleDemo::IsSequenceTerminal(const FQuery& Query, bool& bOutSchemaComplete, FString& OutWhy) const
+bool FSuperSLMExampleDemo::IsSequenceTerminal(const FQuery& Query, FString& OutWhy) const
 {
-	bOutSchemaComplete = false;
 	const bool bCpu = Readout.Settings.Backend == ESuperSLMExampleBackend::CPU;
 	const ESuperSLMSequencePhase Phase = bCpu ? Cpu.GetPhase(Query.CpuSequence) : Gpu->GetPhase(Query.GpuSequence);
 	if (Phase == ESuperSLMSequencePhase::Complete)
@@ -872,9 +872,9 @@ bool FSuperSLMExampleDemo::IsSequenceTerminal(const FQuery& Query, bool& bOutSch
 		return false;
 	}
 	const ESuperSLMDecodeOutcome Outcome = bCpu ? Cpu.GetLastDecodeOutcome(Query.CpuSequence) : Gpu->GetLastDecodeOutcome(Query.GpuSequence);
-	// A schema-bound walk that has emitted its last legal token ends in Schema Dead End: the
-	// schema is complete. The JSON validator decides whether it completed or stopped short.
-	bOutSchemaComplete = Outcome == ESuperSLMDecodeOutcome::SchemaDeadEnd;
+	// A schema-bound walk that has emitted its last legal token ends Complete (Schema Complete), above.
+	// Schema Dead End is a -2 with the walk not accepting: the document stopped short, a fault like any
+	// other, and the caller fails the stage on it.
 	OutWhy = FString::Printf(TEXT("the sequence faulted (%s)"), *DecodeOutcomeName(Outcome));
 	if (!bCpu && Gpu->GetLastFaultReason(Query.GpuSequence) == ESuperSLMGpuFaultReason::TerminalDeviceLost)
 	{
@@ -917,15 +917,14 @@ void FSuperSLMExampleDemo::PollQuery(FQuery& Query)
 
 	case EStage::Extracting:
 	{
-		bool bSchemaComplete = false;
 		FString Why;
-		if (!IsSequenceTerminal(Query, bSchemaComplete, Why))
+		if (!IsSequenceTerminal(Query, Why))
 		{
 			return;
 		}
 		const bool bCompleted = bCpu ? Cpu.GetPhase(Query.CpuSequence) == ESuperSLMSequencePhase::Complete
 			: Gpu->GetPhase(Query.GpuSequence) == ESuperSLMSequencePhase::Complete;
-		if (!bCompleted && !bSchemaComplete)
+		if (!bCompleted)
 		{
 			Query.Stage = EStage::Failed;
 			Query.Error = FString::Printf(TEXT("extraction: %s"), *Why);
@@ -945,9 +944,8 @@ void FSuperSLMExampleDemo::PollQuery(FQuery& Query)
 
 	case EStage::Replying:
 	{
-		bool bSchemaComplete = false;
 		FString Why;
-		if (!IsSequenceTerminal(Query, bSchemaComplete, Why))
+		if (!IsSequenceTerminal(Query, Why))
 		{
 			return;
 		}

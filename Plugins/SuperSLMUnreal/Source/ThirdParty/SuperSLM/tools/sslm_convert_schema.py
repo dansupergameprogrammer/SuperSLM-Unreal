@@ -63,6 +63,40 @@ design, closed across four folds (`Claude/Plans/te266-gpu-path.md` Sec3.9.1):
   decodes, 3.5%) -- a caller whose prompt's natural answer may contain an internal quote should ask
   for plain, unstructured text, or treat the returned value as possibly truncated there.
 
+A `"type": "array"` node (T-3094 S1, plan of record `Claude/Plans/superslm-multicommand-array/plan.md`
+Sec4.1, Wizard repo) compiles to a cyclic item automaton:
+
+- **Grammar.** `[`, then the `minItems` required item occurrences separated by `,`; after the minimum the
+  automaton offers `]` or `,` followed by the same item automaton again. `minItems: 0` has a direct `[]`
+  path, a first-item path and a repeat-item path. The loop edge starts only after a complete item, so a
+  trailing, leading or doubled comma is never accepted. `items` must be one schema object; arrays nest by
+  the same recursion (an array's item may hold another array).
+- **Construction.** `_groups()` emits an array as a one-element group holding an `_ArrayGroup`
+  sentinel; `_char_dfa()` wires the byte NFA recursively (epsilon-free) and determinizes it by the same
+  subset construction every schema already uses. `_token_targets`, the special-id exclusion and the
+  `MaskPages` representation are unchanged. The release limits bind only a schema the compiler builds
+  an array for (S1 fix round 1, R1; `_contains_array`): a schema without one compiles to the same
+  table and SCM1 bytes as v1.13.1, however large, because no release limit is applied to it --
+  unless its table has a reachable state that cannot finish, which is refused by name (the
+  dead-state refusal below outranks R1: such a table could never complete a document). Limits
+  injected through `limits=` bind every schema.
+- **Refused.** `maxItems` is refused by name even where a small value could be flattened (Sec4.1).
+- **Resource admission.** Seven limits (`RELEASE_LIMITS`, the frozen provisional release values of the
+  T-3094 S0 limits freeze) are checked at their counting stage, each with its own named diagnostic
+  (`LIMIT_DIAGNOSTICS`): `minItems` per array (the diagnostic names the array's RFC 6901 schema
+  pointer) and nesting depth before any automaton is built; NFA states as each node is created; token-DFA
+  states, token transitions, SCM1 section bytes and tracked temporary bytes as the token table grows. The
+  tracked budget is reserved before each charged structure is allocated (NFA nodes and edges, byte-DFA
+  states, token states, and each token row's staging bound of one transition per vocabulary id), so a
+  refusal stops at the crossing rather than after the whole table exists. The vocabulary trie is
+  charged its measured storage node by node as it is built (about 79.4 MB at a 151,936-id
+  vocabulary), reserved before each node is created. `limits=` replaces named limits for one call only;
+  the compiled artifact reports every count in `MaskPages.resource_counts`.
+- **Every reachable state can finish.** The empty-row refusal (G-7a) is the zero-step case of the class
+  rule this compiler enforces: a schema whose token DFA has a reachable state from which no accepting
+  state is reachable is refused by name, with no artifact (a cyclic table can loop forever with every row
+  non-empty when the vocabulary cannot spell an exit).
+
 `_token_targets`, `compile_schema_to_mask_pages` and `MaskPages` are generic over whatever alphabet
 the character-level DFA and trie use as dict keys; a byte value (0-255) is as valid a key as a
 one-character string once every layer speaks the same alphabet.
@@ -93,6 +127,7 @@ row at each state) -- not a runtime primitive, used only by this suite's own G5-
 from __future__ import annotations
 
 import json
+import sys
 from collections import deque
 from collections.abc import Hashable
 from typing import Any, Callable, Mapping, Sequence
@@ -102,7 +137,11 @@ __all__ = [
     "MaskPages",
     "compile_schema_to_mask_pages",
     "zero_special_ids",
+    "serialize_scm1",
+    "fnv1a64",
     "INSIGNIFICANT_VALUE_BYTES",
+    "RELEASE_LIMITS",
+    "LIMIT_DIAGNOSTICS",
 ]
 
 
@@ -147,6 +186,19 @@ class _StringLeaf:
 
 _STRING_LEAF = _StringLeaf()
 
+
+class _ArrayGroup:
+    """Sentinel group for a `"type": "array"` node (T-3094 S1, plan Sec4.1): `_groups()` emits a
+    one-element group holding one instance, exactly as a string leaf emits `(_STRING_LEAF,)`, and
+    `_char_dfa()` wires it as the cyclic item automaton (`_wire_array`). `item` is the item
+    schema's own ordered group list; `min_items` is the array's own required minimum."""
+
+    __slots__ = ("min_items", "item")
+
+    def __init__(self, min_items: int, item: list) -> None:
+        self.min_items = min_items
+        self.item = item
+
 # T-2853 Sec3.2's eight short escapes, `S_e -> S_c`, keyed by the literal character that
 # follows the backslash in the token stream (not by the character it unescapes to).
 _SHORT_ESCAPE_CHARS = ('"', "\\", "/", "b", "f", "n", "r", "t")
@@ -187,9 +239,16 @@ _ALLOWED_KEYWORDS: dict[str, frozenset[str]] = {
     "boolean": frozenset({"type"}) | _ANNOTATION_KEYWORDS,
     "string": frozenset({"type"}) | _ANNOTATION_KEYWORDS,
     "object": frozenset({"type", "properties", "required", "additionalProperties"}) | _ANNOTATION_KEYWORDS,
+    "array": frozenset({"type", "items", "minItems"}) | _ANNOTATION_KEYWORDS,
 }
 
 _KEYWORD_REASON_OVERRIDES: dict[str, str] = {
+    "maxItems": (
+        "the production converter refuses maxItems even where a small value could be flattened "
+        "into positional copies: the array compiles to one cyclic item automaton with no upper "
+        "bound, so accepting the keyword would compile an unbounded array while discarding the "
+        "author's stated bound (T-3094 plan Sec4.1)"
+    ),
     "maxLength": (
         "D-SLM7435 rules only that no length bound is added to the DFA -- an unbounded "
         "self-loop ships regardless of what value a schema names -- and says nothing about "
@@ -225,7 +284,10 @@ _JSON_SCHEMA_TYPE_CHECKS: dict[str, Callable[[Any], bool]] = {
 }
 
 
-def _reject_unimplemented_keywords(schema: Mapping[str, Any], path: str, allowed: frozenset[str]) -> None:
+def _reject_unimplemented_keywords(
+    schema: Mapping[str, Any], path: str, allowed: frozenset[str], pointer: str | None = None
+) -> None:
+    where = path if pointer is None else f"{path} (schema pointer {pointer})"
     for key in sorted(schema):
         if key in allowed:
             continue
@@ -235,22 +297,49 @@ def _reject_unimplemented_keywords(schema: Mapping[str, Any], path: str, allowed
             f"unenforced (generalizes the maxLength precedent, T-2859 F2/S3, to every "
             f"keyword outside {sorted(allowed)!r})"
         ))
-        raise SchemaCompileError(f"{key} is not supported at {path}", reason=reason)
+        raise SchemaCompileError(f"{key} is not supported at {where}", reason=reason)
 
 
-def _groups(schema: Mapping[str, Any], path: str) -> list[_Group]:
+def _pointer_token(key: str) -> str:
+    """One RFC 6901 reference token: `~` is written `~0` and `/` is written `~1`."""
+    return key.replace("~", "~0").replace("/", "~1")
+
+
+def _groups(
+    schema: Mapping[str, Any],
+    path: str,
+    *,
+    pointer: str = "",
+    limits: Mapping[str, int] | None = None,
+    arrays: dict[str, int] | None = None,
+) -> list[_Group]:
     """`schema`'s canonical serialization as an ordered list of alternation groups.
 
     Each group is the set of strings the serialization may take at that position; a
     literal is a group of one. Concatenating one choice from each group, in order,
     produces exactly the canonical serializations D-SLM40 admits for this schema --
     except `_STRING_LEAF` (T-2853), which names a cyclic sub-automaton rather than a
-    finite set of choices; `_char_dfa()` is what expands it.
+    finite set of choices, and an `_ArrayGroup` (T-3094 S1), which names the cyclic
+    item automaton; `_char_dfa()` is what expands both.
+
+    `pointer` is the node's RFC 6901 pointer into the schema document (array diagnostics name
+    it). `arrays`, when given, collects each array's pointer and `minItems`; `limits`, when
+    given, applies the per-array `minItems` limit (T-3094 S1, D-SLM8087: every array
+    independently).
     """
     root_extra = _ROOT_ONLY_ANNOTATION_KEYWORDS if path == "$" else frozenset()
     node_type = schema.get("type")
 
     if "enum" in schema:
+        if node_type in ("object", "array") and set(schema) - (_ALLOWED_KEYWORDS["enum"] | root_extra):
+            # An object or array node carrying `enum`: the node is refused either way (its own
+            # structural keys are outside the enum allowlist), and the keyword this compiler does
+            # not implement at that node is `enum` itself, so the refusal names it.
+            raise SchemaCompileError(
+                f"enum is not supported at {path} on a {node_type} node",
+                reason=f"enum is implemented only on a scalar leaf; a {node_type} node's language "
+                       f"comes from its own structural keywords",
+            )
         _reject_unimplemented_keywords(schema, path, _ALLOWED_KEYWORDS["enum"] | root_extra)
         values = schema["enum"]
         if not values:
@@ -297,12 +386,12 @@ def _groups(schema: Mapping[str, Any], path: str) -> list[_Group]:
         required = list(schema.get("required", list(properties)))
         if schema.get("additionalProperties", False) is not False:
             raise SchemaCompileError(
-                f"object at {path} permits additional properties",
+                f"object at {path} permits additional properties (additionalProperties must be false)",
                 reason="additionalProperties must be false; an open object has no fixed serialization",
             )
         if required != list(properties):
             raise SchemaCompileError(
-                f"object at {path} has optional or reordered keys",
+                f"object at {path} has optional or reordered keys (required must list every property, in properties order)",
                 reason="every property must be required, in properties order (D-SLM45); optional/reordered keys are outside the compilable subset",
             )
         groups: list[_Group] = [("{",)]
@@ -310,14 +399,64 @@ def _groups(schema: Mapping[str, Any], path: str) -> list[_Group]:
             if index:
                 groups.append((",",))
             groups.append((json.dumps(key, ensure_ascii=False) + ":",))
-            groups.extend(_groups(sub_schema, f"{path}.{key}"))
+            groups.extend(_groups(sub_schema, f"{path}.{key}",
+                                  pointer=f"{pointer}/properties/{_pointer_token(key)}",
+                                  limits=limits, arrays=arrays))
         groups.append(("}",))
         return groups
 
+    if node_type == "array":
+        return [(_array_group(schema, path, pointer, root_extra, limits, arrays),)]
+
     raise SchemaCompileError(
         f"unsupported construct at {path}",
-        reason=f"type {node_type!r} is outside D-SLM45's compilable subset (objects with known keys, enums, booleans, unbounded free-text strings; cross-field constraints are scored, not compiled)",
+        reason=f"type {node_type!r} is outside D-SLM45's compilable subset (objects with known keys, arrays of one item schema, enums, booleans, unbounded free-text strings; cross-field constraints are scored, not compiled)",
     )
+
+
+def _array_group(
+    schema: Mapping[str, Any],
+    path: str,
+    pointer: str,
+    root_extra: frozenset[str],
+    limits: Mapping[str, int] | None,
+    arrays: dict[str, int] | None,
+) -> _ArrayGroup:
+    """An array node's `_ArrayGroup` (T-3094 S1, plan Sec4.1). Every refusal here names the
+    array's RFC 6901 schema pointer."""
+    where = f"{path} (schema pointer {pointer})"
+    _reject_unimplemented_keywords(schema, path, _ALLOWED_KEYWORDS["array"] | root_extra, pointer)
+    if "items" not in schema:
+        raise SchemaCompileError(
+            f"array at {where} has no items schema",
+            reason="items must name the one schema every array item follows",
+        )
+    items = schema["items"]
+    if not isinstance(items, Mapping):
+        raise SchemaCompileError(
+            f"items at {where} must be a single schema object, not {type(items).__name__}",
+            reason="tuple-form (positional) items and boolean items are outside the compilable "
+                   "subset; every item follows one schema",
+        )
+    min_items = schema.get("minItems", 0)
+    if isinstance(min_items, bool) or not isinstance(min_items, int) or min_items < 0:
+        raise SchemaCompileError(
+            f"minItems at {where} must be a non-negative integer, not {min_items!r}",
+            reason="minItems is the array's required minimum item count",
+        )
+    if arrays is not None:
+        arrays[pointer] = min_items
+    if limits is not None and min_items > limits["minItems"]:
+        raise SchemaCompileError(
+            f"{LIMIT_DIAGNOSTICS['minItems']} exceeded: "
+            f"{'the root array (schema pointer' if not pointer else 'the array at schema pointer'} '{pointer}'"
+            f"{')' if not pointer else ''} requires minItems {min_items}, above the per-array limit of "
+            f"{limits['minItems']}",
+            reason="each required item is a separate copy of the item automaton; the limit applies "
+                   "to every array independently (D-SLM8087)",
+        )
+    return _ArrayGroup(min_items, _groups(items, f"{path}[]", pointer=f"{pointer}/items",
+                                          limits=limits, arrays=arrays))
 
 
 # --- the byte-level content sub-automaton (T-2908's alphabet, T-2912's U/M value closure) ----
@@ -479,39 +618,141 @@ def _add_string_leaf(
     return following
 
 
-def _char_dfa(groups: Sequence[_Group]) -> tuple[list[dict[int, int]], int, frozenset[int], frozenset[int]]:
-    """Returns `(dfa, start, accepting, content_states)`. `content_states` (T-2910) is the
-    DFA state ids whose underlying NFA node set intersects the string leaf's own content
-    nodes -- `_token_targets` consults it to tell content from literal skeleton."""
-    edges: list[dict[int, set[int]]] = [{}]
-    content_nodes: set[int] = set()
+class _NFA:
+    """The epsilon-free byte NFA under construction: `edges[node][byte]` is the node's target set.
+    Node 0 is the start. Every node is created through `add_node`, which charges the admission
+    budget (when there is one) before the node exists; every edge is charged before it is inserted."""
 
-    def add_node() -> int:
-        edges.append({})
-        return len(edges) - 1
+    def __init__(self, admission: "_Admission | None") -> None:
+        self.admission = admission
+        self.edges: list[dict[int, set[int]]] = []
+        self.content_nodes: set[int] = set()
+        self.add_node()
 
-    cursor = 0
+    def add_node(self) -> int:
+        if self.admission is not None:
+            self.admission.nfa_node()
+        self.edges.append({})
+        return len(self.edges) - 1
+
+    def edge_count(self, nodes: Sequence[int] | range) -> int:
+        return sum(len(targets) for node in nodes for targets in self.edges[node].values())
+
+    def charge_edges(self, count: int) -> None:
+        if self.admission is not None and count:
+            self.admission.nfa_edges(count)
+
+    def literal(self, start: int, raw: bytes, end: int | None = None) -> int:
+        """A literal byte chain from `start` to `end` (a fresh node when `end` is None)."""
+        following = self.add_node() if end is None else end
+        node = start
+        for index, byte_val in enumerate(raw):
+            target = following if index == len(raw) - 1 else self.add_node()
+            if target not in self.edges[node].get(byte_val, ()):
+                self.charge_edges(1)
+                self.edges[node].setdefault(byte_val, set()).add(target)
+            node = target
+        return following
+
+    def refund_edges(self, count: int) -> None:
+        if self.admission is not None and count:
+            self.admission.release(count * _CHARGE_NFA_EDGE)
+
+
+_STRING_LEAF_EDGES: list[int] = []
+
+
+def _string_leaf_edge_bound() -> int:
+    """The number of edges one string leaf adds when wired from a cursor with no edges of its own
+    (an upper bound on what it adds anywhere): measured once on a scratch automaton."""
+    if not _STRING_LEAF_EDGES:
+        scratch: list[dict[int, set[int]]] = [{}]
+
+        def add() -> int:
+            scratch.append({})
+            return len(scratch) - 1
+
+        _add_string_leaf(scratch, add, 0, set())
+        _STRING_LEAF_EDGES.append(sum(len(t) for row in scratch for t in row.values()))
+    return _STRING_LEAF_EDGES[0]
+
+
+def _wire(nfa: _NFA, groups: Sequence[_Group], cursor: int) -> int:
+    """Wires `groups` into `nfa` from `cursor`; returns the node after the last group."""
     for group in groups:
         if len(group) == 1 and group[0] is _STRING_LEAF:
-            cursor = _add_string_leaf(edges, add_node, cursor, content_nodes)
+            # The leaf's edge bound is reserved before any of its edges exist; the part the
+            # cursor already carried (a shared edge is not a new one) is returned afterwards.
+            bound = _string_leaf_edge_bound()
+            nfa.charge_edges(bound)
+            before = nfa.edge_count((cursor,))
+            first_new = len(nfa.edges)
+            following = _add_string_leaf(nfa.edges, nfa.add_node, cursor, nfa.content_nodes)
+            nfa.refund_edges(bound - (nfa.edge_count((cursor,)) - before
+                                      + nfa.edge_count(range(first_new, len(nfa.edges)))))
+            cursor = following
             continue
-        following = add_node()
+        if len(group) == 1 and isinstance(group[0], _ArrayGroup):
+            cursor = _wire_array(nfa, group[0], cursor)
+            continue
+        following = nfa.add_node()
         for alternative in group:
             if not alternative:
                 raise SchemaCompileError(
                     "an alternation contains the empty string",
                     reason="a zero-length alternative makes the serialization ambiguous",
                 )
-            raw = alternative.encode("utf-8")
-            node = cursor
-            for index, byte_val in enumerate(raw):
-                target = following if index == len(raw) - 1 else add_node()
-                edges[node].setdefault(byte_val, set()).add(target)
-                node = target
+            nfa.literal(cursor, alternative.encode("utf-8"), following)
         cursor = following
-    accept_node = cursor
+    return cursor
+
+
+def _wire_array(nfa: _NFA, array: _ArrayGroup, cursor: int) -> int:
+    """The cyclic item automaton (T-3094 S1, plan Sec4.1): `[`, the `min_items` required item
+    occurrences separated by `,`, then `]` or `,` back into the same (last) item copy. The loop
+    edge leaves only a complete item, so no comma is ever followed by `]`. `minItems: 0` has the
+    direct `[]` path, a first-item copy and a repeat-item copy whose `,` loops into itself (the
+    first copy's start also carries `]`, so it cannot be the loop target)."""
+    following = nfa.add_node()
+    cur = nfa.literal(cursor, b"[")
+    if array.min_items == 0:
+        nfa.literal(cur, b"]", following)
+        first_end = _wire(nfa, array.item, cur)
+        nfa.literal(first_end, b"]", following)
+        repeat = nfa.add_node()
+        nfa.literal(first_end, b",", repeat)
+        repeat_end = _wire(nfa, array.item, repeat)
+        nfa.literal(repeat_end, b"]", following)
+        nfa.literal(repeat_end, b",", repeat)
+        return following
+    repeat = cur
+    for index in range(array.min_items):
+        if index:
+            cur = nfa.literal(cur, b",")
+        repeat = cur
+        cur = _wire(nfa, array.item, cur)
+    nfa.literal(cur, b"]", following)
+    nfa.literal(cur, b",", repeat)
+    return following
+
+
+def _char_dfa(
+    groups: Sequence[_Group], admission: "_Admission | None" = None
+) -> tuple[list[dict[int, int]], int, frozenset[int], frozenset[int]]:
+    """Returns `(dfa, start, accepting, content_states)`. `content_states` (T-2910) is the
+    DFA state ids whose underlying NFA node set intersects the string leaf's own content
+    nodes -- `_token_targets` consults it to tell content from literal skeleton.
+
+    With `admission` (T-3094 S1), every NFA node is admitted against the NFA state limit as it
+    is created, and every NFA edge and byte-DFA state is reserved against the tracked budget
+    before it is stored."""
+    nfa = _NFA(admission)
+    accept_node = _wire(nfa, groups, 0)
+    edges, content_nodes = nfa.edges, nfa.content_nodes
 
     start_set = frozenset({0})
+    if admission is not None:
+        admission.byte_dfa_state()
     ids: dict[frozenset[int], int] = {start_set: 0}
     dfa: list[dict[int, int]] = [{}]
     accepting: set[int] = set()
@@ -532,6 +773,8 @@ def _char_dfa(groups: Sequence[_Group]) -> tuple[list[dict[int, int]], int, froz
         for byte_val in sorted(moves):
             target_set = frozenset(moves[byte_val])
             if target_set not in ids:
+                if admission is not None:
+                    admission.byte_dfa_state()
                 ids[target_set] = len(dfa)
                 dfa.append({})
                 queue.append(target_set)
@@ -566,7 +809,30 @@ class _TrieNode:
         self.token_id: int | None = None
 
 
-def _vocab_trie(vocab: Sequence[bytes]) -> _TrieNode:
+_TRIE_STORAGE: list[int] = []
+
+
+def _trie_storage() -> tuple[int, int]:
+    """(bytes of one new node with its empty child table, bytes a child table grows on its first
+    insertion), measured once from the interpreter's own objects (`sys.getsizeof`)."""
+    if not _TRIE_STORAGE:
+        node = _TrieNode()
+        _TRIE_STORAGE.append(sys.getsizeof(node) + sys.getsizeof(node.children))
+        probe: dict[int, Any] = {}
+        before = sys.getsizeof(probe)
+        probe[0] = None
+        _TRIE_STORAGE.append(sys.getsizeof(probe) - before)
+    return _TRIE_STORAGE[0], _TRIE_STORAGE[1]
+
+
+def _vocab_trie(vocab: Sequence[bytes], admission: "_Admission | None" = None) -> _TrieNode:
+    """The vocabulary trie. With `admission` (S1 fix round 1), its storage is charged as it is
+    actually held: before each node is created, the node, its empty child table and a bound on its
+    parent table's growth are reserved; the unused part of the bound is returned once the parent's
+    new size is known, and a token id object the trie keeps alive is charged before it is stored."""
+    node_bytes, first_growth = _trie_storage()
+    if admission is not None:
+        admission.trie_storage(node_bytes)
     root = _TrieNode()
     for token_id, piece in enumerate(vocab):
         if not piece:
@@ -575,10 +841,24 @@ def _vocab_trie(vocab: Sequence[bytes]) -> _TrieNode:
         for byte_val in piece:
             child = node.children.get(byte_val)
             if child is None:
-                child = _TrieNode()
-                node.children[byte_val] = child
+                if admission is None:
+                    child = _TrieNode()
+                    node.children[byte_val] = child
+                else:
+                    table_before = sys.getsizeof(node.children)
+                    bound = node_bytes + table_before + first_growth
+                    admission.trie_storage(bound)
+                    child = _TrieNode()
+                    node.children[byte_val] = child
+                    used = node_bytes + sys.getsizeof(node.children) - table_before
+                    if used <= bound:
+                        admission.release(bound - used)
+                    else:  # a table grew past its bound: charge the rest (refused if over)
+                        admission.trie_storage(used - bound)
             node = child
         if node.token_id is None:  # first (lowest-index) token spelling this piece wins
+            if admission is not None and not -5 <= token_id <= 256:  # not an interpreter-cached int
+                admission.trie_storage(sys.getsizeof(token_id))
             node.token_id = token_id
     return root
 
@@ -677,11 +957,16 @@ class MaskPages:
         transitions: Mapping[int, Mapping[int, int]],
         start: int,
         accepting: frozenset[int],
+        resource_counts: Mapping[str, Any] | None = None,
     ) -> None:
         self.vocab = tuple(vocab)
         self.transitions: dict[int, dict[int, int]] = {s: dict(row) for s, row in transitions.items()}
         self.start = start
         self.accepting = frozenset(accepting)
+        # T-3094 S1: the seven admitted counts of the compile that produced this table (`minItems`
+        # maps each array's RFC 6901 schema pointer to its minimum). None for a hand-built table.
+        self.resource_counts: dict[str, Any] | None = (
+            None if resource_counts is None else dict(resource_counts))
 
     def valid_token_ids(self, state: int) -> frozenset[int]:
         return frozenset(self.transitions.get(state, {}))
@@ -726,6 +1011,203 @@ class MaskPages:
         return state in self.accepting
 
 
+# --- resource admission (T-3094 S1, plan Sec4.1 resource admission contract) ---------------------
+
+# The release limits (T-3103 S0 limits freeze, D-SLM8087 rule, D-SLM8095 values; keys use the T-3094
+# names; tracked bytes finalized in S1, below). A count equal to its limit is admitted; a count above it
+# is refused. They bind only a schema that contains an array (S1 fix round 1, R1); injected `limits=`
+# keys bind every schema.
+RELEASE_LIMITS: dict[str, int] = {
+    "minItems": 8,                              # per array, every array independently
+    "recursion_depth": 8,                       # a leaf is 1; an object or array is 1 + its deepest child
+    "nfa_states": 4_096,                        # byte NFA nodes, the start node included
+    "dfa_states": 4_096,                        # token-DFA states (one SCM1 mask page each)
+    "token_transitions": 8_388_608,             # (state, token) entries in the token table
+    "serialized_mask_bytes": 134_217_728,       # this schema's SCM1 section, name included
+    "tracked_temporary_bytes": 536_870_912,     # the compiler's charged allocations (below)
+}
+# tracked_temporary_bytes was 268,435,456 in the S0 freeze, derived with the trie charged a 8,224 B
+# constant. S1 fix round 1 charges the trie's measured storage (about 79.4 MB at the pinned 151,936-id
+# vocabulary) and finalizes the limit by the D-SLM8087 rule: the next power of two at or above twice
+# the larger measured count of IntentDoc v2 (165,514,483 B) and G1 (133,260,439 B) at the pinned
+# vocabulary, i.e. 2 x 165,514,483 = 331,028,966 -> 536,870,912. The loader has no tracked-memory
+# bound (`include/superslm/schema_masks.h` bounds states and transitions only), so no cap applies.
+
+LIMIT_DIAGNOSTICS: dict[str, str] = {
+    "minItems": "minItems limit",
+    "recursion_depth": "recursion depth limit",
+    "nfa_states": "NFA state limit",
+    "dfa_states": "DFA state limit",
+    "token_transitions": "token transition limit",
+    "serialized_mask_bytes": "serialized mask byte limit",
+    "tracked_temporary_bytes": "tracked temporary memory limit",
+}
+
+# SCM1 layout (t2119 design Sec13.2, as `serialize_scm1` writes it): a 24-byte header, one 56-byte
+# descriptor per schema, the name blob, then per schema the mask pages, the (states + 1) CSR state
+# offsets, the accepting ids and the 8-byte (token, target) transitions.
+_SCM1_HEADER_BYTES = 24
+_SCM1_DESCRIPTOR_BYTES = 56
+
+# Tracked-allocation charges, per structure, of the frozen allocation model the limits were derived
+# from (T-3094 S0 `resource_pairs.py`, plan Sec4.1 memory paragraph): an NFA node, an NFA byte edge,
+# a DFA state (charged for every byte-DFA state and every token-DFA state), a token transition's
+# staging entry, plus the SCM1 section bytes the table will occupy. The vocabulary trie is charged its
+# measured storage instead (`_vocab_trie`; S1 fix round 1 replaced the frozen 257 * 32 B constant).
+_CHARGE_NFA_NODE = 64
+_CHARGE_NFA_EDGE = 16
+_CHARGE_DFA_STATE = 48
+_CHARGE_TRANSITION = 16
+
+
+_UNBOUNDED = sys.maxsize
+
+
+def _contains_array(schema: Any) -> bool:
+    """Whether the compiler will build an array automaton for `schema`: a node with
+    `"type": "array"` and no `enum`, reached only along the edges `_groups` descends (an object
+    node's `properties` values; nothing below an array is needed). `enum` values, annotations,
+    `default`, `examples` and every other value are data, never schema, so an array spelled inside
+    them does not count (S1 confirmation pass 1, C1)."""
+    stack = [schema]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, Mapping) or "enum" in node:
+            continue
+        kind = node.get("type")
+        if kind == "array":
+            return True
+        if kind == "object" and isinstance(node.get("properties"), Mapping):
+            stack.extend(node["properties"].values())
+    return False
+
+
+def _resolve_limits(limits: Mapping[str, int] | None, release: bool = True) -> dict[str, int]:
+    """A fresh per-call copy of the base limits with `limits` replacing only the keys it names
+    (the test harness and the attachment command inject smaller limits through the same guard).
+    The base is `RELEASE_LIMITS` when `release`, otherwise unbounded. Nothing persists past the
+    call that received it."""
+    active = dict(RELEASE_LIMITS) if release else {key: _UNBOUNDED for key in RELEASE_LIMITS}
+    for key, value in (limits or {}).items():
+        if key not in active:
+            raise ValueError(f"unknown resource limit {key!r}; the limits are {sorted(active)}")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"resource limit {key!r} must be a non-negative integer, not {value!r}")
+        active[key] = value
+    return active
+
+
+def _schema_depth(schema: Mapping[str, Any], limit: int) -> int:
+    """The schema's nesting depth (a leaf is 1; an object or array is 1 + its deepest child),
+    refused by name as soon as any node lies deeper than `limit` -- before anything is built and
+    without descending further, so a hostile nesting cannot exhaust the walk."""
+    deepest = 0
+    stack: list[tuple[Any, int, str]] = [(schema, 1, "$")]
+    while stack:
+        node, level, path = stack.pop()
+        if level > limit:
+            raise SchemaCompileError(
+                f"{LIMIT_DIAGNOSTICS['recursion_depth']} exceeded: the schema nests {level} levels "
+                f"deep at {path}, above the limit of {limit}",
+                reason="nesting depth is checked before any automaton is built",
+            )
+        deepest = max(deepest, level)
+        if not isinstance(node, Mapping):
+            continue
+        if node.get("type") == "object" and isinstance(node.get("properties"), Mapping):
+            for key, child in node["properties"].items():
+                stack.append((child, level + 1, f"{path}.{key}"))
+        elif node.get("type") == "array" and isinstance(node.get("items"), Mapping):
+            stack.append((node["items"], level + 1, f"{path}[]"))
+    return deepest
+
+
+class _Admission:
+    """One compile's running resource counts, each checked against its limit at the moment its
+    structure is about to be created -- never after the table exists. `tracked` accumulates the
+    charges above and is reserved before the charged structure is stored."""
+
+    def __init__(self, limits: Mapping[str, int], vocab_size: int) -> None:
+        self.limits = limits
+        self.page_bytes = (vocab_size + 7) // 8
+        self.counts = {"nfa_states": 0, "dfa_states": 0, "token_transitions": 0,
+                       "serialized_mask_bytes": 0, "tracked_temporary_bytes": 0}
+
+    def _admit(self, key: str, amount: int, what: str) -> None:
+        value = self.counts[key] + amount
+        limit = self.limits[key]
+        if value > limit:
+            raise SchemaCompileError(
+                f"{LIMIT_DIAGNOSTICS[key]} exceeded: {what} brings {key} to {value:,}, "
+                f"above the limit of {limit:,}",
+                reason=f"refused at the crossing, before {what} was created",
+            )
+        self.counts[key] = value
+
+    def _reserve(self, nbytes: int, what: str) -> None:
+        self._admit("tracked_temporary_bytes", nbytes, what)
+
+    def release(self, nbytes: int) -> None:
+        """Returns reserved bytes whose structure was smaller than its reservation, or was freed."""
+        self.counts["tracked_temporary_bytes"] -= nbytes
+
+    def row_staging(self, vocab_size: int) -> int:
+        """Reserves the bound of one token row's staging buffer (one transition per vocabulary id)
+        before the row is walked; the caller releases it once the row is stored."""
+        nbytes = vocab_size * _CHARGE_TRANSITION
+        self._reserve(nbytes, f"the staging buffer of one token row (up to {vocab_size:,} transitions)")
+        return nbytes
+
+    def nfa_node(self) -> None:
+        self._admit("nfa_states", 1, "one more byte-NFA node")
+        self._reserve(_CHARGE_NFA_NODE, "one more byte-NFA node")
+
+    def nfa_edges(self, count: int) -> None:
+        self._reserve(count * _CHARGE_NFA_EDGE, f"{count} byte-NFA edge(s)")
+
+    def byte_dfa_state(self) -> None:
+        self._reserve(_CHARGE_DFA_STATE, "one more byte-DFA subset state")
+
+    def trie_storage(self, nbytes: int) -> None:
+        self._reserve(nbytes, "one more vocabulary-trie node")
+
+    def section_header(self, name_bytes: int) -> None:
+        fixed = _SCM1_HEADER_BYTES + _SCM1_DESCRIPTOR_BYTES + name_bytes + 4  # + the closing CSR offset
+        self._admit("serialized_mask_bytes", fixed, "the SCM1 header, descriptor and name")
+        self._reserve(fixed, "the SCM1 header, descriptor and name")
+
+    def token_state(self) -> None:
+        self._admit("dfa_states", 1, "one more token-DFA state")
+        per_state = self.page_bytes + 4  # its mask page and its CSR offset
+        self._admit("serialized_mask_bytes", per_state, "one more mask page and CSR offset")
+        self._reserve(_CHARGE_DFA_STATE + per_state, "one more token-DFA state and its mask page")
+
+    def accepting_state(self) -> None:
+        self._admit("serialized_mask_bytes", 4, "one more accepting-state id")
+        self._reserve(4, "one more accepting-state id")
+
+    def transitions(self, count: int) -> None:
+        self._admit("token_transitions", count, f"a row of {count:,} token transition(s)")
+        self._admit("serialized_mask_bytes", 8 * count, f"a row of {count:,} serialized transition(s)")
+        self._reserve((_CHARGE_TRANSITION + 8) * count, f"a row of {count:,} transition(s) and its serialized form")
+
+
+def _states_that_cannot_finish(transitions: Mapping[int, Mapping[int, int]], accepting: set[int]) -> list[int]:
+    """Every state of the (fully reachable) token table from which no accepting state is reachable."""
+    back: dict[int, set[int]] = {}
+    for state, row in transitions.items():
+        for target in row.values():
+            back.setdefault(target, set()).add(state)
+    live = set(accepting)
+    frontier = list(accepting)
+    while frontier:
+        for source in back.get(frontier.pop(), ()):
+            if source not in live:
+                live.add(source)
+                frontier.append(source)
+    return sorted(s for s in transitions if s not in live)
+
+
 # --- the compiler ---------------------------------------------------------------------------
 
 
@@ -734,6 +1216,8 @@ def compile_schema_to_mask_pages(
     vocab: Sequence[bytes],
     *,
     special_ids: frozenset[int],
+    limits: Mapping[str, int] | None = None,
+    name: str | bytes | None = None,
 ) -> MaskPages:
     """Compile `schema` (D-SLM45's per-field subset) to a token-level DFA with per-state
     valid-token bitmask pages, over `vocab` (each token's own undecoded bytes).
@@ -755,7 +1239,18 @@ def compile_schema_to_mask_pages(
     compiler's own proof obligation: an all-zero mask is indistinguishable from a
     legitimate one at the runtime's AND step (D-SLM40), so the guarantee must be
     structural, here, at compile time -- the runtime must not (and, by this design, does
-    not) check for it.
+    not) check for it. The same refusal covers its general case (T-3094 S1): a reachable
+    state with a non-empty row from which no accepting state can be reached (a cyclic table
+    whose exit no token spells) is refused by name, with no artifact.
+
+    `limits` (T-3094 S1) replaces the named `RELEASE_LIMITS` for this call only. The release
+    limits apply only when the compiler builds an array for `schema`; an array-free schema is bound
+    only by the keys `limits` names (S1 fix round 1, R1), and is otherwise compiled exactly as
+    v1.13.1 compiled it unless the dead-state refusal applies. A count above its limit raises `SchemaCompileError` whose message starts with that limit's
+    `LIMIT_DIAGNOSTICS` string. `name` is the SCM1 schema name this table will be attached
+    under; the section-byte count includes it (an omitted name counts as zero bytes, so the
+    attachment command, which always names the schema, is where that count is exact). The
+    returned `MaskPages.resource_counts` holds every count this compile admitted.
     """
     for index, piece in enumerate(vocab):
         if not isinstance(piece, bytes):
@@ -764,10 +1259,24 @@ def compile_schema_to_mask_pages(
                 "Sequence[bytes] (each token's own undecoded bytes), not Sequence[str]. Encode "
                 "each vocabulary piece to bytes before calling (T-2908's byte-level port)."
             )
+    # R1 (S1 fix round 1): the release limits bind only a schema that contains an array, which
+    # v1.13.1 refused; an array-free schema compiles exactly as v1.13.1 compiled it. Injected
+    # `limits=` keys bind every schema.
+    active = _resolve_limits(limits, release=_contains_array(schema))
+    name_bytes = b"" if name is None else (name.encode("utf-8") if isinstance(name, str) else bytes(name))
     vocab = tuple(zero_special_ids(vocab, special_ids))
-    char_dfa, char_start, char_accepting, content_states = _char_dfa(_groups(schema, "$"))
-    trie = _vocab_trie(vocab)
 
+    # Exact schema properties first: nesting depth, then every array's minItems (in `_groups`).
+    depth = _schema_depth(schema, active["recursion_depth"])
+    arrays: dict[str, int] = {}
+    groups = _groups(schema, "$", limits=active, arrays=arrays)
+
+    admission = _Admission(active, len(vocab))
+    char_dfa, char_start, char_accepting, content_states = _char_dfa(groups, admission)
+    trie = _vocab_trie(vocab, admission)
+    admission.section_header(len(name_bytes))
+
+    admission.token_state()
     ids: dict[int, int] = {char_start: 0}
     prefixes: dict[int, bytes] = {0: b""}
     transitions: dict[int, dict[int, int]] = {}
@@ -777,7 +1286,9 @@ def compile_schema_to_mask_pages(
         current = queue.popleft()
         state = ids[current]
         if current in char_accepting:
+            admission.accepting_state()
             accepting.add(state)
+        staged = admission.row_staging(len(vocab))
         targets = _token_targets(char_dfa, current, trie, content_states)
         if not targets and current not in char_accepting:
             prefix = prefixes[state]
@@ -792,14 +1303,101 @@ def compile_schema_to_mask_pages(
                 prefix=prefix,
                 reason=reason,
             )
+        admission.transitions(len(targets))
         row: dict[int, int] = {}
         for token_id in sorted(targets):
             target = targets[token_id]
             if target not in ids:
+                admission.token_state()
                 ids[target] = len(ids)
                 prefixes[ids[target]] = prefixes[state] + vocab[token_id]
                 queue.append(target)
             row[token_id] = ids[target]
         transitions[state] = row
+        admission.release(staged)
 
-    return MaskPages(vocab, transitions, 0, frozenset(accepting))
+    dead = _states_that_cannot_finish(transitions, accepting)
+    if dead:
+        state = dead[0]
+        char_state = next(c for c, s in ids.items() if s == state)
+        completion = _shortest_completion(char_dfa, char_accepting, char_state)
+        reason = (
+            f"{len(dead)} reachable state(s) can never reach an accepting state: every token "
+            f"sequence from them loops or stops short of a complete document (the byte completion "
+            f"{completion!r} has no spelling in the vocabulary from there)"
+        )
+        raise SchemaCompileError(
+            f"state {state} cannot reach an accepting state (dead end) after the serialization "
+            f"prefix {prefixes[state]!r}: {reason}",
+            state_id=state,
+            prefix=prefixes[state],
+            reason=reason,
+        )
+
+    counts = {"minItems": dict(arrays), "recursion_depth": depth, **admission.counts}
+    return MaskPages(vocab, transitions, 0, frozenset(accepting), resource_counts=counts)
+
+
+# --- SCM1 serialization (the attachment command's writer) -----------------------------------
+
+
+def fnv1a64(data: bytes) -> int:
+    """FNV-1a 64 (standard offset basis and prime), the SCM1 schema-name hash
+    (`include/superslm/schema_masks.h::Fnv1a64`)."""
+    h = 0xCBF29CE484222325
+    for byte_val in data:
+        h = ((h ^ byte_val) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def serialize_scm1(named_schemas: Sequence[tuple[str | bytes, MaskPages]], vocab_size: int) -> bytes:
+    """The SCM1 section for `named_schemas`, in the byte format of design Sec13.2 as the T-2132
+    fixture mechanism writes it (`tools/t2132_build_g5_fixture.py::_serialize_scm1`): a 24-byte
+    header, one 56-byte descriptor per schema, the name blob, then per schema the mask pages,
+    the CSR state-offset array, the ascending accepting ids and the (token, target) pairs in
+    ascending token order. State ids must be dense `[0, N)` (MaskPages' own BFS numbering)."""
+    import struct
+
+    names = [n.encode("utf-8") if isinstance(n, str) else bytes(n) for n, _ in named_schemas]
+    name_blob = b"".join(names)
+    cursor = _SCM1_HEADER_BYTES + _SCM1_DESCRIPTOR_BYTES * len(named_schemas) + len(name_blob)
+    page_bytes = (vocab_size + 7) // 8
+    descriptors: list[bytes] = []
+    blocks: list[bytes] = []
+    name_off = 0
+    for raw_name, (_, mp) in zip(names, named_schemas):
+        states = sorted(set(mp.transitions) | {mp.start} |
+                        {t for row in mp.transitions.values() for t in row.values()})
+        state_count = max(states) + 1 if states else 1
+        if states != list(range(state_count)):
+            raise ValueError("MaskPages state ids are not dense [0, N)")
+        masks_off = cursor
+        for s in range(state_count):
+            page = mp.page(s)
+            if len(page) != page_bytes:
+                raise ValueError(f"mask page width {len(page)} disagrees with vocab_size {vocab_size}")
+            blocks.append(page)
+        cursor += state_count * page_bytes
+        offsets_off = cursor
+        row_starts = [0]
+        flat = bytearray()
+        for s in range(state_count):
+            row = mp.transitions.get(s, {})
+            for token in sorted(row):
+                flat += struct.pack("<II", token, row[token])
+            row_starts.append(row_starts[-1] + len(row))
+        blocks.append(struct.pack(f"<{len(row_starts)}I", *row_starts))
+        cursor += len(row_starts) * 4
+        accepting_off = cursor
+        accepting_sorted = sorted(mp.accepting)
+        blocks.append(struct.pack(f"<{len(accepting_sorted)}I", *accepting_sorted))
+        cursor += len(accepting_sorted) * 4
+        transitions_off = cursor
+        blocks.append(bytes(flat))
+        cursor += len(flat)
+        descriptors.append(struct.pack(
+            "<IIIIIIQQQQ", name_off, len(raw_name), state_count, len(accepting_sorted), row_starts[-1], 0,
+            masks_off, offsets_off, accepting_off, transitions_off))
+        name_off += len(raw_name)
+    header = struct.pack("<4sIIIII", b"SCM1", 1, len(named_schemas), vocab_size, len(name_blob), 0)
+    return header + b"".join(descriptors) + name_blob + b"".join(blocks)

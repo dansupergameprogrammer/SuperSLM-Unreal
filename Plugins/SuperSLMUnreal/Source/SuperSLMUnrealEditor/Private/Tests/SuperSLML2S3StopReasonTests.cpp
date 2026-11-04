@@ -92,6 +92,12 @@ bool FSuperSLML2S3ContextCapStopReasonTest::RunTest(const FString& Parameters)
 		Facts(P::Faulted, O::Generating, true, true), R::Completed);
 	ExpectComposed(*this, TEXT("Faulted/SchemaDeadEnd at context_cap"),
 		Facts(P::Faulted, O::SchemaDeadEnd, false, true), R::SchemaRejected);
+	// Plugin 1.5.0: the schema's end with the walk accepting is a clean stop, Complete/SchemaComplete, and composes
+	// Completed; the non-accepting -2 stays Faulted/SchemaDeadEnd and composes SchemaRejected, below the cap too.
+	ExpectComposed(*this, TEXT("Complete/SchemaComplete below context_cap, walk accepting"),
+		Facts(P::Complete, O::SchemaComplete, true, false), R::Completed);
+	ExpectComposed(*this, TEXT("Faulted/SchemaDeadEnd below context_cap, walk not accepting"),
+		Facts(P::Faulted, O::SchemaDeadEnd, false, false), R::SchemaRejected);
 
 	// The cap is read only on a Faulted/Generating stop: another fault at the cap is still a failure.
 	ExpectNotComposed(*this, TEXT("Faulted/SequenceNoLongerValid at context_cap"),

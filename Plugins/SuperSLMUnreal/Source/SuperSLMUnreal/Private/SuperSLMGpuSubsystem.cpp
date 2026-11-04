@@ -128,6 +128,11 @@ namespace GpuRowCost = SuperSLMCore::GpuRowCost;
 
 #include "superslm/gpu_1p0.h"
 #include "superslm/gpu_1p0_g5_bridge.h"
+#if WITH_DEV_AUTOMATION_TESTS
+// SuperSLM's single-shot GPU degenerate-row seam (src/gpu/gpu_1p0.cpp), extern "C" with no header; the vendored wrapper
+// compiles it into development builds (plugin 1.5.0, cell P5). ArmExactCloseDeadEnd() arms it before an Exact close.
+extern "C" void ArmGpuFinishDegenerateLogitRowInjection();
+#endif
 #include "superslm/layer_marshal.h"
 #include "superslm/model.h"
 #include "superslm/schema_masks.h"
@@ -778,6 +783,10 @@ namespace
 		bool bRestoreGetterRead = false;
 		bool bRestoreGetterReady = false;
 		bool bSchemaCrossCheckFailed = false; // row 5: the restored binding disagrees with the wrapper
+		// Plugin 1.5.0: the restored walk's accepting reading (SslmGpuSeqSchemaAcceptingForG5Bridge on the fresh
+		// handle; false when unbound or the read fails). A carried schema-end event (a DeadEnd result pending at the
+		// save) takes it, since the -2 kept the walk and the save carried that walk: accepting completes, not faults.
+		bool bRestoreSchemaAccepting = false;
 		// Plugin paging plan §3.5 (K7): a pooled restore's out_shared_pages, for the ledger's apply.
 		uint32 SharedPages = 0;
 
@@ -1387,6 +1396,9 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	std::atomic<int32> TestExactFallbackNoDraft{0};
 	std::atomic<int32> TestExactFallbackOpenFailed{0};
 	std::atomic<bool> bTestNoDraftArmed{false}; // ArmNoDraftStep() (ruling 56 (6)): the next Exact open drafts nothing
+	// ArmExactCloseDeadEnd() (plugin 1.5.0): 0 none, else the ESuperSLMGpuExactCloseDeadEnd value armed for the next
+	// Exact close. Written on the game thread, taken on the submission thread.
+	std::atomic<int32> TestExactCloseDeadEnd{0};
 	// GetLayer1StatusCount() (ruling 43 N2): every non-OK status NoteLayer1Status() saw since StartRecording(), by status.
 	// Written on either thread.
 	FCriticalSection Layer1StatusLock;
@@ -2807,9 +2819,11 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 	}
 
 	// Records a produced token. Plan §2.5 row 8 (D-SLM7667): Layer 1's finish returns -2 at
-	// SSLM_OK for a schema dead end (1.6.0), leaving the walk and layer_index as they were and
+	// SSLM_OK at the schema's end (1.6.0), leaving the walk and layer_index as they were and
 	// re-arming ready_for_logits; it is handled first, before the token is used anywhere, and
-	// stops the sequence. Then the stop set and MaxNewTokens.
+	// stops the sequence. The accepting reading above is the end's, and the game thread classifies
+	// the end by it (EndAtSchemaEnd(): accepting completes, not accepting faults). Then the stop
+	// set and MaxNewTokens.
 	void RecordToken(FThreadSlot& TS, FActionResult& R, int32 Token)
 	{
 		if (TS.SchemaIndex >= 0)
@@ -2829,7 +2843,9 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		if (Token == -2)
 		{
 			R.Kind = EResultKind::DeadEnd;
-			R.Message = TEXT("the bound schema has no legal continuation (schema dead end)");
+			R.Message = R.bSchemaAccepting
+				? TEXT("the bound schema's document is complete (schema complete)")
+				: TEXT("the bound schema has no legal continuation and its walk is not accepting (schema dead end)");
 			TS.bStopped = true;
 			// The armed invariant (kept from P2's re-check R1; ruling 40): the engine re-arms ready_for_logits at a
 			// dead end, so the mirror follows it, in every mode (it removes 1.3.0's stale flag on a reused sequence).
@@ -3409,6 +3425,17 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		NoteLayer1Status(sslm_gpu_seq_last_rows_committed(TS.Handle, &Committed));
 		int32_t Produced = -1;
 		const FGpuStatus ProducedSt = sslm_gpu_seq_rows_produced(TS.Handle, &Produced);
+#if WITH_DEV_AUTOMATION_TESTS
+		if (ProducedSt == FGpuStatus::SSLM_OK && Committed >= 2)
+		{
+			// ArmExactCloseDeadEnd(AfterDrafts): the close's report, as a dead end at its last committed row.
+			int32 Expected = static_cast<int32>(ESuperSLMGpuExactCloseDeadEnd::AfterDrafts);
+			if (TestExactCloseDeadEnd.compare_exchange_strong(Expected, 0))
+			{
+				Produced = -2;
+			}
+		}
+#endif
 		const TArray<int32, TInlineAllocator<8>> Drafts = TS.RowsDrafts;
 		ClearRows(TS);
 		// Ruling 37, 39 Q6: the close's host finish, report-only (the trace counter; never a chooser input).
@@ -3492,6 +3519,20 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		}
 		bool bClosed = false;
 		double CloseUs = 0.0;
+#if WITH_DEV_AUTOMATION_TESTS
+		if (A.bCloseRows && TS.RowsKind == ERowsKind::Exact)
+		{
+			// ArmExactCloseDeadEnd(FirstRow): this slice closes an embedded Exact chunk (a chunk that fell back returned
+			// above), so the next finish the engine runs is the close's row 0. The engine seam has no disarm: if this
+			// slice fails before any finish runs, the seam stays armed and the next GPU finish dead-ends, so a later
+			// cell goes red (never a false pass).
+			int32 Expected = static_cast<int32>(ESuperSLMGpuExactCloseDeadEnd::FirstRow);
+			if (TestExactCloseDeadEnd.compare_exchange_strong(Expected, 0))
+			{
+				ArmGpuFinishDegenerateLogitRowInjection();
+			}
+		}
+#endif
 		const FGpuStatus St = RunRowsLayers(TS, A.Layers, bClosed, CloseUs);
 		if (St != FGpuStatus::SSLM_OK)
 		{
@@ -6578,6 +6619,8 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		TRACE_CPUPROFILER_EVENT_SCOPE_STR_ON_CHANNEL("SuperSLM.Gpu.Save", SuperSLMGpuChannel);
 		FGameSlot& S = Slots[SlotIndex];
 		Entry.bSubmitted = true;
+		// A generation that ended at its schema's complete document is Complete, not Faulted (plugin 1.5.0), so it saves
+		// as any completed sequence does; only a dead end mid-document (SchemaDeadEnd) is refused here.
 		if (S.Phase == ESuperSLMSequencePhase::Faulted)
 		{
 			ResolveEntry(Entry, ESuperSLMRestoreResult::SaveRefused);
@@ -7432,6 +7475,13 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				St8->NoteLayer1Status(sslm_gpu_seq_release(St8->Ctx, Fresh));
 				return;
 			}
+			if (SchemaIndex >= 0)
+			{
+				int32_t Accepting = 0;
+				const FGpuStatus AcceptingSt = SslmGpuSeqSchemaAcceptingForG5Bridge(St8->Ctx, Fresh, &Accepting);
+				St8->NoteLayer1Status(AcceptingSt);
+				Async->bRestoreSchemaAccepting = AcceptingSt == FGpuStatus::SSLM_OK && Accepting != 0;
+			}
 			FThreadSlot& TS = St8->ThreadSlots[SlotIndex];
 			if (TS.Handle != nullptr)
 			{
@@ -7604,6 +7654,10 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		S.Schema.Index = Entry.RestoreSchemaIndex;
 		S.SchemaName = Entry.RestoreContents.SchemaName;
 		S.WalkState = Async.WalkState; // ruling 2026-09-26: the game-side walk record, as restored
+		// Plugin 1.5.0: IsSchemaAccepting() reads the restored walk (the restore job's reading on the fresh handle), so a
+		// sequence saved after its clean stop restores Complete and accepting, and ComposeStopReason gives Completed, as
+		// the CPU's restore does (it re-reads sslm_stats). Not accepting when unbound or when the read failed.
+		S.bSchemaAccepting = Async.bRestoreSchemaAccepting;
 		// Plugin paging plan §3.4, §3.9 (K6): the restored holder's ContextUsed mirror, and the slot's
 		// handle generation (its Layer-1 handle was replaced).
 		S.ContextUsedMirror = Entry.RestoreContents.ContextUsed;
@@ -7622,6 +7676,10 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				R.Kind = C.Kind;
 				R.Fault = C.Fault;
 				R.Token = C.Token;
+				if (C.Kind == EResultKind::DeadEnd)
+				{
+					R.bSchemaAccepting = Async.bRestoreSchemaAccepting; // the walk the -2 kept (EndAtSchemaEnd())
+				}
 				const int32 Index = Done->Results.Add(R);
 				FPendingEvent E;
 				E.Kind = C.Kind == EResultKind::PrefillOk ? EEventKind::Prefill : EEventKind::Token;
@@ -7769,6 +7827,20 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		UE_LOG(LogSuperSLM, Warning, TEXT("GPU sequence %lld faulted: %s"), S.Id, *Message);
 	}
 
+	// Plugin 1.5.0: a -2 result (a DeadEnd result, or an Exact close's JumpEnd) is the schema's end at SSLM_OK; the walk
+	// is kept, so the accepting reading carried with the result (RecordToken()) says which end it is. Accepting: the
+	// document is complete, a clean stop (Complete / SchemaComplete). Not accepting: a dead end mid-document, a fault.
+	void EndAtSchemaEnd(FGameSlot& S, const FActionResult& R)
+	{
+		if (R.bSchemaAccepting)
+		{
+			S.LastOutcome = ESuperSLMDecodeOutcome::SchemaComplete;
+			Complete(S);
+			return;
+		}
+		FaultSlot(S, ESuperSLMDecodeOutcome::SchemaDeadEnd, ESuperSLMGpuFaultReason::None, R.Message);
+	}
+
 	void Complete(FGameSlot& S)
 	{
 		S.Phase = ESuperSLMSequencePhase::Complete;
@@ -7832,7 +7904,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 		}
 		if (R.JumpEnd == EResultKind::DeadEnd)
 		{
-			FaultSlot(S, ESuperSLMDecodeOutcome::SchemaDeadEnd, ESuperSLMGpuFaultReason::None, R.Message);
+			EndAtSchemaEnd(S, R); // the close's accepting reading is the dead-ended row's (CloseRows())
 		}
 		else if (R.JumpEnd == EResultKind::Fault)
 		{
@@ -7909,7 +7981,7 @@ struct FSuperSLMGpuSubsystemState : public FRunnable
 				{
 					S.WalkState = R.WalkState; // a dead end leaves the walk where it was
 				}
-				FaultSlot(S, ESuperSLMDecodeOutcome::SchemaDeadEnd, ESuperSLMGpuFaultReason::None, R.Message);
+				EndAtSchemaEnd(S, R);
 				return;
 			case EResultKind::Fault:
 				FaultSlot(S, ESuperSLMDecodeOutcome::Generating, R.Fault, R.Message);
@@ -14630,6 +14702,18 @@ bool FSuperSLMGpuMultiRowTestAccess::ArmNoDraftStep(USuperSLMGpuSubsystem& Gpu)
 	return true;
 }
 
+// Plugin 1.5.0 (the clean stop's gap-5 cells): one shot, taken by the next Exact close on the submission thread.
+bool FSuperSLMGpuMultiRowTestAccess::ArmExactCloseDeadEnd(USuperSLMGpuSubsystem& Gpu, ESuperSLMGpuExactCloseDeadEnd Where)
+{
+	FSuperSLMGpuSubsystemState* S = Gpu.State;
+	if (S == nullptr || !S->bActive)
+	{
+		return false;
+	}
+	S->TestExactCloseDeadEnd.store(static_cast<int32>(Where));
+	return true;
+}
+
 // Ruling 57 (F1, F5): the suite's red stub, implemented here: the chooser's candidate widths for the widened warm-up.
 bool FSuperSLMGpuMultiRowTestAccess::GetWidenWarmUpRows(const USuperSLMGpuSubsystem& Gpu, TArray<int32>& OutRows)
 {
@@ -15101,6 +15185,7 @@ int64 FSuperSLMGpuMultiRowTestAccess::GetNextRowPosition(const USuperSLMGpuSubsy
 int32 FSuperSLMGpuMultiRowTestAccess::GetFinishSliceLayersAt(const USuperSLMGpuSubsystem&, int64) { return -1; }
 bool FSuperSLMGpuMultiRowTestAccess::GetLiveSaveBytes(const USuperSLMGpuSubsystem&, const TArray<uint8>&, TArray<uint8>& OutLive) { OutLive.Reset(); return false; }
 bool FSuperSLMGpuMultiRowTestAccess::ArmNoDraftStep(USuperSLMGpuSubsystem&) { return false; }
+bool FSuperSLMGpuMultiRowTestAccess::ArmExactCloseDeadEnd(USuperSLMGpuSubsystem&, ESuperSLMGpuExactCloseDeadEnd) { return false; }
 bool FSuperSLMGpuMultiRowTestAccess::GetWidenWarmUpRows(const USuperSLMGpuSubsystem&, TArray<int32>& OutRows) { OutRows.Reset(); return false; }
 #endif // WITH_DEV_AUTOMATION_TESTS
 

@@ -444,7 +444,7 @@ private:
 	bool TryStartExtraction(FQuery& Query);
 	bool TryStartReply(FQuery& Query);
 	void PollQuery(FQuery& Query);
-	bool IsSequenceTerminal(const FQuery& Query, bool& bOutSchemaComplete, FString& OutWhy) const;
+	bool IsSequenceTerminal(const FQuery& Query, FString& OutWhy) const;
 	const TArray<int32>& GeneratedTokens(const FQuery& Query) const;
 	void ReturnSequence(FQuery& Query);
 

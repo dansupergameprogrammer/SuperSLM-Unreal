@@ -157,7 +157,7 @@ works in packaged builds. See [DETERMINISM.md](DETERMINISM.md).
 Rules the surface keeps:
 
 - **Decode status is an enum, never a sentinel number:** *Token Produced*, *Generating*,
-  *Schema Dead End*, *Sequence No Longer Valid*.
+  *Schema Dead End*, *Sequence No Longer Valid*, *Schema Complete*.
 - **Restore, Save, Reset and Adopt Prefix share one result type** (`ESuperSLMRestoreResultBP`), so
   every caller can tell a full queue from every other named failure. A queued call returns
   *Success* when it is queued, and its handle's read reports *Pending* until it finishes. Its last
@@ -209,9 +209,11 @@ Rules the surface keeps:
   a sequence's first needs a reset first (`ResetSequence` on the CPU, `RequestResetSequence` on
   the GPU).
 - A faulted sequence is refused the same way, at the call, on both backends. A generation that
-  ended in *Schema Dead End* is faulted too (SuperSLM itself lets a dead end be retried; requiring
-  a reset after every fault is the plugin's own rule, since SuperSLM requires one only after an
-  allocation failure), so a sequence reused after its schema completed is refused as well. Reset
+  ended in *Schema Dead End* (the schema allowed no next token before its document was complete) is
+  faulted too (SuperSLM itself lets a dead end be retried; requiring a reset after every fault is the
+  plugin's own rule, since SuperSLM requires one only after an allocation failure). A generation
+  whose schema's document is complete ends *Complete* with *Schema Complete*, and is refused as any
+  completed one is, so a sequence reused after its schema completed needs a reset too. Reset
   it, or return it and restore a save, which gives a new sequence; a restore never clears the
   faulted one. A reset SuperSLM refuses leaves the sequence faulted, with its previous
   generation's tokens still readable, on both backends; a reset that succeeds leaves it Idle with

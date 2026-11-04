@@ -486,7 +486,10 @@ do {
   sequence is then byte-identical to one that decoded the same a tokens one
   at a time, the produced token walked (a dead end keeps the walk and sets
   the ready flag). `sslm_gpu_seq_rows_produced(seq, out_token)` reads the
-  produced token (-2 at a dead end), or returns the failed finish's status
+  produced token (-2 when the walk has no next token: a clean stop if
+  `SslmGpuSeqSchemaAcceptingForG5Bridge` then reads 1, a dead end if 0; a
+  draft that runs through the schema's last token closes as a clean stop),
+  or returns the failed finish's status
   with nothing written; `SSLM_BUSY` while a chunk is open, and
   `SSLM_SEQUENCE_REJECTED` when no Exact close has happened since the last
   `sslm_gpu_seq_embed_rows` or reset. It takes no claim. When the finish
@@ -842,7 +845,11 @@ silently accepted.
   call is still mid-token and safe to retry (call again with the same layer
   budget to continue); `-2` means that sequence's schema-bound walk has
   reached a state with no legal continuation at all — a per-sequence
-  outcome, not a call failure, and safe to retry (nothing about that
+  outcome, not a call failure. Read `sslm_stats().schema_accepting` (or
+  `sslm_seq_forced_tokens`' `out_accepting`) to tell which: 1 is a
+  **clean stop** — the document is complete, stop decoding, the output is
+  final; 0 is a **dead end**, an error (1.19.0; no ABI change). Either way
+  it is safe to retry (nothing about that
   sequence changes until the caller does something else with it — rebind a
   schema, reset, etc.); and `-3` means this index named a sequence that is
   **not currently live** (concurrently released by another thread) — unlike
@@ -1316,6 +1323,73 @@ already has for an unconstrained span. The determinism guarantee is
 unchanged by any of this — a schema-constrained decode is exactly as
 reproducible, on the same certified platform, as an unconstrained one.
 
+#### Compiling and attaching a schema
+
+`tools/sslm_attach_schema.py` compiles one or more JSON Schemas and attaches them
+to a completed artifact as its `SchemaMasks` section:
+
+```
+python tools/sslm_attach_schema.py --base <model>.sslm --ckpt <tokenizer checkpoint dir> \
+  --schema <name>:<schema>.json [--schema <name>:<schema>.json ...] --out <output>.sslm \
+  [--limits-json <limits>.json] [--verifier build/sslm_verify]
+```
+
+- `--base` is an artifact that carries its own tokenizer sections. `--ckpt` is the
+  exact tokenizer checkpoint it was built from: its serialized tokenizer tables must
+  equal the artifact's, byte for byte, because a schema is compiled against token ids.
+- Each `--schema` names the schema as `sslm_schema_lookup` will find it. Names must be
+  non-empty and unique, and their FNV-1a-64 hash must not be zero.
+- Every section and header flag of the base is carried over unchanged. The command
+  refuses a base that already has a `SchemaMasks` section, because no merge policy is
+  defined.
+- The independent verifier (`sslm_verify`, built by
+  `cmake --build build --target sslm_verify`) checks the base before any schema is
+  compiled, and checks the new artifact before success is reported.
+- `--out` is never the base. An `--out` that already exists is refused unless `--force`
+  is given.
+- A refusal exits non-zero, prints its reason, and writes nothing at `--out`. A missing
+  or malformed schema file or `--limits-json` is a refusal too.
+
+The compilable subset is objects with required keys in `properties` order and
+`additionalProperties: false`, enums, booleans, free-text strings, and arrays.
+
+- An array takes one `items` schema and an optional `minItems`, which defaults to 0. It
+  accepts that many items or more, comma-separated, with no whitespace.
+- Arrays can nest. `maxItems` is refused, as is every other keyword the compiler does
+  not enforce. Annotations (`title`, `description` and the like) are ignored.
+
+The compiler refuses a schema that exceeds one of seven resource limits. Each refusal
+names its limit.
+
+| Limit | Release value | Diagnostic |
+|---|---:|---|
+| `minItems`, per array | 8 | `minItems limit`, naming the array's JSON pointer |
+| `recursion_depth` | 8 | `recursion depth limit` |
+| `nfa_states` | 4,096 | `NFA state limit` |
+| `dfa_states` | 4,096 | `DFA state limit` |
+| `token_transitions` | 8,388,608 | `token transition limit` |
+| `serialized_mask_bytes` | 134,217,728 | `serialized mask byte limit` |
+| `tracked_temporary_bytes` | 536,870,912 | `tracked temporary memory limit` |
+
+- The limits are per schema, like the runtime loader's own bounds. Each `--schema` is
+  compiled under its own limits, and the command sets no cap on the combined
+  `SchemaMasks` section of several schemas.
+- The release limits apply only to a schema that contains an array, counting only
+  arrays the compiler builds (an array spelled inside `enum`, `default` or an annotation
+  does not count). A schema without an array compiles exactly as it did in 1.13.1, to
+  the same table and the same `SchemaMasks` bytes, however large it is, unless its
+  table has a reachable state that cannot finish. That schema is refused by name,
+  because generation from it could never complete. Limits given in `--limits-json`
+  (or `limits=`) apply to every schema.
+- `--limits-json` takes a JSON object that replaces the named limits for that run.
+- Tracked temporary memory includes the vocabulary trie at its measured size, about
+  79 MB for a 151,936-token vocabulary. IntentDoc v2 measures about 165.5 MB there.
+- Known limit: an array or object value inside `enum` is matched only in Python's
+  default `json.dumps` spacing, `[1, 2]` and `{"k": 1}`, as in 1.13.1. For the compact
+  form, write the array or object schema itself instead of an `enum` of arrays.
+- The compiler also refuses a schema if the vocabulary leaves some reachable state
+  unable to finish a document.
+
 #### The masked finish (1.15.0)
 
 When a schema is bound and the model's hidden size is at most 131,071, the
@@ -1562,18 +1636,25 @@ the decode path's own contract — `sslm_decode_step_gpu` and
 `SslmGpuSeqDecodeStepForG5Bridge`'s layer-loop-to-depth step — unchanged
 by either prefill call.
 
-A schema-bound sequence that reaches its schema's own dead end (an
-accepting state whose mask page is legitimately all-zero, or a synthetic
-degenerate row where every admitted logit ties and the tie-break returns a
-token with no transition) returns `*out_token == -2` at `SSLM_OK` from
+A schema-bound sequence whose walk has no next token (an accepting state
+whose mask page is legitimately all-zero — the schema's own end — or a
+synthetic degenerate row where every admitted logit ties and the tie-break
+returns a token with no transition) returns `*out_token == -2` at `SSLM_OK` from
 `SslmGpuSeqFinishTokenForG5Bridge`/`SslmGpuSeqDecodeStepForG5Bridge` —
 never `SSLM_SEQUENCE_REJECTED`, which those calls reserve for their own
 precondition failures — matching the CPU path's identical `-2` convention
-for the same event. The walk state and layer index are left exactly as
+for the same event. **What the `-2` means is read, not inferred (1.19.0;
+no ABI change):** call `SslmGpuSeqSchemaAcceptingForG5Bridge` (or read
+`sslm_gpu_seq_forced_tokens`' `out_accepting`) right after it. 1 is a
+**clean stop** — the walk is in an accept state, the document is complete,
+and this is the normal end of schema-constrained generation; 0 is a **dead
+end**, which stays an error. The CPU path reports the same pair through
+`sslm_stats().schema_accepting`, and the two paths agree token for token
+and on the accepting bit. The walk state and layer index are left exactly as
 they were and `ready_for_logits` is re-armed, so a further call to either
 GPU entry point reproduces the identical `-2` result deterministically,
-consuming no new token from the caller: retrying after a dead end is
-always safe. A dead-ended sequence is `sslm_gpu_seq_reset`- and
+consuming no new token from the caller: retrying after a clean stop or a
+dead end is always safe. A sequence stopped either way is `sslm_gpu_seq_reset`- and
 `sslm_gpu_seq_bind_adapter`-eligible (see the CHANGELOG), and is proven
 bit-identical between the CPU and GPU paths at real scale (see
 [Certified platforms](#certified-platforms)).

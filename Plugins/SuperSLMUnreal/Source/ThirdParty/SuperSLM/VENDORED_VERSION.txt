@@ -1,13 +1,23 @@
 SuperSLM -- vendored source dependency
 
-Tag:    v1.18.1
-Commit: c3c14b16690a0c0c54de781f6f30380d88e62bd1
-Base release commit: c3c14b16690a0c0c54de781f6f30380d88e62bd1
-Release status: published release v1.18.1
+Tag:    v1.19.0
+Commit: 92ab95b760fdb6f24a27474c2a0e0f5f6be85568
+Base release commit: 92ab95b760fdb6f24a27474c2a0e0f5f6be85568
+Release status: published release v1.19.0
 Source repository: the upstream SuperSLM repository (not this repository)
 
 The Tag line names the release and the Commit line the commit the tag points to (annotated tag object
-e154c666bf6388c65edb5c69c19af4c77310074e).
+e533bb81abec20e6290430b16fc6bce0b95e3c76).
+
+1.19.0 lets a schema contain JSON arrays (the converter, tools/sslm_convert_schema.py, compiles a "type": "array"
+node with one items schema; tools/sslm_attach_schema.py appends compiled schemas to a finished .sslm; sslm_verify
+refuses a schema section the runtime would refuse) and states what the engine's -2 means at the end of a schema-bound
+reply: read right after the -2, an accepting bit of 1 (sslm_stats().schema_accepting or sslm_seq_forced_tokens'
+out_accepting on the CPU, SslmGpuSeqSchemaAcceptingForG5Bridge or sslm_gpu_seq_forced_tokens' out_accepting on the
+GPU) is a clean stop, the document complete; 0 is a dead end, an error. No ABI, struct layout, status or save format
+changes; no library source changes (the four changed headers change comments and the version only). It also fixes
+the Qwen3 converter (a tied lm_head copy, relative tool paths). Release notes: CHANGELOG.md's 1.19.0 section and
+docs/releases/1.19.0.md.
 
 1.18.1 is v1.18.0 plus one GPU fix: no D3D12 object is released by a static destructor. The process's GPU device,
 the two pipeline caches, the shared root signature and the descriptor-table probe's pipeline live until the process
@@ -30,11 +40,11 @@ The pin moves from v1.15.0 to v1.18.0 across three releases:
   so sslm_seq_jump_forward and sslm_gpu_seq_jump_forward with NULL options or mode 0 run Exact.
   CPU slice 2 adds the opt-in SSLM_PARALLEL_FOR_PREFILL bit (bit 0 of sslm_parallel_for.reserved); this
   plugin sets only SSLM_PARALLEL_FOR_MATVEC, so its behaviour and outputs are unchanged.
-Release notes: CHANGELOG.md's 1.16.0, 1.17.0, 1.18.0 and 1.18.1 sections.
+Release notes: CHANGELOG.md's 1.16.0, 1.17.0, 1.18.0, 1.18.1 and 1.19.0 sections.
 
-The distribution has 1718 files, excluding .github/ and this vendoring metadata. Each is byte-identical
-to git show v1.18.1:<path>, except the five existing consumer-witness repairs
-listed below (upstream did not change those five files between v1.15.0 and v1.18.1). Two upstream files
+The distribution has 2063 files, excluding .github/ and this vendoring metadata. Each is byte-identical
+to git show v1.19.0:<path>, except the five existing consumer-witness repairs
+listed below (upstream did not change those five files between v1.15.0 and v1.19.0). Two upstream files
 are stored with CRLF line endings (tests/multirow-gpu/p41_wine_baseline_*.txt); this repository's .gitattributes
 marks them -text so they stay byte-identical. No library source is added since v1.15.0, so the wrapper set is
 unchanged; the multi-row code is in src/gpu/gpu_1p0.cpp and the headers it includes.
@@ -52,7 +62,11 @@ Repaired: tools/consumer_reach/route_p_hook/run_route_p_hook_witness.sh
 Repaired: tools/consumer_reach/route_p_hook/run_merge_acceptance.sh
 Repaired: tools/consumer_reach/route_p_hook/shim/CoreMinimal.h
 
-History: the pin moved from the v1.18.0 tag to the v1.18.1 tag (c3c14b16) on 2026-10-31: the exit-destructor
+History: the pin moved from the v1.18.1 tag to the v1.19.0 tag (92ab95b7) on 2026-11-03: JSON arrays in schemas,
+the -2 clean-stop contract, the Qwen3 converter fixes, the version bump to 1.19.0 and the release note; 24 files
+change and 345 are added (1718 to 2063), none removed. No library source is added, so the wrapper set is unchanged.
+Seventy-seven of the added files are upstream run logs (*.log under tests/array-s2/results/) that this repository's
+.gitignore would drop; they are force-added so the tree stays the tag's. Before that it moved from the v1.18.0 tag to the v1.18.1 tag (c3c14b16) on 2026-10-31: the exit-destructor
 fix above, the version bump to 1.18.1 and the release note; ten files change and three are added (1715 to 1718),
 none removed. Before that it moved from the a7d6ac22 candidate to the v1.18.0 tag (6c380ec1) on 2026-10-28: CPU slice 2
 (threaded batched passes, opt-in), the version bump to 1.18.0, SslmGpuStatus 33 final, the release notes and
@@ -65,11 +79,11 @@ MR6, errata E-6), skipping v1.16.0 and v1.17.0 pins. v1.15.0 was vendored from v
 v1.13.1 on 2026-10-19, and v1.13.0 from v1.11.0 on 2026-10-15. No library source or existing test is removed.
 Earlier source pins and the initial v1.2.0 import are retained in Git history.
 
-What changed in this plugin for the pin: see CHANGELOG.md (1.4.0).
+What changed in this plugin for the pin: see CHANGELOG.md (1.5.0).
 
-Saves: as at every pin, the Layer-1 tag in the save wrapper changes, so a save taken at the v1.15.0 pin is
-refused Layer1Mismatch. An SPX1 prefix blob records its producer, so a cached prefix from another engine version
-is refused SSLM_RESTORE_PRODUCER_MISMATCH and rebuilt by prefill (a cache miss, not an error).
+Saves: as at every pin, the Layer-1 tag in the save wrapper changes, so a save taken at the v1.18.1 pin
+(plugin 1.4.0) is refused Layer1Mismatch. An SPX1 prefix blob records its producer, so a cached prefix from another
+engine version is refused SSLM_RESTORE_PRODUCER_MISMATCH and rebuilt by prefill (a cache miss, not an error).
 
 **The first vendoring pass at v1.2.0 (2026-08-22) was corrected the same day**: `git archive`
 on Windows applies `.gitattributes`' `text`/`eol=crlf`

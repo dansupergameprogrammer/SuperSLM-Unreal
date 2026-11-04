@@ -7567,8 +7567,21 @@ namespace
 				else if (Token == -2)
 				{
 					++Finishes;
-					S.Fault(Slot, ESuperSLMDecodeOutcome::SchemaDeadEnd,
-						FString::Printf(TEXT("schema '%s' has no legal continuation after %d generated tokens (Schema Dead End)"), *Slot.BoundSchemaName, Slot.Generated.Num()));
+					// Plugin 1.5.0: -2 is the schema's end at SSLM_OK, and the walk is kept, so the job's own
+					// sslm_stats read at its tail (ReadStatsOnWorker, after this -2) says which end it is. An
+					// accepting walk means the document is complete: a clean stop. A walk that is not accepting
+					// (or a stats read that failed) is a dead end mid-document: a fault, as before.
+					const FSequenceJobResult& Result = Out->PerSequence[I];
+					if (Result.bStatsValid && Result.Stats.bSchemaAccepting)
+					{
+						Slot.LastOutcome = ESuperSLMDecodeOutcome::SchemaComplete;
+						Slot.Phase = ESuperSLMSequencePhase::Complete;
+					}
+					else
+					{
+						S.Fault(Slot, ESuperSLMDecodeOutcome::SchemaDeadEnd,
+							FString::Printf(TEXT("schema '%s' has no legal continuation after %d generated tokens and its walk is not accepting (Schema Dead End)"), *Slot.BoundSchemaName, Slot.Generated.Num()));
+					}
 				}
 				else if (Token == -3)
 				{
@@ -9141,6 +9154,28 @@ namespace
 bool FSuperSLMSchemaJumpTestAccess::IsBuilt()
 {
 	return true;
+}
+
+// SuperSLM's seams (src/sslm_abi.cpp, src/gpu/gpu_1p0.cpp) are extern "C" at global scope with no header; the vendored
+// wrappers compile them into this module's development builds.
+extern "C" void ArmCpuFinishDegenerateLogitRowInjection();
+#if SUPERSLMUNREAL_WITH_GPU
+extern "C" void ArmGpuFinishDegenerateLogitRowInjection();
+#endif
+
+void FSuperSLMSchemaJumpTestAccess::ArmCpuDegenerateFinishRow()
+{
+	ArmCpuFinishDegenerateLogitRowInjection();
+}
+
+bool FSuperSLMSchemaJumpTestAccess::ArmGpuDegenerateFinishRow()
+{
+#if SUPERSLMUNREAL_WITH_GPU
+	ArmGpuFinishDegenerateLogitRowInjection();
+	return true;
+#else
+	return false;
+#endif
 }
 
 void FSuperSLMSchemaJumpTestAccess::StartRecording(USuperSLMSubsystem& Subsystem)

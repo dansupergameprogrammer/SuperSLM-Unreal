@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(superslm VERSION 1.18.1 LANGUAGES CXX)
+project(superslm VERSION 1.19.0 LANGUAGES CXX)
 
 # C++20: the S-LoRA delta path is specified at -std=c++20 (SuperSLM_Plan.md §19),
 # and the core carries wide-integer (int64) composition arithmetic throughout. One
@@ -1180,6 +1180,10 @@ if(WIN32 AND (SUPERSLM_BUILD_GPU OR BUILD_TESTING))
 	# build.bat's own ordering (dxc runs before the test binary compiles).
 	if(BUILD_TESTING)
 		add_dependencies(superslm_tests superslm_gpu_shaders)
+		# Engine 1.19 clean stop: the GPU cells G1-G9, registered with CTest (label clean-stop-gpu; box only).
+		if(MSVC)
+			include(tests/schema-fast-decode-gpu/clean_stop_gpu.cmake)
+		endif()
 	endif()
 	# The forced-tier full suites compile the same GPU sources on WIN32 and run the same GPU
 	# cells, so they need the same shaders. A build of only a forced target (the Windows forced

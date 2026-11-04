@@ -886,10 +886,13 @@ std::vector<int32_t> OwnNext(sslm_model m, sslm_seq s, int n, const sslm_decode_
 	if (sslm_workspace_create(m, &cfg, ws_buf.p, wsz, &w) == SSLM_OK &&
 	    sslm_seq_restore(m, &pool, blob.data(), blob.size(), &q) == SSLM_OK) {
 		sslm_decode_params g{};
-		sslm_decode_params_init(m, SSLM_DECODE_MODE_GREEDY, kLayers, &g);
-		for (int i = 0; i < n; ++i) {
+		const sslm_status is = sslm_decode_params_init(m, SSLM_DECODE_MODE_GREEDY, kLayers, &g);
+		CHECK_MSG(is == SSLM_OK, "OwnNext: sslm_decode_params_init(greedy, %d) == %d", kLayers, static_cast<int>(is));
+		for (int i = 0; is == SSLM_OK && i < n; ++i) {
 			int32_t t = -100;
-			if (sslm_decode_step_v2(m, &q, 1, p ? p : &g, w, &t) != SSLM_OK || t < 0) break;
+			const sslm_status st = sslm_decode_step_v2(m, &q, 1, p ? p : &g, w, &t);
+			CHECK_MSG(st == SSLM_OK, "OwnNext: the reference twin's decode %d == %d", i, static_cast<int>(st));
+			if (st != SSLM_OK || t < 0) break;
 			out.push_back(t);
 		}
 		sslm_seq_release(q);
@@ -948,10 +951,11 @@ OffRun DecodeOnly(sslm_model m, const char* schema, const std::vector<int32_t>& 
 	    sslm_prefill(m, q, prompt.data(), int32_t(prompt.size()), int32_t(prompt.size()), SSLM_SPAN_PROMPT, w,
 	                 &consumed) == SSLM_OK) {
 		sslm_decode_params g{};
-		sslm_decode_params_init(m, SSLM_DECODE_MODE_GREEDY, kLayers, &g);
-		o.ok = true;
+		const sslm_status is = sslm_decode_params_init(m, SSLM_DECODE_MODE_GREEDY, kLayers, &g);
+		CHECK_MSG(is == SSLM_OK, "DecodeOnly: sslm_decode_params_init(greedy, %d) == %d", kLayers, static_cast<int>(is));
+		o.ok = is == SSLM_OK;
 		o.blob_at.push_back(SaveOf(m, q));
-		for (int i = 0; i < max; ++i) {
+		for (int i = 0; o.ok && i < max; ++i) {
 			int32_t t = -100;
 			if (sslm_decode_step_v2(m, &q, 1, p ? p : &g, w, &t) != SSLM_OK) {
 				o.ok = false;
@@ -4869,6 +4873,9 @@ void Cell_TF_4b() {
 // J1-X (plan rev 1.3.3 §5.10, §11.4): the exact jump-forward cells.
 #include "schema_fast_decode/sfd_cells_x.inc"
 
+// Engine 1.19, the clean stop at the schema's end: the CPU cells E1-E8 (the -2 contract's pins).
+#include "schema_fast_decode/sfd_cells_cleanstop.inc"
+
 // Q6C.7 [Q6 C] One thread, no hook (the box's 1-thread jump-forward-on arm; A/B 2026-10-20): the §5.6 host
 // loop on POTION and LONGKEY at budget 64, with the workspace and with ws = NULL. Every verb call that admits
 // M >= 1 rows makes exactly one S-LAYERROWS entry, a batched pass of M rows, and the stream is the
@@ -5058,7 +5065,16 @@ void RunSchemaFastDecodeCells(int& checks, int& failures) {
 	run("11.X3", Cell_X_11_3);
 	run("TF.2d", Cell_X_TF_2d);
 	run("TF.4bX", Cell_X_TF_4b);
-	std::printf("schema fast-decode (M1, J1, TF, J1-X) cells: %d checks, %d failures\n", GChecks.load(), GFailures.load());
+	// Engine 1.19 clean stop (-2 at SSLM_OK; accepting 1 is the schema's end, 0 a dead end)
+	run("CS.E1", Cell_CS_E1);
+	run("CS.E2", Cell_CS_E2);
+	run("CS.E3", Cell_CS_E3);
+	run("CS.E4", Cell_CS_E4);
+	run("CS.E5", Cell_CS_E5);
+	run("CS.E6", Cell_CS_E6);
+	run("CS.E7", Cell_CS_E7);
+	run("CS.E8", Cell_CS_E8);
+	std::printf("schema fast-decode (M1, J1, TF, J1-X, clean stop) cells: %d checks, %d failures\n", GChecks.load(), GFailures.load());
 	checks += GChecks;
 	failures += GFailures;
 }

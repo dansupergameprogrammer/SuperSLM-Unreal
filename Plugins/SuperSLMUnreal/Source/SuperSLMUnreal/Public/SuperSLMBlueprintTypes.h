@@ -31,12 +31,14 @@ enum class ESuperSLMDecodeOutcomeBP : uint8
 	TokenProduced = 0,
 	/** The step ran part of a token; the token is not finished yet. On a Faulted sequence it names no cause: the fault's reason is in the log (LogSuperSLM, "Sequence N faulted: ..."). */
 	Generating = 1,
-	/** The bound schema allows no next token, so the sequence stopped (Schema Dead End). */
+	/** The bound schema allows no next token before its document is complete, so the sequence faulted (Schema Dead End). */
 	SchemaDeadEnd = 2,
 	/** The sequence is no longer live: it was released while the step was queued. */
 	SequenceNoLongerValid = 3,
 	/** The sequence reached its own budget limit (paged KV mode), below the context cap, and stopped. */
 	KvBudgetExceeded = 4,
+	/** The bound schema's document is complete, so the generation ended Complete before MaxNewTokens (Schema Complete). */
+	SchemaComplete = 5,
 };
 
 /** Where a sequence is in its generation. */

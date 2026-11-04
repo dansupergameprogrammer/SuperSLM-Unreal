@@ -30,13 +30,18 @@ enum class ESuperSLMDecodeOutcome : uint8
 {
 	TokenProduced = 0,         // a token was produced this call
 	Generating = 1,            // ABI sentinel -1: mid-token, re-queue and retry with the same state
-	SchemaDeadEnd = 2,         // ABI sentinel -2: schema-bound walk has no legal continuation
+	SchemaDeadEnd = 2,         // ABI sentinel -2 with the walk NOT accepting: no legal continuation mid-document (a fault)
 	SequenceNoLongerValid = 3, // ABI sentinel -3: released concurrently -- never re-queue
 	// Plugin paging plan §3.3: a budget holder reached its own limit, min(origin + budget, cap),
 	// below the cap: at activation (prefix + prompt > limit) or at the token boundary after the
 	// limit's ready token (engine token law E7). At the cap the existing cap outcome fires
 	// instead. Appended last so every earlier value keeps its number.
 	KvBudgetExceeded = 4,
+	// Plugin 1.5.0: ABI sentinel -2 with the walk accepting. The schema's document is complete and has no
+	// continuation, so the generation ends Complete (not Faulted) with tokens still left in MaxNewTokens. The
+	// accepting reading taken after the -2 tells this from SchemaDeadEnd; the sentinel is the same. Appended last
+	// so every earlier value keeps its number.
+	SchemaComplete = 5,
 };
 
 // One vended sequence. Wraps the subsystem's own private lookup key -- never a raw sslm_seq --
@@ -55,8 +60,9 @@ struct SUPERSLMUNREAL_API FSuperSLMSequence
 // A phase machine, one per vended sequence, driven forward by USuperSLMSubsystem::Tick() (§5).
 // A freshly vended or just-reset sequence is Idle -- also the state SetSchema()/adapter binding
 // require (§2.1: "Binding is legal only on a fresh or just-reset sequence"). BeginGeneration()
-// moves Idle -> Prefilling -> Decoding; a sequence reaches Complete on MaxNewTokens or the
-// model's own end-of-text token, or Faulted on SchemaDeadEnd or a rejected call.
+// moves Idle -> Prefilling -> Decoding; a sequence reaches Complete on MaxNewTokens, the
+// model's own end-of-text token or the end of its schema's document (SchemaComplete), or Faulted
+// on SchemaDeadEnd or a rejected call.
 enum class ESuperSLMSequencePhase : uint8
 {
 	Idle,
@@ -74,7 +80,8 @@ enum class ESuperSLMSequencePhase : uint8
 // schema-bound query is classified: an unbound one has no accepting state to read.
 enum class ESuperSLMQueryStopReason : uint8
 {
-	Completed,       // schema_accepting == 1: the walk reached the schema's one accepting state
+	Completed,       // schema_accepting == 1: the walk reached the schema's one accepting state (Complete / SchemaComplete,
+	                 // or Complete via MaxNewTokens on the token that closed the document)
 	SchemaRejected,  // Faulted / SchemaDeadEnd: a token had no legal continuation (grammar violation)
 	BudgetExhausted, // Complete via MaxNewTokens, or Faulted / Generating via SSLM_CONTEXT_CAP_EXCEEDED,
 	                 // with bSchemaAccepting == false -- the walk was still open when generation stopped

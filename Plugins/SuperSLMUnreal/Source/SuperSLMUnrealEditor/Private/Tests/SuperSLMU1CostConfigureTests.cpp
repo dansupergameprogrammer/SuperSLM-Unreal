@@ -48,6 +48,7 @@ namespace
 			case ESuperSLMDecodeOutcome::SchemaDeadEnd: return TEXT("SchemaDeadEnd");
 			case ESuperSLMDecodeOutcome::SequenceNoLongerValid: return TEXT("SequenceNoLongerValid");
 			case ESuperSLMDecodeOutcome::KvBudgetExceeded: return TEXT("KvBudgetExceeded");
+			case ESuperSLMDecodeOutcome::SchemaComplete: return TEXT("SchemaComplete");
 		}
 		return TEXT("Unknown");
 	}

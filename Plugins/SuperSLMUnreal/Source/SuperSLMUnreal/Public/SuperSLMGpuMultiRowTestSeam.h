@@ -72,6 +72,13 @@ struct SUPERSLMUNREAL_API FSuperSLMGpuRowsActionRecord
 	bool bDraftTableReached = false;
 };
 
+// Plugin 1.5.0: where ArmExactCloseDeadEnd() puts the dead end.
+enum class ESuperSLMGpuExactCloseDeadEnd : uint8
+{
+	FirstRow = 1,     // the close's row 0 (no draft delivered)
+	AfterDrafts = 2,  // after the close's committed drafts (at least one delivered)
+};
+
 // Ruling 42 S1, M2: the engine calls ArmRowsFault() can fail.
 enum class ESuperSLMGpuRowsFaultPoint : uint8
 {
@@ -335,6 +342,16 @@ struct SUPERSLMUNREAL_API FSuperSLMGpuMultiRowTestAccess
 	// empty and no draft table were loaded: it drafts nothing, falls back (ruling 42a) and is counted a no-draft
 	// fallback (GetExactFallbacks). False when the seam is not built.
 	static bool ArmNoDraftStep(USuperSLMGpuSubsystem& Gpu);
+	// Plugin 1.5.0 (the clean stop, the audit's gap 5): one shot, a -2 whose walk is not accepting in the next Exact
+	// close (any sequence; a chunk that falls back is not a close). FirstRow: SuperSLM's degenerate-row seam (the one
+	// FSuperSLMSchemaJumpTestAccess::ArmGpuDegenerateFinishRow() arms) is armed on the submission thread right before the
+	// close, so the close's first finish, row 0's, sees the degenerate row: a real -2 at that row's walk state, no draft
+	// committed past it, and CloseRows() hands on the one-row result. AfterDrafts: the next Exact close that commits two
+	// rows or more reports its produced token as -2 in place of sslm_gpu_seq_rows_produced's, so its committed drafts are
+	// delivered and then the dead end, through ApplyJumpResult(). That substitutes the engine's report, as ArmRowsFault()
+	// does: the engine's walk has taken the real token, and the accepting reading is the walk after it (not accepting
+	// mid-document). Development builds only, as the degenerate-row seam is. False when the seam is not built.
+	static bool ArmExactCloseDeadEnd(USuperSLMGpuSubsystem& Gpu, ESuperSLMGpuExactCloseDeadEnd Where);
 	// Ruling 57 (F1, F5), 57a: the widths phase 1's load-time warm-up of the widened row kernels takes at the last
 	// Configure(): exactly the chooser's candidate widths (WidenCandidateMask()), ascending, each in 2..8; possibly
 	// empty, and empty with multi-row off. Each width, in each phase-1 attempt, either runs once (a Calibration call of

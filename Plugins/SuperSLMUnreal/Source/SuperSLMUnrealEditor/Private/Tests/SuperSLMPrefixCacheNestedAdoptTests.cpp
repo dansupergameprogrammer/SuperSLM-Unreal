@@ -114,11 +114,11 @@ namespace SuperSLMPrefixCacheNestedAdoptTests
 		return true;
 	}
 
-	// The run ended as a schema-bound generation should: Complete, or Faulted with the documented Schema Dead End close.
+	// The run ended as a schema-bound generation should: Complete, on MaxNewTokens or at its schema's end (SchemaComplete,
+	// plugin 1.5.0). A Faulted run, Schema Dead End included, is not clean.
 	bool EndedCleanly(FAutomationTestBase& T, const FRunResult& R, const TCHAR* What)
 	{
-		const bool bClean = R.Phase == ESuperSLMSequencePhase::Complete ||
-			(R.Phase == ESuperSLMSequencePhase::Faulted && R.Outcome == ESuperSLMDecodeOutcome::SchemaDeadEnd);
+		const bool bClean = R.Phase == ESuperSLMSequencePhase::Complete;
 		return T.TestTrue(*FString::Printf(TEXT("%s: ends Complete or at its schema's end, not by a fault (phase %d, outcome %d, %d tokens; %s)"),
 			What, (int32)R.Phase, (int32)R.Outcome, R.Tokens.Num(), *R.Error), bClean);
 	}

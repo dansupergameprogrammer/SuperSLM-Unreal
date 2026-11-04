@@ -69,6 +69,7 @@ SUPERSLM_BP_MIRRORS(ESuperSLMDecodeOutcome, ESuperSLMDecodeOutcomeBP, Generating
 SUPERSLM_BP_MIRRORS(ESuperSLMDecodeOutcome, ESuperSLMDecodeOutcomeBP, SchemaDeadEnd)
 SUPERSLM_BP_MIRRORS(ESuperSLMDecodeOutcome, ESuperSLMDecodeOutcomeBP, SequenceNoLongerValid)
 SUPERSLM_BP_MIRRORS(ESuperSLMDecodeOutcome, ESuperSLMDecodeOutcomeBP, KvBudgetExceeded)
+SUPERSLM_BP_MIRRORS(ESuperSLMDecodeOutcome, ESuperSLMDecodeOutcomeBP, SchemaComplete)
 
 SUPERSLM_BP_MIRRORS(ESuperSLMSequencePhase, ESuperSLMSequencePhaseBP, Idle)
 SUPERSLM_BP_MIRRORS(ESuperSLMSequencePhase, ESuperSLMSequencePhaseBP, Prefilling)

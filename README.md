@@ -224,7 +224,7 @@ model. See [Assets and Import](docs/ASSETS_AND_IMPORT.md).
 
 SuperSLM is the engine-independent runtime: the `.sslm` format, the converter, the inference kernels,
 constrained decoding and the determinism guarantee. This plugin builds SuperSLM's sources, vendored
-unmodified at a pinned release tag (currently `v1.18.1`), with the engine's own toolchain. Nothing is
+unmodified at a pinned release tag (currently `v1.19.0`), with the engine's own toolchain. Nothing is
 downloaded at build time and no prebuilt library is used. For the runtime's internals, see the
 [SuperSLM repository](https://github.com/dansupergameprogrammer/SuperSLM).
 

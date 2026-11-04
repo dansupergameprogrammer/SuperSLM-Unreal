@@ -142,6 +142,8 @@ namespace
 		case ESuperSLMDecodeOutcome::TokenProduced: return TEXT("TokenProduced");
 		case ESuperSLMDecodeOutcome::Generating: return TEXT("Generating");
 		case ESuperSLMDecodeOutcome::SchemaDeadEnd: return TEXT("SchemaDeadEnd");
+		case ESuperSLMDecodeOutcome::SchemaComplete: return TEXT("SchemaComplete");
+		case ESuperSLMDecodeOutcome::KvBudgetExceeded: return TEXT("KvBudgetExceeded");
 		default: return TEXT("SequenceNoLongerValid");
 		}
 	}

@@ -55,23 +55,13 @@ namespace SuperSLMSchemaJumpFixtures
 	}
 
 #if SUPERSLMUNREAL_WITH_GPU
-	// A schema-bound GPU generation to its end: Complete, or Faulted with the documented Schema Dead End close (the
-	// plugin reports a schema-bound generation whose object closed before MaxNewTokens that way,
-	// SuperSLMGpuSubsystem.h GetLastDecodeOutcome) with the walk accepting, so the object is complete: a dead end
-	// mid-object leaves the walk not accepting (IsSchemaAccepting) and is an error, as is any other fault.
-	// OutTokens holds the run's tokens.
+	// A schema-bound GPU generation to its end: Complete, on MaxNewTokens or at the schema's complete document
+	// (SchemaComplete; plugin 1.5.0 ends it there cleanly). A dead end mid-object (SchemaDeadEnd, the walk not
+	// accepting) is Faulted and an error, as is any other fault. OutTokens holds the run's tokens.
 	inline bool RunGpuToSchemaEnd(USuperSLMGpuSubsystem& Gpu, const FSuperSLMGpuSequence& Seq, const FSuperSLMGenerationRequest& Request,
 		TArray<int32>& OutTokens, double MaxWallClockSeconds, FString& OutError)
 	{
-		if (SuperSLML2S2Fixtures::RunGpuGenerationToCompletion(Gpu, Seq, Request, OutTokens, MaxWallClockSeconds, OutError)) { return true; }
-		if (Gpu.GetPhase(Seq) == ESuperSLMSequencePhase::Faulted && Gpu.GetLastDecodeOutcome(Seq) == ESuperSLMDecodeOutcome::SchemaDeadEnd
-			&& Gpu.IsSchemaAccepting(Seq))
-		{
-			OutTokens = Gpu.GetGeneratedTokens(Seq);
-			OutError.Reset();
-			return true;
-		}
-		return false;
+		return SuperSLML2S2Fixtures::RunGpuGenerationToCompletion(Gpu, Seq, Request, OutTokens, MaxWallClockSeconds, OutError);
 	}
 #endif
 

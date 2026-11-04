@@ -2,7 +2,8 @@
 any MR6 cell can run.
 
   - the plugin is 1.4 and vendors engine 1.18 (errata E-6; ruling 39: until the 1.18 tag it vendors SuperSLM
-    a 1.18.0 candidate, then re-vendors the v1.18.0 tag);
+    a 1.18.0 candidate, then re-vendors the v1.18.0 tag), or a later plugin on a later engine (plugin 1.5 vendors
+    v1.19.0, which keeps the multi-row verbs and the measured cost table);
   - the vendored cost table is the measured one (N4, ruling 37), and the chooser is fed from its merged arrays only
     (ruling 39 Q11);
   - the configuration carries ruling 39 Q9's knobs: int32 GpuRowsMarginPerMille (default 150) and bool bGpuMultiRow
@@ -46,7 +47,8 @@ def enumerators(body):
 def test_plugin_version_is_1_4():
     uplugin = next(PLUGIN.glob("*.uplugin")).read_text(encoding="utf-8")
     match = re.search(r'"VersionName"\s*:\s*"([^"]+)"', uplugin)
-    assert match and match.group(1).startswith("1.4."), "VersionName %s, want 1.4.x" % (match and match.group(1))
+    version = match and tuple(int(p) for p in re.match(r"(\d+)\.(\d+)", match.group(1)).groups())
+    assert version and version >= (1, 4), "VersionName %s, want 1.4.x or later" % (match and match.group(1))
 
 
 R17_VENDOR_COMMIT = "a7d6ac22d0078809b58aceb9a499a24ddee1672d"  # ruling 39: MR6's vendor until the 1.18 tag (re-vendored for rulings 46/46a)
@@ -56,9 +58,9 @@ def test_vendored_engine_is_1_18():
     text = (VENDORED / "VENDORED_VERSION.txt").read_text(encoding="utf-8")
     tag = re.search(r"^Tag:\s*v(\d+)\.(\d+)\.(\d+)", text, re.M)
     commit = re.search(r"^Commit:\s*([0-9a-f]{40})", text, re.M)
-    on_tag = tag and (int(tag.group(1)), int(tag.group(2))) == (1, 18)
+    on_tag = tag and (int(tag.group(1)), int(tag.group(2))) >= (1, 18)
     on_r17 = commit and commit.group(1) == R17_VENDOR_COMMIT
-    assert on_tag or on_r17, "vendored %s at %s; want the v1.18 tag, or %s until it" % (
+    assert on_tag or on_r17, "vendored %s at %s; want the v1.18 tag or a later one, or %s until it" % (
         tag and "v%s.%s.%s" % tag.groups(), commit and commit.group(1), R17_VENDOR_COMMIT)
 
 

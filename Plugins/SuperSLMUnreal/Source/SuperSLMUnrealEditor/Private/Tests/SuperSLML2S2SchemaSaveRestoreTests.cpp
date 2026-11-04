@@ -50,11 +50,10 @@ namespace
 	constexpr uint32 kWalkStateUnused = 0xFFFFFFFFu;
 
 	// T-2826 build log §3: the demo schema (`potion_shop_order`) bound to the pinned
-	// prompt dead-ends after a MEASURED 29 tokens, identical on both GPU paths --
-	// well under this file's own MaxNewTokens=48, so both of this file's own
-	// constructions are EXPECTED to reach Faulted/SchemaDeadEnd, never Complete
-	// (§5.3: "the schema dead-ends at 29 tokens ... the sequence ends
-	// Faulted/SchemaDeadEnd, exactly as the CPU backend's -2 does"). Fixtures'
+	// prompt reaches its end (the -2) after a MEASURED 29 tokens, identical on both GPU paths --
+	// well under this file's own MaxNewTokens=48. Through plugin 1.4 that end was
+	// Faulted/SchemaDeadEnd; from plugin 1.5.0 the walk is accepting there, so both of this
+	// file's own constructions are EXPECTED to reach Complete/SchemaComplete. Fixtures'
 	// RunGpuGenerationToCompletion() treats Faulted as a test FAILURE, which is
 	// correct for cells that expect a clean stop -- R-S2g's own claim is about
 	// whether a save/restore CHANGES what a sequence does, not about whether the
